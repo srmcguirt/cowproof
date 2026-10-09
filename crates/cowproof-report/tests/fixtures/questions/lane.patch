@@ -1,0 +1,34 @@
+diff --git a/docs/handoffs/handoff-fixture-questions.md b/docs/handoffs/handoff-fixture-questions.md
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/docs/handoffs/handoff-fixture-questions.md
+@@ -0,0 +1,20 @@
++# Checks
++
++| Command | Result |
++| --- | --- |
++| `npm run test:all` | 24 tests passed (exit 0) |
++| `cargo clippy` | No warnings |
++
++# Linting question
++
++Should we enable stricter linting rules in the next phase? The codebase is currently quite permissive. Recommended answer: Yes, enable strict mode after this release is stable.
++
++# Schema migration question
++
++Does the schema migration need to be tested against the legacy data format? There is some legacy data in production. Recommended answer: Yes, add a migration test against the provided sample data.
++
++# Documentation question
++
++Can we defer the API documentation updates to the next cycle? The API has been refactored but the docs are outdated. Recommended answer: No, documentation should land with the code change.
+diff --git a/src/middleware/auth.rs b/src/middleware/auth.rs
+new file mode 100644
+index 0000000..7777777
+--- /dev/null
++++ b/src/middleware/auth.rs
+@@ -0,0 +1,5 @@
++pub fn check_auth(token: &str) -> bool {
++    !token.is_empty()
++}
++

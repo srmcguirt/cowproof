@@ -1,0 +1,40 @@
+diff --git a/docs/handoffs/handoff-fixture-table.md b/docs/handoffs/handoff-fixture-table.md
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/docs/handoffs/handoff-fixture-table.md
+@@ -0,0 +1,12 @@
++# Checks
++
++| Command | Result |
++| --- | --- |
++| `npm run test:all` | passed: 24 tests, 0 failed |
++| `cargo clippy --all-targets -- -D warnings` | All checks passed |
++| `npm run build` | Built successfully, exit code 0 |
++
++# Notes
++
++This fixture demonstrates the markdown table format for reporting checks.
++All checks passed without issues.
+diff --git a/src/todo-cli/main.rs b/src/todo-cli/main.rs
+new file mode 100644
+index 0000000..2222222
+--- /dev/null
++++ b/src/todo-cli/main.rs
+@@ -0,0 +1,5 @@
++fn main() {
++    println!("Todo CLI");
++    // Add task processing logic
++}
++
+diff --git a/package.json b/package.json
+index 0000000..3333333
+--- a/package.json
++++ b/package.json
+@@ -1,5 +1,6 @@
+ {
+   "name": "todo-app",
++  "version": "0.1.0",
+   "scripts": {
+     "test:all": "jest --coverage"
+   }

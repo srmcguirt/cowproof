@@ -1,0 +1,49 @@
+diff --git a/docs/handoffs/handoff-fixture-baseline.md b/docs/handoffs/handoff-fixture-baseline.md
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/docs/handoffs/handoff-fixture-baseline.md
+@@ -0,0 +1,16 @@
++# Checks
++
++| Command | Result |
++| --- | --- |
++| `npm run test:migrations` | Schema validation passed (exit 0) |
++| `cargo test --test integration_tests` | 15 integration tests passed |
++
++# Notes
++
++This fixture demonstrates migration baseline testing.
++The new migration (20260410_add_user_preferences.sql) was tested against the baseline schema (20260401_existing.sql).
++
++Schema compatibility verified for:
++- Data type changes
++- Constraint additions
++- Index optimizations
+diff --git a/migrations/20260410_add_user_preferences.sql b/migrations/20260410_add_user_preferences.sql
+new file mode 100644
+index 0000000..9999999
+--- /dev/null
++++ b/migrations/20260410_add_user_preferences.sql
+@@ -0,0 +1,10 @@
++BEGIN;
++
++CREATE TABLE user_preferences (
++  id INT PRIMARY KEY,
++  user_id INT NOT NULL,
++  theme VARCHAR(20) DEFAULT 'light',
++  notify_email BOOLEAN DEFAULT true,
++  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
++);
++COMMIT;
+diff --git a/README.md b/README.md
+new file mode 100644
+index 0000000..aaaaaaa
+--- /dev/null
++++ b/README.md
+@@ -0,0 +1,5 @@
++# Todo App
++
++A todo application with user preferences.
++
++## Setup

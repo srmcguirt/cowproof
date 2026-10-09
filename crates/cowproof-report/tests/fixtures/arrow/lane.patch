@@ -1,0 +1,26 @@
+diff --git a/docs/handoffs/handoff-fixture-arrow.md b/docs/handoffs/handoff-fixture-arrow.md
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/docs/handoffs/handoff-fixture-arrow.md
+@@ -0,0 +1,10 @@
++# Verification Status
++
++cargo fmt --all -- --check  ->  All files properly formatted (exit 0)
++npm run test  ->  117 passed, 0 failed, exit code 0
++git diff --check  ->  No whitespace issues found
++
++# Summary
++
++This fixture demonstrates the arrow format for check reporting.
++Each command is reported with a compact inline result.
+diff --git a/src/config.json b/src/config.json
+new file mode 100644
+index 0000000..6666666
+--- /dev/null
++++ b/src/config.json
+@@ -0,0 +1,4 @@
++{
++  "appName": "todo-app",
++  "version": "0.1.0"
++}

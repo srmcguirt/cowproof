@@ -1,0 +1,32 @@
+diff --git a/docs/handoffs/handoff-fixture-fenced.md b/docs/handoffs/handoff-fixture-fenced.md
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/docs/handoffs/handoff-fixture-fenced.md
+@@ -0,0 +1,17 @@
++# Verification Checks
++
++## Commands below were executed:
++```
++cargo test --all
++npm run coverage
++cargo clippy --all-targets
++```
++
++All test suites executed successfully with no failures.
++Coverage targets met at 85% overall.
++Schema validation passed.
++
++## Notes
++
++The fenced format groups multiple commands with a single shared result paragraph.
++This demonstrates the coalesced check reporting pattern.
+diff --git a/scripts/validate.sh b/scripts/validate.sh
+new file mode 100755
+index 0000000..5555555
+--- /dev/null
++++ b/scripts/validate.sh
+@@ -0,0 +1,5 @@
++#!/bin/bash
++echo "Validating schema"
++exit 0

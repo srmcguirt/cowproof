@@ -730,4 +730,112 @@ mod tests {
             "fixture-lane"
         ));
     }
+    #[test]
+    fn table_format_fixture_parses_checks() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/table");
+        let args = vec![dir.to_string_lossy().to_string()];
+        let r = main_report(&args).unwrap();
+        assert_eq!(r.lane_id, "fixture-table");
+        assert_eq!(r.checks.len(), 3);
+        assert_eq!(r.checks[0].command, "npm run test:all");
+        assert_eq!(r.checks[0].classification, "pass");
+        assert_eq!(
+            r.checks[1].command,
+            "cargo clippy --all-targets -- -D warnings"
+        );
+        assert_eq!(r.checks[1].classification, "pass");
+        assert_eq!(r.checks[2].command, "npm run build");
+        assert_eq!(r.checks[2].classification, "pass");
+    }
+    #[test]
+    fn bullet_format_fixture_parses_checks() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/bullet");
+        let args = vec![dir.to_string_lossy().to_string()];
+        let r = main_report(&args).unwrap();
+        assert_eq!(r.lane_id, "fixture-bullet");
+        assert_eq!(r.checks.len(), 4);
+        assert_eq!(r.checks[0].command, "npm run lint");
+        assert_eq!(r.checks[0].classification, "pass");
+        assert_eq!(r.checks[3].command, "git diff --check");
+        assert_eq!(r.checks[3].classification, "pass");
+    }
+    #[test]
+    fn fenced_format_fixture_parses_checks() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fenced");
+        let args = vec![dir.to_string_lossy().to_string()];
+        let r = main_report(&args).unwrap();
+        assert_eq!(r.lane_id, "fixture-fenced");
+        assert_eq!(r.checks.len(), 3);
+        assert_eq!(r.checks[0].command, "cargo test --all");
+        assert_eq!(r.checks[1].command, "npm run coverage");
+        assert_eq!(r.checks[2].command, "cargo clippy --all-targets");
+        assert!(r.checks.iter().all(|c| c.classification == "pass"));
+    }
+    #[test]
+    fn arrow_format_fixture_parses_checks() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/arrow");
+        let args = vec![dir.to_string_lossy().to_string()];
+        let r = main_report(&args).unwrap();
+        assert_eq!(r.lane_id, "fixture-arrow");
+        assert_eq!(r.checks.len(), 3);
+        assert_eq!(r.checks[0].command, "cargo fmt --all -- --check");
+        assert_eq!(r.checks[0].classification, "pass");
+        assert_eq!(r.checks[1].command, "npm run test");
+        assert_eq!(r.checks[1].classification, "pass");
+    }
+    #[test]
+    fn questions_fixture_extracts_sections() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/questions");
+        let args = vec![dir.to_string_lossy().to_string()];
+        let r = main_report(&args).unwrap();
+        assert_eq!(r.lane_id, "fixture-questions");
+        assert_eq!(r.questions.len(), 3);
+        assert!(r.questions.iter().any(|q| q.contains("linting")));
+        assert!(r.questions.iter().any(|q| q.contains("schema migration")));
+        assert!(r.questions.iter().any(|q| q.contains("documentation")));
+    }
+    #[test]
+    fn limits_fixture_extracts_all_sections() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/limits");
+        let args = vec![dir.to_string_lossy().to_string()];
+        let r = main_report(&args).unwrap();
+        assert_eq!(r.lane_id, "fixture-limits");
+        assert!(!r.limits.is_empty());
+        assert!(
+            r.limits[0].contains("unit tests") || r.limits.iter().any(|s| s.contains("unit tests"))
+        );
+        assert!(!r.unverified.is_empty());
+        assert!(r.unverified.iter().any(|s| s.contains("concurrency")));
+    }
+    #[test]
+    fn baseline_fixture_accepts_baseline_argument() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/baseline");
+        let args = vec![
+            dir.to_string_lossy().to_string(),
+            "--baseline".into(),
+            "20260401_existing.sql".into(),
+        ];
+        let r = main_report(&args).unwrap();
+        assert_eq!(r.lane_id, "fixture-baseline");
+        assert_eq!(r.checks.len(), 2);
+        assert!(r.checks.iter().all(|c| c.classification == "pass"));
+    }
+    #[test]
+    fn malformed_table_row_ignored_not_parsed() {
+        // Empty cells in table should be skipped, not cause errors
+        let checks = parse_checks("| Command | Result |\n| --- | --- |\n| | missing result |");
+        assert!(checks.is_empty());
+    }
+    #[test]
+    fn malformed_bullet_without_result_ignored() {
+        // Bullet without result separator should be ignored
+        let checks = parse_checks("- `cargo test` with no separator");
+        assert!(checks.is_empty());
+    }
+    #[test]
+    fn malformed_arrow_format_too_few_spaces_ignored() {
+        // Arrow with only one space should not match (requires 2+ spaces)
+        let checks = parse_checks("cargo test - result");
+        assert!(checks.is_empty());
+    }
 }

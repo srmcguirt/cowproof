@@ -1,0 +1,43 @@
+diff --git a/docs/handoffs/handoff-fixture-limits.md b/docs/handoffs/handoff-fixture-limits.md
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/docs/handoffs/handoff-fixture-limits.md
+@@ -0,0 +1,30 @@
++# Checks
++
++cargo test  ->  All 42 tests passed (exit 0)
++
++# Limits
++
++Testing was restricted to unit tests on macOS.
++Integration tests against the staging database were not run due to time constraints.
++The async task queue initialization path was not covered in this fixture.
++
++# Deferred
++
++The performance profiling work is deferred to the next phase as per the director's guidance.
++The API versioning decision awaits product input.
++
++# Unverified
++
++The todo-app behavior under high concurrency has not been verified.
++The email notification delivery on the staging SMTP relay is unverified (uses mock server in tests).
++The schema migration against a large production snapshot has not been tested.
++
++# Notes
++
++This fixture demonstrates the sections for scoping work and documenting what remains.
++All tested functionality is correct; the items above are outside the scope of this work.
+diff --git a/Cargo.toml b/Cargo.toml
+new file mode 100644
+index 0000000..8888888
+--- /dev/null
++++ b/Cargo.toml
+@@ -0,0 +1,6 @@
++[package]
++name = "todo-app"
++version = "0.1.0"
++edition = "2021"
++
++[dependencies]
