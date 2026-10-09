@@ -663,9 +663,9 @@ impl SandboxFixture {
 
 #[cfg(test)]
 mod sandbox_tests {
-    use super::tests::{assert_process_gone, run_backgrounding_check};
     use super::*;
     use std::net::TcpListener;
+    use std::time::Instant;
 
     const LIMIT: Duration = Duration::from_secs(60);
 
@@ -847,10 +847,32 @@ mod sandbox_tests {
             return;
         }
         let fx = SandboxFixture::new();
+        let tree = &fx.lane.clone;
 
-        let pid = run_backgrounding_check(&fx.runner(), &fx.lane.clone).await;
-
-        assert_process_gone(pid);
+        // A pid recorded inside the sandbox means nothing outside it: bwrap runs with
+        // `--unshare-pid`, so `$!` there is a pid in the sandbox's own namespace. Prove
+        // the kill by effect instead: a background child that outlived the timeout
+        // would write `survived` two seconds later.
+        let command = "(sleep 2; echo alive > survived) & wait";
+        let start = Instant::now();
+        let result = fx
+            .runner()
+            .run(tree, command, Duration::from_millis(500))
+            .await;
+        match result {
+            Err(InfraError::Timeout(named)) => assert!(named.contains(command), "{named}"),
+            other => panic!("expected InfraError::Timeout, got {other:?}"),
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(3),
+            "took {:?}",
+            start.elapsed()
+        );
+        tokio::time::sleep(Duration::from_millis(3500)).await;
+        assert!(
+            !tree.join("survived").exists(),
+            "a background child outlived the timeout and wrote its marker"
+        );
     }
 
     /// The verifier's cleared environment carries an explicit PATH: the fixed system
