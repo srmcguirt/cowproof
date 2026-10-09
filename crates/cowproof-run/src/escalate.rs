@@ -1034,6 +1034,62 @@ impl Queue {
         }
     }
 
+    /// Retry delivery of an already-recorded ruling.
+    ///
+    /// 1. Checks that `id` is known, belongs to this lane, and has a ruling.
+    /// 2. Checks that the ruling has not yet been delivered.
+    /// 3. Calls `delivery.deliver` with the recorded verdict (byte-identical).
+    /// 4. On success, records a `delivered` event (same as `rule_and_deliver`).
+    /// 5. On delivery failure, the state stays undelivered and the error is returned.
+    pub fn redeliver(
+        &mut self,
+        lane: &str,
+        id: &EscalationId,
+        delivery: &mut dyn Delivery,
+    ) -> Result<DeliveryOutcome, String> {
+        // Check if the id exists and belongs to the correct lane
+        let entry = self
+            .escalations
+            .get(id)
+            .ok_or_else(|| format!("escalation {} unknown", id))?;
+
+        if entry.lane != lane {
+            return Err(format!(
+                "escalation {} belongs to lane {}, not {}",
+                id, entry.lane, lane
+            ));
+        }
+
+        // Check if a ruling exists
+        let verdict = entry
+            .verdict
+            .as_ref()
+            .ok_or_else(|| format!("escalation {} has no ruling yet", id))?;
+
+        // Check if already delivered
+        if entry.delivered {
+            return Err(format!("escalation {} already delivered", id));
+        }
+
+        // Attempt delivery with the recorded verdict
+        match delivery
+            .deliver(lane, id, verdict)
+            .map_err(|e| e.0.clone())?
+        {
+            DeliveryResult::Delivered => {
+                self.record_delivered(lane, id, false)
+                    .map_err(|e| e.to_string())?;
+                Ok(DeliveryOutcome::Delivered)
+            }
+            DeliveryResult::SessionGone => {
+                // Session gone during redelivery means the session was lost.
+                // We do not fall back to a fresh session during redelivery—that
+                // would be a separate escalation. Just return the error.
+                Err("session gone during redelivery".to_string())
+            }
+        }
+    }
+
     fn record_delivered(
         &mut self,
         lane: &str,
@@ -2451,6 +2507,155 @@ mod tests {
         let err = queue.rule("lane2", &id, &answer("wrong lane")).unwrap_err();
         assert!(err.contains("belongs to lane lane1"), "{err}");
         assert!(queue.get(&id).unwrap().2.is_none());
+    }
+
+    #[test]
+    fn test_redeliver_after_failed_delivery() {
+        let tmpdir = tempfile::TempDir::new().unwrap();
+        let mut queue = Queue::new(tmpdir.path(), Box::new(TestClock::new())).unwrap();
+        let id = queue
+            .ask("lane1", &new_ask("test?"), Origin::Builder)
+            .unwrap();
+        let verdict = answer("first attempt");
+
+        // First rule_and_deliver with a failing delivery
+        let mut delivery =
+            ScriptedDelivery::new(vec![Err(DeliveryError("pipe broke".to_string()))]);
+        let err = queue
+            .rule_and_deliver("lane1", &id, &verdict, &mut delivery)
+            .unwrap_err();
+        assert!(matches!(&err, RuleError::Delivery(_)));
+        assert!(!queue.is_delivered(&id));
+
+        // Now redeliver with a working delivery
+        let mut delivery2 = ScriptedDelivery::new(vec![Ok(DeliveryResult::Delivered)]);
+        let outcome = queue.redeliver("lane1", &id, &mut delivery2).unwrap();
+
+        assert_eq!(outcome, DeliveryOutcome::Delivered);
+        assert!(queue.is_delivered(&id));
+        assert_eq!(queue.get(&id).unwrap().2, Some(&verdict));
+        // Should have exactly one Delivered event
+        assert_eq!(count_events(tmpdir.path(), "delivered"), 1);
+    }
+
+    #[test]
+    fn test_redeliver_after_reopen() {
+        let tmpdir = tempfile::TempDir::new().unwrap();
+        let mut queue = Queue::new(tmpdir.path(), Box::new(TestClock::new())).unwrap();
+        let id = queue
+            .ask("lane1", &new_ask("test?"), Origin::Builder)
+            .unwrap();
+        let verdict = answer("settled");
+        let mut delivery = ScriptedDelivery::new(vec![Ok(DeliveryResult::Delivered)]);
+
+        queue
+            .rule_and_deliver("lane1", &id, &verdict, &mut delivery)
+            .unwrap();
+        assert!(queue.is_delivered(&id));
+        drop(queue);
+
+        // Reopen and verify delivered state survives
+        let queue = Queue::new(tmpdir.path(), Box::new(TestClock::new())).unwrap();
+        assert!(queue.is_delivered(&id));
+        assert_eq!(queue.get(&id).unwrap().2, Some(&verdict));
+    }
+
+    #[test]
+    fn test_redeliver_on_delivered_id_errors() {
+        let tmpdir = tempfile::TempDir::new().unwrap();
+        let mut queue = Queue::new(tmpdir.path(), Box::new(TestClock::new())).unwrap();
+        let id = queue
+            .ask("lane1", &new_ask("test?"), Origin::Builder)
+            .unwrap();
+        let verdict = answer("done");
+        let mut delivery = ScriptedDelivery::new(vec![Ok(DeliveryResult::Delivered)]);
+
+        queue
+            .rule_and_deliver("lane1", &id, &verdict, &mut delivery)
+            .unwrap();
+        let file_before = std::fs::read(tmpdir.path().join("escalations.jsonl")).unwrap();
+
+        // Try to redeliver to an already-delivered id
+        let mut delivery2 = ScriptedDelivery::new(vec![]);
+        let err = queue.redeliver("lane1", &id, &mut delivery2).unwrap_err();
+        assert!(err.contains("already delivered"), "{err}");
+
+        // File unchanged
+        let file_after = std::fs::read(tmpdir.path().join("escalations.jsonl")).unwrap();
+        assert_eq!(file_before, file_after);
+    }
+
+    #[test]
+    fn test_redeliver_on_unruled_id_errors() {
+        let tmpdir = tempfile::TempDir::new().unwrap();
+        let mut queue = Queue::new(tmpdir.path(), Box::new(TestClock::new())).unwrap();
+        let id = queue
+            .ask("lane1", &new_ask("test?"), Origin::Builder)
+            .unwrap();
+        let file_before = std::fs::read(tmpdir.path().join("escalations.jsonl")).unwrap();
+
+        // Try to redeliver without a ruling
+        let mut delivery = ScriptedDelivery::new(vec![]);
+        let err = queue.redeliver("lane1", &id, &mut delivery).unwrap_err();
+        assert!(err.contains("no ruling yet"), "{err}");
+
+        // File unchanged
+        let file_after = std::fs::read(tmpdir.path().join("escalations.jsonl")).unwrap();
+        assert_eq!(file_before, file_after);
+    }
+
+    #[test]
+    fn test_redeliver_on_wrong_lane_errors() {
+        let tmpdir = tempfile::TempDir::new().unwrap();
+        let mut queue = Queue::new(tmpdir.path(), Box::new(TestClock::new())).unwrap();
+        let id = queue
+            .ask("lane1", &new_ask("test?"), Origin::Builder)
+            .unwrap();
+        let verdict = answer("ruling");
+        queue.rule("lane1", &id, &verdict).unwrap();
+        let file_before = std::fs::read(tmpdir.path().join("escalations.jsonl")).unwrap();
+
+        // Try to redeliver from wrong lane
+        let mut delivery = ScriptedDelivery::new(vec![]);
+        let err = queue.redeliver("lane2", &id, &mut delivery).unwrap_err();
+        assert!(err.contains("belongs to lane lane1"), "{err}");
+
+        // File unchanged
+        let file_after = std::fs::read(tmpdir.path().join("escalations.jsonl")).unwrap();
+        assert_eq!(file_before, file_after);
+    }
+
+    #[test]
+    fn test_redeliver_two_failures_then_success() {
+        let tmpdir = tempfile::TempDir::new().unwrap();
+        let mut queue = Queue::new(tmpdir.path(), Box::new(TestClock::new())).unwrap();
+        let id = queue
+            .ask("lane1", &new_ask("test?"), Origin::Builder)
+            .unwrap();
+        let verdict = answer("ruling");
+        queue.rule("lane1", &id, &verdict).unwrap();
+        assert!(!queue.is_delivered(&id));
+
+        // First redelivery fails
+        let mut delivery1 = ScriptedDelivery::new(vec![Err(DeliveryError("error1".to_string()))]);
+        let err1 = queue.redeliver("lane1", &id, &mut delivery1).unwrap_err();
+        assert!(err1.contains("error1"));
+        assert!(!queue.is_delivered(&id));
+
+        // Second redelivery fails
+        let mut delivery2 = ScriptedDelivery::new(vec![Err(DeliveryError("error2".to_string()))]);
+        let err2 = queue.redeliver("lane1", &id, &mut delivery2).unwrap_err();
+        assert!(err2.contains("error2"));
+        assert!(!queue.is_delivered(&id));
+
+        // Third redelivery succeeds
+        let mut delivery3 = ScriptedDelivery::new(vec![Ok(DeliveryResult::Delivered)]);
+        let outcome = queue.redeliver("lane1", &id, &mut delivery3).unwrap();
+        assert_eq!(outcome, DeliveryOutcome::Delivered);
+        assert!(queue.is_delivered(&id));
+
+        // Exactly one Delivered event in the file
+        assert_eq!(count_events(tmpdir.path(), "delivered"), 1);
     }
 
     #[test]
