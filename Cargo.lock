@@ -501,6 +501,7 @@ dependencies = [
  "assert_cmd",
  "async-trait",
  "cowproof-core",
+ "cowproof-run",
  "predicates",
  "regex",
  "serde",
@@ -538,9 +539,11 @@ dependencies = [
  "hyper-util",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "tokio",
  "uuid",
+ "walkdir",
 ]
 
 [[package]]

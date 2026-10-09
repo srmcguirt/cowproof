@@ -50,12 +50,6 @@ pub struct VerifyReport {
     pub checks: Vec<CheckMatch>,
 }
 
-/// Type alias for Reproduced for backwards compatibility.
-pub type Reproduced = ();
-
-/// Type alias for Diverged for backwards compatibility.
-pub type Diverged = Vec<String>;
-
 /// Maximum attempts for a check marked flaky in the capsule.
 const FLAKY_ATTEMPTS: u32 = 3;
 

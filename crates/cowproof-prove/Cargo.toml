@@ -14,9 +14,11 @@ tracing.workspace = true
 sha2 = "0.10"
 time.workspace = true
 async-trait.workspace = true
+tempfile.workspace = true
 cowproof-core = { version = "0.1.0", path = "../cowproof-core" }
 regex.workspace = true
 toml.workspace = true
+cowproof-run = { version = "0.1.0", path = "../cowproof-run" }
 
 [dev-dependencies]
 tempfile.workspace = true

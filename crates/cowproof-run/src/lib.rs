@@ -13,6 +13,8 @@
 
 pub mod proxy;
 
+use sha2::{Digest, Sha256};
+
 use anyhow::{Context, Result, anyhow, bail};
 use std::collections::BTreeSet;
 use std::path::{Component, Path, PathBuf};
@@ -178,6 +180,208 @@ pub struct LaneLayout {
     pub control: PathBuf,
     /// The user's real home directory, hidden from the sandbox.
     pub real_home: PathBuf,
+}
+
+/// Compute a deterministic cache key for dependency resolution (D11, D14).
+///
+/// The key is a sha256 hash of (in order):
+/// - The target triple (e.g., "x86_64-unknown-linux-gnu")
+/// - Lockfile bytes if present (Cargo.lock, package-lock.json, etc.)
+/// - Registry/source config files if present (.cargo/config.toml, .npmrc, etc.)
+///
+/// The order is deterministic across different filesystem iteration orders.
+/// Changing any of these inputs produces a different key.
+pub fn dependency_cache_key(repo_tree: &Path, target_triple: &str) -> Result<String> {
+    let mut hasher = Sha256::new();
+
+    // Hash the target triple first
+    hasher.update(target_triple.as_bytes());
+
+    // Collect lockfiles in sorted order for determinism
+    let mut lockfiles = Vec::new();
+    for entry in walkdir::WalkDir::new(repo_tree)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file())
+    {
+        let name = entry.file_name().to_string_lossy();
+        if [
+            "Cargo.lock",
+            "package-lock.json",
+            "yarn.lock",
+            "pnpm-lock.yaml",
+            "Gemfile.lock",
+        ]
+        .contains(&name.as_ref())
+        {
+            lockfiles.push(entry.path().to_path_buf());
+        }
+    }
+    lockfiles.sort();
+
+    for lockfile_path in lockfiles {
+        if let Ok(contents) = std::fs::read(&lockfile_path) {
+            hasher.update(&contents);
+        }
+    }
+
+    // Collect registry/source config files in sorted order
+    let mut config_files = Vec::new();
+    for entry in walkdir::WalkDir::new(repo_tree)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file())
+    {
+        let name = entry.file_name().to_string_lossy();
+        let path = entry.path();
+        if (["config.toml", "config", ".npmrc", ".yarnrc", ".yarnrc.yml"].contains(&name.as_ref())
+            || name.ends_with(".npmrc"))
+            && (path.to_string_lossy().contains(".cargo")
+                || path.to_string_lossy().contains(".npm")
+                || path.to_string_lossy().contains(".yarn"))
+        {
+            config_files.push(entry.path().to_path_buf());
+        }
+    }
+    config_files.sort();
+
+    for config_path in config_files {
+        if let Ok(contents) = std::fs::read(&config_path) {
+            hasher.update(&contents);
+        }
+    }
+
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+#[cfg(test)]
+mod cache_key_tests {
+    use super::*;
+
+    #[test]
+    fn same_inputs_produce_same_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        std::fs::create_dir_all(root.join(".cargo")).unwrap();
+        std::fs::write(root.join("Cargo.lock"), "deps = []").unwrap();
+        std::fs::write(root.join(".cargo").join("config.toml"), "[build]").unwrap();
+
+        let key1 = dependency_cache_key(root, "x86_64-unknown-linux-gnu").unwrap();
+        let key2 = dependency_cache_key(root, "x86_64-unknown-linux-gnu").unwrap();
+
+        assert_eq!(key1, key2);
+    }
+
+    #[test]
+    fn different_triple_produces_different_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        std::fs::write(root.join("Cargo.lock"), "deps = []").unwrap();
+        std::fs::create_dir_all(root.join(".cargo")).ok();
+        std::fs::write(root.join(".cargo").join("config.toml"), "[build]").unwrap();
+
+        let key1 = dependency_cache_key(root, "x86_64-unknown-linux-gnu").unwrap();
+        let key2 = dependency_cache_key(root, "aarch64-unknown-linux-gnu").unwrap();
+
+        assert_ne!(key1, key2);
+    }
+
+    #[test]
+    fn different_lockfile_produces_different_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let triple = "x86_64-unknown-linux-gnu";
+
+        std::fs::create_dir_all(root.join(".cargo")).ok();
+        std::fs::write(root.join(".cargo").join("config.toml"), "[build]").unwrap();
+
+        // Create Cargo.lock with content A
+        std::fs::write(root.join("Cargo.lock"), "old").unwrap();
+        let key1 = dependency_cache_key(root, triple).unwrap();
+
+        // Update Cargo.lock with content B
+        std::fs::write(root.join("Cargo.lock"), "new").unwrap();
+        let key2 = dependency_cache_key(root, triple).unwrap();
+
+        assert_ne!(key1, key2);
+    }
+
+    #[test]
+    fn different_config_produces_different_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let triple = "x86_64-unknown-linux-gnu";
+
+        std::fs::write(root.join("Cargo.lock"), "deps").unwrap();
+
+        // Create config with A
+        std::fs::create_dir_all(root.join(".cargo")).ok();
+        std::fs::write(root.join(".cargo").join("config.toml"), "[build]").unwrap();
+        let key1 = dependency_cache_key(root, triple).unwrap();
+
+        // Update config to B
+        std::fs::write(
+            root.join(".cargo").join("config.toml"),
+            "[build]\nopt-level = 2",
+        )
+        .unwrap();
+        let key2 = dependency_cache_key(root, triple).unwrap();
+
+        assert_ne!(key1, key2);
+    }
+
+    #[test]
+    fn file_order_does_not_affect_key() {
+        // This test verifies the key is order-independent by creating files
+        // in a different order and checking the key is the same.
+        let tmp1 = tempfile::tempdir().unwrap();
+        let tmp2 = tempfile::tempdir().unwrap();
+        let triple = "x86_64-unknown-linux-gnu";
+
+        // Create files in tmp1 in order A, B, C
+        std::fs::write(tmp1.path().join("Cargo.lock"), "cargo").unwrap();
+        std::fs::create_dir_all(tmp1.path().join(".cargo")).ok();
+        std::fs::write(tmp1.path().join(".cargo").join("config.toml"), "[cfg]").unwrap();
+        std::fs::write(tmp1.path().join("package-lock.json"), "npm").unwrap();
+
+        // Create files in tmp2 in order C, B, A (reverse)
+        std::fs::write(tmp2.path().join("package-lock.json"), "npm").unwrap();
+        std::fs::create_dir_all(tmp2.path().join(".cargo")).ok();
+        std::fs::write(tmp2.path().join(".cargo").join("config.toml"), "[cfg]").unwrap();
+        std::fs::write(tmp2.path().join("Cargo.lock"), "cargo").unwrap();
+
+        let key1 = dependency_cache_key(tmp1.path(), triple).unwrap();
+        let key2 = dependency_cache_key(tmp2.path(), triple).unwrap();
+
+        assert_eq!(key1, key2);
+    }
+
+    #[test]
+    fn key_handles_missing_lockfiles() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        std::fs::create_dir_all(root.join(".cargo")).ok();
+        std::fs::write(root.join(".cargo").join("config.toml"), "[build]").unwrap();
+
+        // Should not panic even though there's no lockfile
+        let key = dependency_cache_key(root, "x86_64-unknown-linux-gnu").unwrap();
+        assert!(!key.is_empty());
+    }
+
+    #[test]
+    fn key_handles_missing_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        std::fs::write(root.join("Cargo.lock"), "deps").unwrap();
+
+        // Should not panic even though there's no config
+        let key = dependency_cache_key(root, "x86_64-unknown-linux-gnu").unwrap();
+        assert!(!key.is_empty());
+    }
 }
 
 /// Resolve `path` to the spelling the kernel (and so Seatbelt) compares.

@@ -17,8 +17,8 @@ pub mod verify;
 pub use capsule::{Capsule, CapsuleError};
 pub use flaws::{FlawFinding, FlawRule, PatchDelta, RuleFile};
 pub use gates::{GatePacket, GateReport, GateResult, run_gates};
-pub use runner::{CheckOutcome, CheckRunner, ProcessRunner};
-pub use verify::{Diverged, Reproduced, VerifyError, VerifyReport, verify};
+pub use runner::{CheckOutcome, CheckRunner, ProcessRunner, SandboxedRunner, SlotGuard};
+pub use verify::{VerifyError, VerifyReport, VerifyResult, verify};
 
 #[cfg(test)]
 mod tests;
