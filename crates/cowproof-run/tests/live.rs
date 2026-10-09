@@ -627,18 +627,29 @@ fn live_lanes_root_hide_other_lanes() {
         return;
     }
 
-    // Create lanes in a directory outside /tmp and the home.
-    // On Linux use /var/tmp; on macOS use target dir.
-    let mut lanes_root = PathBuf::from("/var/tmp");
-    if !lanes_root.exists() {
-        lanes_root = PathBuf::from("/tmp");
-    }
+    // The lanes must sit outside `/tmp` and the home, which the sandbox hides
+    // anyway: under `/tmp` this test would pass whether or not the lanes root is
+    // hidden. `/var/tmp` is outside both on macOS and Linux.
+    let lanes_root = PathBuf::from("/var/tmp");
+    assert!(
+        lanes_root.is_dir(),
+        "/var/tmp is required: lanes under /tmp would make this test vacuous"
+    );
     let test_lanes = lanes_root.join(format!("cowproof-xlaneisolation-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&test_lanes);
-    std::fs::create_dir_all(&test_lanes).unwrap();
-
     // The real_home must be OUTSIDE lanes_root. Create it in a sibling directory.
     let test_homes = lanes_root.join(format!("cowproof-homes-{}", std::process::id()));
+    // Removes both directories when the test ends, including on a panic.
+    struct Cleanup(Vec<PathBuf>);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            for d in &self.0 {
+                let _ = std::fs::remove_dir_all(d);
+            }
+        }
+    }
+    let _cleanup = Cleanup(vec![test_lanes.clone(), test_homes.clone()]);
+    let _ = std::fs::remove_dir_all(&test_lanes);
+    std::fs::create_dir_all(&test_lanes).unwrap();
     let _ = std::fs::remove_dir_all(&test_homes);
     std::fs::create_dir_all(&test_homes).unwrap();
     let fake_home = test_homes.join("shared_home");
@@ -695,8 +706,7 @@ fn live_lanes_root_hide_other_lanes() {
     let sock_path_b = lane_b_root.join("sock/runner.sock");
     let sock_dir_b = sock_path_b.parent().unwrap().to_path_buf();
     std::fs::create_dir_all(&sock_dir_b).unwrap();
-    let _listener_b =
-        std::os::unix::net::UnixListener::bind(&sock_path_b).expect("failed to bind lane B socket");
+    let accepted_b = serve_pong(&sock_path_b);
 
     // Write secret files before moving paths into LaneLayout
     std::fs::write(lane_b_root.join("clone/secret"), "SECRET_B_CLONE").unwrap();
@@ -724,11 +734,12 @@ fn live_lanes_root_hide_other_lanes() {
             "cat {} 2>/dev/null || echo 'DENIED_B_CLONE:' && \
              cat {} 2>/dev/null || echo 'DENIED_B_CONTROL:' && \
              cat {} 2>/dev/null || echo 'DENIED_B_SOCK:' && \
-             cat {} 2>/dev/null && echo ':ALLOWED_A_CLONE'",
+             cat {} 2>/dev/null && echo ':ALLOWED_A_CLONE'; {}",
             lane_b.clone.join("secret").display(),
             lane_b.control.join("secret").display(),
             sock_dir_b.join("secret_file").display(),
-            lane_a.clone.join("myfile").display()
+            lane_a.clone.join("myfile").display(),
+            socket_probe("B", &lane_b.sock)
         ),
     ];
 
@@ -769,9 +780,13 @@ fn live_lanes_root_hide_other_lanes() {
         out
     );
 
-    // Cleanup
-    let _ = std::fs::remove_dir_all(&test_lanes);
-    let _ = std::fs::remove_dir_all(&test_homes);
+    // Lane A cannot connect to lane B's runner socket.
+    assert!(
+        out.contains("B_REFUSED:") && !out.contains("B_CONNECTED"),
+        "lane_a reached lane_b's runner socket: {}",
+        out
+    );
+    assert_eq!(accepted_b.load(Ordering::SeqCst), 0, "{out}");
 }
 
 // ------------------------------------------------- the bug these tests guard
