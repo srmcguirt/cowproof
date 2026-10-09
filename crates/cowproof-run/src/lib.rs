@@ -14,6 +14,7 @@
 pub mod claude;
 pub mod prefix;
 pub mod proxy;
+pub mod stream;
 
 use sha2::{Digest, Sha256};
 
