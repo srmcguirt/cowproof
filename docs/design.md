@@ -73,7 +73,7 @@ Publish the packet, escalation and capsule formats as a spec with a thin referen
 | Role | Default | Job |
 | --- | --- | --- |
 | Director | Opus, in the user's Claude Code session | Writes packets, rules on escalations, judges exceptions, applies, gates, commits |
-| Builder | Haiku 4.5 through headless Claude Code | Implements one packet inside its lane |
+| Builder | Haiku 5.5 (`claude-haiku-5-5`) through headless Claude Code | Implements one packet inside its lane |
 | Ladder | Sonnet, then Opus | Takes over a lane the director reassigns |
 | Challenger | a different model family where available | Attacks a design ruling or a packet's checks |
 
