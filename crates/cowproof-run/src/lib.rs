@@ -182,93 +182,50 @@ pub struct LaneLayout {
     pub real_home: PathBuf,
 }
 
+/// Lockfiles, at the tree root only, that determine the dependencies (D11).
+const LOCKFILES: &[&str] = &[
+    "Cargo.lock",
+    "package-lock.json",
+    "yarn.lock",
+    "pnpm-lock.yaml",
+    "Gemfile.lock",
+];
+
+/// Registry and source configuration, relative to the tree root (D14).
+const REGISTRY_CONFIGS: &[&str] = &[
+    ".cargo/config.toml",
+    ".cargo/config",
+    ".npmrc",
+    ".yarnrc",
+    ".yarnrc.yml",
+];
+
 /// Compute a deterministic cache key for dependency resolution (D11, D14).
 ///
-/// The key is a sha256 hash of (in order):
-/// - The target triple (e.g., "x86_64-unknown-linux-gnu")
-/// - Lockfile bytes if present (Cargo.lock, package-lock.json, etc.)
-/// - Registry/source config files if present (.cargo/config.toml, .npmrc, etc.)
-///
-/// The order is deterministic across different filesystem iteration orders.
-/// Changing any of these inputs produces a different key.
+/// The key is a sha256 hash over the target triple, then every lockfile and registry
+/// config that exists at the tree root (never in subdirectories such as `target/` or
+/// `node_modules/`), in a fixed order. Each file is hashed with its relative name and
+/// its length, so the same bytes in a different file, or bytes moving from one file to
+/// the next, give a different key. Changing the triple, a lockfile or a registry config
+/// changes the key; creation order and directory iteration order do not.
 pub fn dependency_cache_key(repo_tree: &Path, target_triple: &str) -> Result<String> {
     let mut hasher = Sha256::new();
-
-    // Hash the target triple first
+    hasher.update(target_triple.len().to_le_bytes());
     hasher.update(target_triple.as_bytes());
 
-    // Collect lockfiles at tree root only (not from subdirectories)
-    let mut lockfiles = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(repo_tree) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if !path.is_file() {
-                continue;
-            }
-            let name = entry.file_name();
-            let name_str = name.to_string_lossy();
-            if [
-                "Cargo.lock",
-                "package-lock.json",
-                "yarn.lock",
-                "pnpm-lock.yaml",
-                "Gemfile.lock",
-            ]
-            .contains(&name_str.as_ref())
-            {
-                lockfiles.push(path);
-            }
+    let mut names: Vec<&str> = LOCKFILES.iter().chain(REGISTRY_CONFIGS).copied().collect();
+    names.sort_unstable();
+    for name in names {
+        let path = repo_tree.join(name);
+        if !path.is_file() {
+            continue;
         }
-    }
-    lockfiles.sort();
-
-    for lockfile_path in lockfiles {
-        if let Ok(contents) = std::fs::read(&lockfile_path) {
-            hasher.update(&contents);
-        }
-    }
-
-    // Collect registry/source config files at tree root and in .cargo/ at root only
-    let mut config_files = Vec::new();
-
-    // Check .cargo/ subdirectory at root
-    let cargo_dir = repo_tree.join(".cargo");
-    if cargo_dir.is_dir() {
-        if let Ok(entries) = std::fs::read_dir(&cargo_dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if !path.is_file() {
-                    continue;
-                }
-                let name = entry.file_name();
-                let name_str = name.to_string_lossy();
-                if ["config.toml", "config"].contains(&name_str.as_ref()) {
-                    config_files.push(path);
-                }
-            }
-        }
-    }
-
-    // Check .npmrc, .yarnrc files at root
-    if let Ok(entries) = std::fs::read_dir(repo_tree) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if !path.is_file() {
-                continue;
-            }
-            let name = entry.file_name();
-            let name_str = name.to_string_lossy();
-            if [".npmrc", ".yarnrc", ".yarnrc.yml"].contains(&name_str.as_ref()) {
-                config_files.push(path);
-            }
-        }
-    }
-
-    config_files.sort();
-    for config_path in config_files {
-        if let Ok(contents) = std::fs::read(&config_path) {
-            hasher.update(&contents);
-        }
+        let contents =
+            std::fs::read(&path).with_context(|| format!("cannot read {}", path.display()))?;
+        hasher.update(name.len().to_le_bytes());
+        hasher.update(name.as_bytes());
+        hasher.update(contents.len().to_le_bytes());
+        hasher.update(&contents);
     }
 
     Ok(format!("{:x}", hasher.finalize()))
@@ -401,34 +358,60 @@ mod cache_key_tests {
         // Should not panic even though there's no config
         let key = dependency_cache_key(root, "x86_64-unknown-linux-gnu").unwrap();
         assert!(!key.is_empty());
-        #[test]
-        fn lockfile_in_nested_dir_does_not_affect_key() {
-            let tmp = tempfile::tempdir().unwrap();
-            let root = tmp.path();
-            let triple = "x86_64-unknown-linux-gnu";
+    }
 
-            std::fs::write(root.join("Cargo.lock"), "root").unwrap();
+    #[test]
+    fn lockfile_in_nested_dir_does_not_affect_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let triple = "x86_64-unknown-linux-gnu";
 
-            let key1 = dependency_cache_key(root, triple).unwrap();
+        std::fs::write(root.join("Cargo.lock"), "root").unwrap();
 
-            // Create lockfile in node_modules/ (should be ignored)
-            std::fs::create_dir_all(root.join("node_modules/dep")).ok();
-            std::fs::write(root.join("node_modules/dep/package-lock.json"), "nested").unwrap();
+        let key1 = dependency_cache_key(root, triple).unwrap();
 
-            let key2 = dependency_cache_key(root, triple).unwrap();
+        // Create lockfile in node_modules/ (should be ignored)
+        std::fs::create_dir_all(root.join("node_modules/dep")).ok();
+        std::fs::write(root.join("node_modules/dep/package-lock.json"), "nested").unwrap();
 
-            // Key must be the same; nested lockfile is ignored
-            assert_eq!(key1, key2);
+        let key2 = dependency_cache_key(root, triple).unwrap();
 
-            // Create another in target/ (should also be ignored)
-            std::fs::create_dir_all(root.join("target/debug")).ok();
-            std::fs::write(root.join("target/debug/Cargo.lock"), "target").unwrap();
+        // Key must be the same; nested lockfile is ignored
+        assert_eq!(key1, key2);
 
-            let key3 = dependency_cache_key(root, triple).unwrap();
+        // Create another in target/ (should also be ignored)
+        std::fs::create_dir_all(root.join("target/debug")).ok();
+        std::fs::write(root.join("target/debug/Cargo.lock"), "target").unwrap();
 
-            // Still the same
-            assert_eq!(key1, key3);
-        }
+        let key3 = dependency_cache_key(root, triple).unwrap();
+
+        // Still the same
+        assert_eq!(key1, key3);
+    }
+
+    #[test]
+    fn same_bytes_in_a_different_lockfile_change_the_key() {
+        let triple = "x86_64-unknown-linux-gnu";
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        std::fs::write(a.path().join("Cargo.lock"), "same").unwrap();
+        std::fs::write(b.path().join("package-lock.json"), "same").unwrap();
+        assert_ne!(
+            dependency_cache_key(a.path(), triple).unwrap(),
+            dependency_cache_key(b.path(), triple).unwrap()
+        );
+
+        // Bytes moving across the boundary between two files change the key too.
+        let c = tempfile::tempdir().unwrap();
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(c.path().join("Cargo.lock"), "ab").unwrap();
+        std::fs::write(c.path().join("package-lock.json"), "c").unwrap();
+        std::fs::write(d.path().join("Cargo.lock"), "a").unwrap();
+        std::fs::write(d.path().join("package-lock.json"), "bc").unwrap();
+        assert_ne!(
+            dependency_cache_key(c.path(), triple).unwrap(),
+            dependency_cache_key(d.path(), triple).unwrap()
+        );
     }
 }
 

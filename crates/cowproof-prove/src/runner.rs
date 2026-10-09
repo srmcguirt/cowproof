@@ -30,13 +30,11 @@ pub struct CheckOutcome {
     pub attempts: u32,
 }
 
-/// Trait for executing checks. Implementations must run checks in isolation.
+/// Trait for executing checks.
 ///
-/// For `ProcessRunner`, this is a fresh sandbox with:
-/// - write access to the clone and scratch only
-/// - no read/write access to lane/control/ or the real tree
-/// - no credentials
-/// - no network
+/// `SandboxedRunner` is the production implementation: write access to the tree and
+/// scratch only, no access to `lane/control/` or the real home, no credentials, no
+/// network. `ProcessRunner` gives none of that and exists for tests.
 #[async_trait]
 pub trait CheckRunner: Send + Sync {
     /// Run a check command in the tree at the given path.
@@ -122,7 +120,11 @@ impl SandboxedRunner {
 #[async_trait]
 impl CheckRunner for SandboxedRunner {
     async fn run(&self, tree: &Path, command: &str) -> Result<CheckOutcome, InfraError> {
-        let policy = SandboxPolicy::verifier(&self.lane, &self.cache_dir);
+        // The rebuilt tree is the verifier's clone: it is the one writable tree, so
+        // the policy is built around it, not around the lane's own clone.
+        let mut lane = self.lane.clone();
+        lane.clone = tree.to_path_buf();
+        let policy = SandboxPolicy::verifier(&lane, &self.cache_dir);
 
         // On macOS, write the profile to a temp file outside the clone.
         let profile_file = NamedTempFile::new()
@@ -147,10 +149,20 @@ impl CheckRunner for SandboxedRunner {
         )
         .map_err(|e| InfraError::SpawnError(format!("sandbox_command failed: {e}")))?;
 
-        // Run the sandboxed command.
+        // No credentials (D6): the check starts from an empty environment holding only
+        // PATH and what the policy sets (the verifier's CARGO_HOME), never the
+        // caller's environment, which may carry API keys.
+        let mut env = vec![(
+            "PATH".to_string(),
+            std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".to_string()),
+        )];
+        policy.apply_env(&mut env);
+
         let output_result = Command::new(&sandbox_bin)
             .args(&sandbox_args)
             .current_dir(tree)
+            .env_clear()
+            .envs(env)
             .output()
             .map_err(|e| InfraError::SpawnError(format!("sandbox execution failed: {e}")))?;
 
@@ -167,6 +179,15 @@ impl CheckRunner for SandboxedRunner {
     }
 }
 
+/// The platform string `SandboxedRunner::new` expects for the machine running this code.
+pub fn host_platform() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "darwin"
+    } else {
+        "linux"
+    }
+}
+
 /// RAII guard for a held slot (D12). Released on drop.
 pub struct SlotGuard {
     slot_path: PathBuf,
@@ -180,8 +201,7 @@ impl SlotGuard {
 
 impl Drop for SlotGuard {
     fn drop(&mut self) {
-        // Clean up the slot directory when the guard is dropped.
-        let _ = std::fs::remove_dir_all(&self.slot_path);
+        cowproof_core::release_slot(Some(&self.slot_path));
     }
 }
 
@@ -298,8 +318,10 @@ mod tests {
         let handle =
             std::thread::spawn(move || try_acquire_slot("light", 1, &slot_dir_clone).unwrap());
 
-        // Give the thread time to start waiting
+        // Give the thread time to start waiting: it must still be blocked while the
+        // first guard is held.
         std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(!handle.is_finished(), "waiter got a slot that was held");
 
         // Release the first slot
         drop(guard1);
@@ -325,8 +347,7 @@ mod tests {
         assert!(slot_dir.join("pg-0").exists());
         assert!(slot_dir.join("pg-1").exists());
 
-        // Check that total concurrency counter never exceeds 1
-        // by spawning a thread that spins trying to acquire (it should eventually timeout)
+        // A third attempt, spinning for 200 ms, must never get a slot while both are held.
         let slot_dir_clone = slot_dir.clone();
         let attempt = std::thread::spawn(move || {
             use std::time::{Duration, Instant};
@@ -351,17 +372,46 @@ mod tests {
     }
 }
 
+/// Whether this host can create the sandbox. macOS always can; Linux needs bubblewrap and
+/// user namespaces. With `COWPROOF_REQUIRE_SANDBOX=1` (set in CI) an unavailable sandbox
+/// panics instead of skipping, so a runner that cannot sandbox never reports these tests
+/// as passing.
 #[cfg(test)]
-#[cfg(target_os = "macos")]
-mod macos_tests {
-    use super::*;
+pub(crate) fn sandbox_available() -> bool {
+    if cfg!(target_os = "macos") {
+        return true;
+    }
+    let reason = match Command::new("bwrap")
+        .args(["--ro-bind", "/", "/", "true"])
+        .output()
+    {
+        Ok(o) if o.status.success() => return true,
+        Ok(o) => format!(
+            "bwrap cannot create a sandbox here: {}",
+            String::from_utf8_lossy(&o.stderr).trim()
+        ),
+        Err(e) => format!("bwrap is not installed: {e}"),
+    };
+    if std::env::var_os("COWPROOF_REQUIRE_SANDBOX").is_some_and(|v| v == "1") {
+        panic!("COWPROOF_REQUIRE_SANDBOX=1 but {reason}");
+    }
+    eprintln!("SKIP: {reason}");
+    false
+}
 
-    #[tokio::test]
-    async fn sandboxed_runner_denies_home_access() {
+/// A lane layout, a verifier cache and a fake real home, all under one temp dir.
+#[cfg(test)]
+pub(crate) struct SandboxFixture {
+    _tmp: tempfile::TempDir,
+    pub root: PathBuf,
+    pub lane: LaneLayout,
+}
+
+#[cfg(test)]
+impl SandboxFixture {
+    pub(crate) fn new() -> Self {
         let tmp = tempfile::tempdir().unwrap();
         let root = std::fs::canonicalize(tmp.path()).unwrap();
-
-        // Create lane structure
         for d in [
             "lane/clone",
             "lane/home",
@@ -372,7 +422,6 @@ mod macos_tests {
         ] {
             std::fs::create_dir_all(root.join(d)).unwrap();
         }
-
         let lane = LaneLayout {
             clone: root.join("lane/clone"),
             home: root.join("lane/home"),
@@ -380,282 +429,194 @@ mod macos_tests {
             control: root.join("lane/control"),
             real_home: root.join("realhome"),
         };
-
-        let runner = SandboxedRunner::new(lane.clone(), root.join("cache"), "darwin".to_string());
-
-        // Create a secret file in the real home
-        std::fs::write(root.join("realhome/.bashrc"), "SECRET_CREDENTIAL").unwrap();
-
-        // Create an allowed file in the clone to verify sandbox is working
-        std::fs::write(root.join("lane/clone/allowed.txt"), "allowed_content").unwrap();
-
-        // Verify the allowed file can be read (proves sandbox is active)
-        let allowed_outcome = runner
-            .run(&root.join("lane/clone"), "cat allowed.txt")
-            .await
-            .unwrap();
-        assert_eq!(allowed_outcome.exit_status, 0);
-        assert_eq!(allowed_outcome.output.trim(), "allowed_content");
-
-        // Try to read the secret from the hidden home—must fail specifically
-        let home_path = root.join("realhome/.bashrc");
-        let secret_outcome = runner
-            .run(
-                &root.join("lane/clone"),
-                &format!("cat {}", home_path.display()),
-            )
-            .await
-            .unwrap();
-
-        // Must fail (non-zero exit) AND secret must not be in output
-        assert_ne!(
-            secret_outcome.exit_status, 0,
-            "read of hidden home should fail"
-        );
-        assert!(
-            !secret_outcome.output.contains("SECRET_CREDENTIAL"),
-            "secret text must not appear in output"
-        );
+        Self {
+            _tmp: tmp,
+            root,
+            lane,
+        }
     }
 
-    #[tokio::test]
-    async fn sandboxed_runner_allows_clone_access() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = std::fs::canonicalize(tmp.path()).unwrap();
-
-        // Create lane structure
-        for d in [
-            "lane/clone",
-            "lane/home",
-            "lane/scratch",
-            "lane/control",
-            "cache/.cargo",
-            "realhome",
-        ] {
-            std::fs::create_dir_all(root.join(d)).unwrap();
-        }
-
-        let lane = LaneLayout {
-            clone: root.join("lane/clone"),
-            home: root.join("lane/home"),
-            scratch: root.join("lane/scratch"),
-            control: root.join("lane/control"),
-            real_home: root.join("realhome"),
-        };
-
-        let runner = SandboxedRunner::new(lane, root.join("cache"), "darwin".to_string());
-
-        // Create a test file in the clone
-        std::fs::write(root.join("lane/clone/test.txt"), "hello").unwrap();
-
-        // Read it from the sandbox—should succeed
-        let outcome = runner
-            .run(&root.join("lane/clone"), "cat test.txt")
-            .await
-            .unwrap();
-
-        assert_eq!(outcome.exit_status, 0, "read from clone should succeed");
-        assert_eq!(outcome.output.trim(), "hello");
-    }
-
-    #[tokio::test]
-    async fn before_after_proof_home_access() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = std::fs::canonicalize(tmp.path()).unwrap();
-
-        // Create lane structure
-        for d in [
-            "lane/clone",
-            "lane/home",
-            "lane/scratch",
-            "lane/control",
-            "cache/.cargo",
-            "realhome",
-        ] {
-            std::fs::create_dir_all(root.join(d)).unwrap();
-        }
-
-        let lane = LaneLayout {
-            clone: root.join("lane/clone"),
-            home: root.join("lane/home"),
-            scratch: root.join("lane/scratch"),
-            control: root.join("lane/control"),
-            real_home: root.join("realhome"),
-        };
-
-        // Create secret file
-        std::fs::write(root.join("realhome/.bashrc"), "SECRET_VALUE").unwrap();
-
-        // Test with ProcessRunner (unsandboxed) - should succeed at reading secret
-        let unsandboxed = ProcessRunner::new(1);
-        let unsandboxed_outcome = unsandboxed
-            .run(
-                &root.join("lane/clone"),
-                &format!("cat {}", root.join("realhome/.bashrc").display()),
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            unsandboxed_outcome.exit_status, 0,
-            "unsandboxed runner reads secret"
-        );
-        assert!(
-            unsandboxed_outcome.output.contains("SECRET_VALUE"),
-            "secret is readable without sandbox"
-        );
-
-        // Test with SandboxedRunner - should fail
-        let sandboxed = SandboxedRunner::new(lane, root.join("cache"), "darwin".to_string());
-        let sandboxed_outcome = sandboxed
-            .run(
-                &root.join("lane/clone"),
-                &format!("cat {}", root.join("realhome/.bashrc").display()),
-            )
-            .await
-            .unwrap();
-        assert_ne!(
-            sandboxed_outcome.exit_status, 0,
-            "sandboxed runner denies home access"
-        );
-        assert!(
-            !sandboxed_outcome.output.contains("SECRET_VALUE"),
-            "secret is not readable in sandbox"
-        );
+    pub(crate) fn runner(&self) -> SandboxedRunner {
+        SandboxedRunner::new(
+            self.lane.clone(),
+            self.root.join("cache"),
+            host_platform().to_string(),
+        )
     }
 }
 
 #[cfg(test)]
-#[cfg(target_os = "linux")]
-mod linux_tests {
+mod sandbox_tests {
     use super::*;
+    use std::net::TcpListener;
 
-    fn sandbox_available() -> bool {
-        match std::process::Command::new("bwrap")
-            .args(["--ro-bind", "/", "/", "true"])
-            .output()
-        {
-            Ok(o) if o.status.success() => true,
-            Ok(o) => {
-                let reason = format!(
-                    "bwrap cannot create sandbox: {}",
-                    String::from_utf8_lossy(&o.stderr).trim()
-                );
-                if std::env::var_os("COWPROOF_REQUIRE_SANDBOX").is_some_and(|v| v == "1") {
-                    panic!("COWPROOF_REQUIRE_SANDBOX=1 but {reason}");
-                }
-                eprintln!("SKIP: {reason}");
-                false
-            }
-            Err(e) => {
-                let reason = format!("bwrap not installed: {e}");
-                if std::env::var_os("COWPROOF_REQUIRE_SANDBOX").is_some_and(|v| v == "1") {
-                    panic!("COWPROOF_REQUIRE_SANDBOX=1 but {reason}");
-                }
-                eprintln!("SKIP: {reason}");
-                false
-            }
-        }
-    }
+    /// What the sandbox says when it refuses a read of the hidden home: Seatbelt denies
+    /// the open, bubblewrap replaces the home with an empty tmpfs.
+    const HOME_DENIED: &str = if cfg!(target_os = "macos") {
+        "Operation not permitted"
+    } else {
+        "No such file or directory"
+    };
 
     #[tokio::test]
-    async fn linux_sandboxed_runner_denies_home_access() {
+    async fn sandboxed_runner_reads_and_writes_the_tree() {
         if !sandbox_available() {
             return;
         }
+        let fx = SandboxFixture::new();
+        let tree = &fx.lane.clone;
+        std::fs::write(tree.join("in.txt"), "from-host").unwrap();
 
-        let tmp = tempfile::tempdir().unwrap();
-        let root = std::fs::canonicalize(tmp.path()).unwrap();
-
-        // Create lane structure
-        for d in [
-            "lane/clone",
-            "lane/home",
-            "lane/scratch",
-            "lane/control",
-            "cache/.cargo",
-            "realhome",
-        ] {
-            std::fs::create_dir_all(root.join(d)).unwrap();
-        }
-
-        let lane = LaneLayout {
-            clone: root.join("lane/clone"),
-            home: root.join("lane/home"),
-            scratch: root.join("lane/scratch"),
-            control: root.join("lane/control"),
-            real_home: root.join("realhome"),
-        };
-
-        let runner = SandboxedRunner::new(lane.clone(), root.join("cache"), "linux".to_string());
-
-        // Create a secret file in the real home
-        std::fs::write(root.join("realhome/.bashrc"), "SECRET_CRED").unwrap();
-
-        // Verify allowed file can be read
-        std::fs::write(root.join("lane/clone/allowed.txt"), "allowed_content").unwrap();
-        let allowed = runner
-            .run(&root.join("lane/clone"), "cat allowed.txt")
-            .await
-            .unwrap();
-        assert_eq!(allowed.exit_status, 0);
-
-        // Try to read secret from hidden home - must fail
-        let secret = runner
-            .run(
-                &root.join("lane/clone"),
-                &format!("cat {}", root.join("realhome/.bashrc").display()),
-            )
+        let outcome = fx
+            .runner()
+            .run(tree, "cat in.txt && echo from-sandbox > out.txt")
             .await
             .unwrap();
 
-        assert_ne!(secret.exit_status, 0, "should fail to read hidden home");
-        assert!(
-            !secret.output.contains("SECRET_CRED"),
-            "secret must not leak in output"
+        assert_eq!(outcome.exit_status, 0, "{}", outcome.output);
+        assert_eq!(outcome.output.trim(), "from-host");
+        assert_eq!(outcome.attempts, 1);
+        assert_eq!(
+            std::fs::read_to_string(tree.join("out.txt"))
+                .unwrap()
+                .trim(),
+            "from-sandbox"
         );
     }
 
+    /// The same read that works unsandboxed fails under the sandbox, and fails because
+    /// the home is hidden: the denial message is asserted, and the secret never appears.
     #[tokio::test]
-    async fn linux_sandboxed_runner_allows_clone_access() {
+    async fn sandboxed_runner_hides_the_real_home() {
         if !sandbox_available() {
             return;
         }
+        let fx = SandboxFixture::new();
+        let secret = fx.root.join("realhome/.bashrc");
+        std::fs::write(&secret, "SECRET_CREDENTIAL").unwrap();
+        let cmd = format!("cat {}", secret.display());
 
-        let tmp = tempfile::tempdir().unwrap();
-        let root = std::fs::canonicalize(tmp.path()).unwrap();
-
-        // Create lane structure
-        for d in [
-            "lane/clone",
-            "lane/home",
-            "lane/scratch",
-            "lane/control",
-            "cache/.cargo",
-            "realhome",
-        ] {
-            std::fs::create_dir_all(root.join(d)).unwrap();
-        }
-
-        let lane = LaneLayout {
-            clone: root.join("lane/clone"),
-            home: root.join("lane/home"),
-            scratch: root.join("lane/scratch"),
-            control: root.join("lane/control"),
-            real_home: root.join("realhome"),
-        };
-
-        let runner = SandboxedRunner::new(lane, root.join("cache"), "linux".to_string());
-
-        // Create test file in clone
-        std::fs::write(root.join("lane/clone/test.txt"), "hello").unwrap();
-
-        // Read from clone - should succeed
-        let outcome = runner
-            .run(&root.join("lane/clone"), "cat test.txt")
+        // Control: the path is valid and readable without the sandbox.
+        let open = ProcessRunner::new(1)
+            .run(&fx.lane.clone, &cmd)
             .await
             .unwrap();
+        assert_eq!(open.exit_status, 0, "{}", open.output);
+        assert_eq!(open.output.trim(), "SECRET_CREDENTIAL");
 
-        assert_eq!(outcome.exit_status, 0);
-        assert_eq!(outcome.output.trim(), "hello");
+        // The sandbox itself works: a read inside the tree succeeds.
+        std::fs::write(fx.lane.clone.join("allowed.txt"), "allowed").unwrap();
+        let ok = fx
+            .runner()
+            .run(&fx.lane.clone, "cat allowed.txt")
+            .await
+            .unwrap();
+        assert_eq!(ok.exit_status, 0, "{}", ok.output);
+        assert_eq!(ok.output.trim(), "allowed");
+
+        let denied = fx.runner().run(&fx.lane.clone, &cmd).await.unwrap();
+        assert_eq!(denied.exit_status, 1, "{}", denied.output);
+        assert!(
+            denied.output.contains(HOME_DENIED),
+            "expected {HOME_DENIED:?}, got {:?}",
+            denied.output
+        );
+        assert!(!denied.output.contains("SECRET_CREDENTIAL"));
+    }
+
+    /// `lane/control` (held-out checks) is unreadable even though it is a sibling of
+    /// the tree.
+    #[tokio::test]
+    async fn sandboxed_runner_hides_lane_control() {
+        if !sandbox_available() {
+            return;
+        }
+        let fx = SandboxFixture::new();
+        let held_out = fx.lane.control.join("heldout");
+        std::fs::write(&held_out, "HELD_OUT_CHECK").unwrap();
+        let cmd = format!("cat {}", held_out.display());
+
+        let open = ProcessRunner::new(1)
+            .run(&fx.lane.clone, &cmd)
+            .await
+            .unwrap();
+        assert_eq!(open.output.trim(), "HELD_OUT_CHECK");
+
+        let denied = fx.runner().run(&fx.lane.clone, &cmd).await.unwrap();
+        assert_eq!(denied.exit_status, 1, "{}", denied.output);
+        assert!(!denied.output.contains("HELD_OUT_CHECK"));
+        assert!(denied.output.contains(HOME_DENIED), "{}", denied.output);
+    }
+
+    /// A TCP connect to a local listener succeeds unsandboxed and is refused by the
+    /// sandbox: the listener accepts one connection in the first case and none in the
+    /// second.
+    #[tokio::test]
+    async fn sandboxed_runner_blocks_network() {
+        if !sandbox_available() {
+            return;
+        }
+        let fx = SandboxFixture::new();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let cmd = format!("echo STARTED; exec /bin/bash -c 'exec 3<>/dev/tcp/127.0.0.1/{port}'");
+
+        // Control: the same command connects without the sandbox.
+        let open = ProcessRunner::new(1)
+            .run(&fx.lane.clone, &cmd)
+            .await
+            .unwrap();
+        assert_eq!(open.exit_status, 0, "{}", open.output);
+        assert!(
+            listener.accept().is_ok(),
+            "unsandboxed connect never reached the listener"
+        );
+
+        let blocked = fx.runner().run(&fx.lane.clone, &cmd).await.unwrap();
+        assert!(
+            blocked.output.contains("STARTED"),
+            "the sandbox did not start the command: {}",
+            blocked.output
+        );
+        assert_eq!(blocked.exit_status, 1, "{}", blocked.output);
+        let refused = listener.accept().unwrap_err();
+        assert_eq!(
+            refused.kind(),
+            std::io::ErrorKind::WouldBlock,
+            "the sandboxed check reached the listener"
+        );
+    }
+
+    /// No credentials (D6): the caller's environment does not reach the check. cargo
+    /// sets CARGO_MANIFEST_DIR for this test process, standing in for an API key.
+    #[tokio::test]
+    async fn sandboxed_runner_does_not_inherit_the_environment() {
+        if !sandbox_available() {
+            return;
+        }
+        let fx = SandboxFixture::new();
+        assert!(std::env::var_os("CARGO_MANIFEST_DIR").is_some());
+
+        let open = ProcessRunner::new(1)
+            .run(&fx.lane.clone, "env")
+            .await
+            .unwrap();
+        assert!(open.output.contains("CARGO_MANIFEST_DIR="), "control");
+
+        let sandboxed = fx.runner().run(&fx.lane.clone, "env").await.unwrap();
+        assert_eq!(sandboxed.exit_status, 0, "{}", sandboxed.output);
+        assert!(
+            !sandboxed.output.contains("CARGO_MANIFEST_DIR="),
+            "{}",
+            sandboxed.output
+        );
+        // What the verifier policy sets is present.
+        let cargo_home = format!("CARGO_HOME={}", fx.root.join("cache/.cargo").display());
+        assert!(
+            sandboxed.output.contains(&cargo_home),
+            "{}",
+            sandboxed.output
+        );
     }
 }

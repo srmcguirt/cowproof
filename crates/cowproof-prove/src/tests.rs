@@ -1,5 +1,7 @@
 use crate::capsule::{Capsule, CapsuleError, CheckResult, EnvironmentFingerprint};
-use crate::runner::{CheckOutcome, CheckRunner, InfraError, ProcessRunner};
+use crate::runner::{
+    CheckOutcome, CheckRunner, InfraError, ProcessRunner, SandboxFixture, sandbox_available,
+};
 use crate::verify::{VerifyError, VerifyResult, verify};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -730,4 +732,100 @@ async fn test_existing_tree_is_refused_not_reused() {
         other => panic!("expected Infrastructure, got {other:?}"),
     }
     assert_eq!(runner.call_count(), 0);
+}
+
+// ============================================================================
+// End-to-end with the production runner (D6): real repo, real capsule, real
+// sandbox. The tree verify() rebuilds is the sandbox's writable clone.
+// ============================================================================
+
+/// A base with `README`, an EMPTY launch.patch, and a lane.patch (made by `git diff`)
+/// that adds `file_name`.
+fn adding_lane(file_name: &str) -> (Repo, (String, String), String) {
+    let repo = Repo::new();
+    let base = repo.base(&[("README", "base\n")]);
+    let lane = repo.change(&[(file_name, Some("content\n"))]);
+    (repo, base, lane)
+}
+
+/// 1. The recorded check `test -f newfile` passed, and replaying base + empty
+/// launch.patch + lane.patch under the sandbox passes it again: Reproduced. A second
+/// recorded check proves the verifier really is sandboxed: reading the real home must
+/// fail, which `! cat` records as a pass, so an unsandboxed runner would diverge.
+#[tokio::test]
+async fn test_sandboxed_verify_reproduces_a_recorded_pass() {
+    if !sandbox_available() {
+        return;
+    }
+    let (repo, base, lane) = adding_lane("newfile");
+    let fx = SandboxFixture::new();
+    let secret = fx.root.join("realhome/credential");
+    std::fs::write(&secret, "SECRET_CREDENTIAL").unwrap();
+    let hidden = format!("! cat {}", secret.display());
+    let (capsule_dir, work) = dirs();
+    write_capsule(
+        capsule_dir.path(),
+        &CapsuleSpec {
+            base: &base,
+            patches: &[("launch.patch", ""), ("lane.patch", &lane)],
+            checks: &[
+                ("adds-newfile", "test -f newfile", 0),
+                ("home-hidden", &hidden, 0),
+            ],
+            flaky: &[],
+            unsandboxed: false,
+        },
+    );
+
+    let report = verify(capsule_dir.path(), repo.path(), work.path(), &fx.runner())
+        .await
+        .unwrap();
+
+    assert!(
+        matches!(report.result, VerifyResult::Reproduced),
+        "{report:?}"
+    );
+    assert_eq!(report.checks.len(), 2);
+    assert!(report.checks.iter().all(|c| c.passed && c.matched_capsule));
+    // The replayed tree is the one the checks ran in.
+    assert!(work.path().join("tree/newfile").is_file());
+}
+
+/// 2. The recorded check passed (`test -f newfile`) but the replayed tree lacks the
+/// file, because the lane.patch adds a different one: Diverged, naming that check, with
+/// the actual status 1 from the sandboxed run.
+#[tokio::test]
+async fn test_sandboxed_verify_diverges_when_the_replayed_tree_lacks_the_file() {
+    if !sandbox_available() {
+        return;
+    }
+    let (repo, base, lane) = adding_lane("other");
+    let fx = SandboxFixture::new();
+    let (capsule_dir, work) = dirs();
+    write_capsule(
+        capsule_dir.path(),
+        &CapsuleSpec {
+            base: &base,
+            patches: &[("launch.patch", ""), ("lane.patch", &lane)],
+            checks: &[("adds-newfile", "test -f newfile", 0)],
+            flaky: &[],
+            unsandboxed: false,
+        },
+    );
+
+    let report = verify(capsule_dir.path(), repo.path(), work.path(), &fx.runner())
+        .await
+        .unwrap();
+
+    match &report.result {
+        VerifyResult::Diverged { check_ids } => {
+            assert_eq!(check_ids, &vec!["adds-newfile".to_string()])
+        }
+        other => panic!("expected Diverged, got {other:?}"),
+    }
+    assert_eq!(report.checks[0].capsule_exit_status, 0);
+    assert_eq!(report.checks[0].actual_exit_status, 1);
+    assert!(!report.checks[0].passed);
+    assert!(work.path().join("tree/other").is_file());
+    assert!(!work.path().join("tree/newfile").exists());
 }

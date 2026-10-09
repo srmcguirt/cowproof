@@ -30,7 +30,6 @@ thiserror = "2"
 jsonschema = { version = "0.55", default-features = false }
 async-trait = "0.1"
 sha2 = "0.10"
-walkdir = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap_complete = "4"
