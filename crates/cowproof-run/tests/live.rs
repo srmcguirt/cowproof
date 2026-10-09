@@ -621,15 +621,14 @@ echo END
 // ------------------------------------------------- cross-lane isolation
 
 #[test]
-#[ignore]
 fn live_lanes_root_hide_other_lanes() {
     if !sandbox_available() {
         eprintln!("sandbox not available, skipping");
         return;
     }
 
-    // Create lanes in a directory outside /tmp and the home (to trigger the bug).
-    // On Linux use a directory under CARGO_TARGET_DIR or /var/tmp; on macOS use target dir.
+    // Create lanes in a directory outside /tmp and the home.
+    // On Linux use /var/tmp; on macOS use target dir.
     let mut lanes_root = PathBuf::from("/var/tmp");
     if !lanes_root.exists() {
         lanes_root = PathBuf::from("/tmp");
@@ -638,7 +637,11 @@ fn live_lanes_root_hide_other_lanes() {
     let _ = std::fs::remove_dir_all(&test_lanes);
     std::fs::create_dir_all(&test_lanes).unwrap();
 
-    let fake_home = test_lanes.join("home");
+    // The real_home must be OUTSIDE lanes_root. Create it in a sibling directory.
+    let test_homes = lanes_root.join(format!("cowproof-homes-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&test_homes);
+    std::fs::create_dir_all(&test_homes).unwrap();
+    let fake_home = test_homes.join("shared_home");
     std::fs::create_dir_all(&fake_home).unwrap();
 
     // Create lane A
@@ -653,17 +656,27 @@ fn live_lanes_root_hide_other_lanes() {
     }
     let scratch_a = test_lanes.join("scratch_a");
     std::fs::create_dir_all(&scratch_a).unwrap();
+
+    // Create a real Unix socket listener for lane A
+    let sock_path_a = lane_a_root.join("sock/runner.sock");
+    let sock_dir_a = sock_path_a.parent().unwrap().to_path_buf();
+    std::fs::create_dir_all(&sock_dir_a).unwrap();
+    let _listener_a =
+        std::os::unix::net::UnixListener::bind(&sock_path_a).expect("failed to bind lane A socket");
+
+    // Write secret files before moving paths into LaneLayout
+    std::fs::write(lane_a_root.join("clone/myfile"), "lane_a_secret").unwrap();
+    std::fs::write(lane_a_root.join("control/control_file"), "lane_a_control").unwrap();
+
     let lane_a = LaneLayout {
         clone: lane_a_root.join("clone"),
         home: lane_a_root.join("home"),
         scratch: scratch_a.clone(),
         control: lane_a_root.join("control"),
         real_home: fake_home.clone(),
-        sock: lane_a_root.join("sock/runner.sock"),
+        sock: sock_path_a,
         lanes_root: test_lanes.clone(),
     };
-    std::fs::write(lane_a.clone.join("myfile"), "lane_a_secret").unwrap();
-    std::fs::write(lane_a.control.join("control_file"), "lane_a_control").unwrap();
 
     // Create lane B with secrets
     let lane_b_root = test_lanes.join("lane_b");
@@ -677,28 +690,33 @@ fn live_lanes_root_hide_other_lanes() {
     }
     let scratch_b = test_lanes.join("scratch_b");
     std::fs::create_dir_all(&scratch_b).unwrap();
+
+    // Create a real Unix socket listener for lane B
+    let sock_path_b = lane_b_root.join("sock/runner.sock");
+    let sock_dir_b = sock_path_b.parent().unwrap().to_path_buf();
+    std::fs::create_dir_all(&sock_dir_b).unwrap();
+    let _listener_b =
+        std::os::unix::net::UnixListener::bind(&sock_path_b).expect("failed to bind lane B socket");
+
+    // Write secret files before moving paths into LaneLayout
+    std::fs::write(lane_b_root.join("clone/secret"), "SECRET_B_CLONE").unwrap();
+    std::fs::write(lane_b_root.join("control/secret"), "SECRET_B_CONTROL").unwrap();
+    std::fs::write(sock_dir_b.join("secret_file"), "SECRET_B_SOCK").unwrap();
+
     let lane_b = LaneLayout {
         clone: lane_b_root.join("clone"),
         home: lane_b_root.join("home"),
         scratch: scratch_b.clone(),
         control: lane_b_root.join("control"),
         real_home: fake_home.clone(),
-        sock: lane_b_root.join("sock/runner.sock"),
+        sock: sock_path_b,
         lanes_root: test_lanes.clone(),
     };
-    std::fs::write(lane_b.clone.join("secret"), "SECRET_B_CLONE").unwrap();
-    std::fs::write(lane_b.control.join("secret"), "SECRET_B_CONTROL").unwrap();
-    let sock_dir = lane_b.sock.parent().unwrap();
-    std::fs::write(sock_dir.join("secret_file"), "SECRET_B_SOCK").unwrap();
-
-    // Create the socket file itself
-    std::fs::write(&lane_b.sock, "").unwrap();
 
     // Build a sandbox policy for lane A and run probes
     let policy = SandboxPolicy::builder(&lane_a, NetworkMode::None);
 
-    // Create the profile (on macOS) or render args (on Linux)
-    let sock_dir = lane_b.sock.parent().unwrap();
+    // Build the test command that tries to read lane B's files
     let cmd = vec![
         "/bin/sh".to_string(),
         "-c".to_string(),
@@ -709,7 +727,7 @@ fn live_lanes_root_hide_other_lanes() {
              cat {} 2>/dev/null && echo ':ALLOWED_A_CLONE'",
             lane_b.clone.join("secret").display(),
             lane_b.control.join("secret").display(),
-            sock_dir.join("secret_file").display(),
+            sock_dir_b.join("secret_file").display(),
             lane_a.clone.join("myfile").display()
         ),
     ];
@@ -753,8 +771,7 @@ fn live_lanes_root_hide_other_lanes() {
 
     // Cleanup
     let _ = std::fs::remove_dir_all(&test_lanes);
-    let _ = std::fs::remove_dir_all(&scratch_a);
-    let _ = std::fs::remove_dir_all(&scratch_b);
+    let _ = std::fs::remove_dir_all(&test_homes);
 }
 
 // ------------------------------------------------- the bug these tests guard

@@ -528,10 +528,12 @@ fn resolve(policy: &SandboxPolicy) -> Result<Resolved> {
         .collect::<Result<Vec<_>>>()?;
 
     // Hide the lanes root to prevent cross-lane access (the backlog).
+    // Check against real_home (the user's actual home), not the lane's private home,
+    // which is expected to be inside lanes_root.
     let lanes_root = canonicalize_for_sandbox(&policy.lanes_root)?;
     if lanes_root == home {
         bail!(
-            "lanes_root {} must not equal the home {}",
+            "lanes_root {} must not equal the real home {}",
             lanes_root.display(),
             home.display()
         );
@@ -541,7 +543,7 @@ fn resolve(policy: &SandboxPolicy) -> Result<Resolved> {
     }
     if home.starts_with(&lanes_root) {
         bail!(
-            "lanes_root {} must not contain the home {}",
+            "lanes_root {} must not contain the real home {}",
             lanes_root.display(),
             home.display()
         );
@@ -1580,6 +1582,118 @@ mod tests {
         assert!(
             err.contains("must not be the filesystem root"),
             "expected error about lanes_root equal to root, got: {err}"
+        );
+    }
+
+    #[test]
+    fn lanes_root_with_private_home_inside_is_accepted() {
+        // Test that a lane's private home can be inside lanes_root.
+        // This is the normal case: <lanes_root>/<lane>/home is the private home,
+        // and lanes_root is < user's real home.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+
+        // Create lanes_root and a separate real_home outside of it
+        let lanes_root = root.join("lanes");
+        let real_home = root.join("realhome");
+        std::fs::create_dir_all(&lanes_root).unwrap();
+        std::fs::create_dir_all(&real_home).unwrap();
+
+        // Create required directories for lane
+        for d in ["lane/clone", "lane/home", "lane/control", "lane/sock"] {
+            std::fs::create_dir_all(lanes_root.join(d)).unwrap();
+        }
+
+        let lane = LaneLayout {
+            clone: lanes_root.join("lane/clone"),
+            home: lanes_root.join("lane/home"), // Private home inside lanes_root
+            scratch: lanes_root.join("lane/scratch"),
+            control: lanes_root.join("lane/control"),
+            real_home: real_home.clone(), // Real home OUTSIDE lanes_root
+            sock: lanes_root.join("lane/sock/runner.sock"),
+            lanes_root: lanes_root.clone(),
+        };
+
+        std::fs::create_dir_all(&lane.scratch).unwrap();
+        std::fs::create_dir_all(real_home.join(".rustup")).unwrap();
+        let policy = SandboxPolicy::builder(&lane, NetworkMode::None);
+        let result = render_macos_profile(&policy);
+        assert!(
+            result.is_ok(),
+            "policy should succeed when private home is inside lanes_root but real_home is outside: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn lanes_root_equal_to_real_home_is_refused() {
+        // Test that lanes_root cannot equal or contain the user's real home.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+
+        // Make real_home the same as lanes_root
+        let lanes_root = root.join("lanes");
+        std::fs::create_dir_all(&lanes_root).unwrap();
+
+        // Create required directories
+        for d in ["lane/clone", "lane/home", "lane/control", "lane/sock"] {
+            std::fs::create_dir_all(lanes_root.join(d)).unwrap();
+        }
+
+        let lane = LaneLayout {
+            clone: lanes_root.join("lane/clone"),
+            home: lanes_root.join("lane/home"),
+            scratch: lanes_root.join("lane/scratch"),
+            control: lanes_root.join("lane/control"),
+            real_home: lanes_root.clone(), // Real home EQUALS lanes_root (should fail)
+            sock: lanes_root.join("lane/sock/runner.sock"),
+            lanes_root: lanes_root.clone(),
+        };
+
+        std::fs::create_dir_all(&lane.scratch).unwrap();
+        let policy = SandboxPolicy::builder(&lane, NetworkMode::None);
+        let err = render_macos_profile(&policy).unwrap_err().to_string();
+        assert!(
+            err.contains("must not equal the real home")
+                || err.contains("must not contain the real home"),
+            "expected error about lanes_root and real_home, got: {err}"
+        );
+    }
+
+    #[test]
+    fn lanes_root_contains_real_home_is_refused() {
+        // Test that lanes_root cannot contain the user's real home.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+
+        // Make real_home inside lanes_root
+        let lanes_root = root.join("lanes");
+        std::fs::create_dir_all(&lanes_root).unwrap();
+
+        let real_home = lanes_root.join("realhome"); // Real home INSIDE lanes_root (should fail)
+        std::fs::create_dir_all(&real_home).unwrap();
+
+        // Create required directories
+        for d in ["lane/clone", "lane/home", "lane/control", "lane/sock"] {
+            std::fs::create_dir_all(lanes_root.join(d)).unwrap();
+        }
+
+        let lane = LaneLayout {
+            clone: lanes_root.join("lane/clone"),
+            home: lanes_root.join("lane/home"),
+            scratch: lanes_root.join("lane/scratch"),
+            control: lanes_root.join("lane/control"),
+            real_home: real_home.clone(),
+            sock: lanes_root.join("lane/sock/runner.sock"),
+            lanes_root: lanes_root.clone(),
+        };
+
+        std::fs::create_dir_all(&lane.scratch).unwrap();
+        let policy = SandboxPolicy::builder(&lane, NetworkMode::None);
+        let err = render_macos_profile(&policy).unwrap_err().to_string();
+        assert!(
+            err.contains("must not contain the real home"),
+            "expected error about lanes_root containing real_home, got: {err}"
         );
     }
 }
