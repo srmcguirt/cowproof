@@ -197,24 +197,27 @@ pub fn dependency_cache_key(repo_tree: &Path, target_triple: &str) -> Result<Str
     // Hash the target triple first
     hasher.update(target_triple.as_bytes());
 
-    // Collect lockfiles in sorted order for determinism
+    // Collect lockfiles at tree root only (not from subdirectories)
     let mut lockfiles = Vec::new();
-    for entry in walkdir::WalkDir::new(repo_tree)
-        .into_iter()
-        .filter_map(|e| e.ok())
-        .filter(|e| e.file_type().is_file())
-    {
-        let name = entry.file_name().to_string_lossy();
-        if [
-            "Cargo.lock",
-            "package-lock.json",
-            "yarn.lock",
-            "pnpm-lock.yaml",
-            "Gemfile.lock",
-        ]
-        .contains(&name.as_ref())
-        {
-            lockfiles.push(entry.path().to_path_buf());
+    if let Ok(entries) = std::fs::read_dir(repo_tree) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if [
+                "Cargo.lock",
+                "package-lock.json",
+                "yarn.lock",
+                "pnpm-lock.yaml",
+                "Gemfile.lock",
+            ]
+            .contains(&name_str.as_ref())
+            {
+                lockfiles.push(path);
+            }
         }
     }
     lockfiles.sort();
@@ -225,26 +228,43 @@ pub fn dependency_cache_key(repo_tree: &Path, target_triple: &str) -> Result<Str
         }
     }
 
-    // Collect registry/source config files in sorted order
+    // Collect registry/source config files at tree root and in .cargo/ at root only
     let mut config_files = Vec::new();
-    for entry in walkdir::WalkDir::new(repo_tree)
-        .into_iter()
-        .filter_map(|e| e.ok())
-        .filter(|e| e.file_type().is_file())
-    {
-        let name = entry.file_name().to_string_lossy();
-        let path = entry.path();
-        if (["config.toml", "config", ".npmrc", ".yarnrc", ".yarnrc.yml"].contains(&name.as_ref())
-            || name.ends_with(".npmrc"))
-            && (path.to_string_lossy().contains(".cargo")
-                || path.to_string_lossy().contains(".npm")
-                || path.to_string_lossy().contains(".yarn"))
-        {
-            config_files.push(entry.path().to_path_buf());
+
+    // Check .cargo/ subdirectory at root
+    let cargo_dir = repo_tree.join(".cargo");
+    if cargo_dir.is_dir() {
+        if let Ok(entries) = std::fs::read_dir(&cargo_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if !path.is_file() {
+                    continue;
+                }
+                let name = entry.file_name();
+                let name_str = name.to_string_lossy();
+                if ["config.toml", "config"].contains(&name_str.as_ref()) {
+                    config_files.push(path);
+                }
+            }
         }
     }
-    config_files.sort();
 
+    // Check .npmrc, .yarnrc files at root
+    if let Ok(entries) = std::fs::read_dir(repo_tree) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if [".npmrc", ".yarnrc", ".yarnrc.yml"].contains(&name_str.as_ref()) {
+                config_files.push(path);
+            }
+        }
+    }
+
+    config_files.sort();
     for config_path in config_files {
         if let Ok(contents) = std::fs::read(&config_path) {
             hasher.update(&contents);
@@ -381,6 +401,34 @@ mod cache_key_tests {
         // Should not panic even though there's no config
         let key = dependency_cache_key(root, "x86_64-unknown-linux-gnu").unwrap();
         assert!(!key.is_empty());
+        #[test]
+        fn lockfile_in_nested_dir_does_not_affect_key() {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path();
+            let triple = "x86_64-unknown-linux-gnu";
+
+            std::fs::write(root.join("Cargo.lock"), "root").unwrap();
+
+            let key1 = dependency_cache_key(root, triple).unwrap();
+
+            // Create lockfile in node_modules/ (should be ignored)
+            std::fs::create_dir_all(root.join("node_modules/dep")).ok();
+            std::fs::write(root.join("node_modules/dep/package-lock.json"), "nested").unwrap();
+
+            let key2 = dependency_cache_key(root, triple).unwrap();
+
+            // Key must be the same; nested lockfile is ignored
+            assert_eq!(key1, key2);
+
+            // Create another in target/ (should also be ignored)
+            std::fs::create_dir_all(root.join("target/debug")).ok();
+            std::fs::write(root.join("target/debug/Cargo.lock"), "target").unwrap();
+
+            let key3 = dependency_cache_key(root, triple).unwrap();
+
+            // Still the same
+            assert_eq!(key1, key3);
+        }
     }
 }
 

@@ -381,22 +381,41 @@ mod macos_tests {
             real_home: root.join("realhome"),
         };
 
-        let runner = SandboxedRunner::new(lane, root.join("cache"), "darwin".to_string());
+        let runner = SandboxedRunner::new(lane.clone(), root.join("cache"), "darwin".to_string());
 
-        // Create a test file in the real home
-        std::fs::write(root.join("realhome/.bashrc"), "secret").unwrap();
+        // Create a secret file in the real home
+        std::fs::write(root.join("realhome/.bashrc"), "SECRET_CREDENTIAL").unwrap();
 
-        // Try to read it from the sandbox—should fail
-        let outcome = runner
+        // Create an allowed file in the clone to verify sandbox is working
+        std::fs::write(root.join("lane/clone/allowed.txt"), "allowed_content").unwrap();
+
+        // Verify the allowed file can be read (proves sandbox is active)
+        let allowed_outcome = runner
+            .run(&root.join("lane/clone"), "cat allowed.txt")
+            .await
+            .unwrap();
+        assert_eq!(allowed_outcome.exit_status, 0);
+        assert_eq!(allowed_outcome.output.trim(), "allowed_content");
+
+        // Try to read the secret from the hidden home—must fail specifically
+        let home_path = root.join("realhome/.bashrc");
+        let secret_outcome = runner
             .run(
                 &root.join("lane/clone"),
-                "cat /etc/shadow 2>&1 || echo 'denied'",
+                &format!("cat {}", home_path.display()),
             )
             .await
             .unwrap();
 
-        // The sandbox should deny access (or the file doesn't exist in the sandbox)
-        assert!(outcome.output.contains("denied") || outcome.exit_status != 0);
+        // Must fail (non-zero exit) AND secret must not be in output
+        assert_ne!(
+            secret_outcome.exit_status, 0,
+            "read of hidden home should fail"
+        );
+        assert!(
+            !secret_outcome.output.contains("SECRET_CREDENTIAL"),
+            "secret text must not appear in output"
+        );
     }
 
     #[tokio::test]
@@ -435,12 +454,12 @@ mod macos_tests {
             .await
             .unwrap();
 
-        assert_eq!(outcome.exit_status, 0);
+        assert_eq!(outcome.exit_status, 0, "read from clone should succeed");
         assert_eq!(outcome.output.trim(), "hello");
     }
 
     #[tokio::test]
-    async fn sandboxed_runner_denies_network() {
+    async fn before_after_proof_home_access() {
         let tmp = tempfile::tempdir().unwrap();
         let root = std::fs::canonicalize(tmp.path()).unwrap();
 
@@ -464,18 +483,179 @@ mod macos_tests {
             real_home: root.join("realhome"),
         };
 
-        let runner = SandboxedRunner::new(lane, root.join("cache"), "darwin".to_string());
+        // Create secret file
+        std::fs::write(root.join("realhome/.bashrc"), "SECRET_VALUE").unwrap();
 
-        // Try to connect to localhost—should be denied by the sandbox
-        let outcome = runner
+        // Test with ProcessRunner (unsandboxed) - should succeed at reading secret
+        let unsandboxed = ProcessRunner::new(1);
+        let unsandboxed_outcome = unsandboxed
             .run(
                 &root.join("lane/clone"),
-                "nc -zv localhost 8080 2>&1 || echo 'network denied'",
+                &format!("cat {}", root.join("realhome/.bashrc").display()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            unsandboxed_outcome.exit_status, 0,
+            "unsandboxed runner reads secret"
+        );
+        assert!(
+            unsandboxed_outcome.output.contains("SECRET_VALUE"),
+            "secret is readable without sandbox"
+        );
+
+        // Test with SandboxedRunner - should fail
+        let sandboxed = SandboxedRunner::new(lane, root.join("cache"), "darwin".to_string());
+        let sandboxed_outcome = sandboxed
+            .run(
+                &root.join("lane/clone"),
+                &format!("cat {}", root.join("realhome/.bashrc").display()),
+            )
+            .await
+            .unwrap();
+        assert_ne!(
+            sandboxed_outcome.exit_status, 0,
+            "sandboxed runner denies home access"
+        );
+        assert!(
+            !sandboxed_outcome.output.contains("SECRET_VALUE"),
+            "secret is not readable in sandbox"
+        );
+    }
+}
+
+#[cfg(test)]
+#[cfg(target_os = "linux")]
+mod linux_tests {
+    use super::*;
+
+    fn sandbox_available() -> bool {
+        match std::process::Command::new("bwrap")
+            .args(["--ro-bind", "/", "/", "true"])
+            .output()
+        {
+            Ok(o) if o.status.success() => true,
+            Ok(o) => {
+                let reason = format!(
+                    "bwrap cannot create sandbox: {}",
+                    String::from_utf8_lossy(&o.stderr).trim()
+                );
+                if std::env::var_os("COWPROOF_REQUIRE_SANDBOX").is_some_and(|v| v == "1") {
+                    panic!("COWPROOF_REQUIRE_SANDBOX=1 but {reason}");
+                }
+                eprintln!("SKIP: {reason}");
+                false
+            }
+            Err(e) => {
+                let reason = format!("bwrap not installed: {e}");
+                if std::env::var_os("COWPROOF_REQUIRE_SANDBOX").is_some_and(|v| v == "1") {
+                    panic!("COWPROOF_REQUIRE_SANDBOX=1 but {reason}");
+                }
+                eprintln!("SKIP: {reason}");
+                false
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn linux_sandboxed_runner_denies_home_access() {
+        if !sandbox_available() {
+            return;
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+
+        // Create lane structure
+        for d in [
+            "lane/clone",
+            "lane/home",
+            "lane/scratch",
+            "lane/control",
+            "cache/.cargo",
+            "realhome",
+        ] {
+            std::fs::create_dir_all(root.join(d)).unwrap();
+        }
+
+        let lane = LaneLayout {
+            clone: root.join("lane/clone"),
+            home: root.join("lane/home"),
+            scratch: root.join("lane/scratch"),
+            control: root.join("lane/control"),
+            real_home: root.join("realhome"),
+        };
+
+        let runner = SandboxedRunner::new(lane.clone(), root.join("cache"), "linux".to_string());
+
+        // Create a secret file in the real home
+        std::fs::write(root.join("realhome/.bashrc"), "SECRET_CRED").unwrap();
+
+        // Verify allowed file can be read
+        std::fs::write(root.join("lane/clone/allowed.txt"), "allowed_content").unwrap();
+        let allowed = runner
+            .run(&root.join("lane/clone"), "cat allowed.txt")
+            .await
+            .unwrap();
+        assert_eq!(allowed.exit_status, 0);
+
+        // Try to read secret from hidden home - must fail
+        let secret = runner
+            .run(
+                &root.join("lane/clone"),
+                &format!("cat {}", root.join("realhome/.bashrc").display()),
             )
             .await
             .unwrap();
 
-        // The network access should be denied
-        assert!(outcome.output.contains("denied") || outcome.exit_status != 0);
+        assert_ne!(secret.exit_status, 0, "should fail to read hidden home");
+        assert!(
+            !secret.output.contains("SECRET_CRED"),
+            "secret must not leak in output"
+        );
+    }
+
+    #[tokio::test]
+    async fn linux_sandboxed_runner_allows_clone_access() {
+        if !sandbox_available() {
+            return;
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+
+        // Create lane structure
+        for d in [
+            "lane/clone",
+            "lane/home",
+            "lane/scratch",
+            "lane/control",
+            "cache/.cargo",
+            "realhome",
+        ] {
+            std::fs::create_dir_all(root.join(d)).unwrap();
+        }
+
+        let lane = LaneLayout {
+            clone: root.join("lane/clone"),
+            home: root.join("lane/home"),
+            scratch: root.join("lane/scratch"),
+            control: root.join("lane/control"),
+            real_home: root.join("realhome"),
+        };
+
+        let runner = SandboxedRunner::new(lane, root.join("cache"), "linux".to_string());
+
+        // Create test file in clone
+        std::fs::write(root.join("lane/clone/test.txt"), "hello").unwrap();
+
+        // Read from clone - should succeed
+        let outcome = runner
+            .run(&root.join("lane/clone"), "cat test.txt")
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.exit_status, 0);
+        assert_eq!(outcome.output.trim(), "hello");
     }
 }
