@@ -17,6 +17,20 @@ index 0000000..1111111
 +Coverage targets met at 85% overall.
 +Schema validation passed.
 +
++## Failed checks:
++```
++npm run lint
++```
++
++Linting failed with errors.
++
++## Unknown status:
++```
++cargo build
++```
++
++Build completed.
++
 +## Notes
 +
 +The fenced format groups multiple commands with a single shared result paragraph.

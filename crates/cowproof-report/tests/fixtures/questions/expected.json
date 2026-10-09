@@ -1,0 +1,36 @@
+{
+  "lane_id": "fixture-questions",
+  "status": "finished",
+  "minutes": 1,
+  "files_changed": 2,
+  "lines_added": 22,
+  "lines_removed": 0,
+  "outside_ownership_count": 0,
+  "checks": [
+    {
+      "command": "npm run test:all",
+      "result": "24 tests passed (exit 0)",
+      "classification": "pass"
+    },
+    {
+      "command": "cargo clippy",
+      "result": "No warnings",
+      "classification": "unclear"
+    }
+  ],
+  "packet_commands_unreported": [],
+  "flaws": [],
+  "removed_assertions": [],
+  "limits": [],
+  "unverified": [],
+  "questions": [
+    "Should we enable stricter linting rules in the next phase? The codebase is currently quite permissive. Recommended answer: Yes, enable strict mode after this release is stable.",
+    "Does the schema migration need to be tested against the legacy data format? There is some legacy data in production. Recommended answer: Yes, add a migration test against the provided sample data.",
+    "Can we defer the API documentation updates to the next cycle? The API has been refactored but the docs are outdated. Recommended answer: No, documentation should land with the code change."
+  ],
+  "verdict_hint": "escalate",
+  "verdict_reasons": [
+    "one or more reported checks are not run or unclear"
+  ],
+  "sample_handoff": "# Checks\n\n| Command | Result |\n| --- | --- |\n| `npm run test:all` | 24 tests passed (exit 0) |\n| `cargo clippy` | No warnings |\n\n# Linting question\n\nShould we enable stricter linting rules in the next phase? The codebase is currently quite permissive. Recommended answer: Yes, enable strict mode after this release is stable.\n\n# Schema migration question\n\nDoes the schema migration need to be tested against the legacy data format? There is some legacy data in production. Recommended answer: Yes, add a migration test against the provided sample data.\n\n# Documentation question\n\nCan we defer the API documentation updates to the next cycle? The API has been refactored but the docs are outdated. Recommended answer: No, documentation should land with the code change.\n"
+}

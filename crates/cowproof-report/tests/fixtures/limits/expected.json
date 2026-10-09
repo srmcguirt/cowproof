@@ -1,0 +1,32 @@
+{
+  "lane_id": "fixture-limits",
+  "status": "finished",
+  "minutes": 1,
+  "files_changed": 2,
+  "lines_added": 31,
+  "lines_removed": 0,
+  "outside_ownership_count": 0,
+  "checks": [
+    {
+      "command": "cargo test",
+      "result": "All 42 tests passed (exit 0)",
+      "classification": "pass"
+    }
+  ],
+  "packet_commands_unreported": [],
+  "flaws": [],
+  "removed_assertions": [],
+  "limits": [
+    "Testing was restricted to unit tests on macOS.\nIntegration tests against the staging database were not run due to time constraints.\nThe async task queue initialization path was not covered in this fixture.",
+    "The performance profiling work is deferred to the next phase as per the director's guidance.\nThe API versioning decision awaits product input."
+  ],
+  "unverified": [
+    "The todo-app behavior under high concurrency has not been verified.\nThe email notification delivery on the staging SMTP relay is unverified (uses mock server in tests).\nThe schema migration against a large production snapshot has not been tested."
+  ],
+  "questions": [],
+  "verdict_hint": "apply",
+  "verdict_reasons": [
+    "no reported blocker found"
+  ],
+  "sample_handoff": "# Checks\n\ncargo test  ->  All 42 tests passed (exit 0)\n\n# Limits\n\nTesting was restricted to unit tests on macOS.\nIntegration tests against the staging database were not run due to time constraints.\nThe async task queue initialization path was not covered in this fixture.\n\n# Deferred\n\nThe performance profiling work is deferred to the next phase as per the director's guidance.\nThe API versioning decision awaits product input.\n\n# Unverified\n\nThe todo-app behavior under high concurrency has not been verified.\nThe email notification delivery on the staging SMTP relay is unverified (uses mock server in tests).\nThe schema migration against a large production snapshot has not been tested.\n\n# Notes\n\nThis fixture demonstrates the sections for scoping work and documenting what remains.\nAll tested functionality is correct; the items above are outside the scope of this work.\n"
+}

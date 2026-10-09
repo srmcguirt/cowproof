@@ -1,0 +1,42 @@
+{
+  "lane_id": "fixture-bullet",
+  "status": "finished",
+  "minutes": 1,
+  "files_changed": 2,
+  "lines_added": 14,
+  "lines_removed": 0,
+  "outside_ownership_count": 0,
+  "checks": [
+    {
+      "command": "npm run lint",
+      "result": "exit code 0",
+      "classification": "pass"
+    },
+    {
+      "command": "npm run test:all",
+      "result": "error: test failure in suite",
+      "classification": "fail"
+    },
+    {
+      "command": "npm run type-check",
+      "result": "completed",
+      "classification": "unclear"
+    },
+    {
+      "command": "git diff --check",
+      "result": "success",
+      "classification": "pass"
+    }
+  ],
+  "packet_commands_unreported": [],
+  "flaws": [],
+  "removed_assertions": [],
+  "limits": [],
+  "unverified": [],
+  "questions": [],
+  "verdict_hint": "fix-then-apply",
+  "verdict_reasons": [
+    "a reported check failed"
+  ],
+  "sample_handoff": "# Verification Results\n\n- `npm run lint` - exit code 0\n- `npm run test:all` - error: test failure in suite\n- `npm run type-check` - completed\n- `git diff --check` - success\n\n# Summary\n\nThe todo-app fixture demonstrates bullet-list format checks.\nAll items have been verified without errors.\n"
+}

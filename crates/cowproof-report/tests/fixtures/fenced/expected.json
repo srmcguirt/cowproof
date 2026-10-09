@@ -1,0 +1,42 @@
+{
+  "lane_id": "fixture-fenced",
+  "status": "finished",
+  "minutes": 1,
+  "files_changed": 2,
+  "lines_added": 34,
+  "lines_removed": 0,
+  "outside_ownership_count": 0,
+  "checks": [
+    {
+      "command": "cargo test --all",
+      "result": "All test suites executed successfully with no failures.",
+      "classification": "pass"
+    },
+    {
+      "command": "npm run coverage",
+      "result": "All test suites executed successfully with no failures.",
+      "classification": "pass"
+    },
+    {
+      "command": "cargo clippy --all-targets",
+      "result": "All test suites executed successfully with no failures.",
+      "classification": "pass"
+    },
+    {
+      "command": "npm run lint",
+      "result": "Linting failed with errors.",
+      "classification": "fail"
+    }
+  ],
+  "packet_commands_unreported": [],
+  "flaws": [],
+  "removed_assertions": [],
+  "limits": [],
+  "unverified": [],
+  "questions": [],
+  "verdict_hint": "fix-then-apply",
+  "verdict_reasons": [
+    "a reported check failed"
+  ],
+  "sample_handoff": "# Verification Checks\n\n## Commands below were executed:\n```\ncargo test --all\nnpm run coverage\ncargo clippy --all-targets\n```\n\nAll test suites executed successfully with no failures.\nCoverage targets met at 85% overall.\nSchema validation passed.\n\n## Failed checks:\n```\nnpm run lint\n```\n\nLinting failed with errors.\n\n## Unknown status:\n```\ncargo build\n```\n\nBuild completed.\n\n## Notes\n\nThe fenced format groups multiple commands with a single shared result paragraph.\nThis demonstrates the coalesced check reporting pattern.\n"
+}

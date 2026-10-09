@@ -731,84 +731,114 @@ mod tests {
         ));
     }
     #[test]
-    fn table_format_fixture_parses_checks() {
+    fn table_format_fixture_matches_snapshot() {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/table");
         let args = vec![dir.to_string_lossy().to_string()];
         let r = main_report(&args).unwrap();
+        let rendered = serde_json::to_string_pretty(&r).unwrap();
+        let expected =
+            fs::read_to_string(dir.join("expected.json")).expect("expected.json must exist");
+        assert_eq!(
+            rendered.trim(),
+            expected.trim(),
+            "rendered snapshot must match expected.json"
+        );
         assert_eq!(r.lane_id, "fixture-table");
         assert_eq!(r.checks.len(), 3);
-        assert_eq!(r.checks[0].command, "npm run test:all");
         assert_eq!(r.checks[0].classification, "pass");
-        assert_eq!(
-            r.checks[1].command,
-            "cargo clippy --all-targets -- -D warnings"
-        );
-        assert_eq!(r.checks[1].classification, "pass");
-        assert_eq!(r.checks[2].command, "npm run build");
-        assert_eq!(r.checks[2].classification, "pass");
+        assert_eq!(r.checks[1].classification, "fail");
+        assert_eq!(r.checks[2].classification, "unclear");
     }
     #[test]
-    fn bullet_format_fixture_parses_checks() {
+    fn bullet_format_fixture_matches_snapshot() {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/bullet");
         let args = vec![dir.to_string_lossy().to_string()];
         let r = main_report(&args).unwrap();
+        let rendered = serde_json::to_string_pretty(&r).unwrap();
+        let expected =
+            fs::read_to_string(dir.join("expected.json")).expect("expected.json must exist");
+        assert_eq!(
+            rendered.trim(),
+            expected.trim(),
+            "rendered snapshot must match expected.json"
+        );
         assert_eq!(r.lane_id, "fixture-bullet");
         assert_eq!(r.checks.len(), 4);
-        assert_eq!(r.checks[0].command, "npm run lint");
-        assert_eq!(r.checks[0].classification, "pass");
-        assert_eq!(r.checks[3].command, "git diff --check");
-        assert_eq!(r.checks[3].classification, "pass");
+        assert!(r.checks.iter().any(|c| c.classification == "pass"));
+        assert!(r.checks.iter().any(|c| c.classification == "fail"));
+        assert!(r.checks.iter().any(|c| c.classification == "unclear"));
     }
     #[test]
-    fn fenced_format_fixture_parses_checks() {
+    fn fenced_format_fixture_matches_snapshot() {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fenced");
         let args = vec![dir.to_string_lossy().to_string()];
         let r = main_report(&args).unwrap();
+        let rendered = serde_json::to_string_pretty(&r).unwrap();
+        let expected =
+            fs::read_to_string(dir.join("expected.json")).expect("expected.json must exist");
+        assert_eq!(
+            rendered.trim(),
+            expected.trim(),
+            "rendered snapshot must match expected.json"
+        );
         assert_eq!(r.lane_id, "fixture-fenced");
-        assert_eq!(r.checks.len(), 3);
-        assert_eq!(r.checks[0].command, "cargo test --all");
-        assert_eq!(r.checks[1].command, "npm run coverage");
-        assert_eq!(r.checks[2].command, "cargo clippy --all-targets");
-        assert!(r.checks.iter().all(|c| c.classification == "pass"));
+        assert_eq!(r.checks.len(), 4);
+        assert!(r.checks.iter().any(|c| c.classification == "pass"));
+        assert!(r.checks.iter().any(|c| c.classification == "fail"));
     }
     #[test]
-    fn arrow_format_fixture_parses_checks() {
+    fn arrow_format_fixture_matches_snapshot() {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/arrow");
         let args = vec![dir.to_string_lossy().to_string()];
         let r = main_report(&args).unwrap();
+        let rendered = serde_json::to_string_pretty(&r).unwrap();
+        let expected =
+            fs::read_to_string(dir.join("expected.json")).expect("expected.json must exist");
+        assert_eq!(
+            rendered.trim(),
+            expected.trim(),
+            "rendered snapshot must match expected.json"
+        );
         assert_eq!(r.lane_id, "fixture-arrow");
         assert_eq!(r.checks.len(), 3);
-        assert_eq!(r.checks[0].command, "cargo fmt --all -- --check");
-        assert_eq!(r.checks[0].classification, "pass");
-        assert_eq!(r.checks[1].command, "npm run test");
-        assert_eq!(r.checks[1].classification, "pass");
+        assert!(r.checks.iter().any(|c| c.classification == "pass"));
+        assert!(r.checks.iter().any(|c| c.classification == "unclear"));
     }
     #[test]
-    fn questions_fixture_extracts_sections() {
+    fn questions_fixture_matches_snapshot() {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/questions");
         let args = vec![dir.to_string_lossy().to_string()];
         let r = main_report(&args).unwrap();
+        let rendered = serde_json::to_string_pretty(&r).unwrap();
+        let expected =
+            fs::read_to_string(dir.join("expected.json")).expect("expected.json must exist");
+        assert_eq!(
+            rendered.trim(),
+            expected.trim(),
+            "rendered snapshot must match expected.json"
+        );
         assert_eq!(r.lane_id, "fixture-questions");
         assert_eq!(r.questions.len(), 3);
-        assert!(r.questions.iter().any(|q| q.contains("linting")));
-        assert!(r.questions.iter().any(|q| q.contains("schema migration")));
-        assert!(r.questions.iter().any(|q| q.contains("documentation")));
     }
     #[test]
-    fn limits_fixture_extracts_all_sections() {
+    fn limits_fixture_matches_snapshot() {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/limits");
         let args = vec![dir.to_string_lossy().to_string()];
         let r = main_report(&args).unwrap();
+        let rendered = serde_json::to_string_pretty(&r).unwrap();
+        let expected =
+            fs::read_to_string(dir.join("expected.json")).expect("expected.json must exist");
+        assert_eq!(
+            rendered.trim(),
+            expected.trim(),
+            "rendered snapshot must match expected.json"
+        );
         assert_eq!(r.lane_id, "fixture-limits");
         assert!(!r.limits.is_empty());
-        assert!(
-            r.limits[0].contains("unit tests") || r.limits.iter().any(|s| s.contains("unit tests"))
-        );
         assert!(!r.unverified.is_empty());
-        assert!(r.unverified.iter().any(|s| s.contains("concurrency")));
     }
     #[test]
-    fn baseline_fixture_accepts_baseline_argument() {
+    fn baseline_fixture_matches_snapshot() {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/baseline");
         let args = vec![
             dir.to_string_lossy().to_string(),
@@ -816,26 +846,47 @@ mod tests {
             "20260401_existing.sql".into(),
         ];
         let r = main_report(&args).unwrap();
+        let rendered = serde_json::to_string_pretty(&r).unwrap();
+        let expected =
+            fs::read_to_string(dir.join("expected.json")).expect("expected.json must exist");
+        assert_eq!(
+            rendered.trim(),
+            expected.trim(),
+            "rendered snapshot must match expected.json"
+        );
         assert_eq!(r.lane_id, "fixture-baseline");
-        assert_eq!(r.checks.len(), 2);
-        assert!(r.checks.iter().all(|c| c.classification == "pass"));
     }
     #[test]
-    fn malformed_table_row_ignored_not_parsed() {
-        // Empty cells in table should be skipped, not cause errors
+    fn malformed_table_row_ignored() {
         let checks = parse_checks("| Command | Result |\n| --- | --- |\n| | missing result |");
-        assert!(checks.is_empty());
+        assert!(
+            checks.is_empty(),
+            "empty table cells should be silently dropped"
+        );
     }
     #[test]
-    fn malformed_bullet_without_result_ignored() {
-        // Bullet without result separator should be ignored
+    fn malformed_bullet_without_separator_ignored() {
         let checks = parse_checks("- `cargo test` with no separator");
-        assert!(checks.is_empty());
+        assert!(
+            checks.is_empty(),
+            "bullet without separator should be silently dropped"
+        );
     }
     #[test]
-    fn malformed_arrow_format_too_few_spaces_ignored() {
-        // Arrow with only one space should not match (requires 2+ spaces)
+    fn malformed_arrow_too_few_spaces_ignored() {
         let checks = parse_checks("cargo test - result");
-        assert!(checks.is_empty());
+        assert!(
+            checks.is_empty(),
+            "arrow with one space should be silently dropped"
+        );
+    }
+    #[test]
+    fn malformed_fenced_outside_checks_section_ignored() {
+        let text = "# Other section\n```\ncargo test\n```\nPassed.";
+        let checks = parse_checks(text);
+        assert!(
+            checks.is_empty(),
+            "commands outside a checks section should be silently dropped"
+        );
     }
 }

@@ -1,0 +1,37 @@
+{
+  "lane_id": "fixture-table",
+  "status": "finished",
+  "minutes": 1,
+  "files_changed": 3,
+  "lines_added": 18,
+  "lines_removed": 0,
+  "outside_ownership_count": 0,
+  "checks": [
+    {
+      "command": "npm run test:all",
+      "result": "passed: 24 tests, 0 failed",
+      "classification": "pass"
+    },
+    {
+      "command": "npm run lint",
+      "result": "failed: 3 errors found",
+      "classification": "fail"
+    },
+    {
+      "command": "npm run build",
+      "result": "Completed with unknown status",
+      "classification": "unclear"
+    }
+  ],
+  "packet_commands_unreported": [],
+  "flaws": [],
+  "removed_assertions": [],
+  "limits": [],
+  "unverified": [],
+  "questions": [],
+  "verdict_hint": "fix-then-apply",
+  "verdict_reasons": [
+    "a reported check failed"
+  ],
+  "sample_handoff": "# Checks\n\n| Command | Result |\n| --- | --- |\n| `npm run test:all` | passed: 24 tests, 0 failed |\n| `npm run lint` | failed: 3 errors found |\n| `npm run build` | Completed with unknown status |\n\n# Notes\n\nThis fixture demonstrates the markdown table format for reporting checks.\nAll checks passed without issues.\n"
+}

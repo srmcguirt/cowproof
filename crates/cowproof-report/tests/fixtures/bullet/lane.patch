@@ -7,8 +7,8 @@ index 0000000..1111111
 +# Verification Results
 +
 +- `npm run lint` - exit code 0
-+- `cargo test --lib` - 18 tests, 0 failed
-+- `npm run type-check` - clean
++- `npm run test:all` - error: test failure in suite
++- `npm run type-check` - completed
 +- `git diff --check` - success
 +
 +# Summary

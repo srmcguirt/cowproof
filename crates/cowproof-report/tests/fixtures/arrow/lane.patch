@@ -7,8 +7,8 @@ index 0000000..1111111
 +# Verification Status
 +
 +cargo fmt --all -- --check  ->  All files properly formatted (exit 0)
-+npm run test  ->  117 passed, 0 failed, exit code 0
-+git diff --check  ->  No whitespace issues found
++npm run test  ->  Errors detected in test suite
++git diff --check  ->  Check in progress
 +
 +# Summary
 +

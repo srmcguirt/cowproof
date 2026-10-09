@@ -9,8 +9,8 @@ index 0000000..1111111
 +| Command | Result |
 +| --- | --- |
 +| `npm run test:all` | passed: 24 tests, 0 failed |
-+| `cargo clippy --all-targets -- -D warnings` | All checks passed |
-+| `npm run build` | Built successfully, exit code 0 |
++| `npm run lint` | failed: 3 errors found |
++| `npm run build` | Completed with unknown status |
 +
 +# Notes
 +

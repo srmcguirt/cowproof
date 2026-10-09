@@ -1,0 +1,32 @@
+{
+  "lane_id": "fixture-baseline",
+  "status": "finished",
+  "minutes": 2,
+  "files_changed": 3,
+  "lines_added": 31,
+  "lines_removed": 0,
+  "outside_ownership_count": 0,
+  "checks": [
+    {
+      "command": "npm run test:migrations",
+      "result": "Schema validation passed (exit 0)",
+      "classification": "pass"
+    },
+    {
+      "command": "cargo test --test integration_tests",
+      "result": "15 integration tests passed",
+      "classification": "pass"
+    }
+  ],
+  "packet_commands_unreported": [],
+  "flaws": [],
+  "removed_assertions": [],
+  "limits": [],
+  "unverified": [],
+  "questions": [],
+  "verdict_hint": "apply",
+  "verdict_reasons": [
+    "no reported blocker found"
+  ],
+  "sample_handoff": "# Checks\n\n| Command | Result |\n| --- | --- |\n| `npm run test:migrations` | Schema validation passed (exit 0) |\n| `cargo test --test integration_tests` | 15 integration tests passed |\n\n# Notes\n\nThis fixture demonstrates migration baseline testing.\nThe new migration (20260410_add_user_preferences.sql) was tested against the baseline schema (20260401_existing.sql).\n\nSchema compatibility verified for:\n- Data type changes\n- Constraint additions\n- Index optimizations\n"
+}
