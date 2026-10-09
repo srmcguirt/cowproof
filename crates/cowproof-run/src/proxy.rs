@@ -34,7 +34,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::task::{Context, Poll};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{Context as _, Result, bail};
 use bytes::Bytes;
@@ -53,6 +53,7 @@ use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, UnixListener};
 use tokio::sync::Semaphore;
+use tokio::time::Sleep;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 type ProxyBody = UnsyncBoxBody<Bytes, BoxError>;
@@ -528,12 +529,13 @@ async fn handle(req: Request<Incoming>, state: Arc<State>) -> Response<ProxyBody
 
     let request_id = format!("req-{}", uuid::Uuid::new_v4());
     let bytes_in = Arc::new(AtomicU64::new(0));
+    let idle_timeout = state.config.idle_timeout();
     let request_body = RequestTap {
         inner: body,
         seen: Arc::clone(&bytes_in),
-        idle_timeout: state.config.idle_timeout(),
+        idle_timeout,
         request_id: request_id.clone(),
-        last_activity: Instant::now(),
+        idle_sleep: Box::pin(tokio::time::sleep(idle_timeout)),
     }
     .boxed_unsync();
     let mut upstream_request = Request::new(request_body);
@@ -579,6 +581,7 @@ async fn handle(req: Request<Incoming>, state: Arc<State>) -> Response<ProxyBody
         }
     }
     let capture_usage = is_plain_json(&response_parts.headers);
+    let idle_timeout = state.config.idle_timeout();
     let tap = ResponseTap {
         inner: response_body,
         report: Some(Report {
@@ -589,9 +592,9 @@ async fn handle(req: Request<Incoming>, state: Arc<State>) -> Response<ProxyBody
         }),
         bytes_out: 0,
         captured: capture_usage.then(Vec::new),
-        idle_timeout: state.config.idle_timeout(),
+        idle_timeout,
         request_id,
-        last_activity: Instant::now(),
+        idle_sleep: Box::pin(tokio::time::sleep(idle_timeout)),
     };
     let mut response = Response::new(tap.boxed_unsync());
     *response.status_mut() = response_parts.status;
@@ -639,7 +642,7 @@ struct RequestTap {
     seen: Arc<AtomicU64>,
     idle_timeout: Duration,
     request_id: String,
-    last_activity: Instant,
+    idle_sleep: Pin<Box<Sleep>>,
 }
 
 impl Body for RequestTap {
@@ -650,8 +653,8 @@ impl Body for RequestTap {
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Bytes>, BoxError>>> {
-        // Check for idle timeout before polling
-        if Instant::now().duration_since(self.last_activity) > self.idle_timeout {
+        // Check idle timeout before trying to read more data
+        if self.as_mut().idle_sleep.as_mut().poll(cx).is_ready() {
             eprintln!(
                 "proxy idle timeout: request_id={} direction=request",
                 self.request_id
@@ -669,7 +672,7 @@ impl Body for RequestTap {
                     }
                 }
                 // Reset idle timeout on successful frame
-                self.last_activity = Instant::now();
+                self.idle_sleep = Box::pin(tokio::time::sleep(self.idle_timeout));
                 Poll::Ready(Some(Ok(frame)))
             }
             Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(Box::new(e)))),
@@ -707,7 +710,7 @@ struct ResponseTap {
     captured: Option<Vec<u8>>,
     idle_timeout: Duration,
     request_id: String,
-    last_activity: Instant,
+    idle_sleep: Pin<Box<Sleep>>,
 }
 
 impl ResponseTap {
@@ -746,8 +749,8 @@ impl Body for ResponseTap {
     ) -> Poll<Option<Result<Frame<Bytes>, BoxError>>> {
         let this = &mut *self;
 
-        // Check for idle timeout before polling
-        if Instant::now().duration_since(this.last_activity) > this.idle_timeout {
+        // Check idle timeout before trying to read more data
+        if this.idle_sleep.as_mut().poll(cx).is_ready() {
             this.finish();
             eprintln!(
                 "proxy idle timeout: request_id={} direction=response",
@@ -769,7 +772,7 @@ impl Body for ResponseTap {
                     }
                 }
                 // Reset idle timeout on successful frame
-                this.last_activity = Instant::now();
+                this.idle_sleep = Box::pin(tokio::time::sleep(this.idle_timeout));
                 // A body framed by Content-Length may never be polled again after its last
                 // frame, so the metric is written here as well as at the end of the stream.
                 if this.inner.is_end_stream() {

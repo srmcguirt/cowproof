@@ -598,17 +598,53 @@ async fn metrics_record_path_status_bytes_and_usage() {
 
 #[tokio::test]
 async fn idle_timeout_upstream_stalls_after_first_chunk() {
-    let fake = fake_upstream(Reply::Sse).await;
-    let config = ProxyConfig::new(REAL_KEY, fake.base())
+    // Fake upstream that sends first chunk, then stalls for 3s
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            tokio::spawn(async move {
+                let Some((head, _)) = read_until_head_end(&mut stream).await else {
+                    return;
+                };
+                let mut lines = head.split("\r\n");
+                let _request_line = lines.next().unwrap_or_default().to_string();
+                let headers: Vec<(String, String)> = lines
+                    .filter(|l| !l.is_empty())
+                    .filter_map(|l| l.split_once(':'))
+                    .map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim().to_string()))
+                    .collect();
+                let _body = read_request_body(&mut stream, &headers).await;
+
+                // Send first chunk immediately
+                let _ = stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n",
+                    )
+                    .await;
+                let data = "data: first\n\n";
+                let chunk = format!("{:x}\r\n{data}\r\n", data.len());
+                let _ = stream.write_all(chunk.as_bytes()).await;
+                let _ = stream.flush().await;
+
+                // Stall for 3 seconds while the connection stays open
+                tokio::time::sleep(Duration::from_secs(3)).await;
+            });
+        }
+    });
+
+    let config = ProxyConfig::new(REAL_KEY, format!("http://{}", upstream_addr))
         .unwrap()
         .with_idle_timeout(Duration::from_millis(300));
     let placeholder = config.placeholder_key().to_string();
+
     let server = ProxyServer::new(config);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
+    let proxy_addr = listener.local_addr().unwrap();
     tokio::spawn(server.serve_tcp(listener));
 
-    let mut stream = TcpStream::connect(addr).await.unwrap();
+    let mut stream = TcpStream::connect(proxy_addr).await.unwrap();
     stream
         .write_all(&request(
             "POST",
@@ -619,7 +655,6 @@ async fn idle_timeout_upstream_stalls_after_first_chunk() {
         .await
         .unwrap();
 
-    let start = Instant::now();
     let mut received = Vec::new();
     let mut chunk = [0u8; 1024];
     let first_chunk_time = loop {
@@ -631,20 +666,33 @@ async fn idle_timeout_upstream_stalls_after_first_chunk() {
             break Instant::now();
         }
         received.extend_from_slice(&chunk[..n]);
-        if String::from_utf8_lossy(&received).contains("data: one") {
+        if String::from_utf8_lossy(&received).contains("data: first") {
             break Instant::now();
         }
     };
 
     let text = String::from_utf8_lossy(&received);
     assert!(
-        text.contains("data: one"),
+        text.contains("data: first"),
         "client received the first chunk"
     );
-    // Stream should end within ~900ms (300ms idle timeout + margin)
-    let elapsed = first_chunk_time.duration_since(start);
+
+    // Continue reading until EOF or error
+    let stream_end = loop {
+        let n = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut chunk))
+            .await
+            .expect("stream read timed out")
+            .unwrap();
+        if n == 0 {
+            break Instant::now();
+        }
+        received.extend_from_slice(&chunk[..n]);
+    };
+
+    // Stream should end between 250ms and 900ms after first chunk (300ms timeout with margin)
+    let elapsed = stream_end.duration_since(first_chunk_time);
     assert!(
-        elapsed < Duration::from_millis(900),
+        elapsed >= Duration::from_millis(250) && elapsed < Duration::from_millis(900),
         "stream ended after idle timeout; elapsed: {:?}",
         elapsed
     );
@@ -739,48 +787,80 @@ async fn idle_timeout_not_an_overall_limit() {
 }
 
 #[tokio::test]
-async fn idle_timeout_client_stalls_mid_read() {
-    let fake = fake_upstream(Reply::Json).await;
-    let config = ProxyConfig::new(REAL_KEY, fake.base())
+async fn idle_timeout_client_stalls_mid_upload() {
+    // Fake upstream that waits to read the full request body
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = listener.local_addr().unwrap();
+    let upstream_error = Arc::new(Mutex::new(String::new()));
+    let error_task = Arc::clone(&upstream_error);
+
+    tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let error = Arc::clone(&error_task);
+            tokio::spawn(async move {
+                let Some((head, _)) = read_until_head_end(&mut stream).await else {
+                    return;
+                };
+                let mut lines = head.split("\r\n");
+                let _request_line = lines.next().unwrap_or_default();
+                let headers: Vec<(String, String)> = lines
+                    .filter(|l| !l.is_empty())
+                    .filter_map(|l| l.split_once(':'))
+                    .map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim().to_string()))
+                    .collect();
+
+                // Try to read the full request body; client will stall
+                match read_request_body(&mut stream, &headers).await {
+                    body if !body.is_empty() => {
+                        // Got some body
+                    }
+                    _ => {
+                        *error.lock().unwrap() = "body read error or incomplete".to_string();
+                    }
+                }
+            });
+        }
+    });
+
+    let config = ProxyConfig::new(REAL_KEY, format!("http://{}", upstream_addr))
         .unwrap()
         .with_idle_timeout(Duration::from_millis(300));
     let placeholder = config.placeholder_key().to_string();
+
     let server = ProxyServer::new(config);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
+    let proxy_addr = listener.local_addr().unwrap();
     tokio::spawn(server.serve_tcp(listener));
 
-    let mut stream = TcpStream::connect(addr).await.unwrap();
+    // Client sends headers with Content-Length but only partial body, then stalls
+    let mut stream = TcpStream::connect(proxy_addr).await.unwrap();
+    let request_text = format!(
+        "POST /v1/messages HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: 1000\r\nx-api-key: {}\r\n\r\n",
+        placeholder
+    );
+    stream.write_all(request_text.as_bytes()).await.unwrap();
     stream
-        .write_all(&request(
-            "POST",
-            "/v1/messages",
-            &[("x-api-key", &placeholder)],
-            REQUEST_BODY,
-        ))
+        .write_all(b"incomplete_body_only_10bytes_")
         .await
         .unwrap();
+    stream.flush().await.unwrap();
 
-    // Try to read response, but set a deadline that will timeout before the proxy can respond
+    // Wait for proxy to close the connection due to idle timeout
     let mut buf = [0u8; 1024];
     let start = Instant::now();
-
-    // This should timeout quickly because the proxy is waiting (no data from upstream yet is one scenario)
-    // In reality, the fake upstream will respond, but we're testing that if data stops coming,
-    // the proxy detects it via idle timeout.
-    match tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf)).await {
-        Ok(Ok(n)) if n > 0 => {
-            // Success - got data within timeout
-        }
-        Ok(Ok(0)) => {
-            // Connection closed
-        }
-        _ => {
-            // Timeout or error - that's fine for this test
-        }
-    }
+    let _n = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut buf))
+        .await
+        .expect("read timed out")
+        .unwrap_or(0);
 
     let elapsed = Instant::now().duration_since(start);
-    // Just verify the test runs without panic
-    assert!(elapsed < Duration::from_secs(10), "test took too long");
+
+    // Connection should be closed or return error within ~600ms (300ms timeout + margin)
+    // The proxy may send an error response before closing
+    assert!(
+        elapsed < Duration::from_millis(600),
+        "proxy should detect idle timeout within 600ms; elapsed: {:?}",
+        elapsed
+    );
 }
