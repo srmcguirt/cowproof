@@ -1,0 +1,9 @@
+/target/
+**/target/
+.env*
+.codemap/
+.DS_Store
+# local review evidence from design sessions
+docs/*.review.*/
+# host inventories stay private
+hosts.json
