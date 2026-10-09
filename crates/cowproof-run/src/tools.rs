@@ -283,32 +283,25 @@ fn own_escalation_id(lane: &str, id: &str) -> Option<EscalationId> {
     Some(EscalationId::from_string(id.to_string()))
 }
 
-/// This lane's undelivered notes, oldest first. `Queue::pending_notes` matches
-/// by prefix, so lane `a` would also see the notes of lane `a-b`; keep only ids
-/// of the exact form `<lane>-n<digits>` and order them by number.
+/// This lane's undelivered notes, oldest first, ordered by numeric sequence.
+/// `Queue::pending_notes` now returns only this lane's notes and orders them numerically.
 fn own_pending_notes(queue: &Queue, lane: &str) -> Vec<(u64, NoteId, String)> {
-    let prefix = format!("{lane}-n");
-    let mut notes: Vec<(u64, NoteId, String)> = queue
+    queue
         .pending_notes(lane)
         .into_iter()
         .filter_map(|(id, text)| {
-            let digits = id.0.strip_prefix(&prefix)?;
+            let digits = id.0.split('-').next_back()?.strip_prefix('n')?;
             if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
                 return None;
             }
             let n = digits.parse().ok()?;
             Some((n, id, text))
         })
-        .collect();
-    notes.sort_by_key(|(n, _, _)| *n);
-    notes
+        .collect()
 }
 
 fn check_ruling(ctx: &Context, id: Option<String>) -> Result<Value, String> {
-    let unknown = || "unknown escalation".to_string();
-    let id = own_escalation_id(&ctx.lane, &id.ok_or("missing id")?).ok_or_else(unknown)?;
     let mut queue = lock(&ctx.queue)?;
-    let verdict = queue.get(&id).ok_or_else(unknown)?.2.cloned();
     let notes = own_pending_notes(&queue, &ctx.lane);
     if !notes.is_empty() {
         let ids: Vec<NoteId> = notes.iter().map(|(_, id, _)| id.clone()).collect();
@@ -318,6 +311,20 @@ fn check_ruling(ctx: &Context, id: Option<String>) -> Result<Value, String> {
         .into_iter()
         .map(|(_, id, text)| json!({ "id": id.0, "text": text }))
         .collect();
+
+    // If no id provided, return notes only with no_escalation status
+    if id.is_none() {
+        return Ok(json!({
+            "ok": true,
+            "status": "no_escalation",
+            "notes": notes,
+        }));
+    }
+
+    let unknown = || "unknown escalation".to_string();
+    let id = own_escalation_id(&ctx.lane, &id.unwrap()).ok_or_else(unknown)?;
+    let verdict = queue.get(&id).ok_or_else(unknown)?.2.cloned();
+
     Ok(match verdict {
         None => json!({ "ok": true, "status": "pending", "notes": notes }),
         Some(v) => json!({
@@ -643,14 +650,23 @@ mod tests {
 
     #[tokio::test]
     async fn a_lane_whose_id_extends_ours_does_not_leak_notes_into_ours() {
-        // `Queue::pending_notes` matches by prefix: lane `l1` would see lane
-        // `l1-x`'s note `l1-x-n1`.
+        // Lane `l1` must not see lane `l1-x`'s notes. Both queues store notes with
+        // recorded lane; `pending_notes` matches by exact equality.
         let h = harness(0);
         {
             let mut q = h.queue.lock().unwrap();
             q.note("l1-x", "belongs to l1-x").unwrap();
-            assert_eq!(q.pending_notes(LANE).len(), 1, "premise: prefix collision");
+            assert_eq!(
+                q.pending_notes(LANE).len(),
+                0,
+                "l1 should not see l1-x notes"
+            );
             q.note(LANE, "mine").unwrap();
+            assert_eq!(
+                q.pending_notes(LANE).len(),
+                1,
+                "l1 should see only its own note"
+            );
         }
         let mut c = Client::connect(&h).await;
         let asked = c.call(json!({"op": "ask", "ask": sample_ask(false)})).await;
@@ -665,7 +681,11 @@ mod tests {
             .collect();
         assert_eq!(texts, ["mine"], "{r}");
         let q = h.queue.lock().unwrap();
-        assert_eq!(q.pending_notes("l1-x").len(), 1, "l1-x's note was consumed");
+        assert_eq!(
+            q.pending_notes("l1-x").len(),
+            1,
+            "l1-x's note is still pending"
+        );
     }
 
     #[tokio::test]
@@ -689,6 +709,44 @@ mod tests {
             .collect();
         let expected: Vec<String> = (1..=10).map(|i| format!("note {i}")).collect();
         assert_eq!(texts, expected);
+    }
+
+    #[tokio::test]
+    async fn check_ruling_without_id_returns_no_escalation_with_notes() {
+        let h = harness(0);
+        {
+            let mut q = h.queue.lock().unwrap();
+            q.note(LANE, "pending note").unwrap();
+        }
+        let mut c = Client::connect(&h).await;
+        let r = c.call(json!({"op": "check_ruling"})).await;
+        assert_eq!(r["ok"], true);
+        assert_eq!(r["status"], "no_escalation");
+        let notes = r["notes"].as_array().unwrap();
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0]["text"], "pending note");
+    }
+
+    #[tokio::test]
+    async fn check_ruling_without_id_marks_notes_delivered_and_second_call_has_none() {
+        let h = harness(0);
+        {
+            let mut q = h.queue.lock().unwrap();
+            q.note(LANE, "first note").unwrap();
+        }
+        let mut c = Client::connect(&h).await;
+
+        let r1 = c.call(json!({"op": "check_ruling"})).await;
+        assert_eq!(r1["status"], "no_escalation");
+        assert_eq!(r1["notes"].as_array().unwrap().len(), 1);
+
+        let r2 = c.call(json!({"op": "check_ruling"})).await;
+        assert_eq!(r2["status"], "no_escalation");
+        assert_eq!(
+            r2["notes"].as_array().unwrap().len(),
+            0,
+            "second call should have no notes"
+        );
     }
 
     #[tokio::test]

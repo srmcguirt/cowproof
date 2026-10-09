@@ -166,6 +166,28 @@ fn check_ruling_and_run_check_forward_only_the_op_and_the_id() {
 }
 
 #[test]
+fn check_ruling_with_no_id_reaches_the_socket_as_check_ruling_with_no_id() {
+    let tmp = tempfile::tempdir().unwrap();
+    let socket = tmp.path().join("runner.sock");
+    let seen = fake_runner(
+        &socket,
+        json!({"ok": true, "status": "no_escalation", "notes": []}),
+    );
+
+    let frames = run_client(
+        &socket,
+        &[rpc(
+            1,
+            "tools/call",
+            json!({"name": "check_ruling", "arguments": {}}),
+        )],
+    );
+
+    assert_eq!(frames[0]["result"]["isError"], false, "{frames:?}");
+    assert_eq!(*seen.lock().unwrap(), [json!({"op": "check_ruling"})]);
+}
+
+#[test]
 fn a_call_naming_a_lane_or_an_unknown_tool_never_reaches_the_socket() {
     let tmp = tempfile::tempdir().unwrap();
     let socket = tmp.path().join("runner.sock");

@@ -659,6 +659,7 @@ struct Entry {
 
 /// One note held by the queue.
 struct NoteEntry {
+    lane: String,
     text: String,
     delivered: bool,
 }
@@ -820,10 +821,11 @@ impl Queue {
                     at_ms: _,
                 } => {
                     let nid = NoteId::from_string(id);
-                    *self.note_count.entry(lane).or_insert(0) += 1;
+                    *self.note_count.entry(lane.clone()).or_insert(0) += 1;
                     self.notes.insert(
                         nid,
                         NoteEntry {
+                            lane,
                             text,
                             delivered: false,
                         },
@@ -1369,6 +1371,7 @@ impl Queue {
         self.notes.insert(
             id.clone(),
             NoteEntry {
+                lane: lane.to_string(),
                 text: text.to_string(),
                 delivered: false,
             },
@@ -1377,27 +1380,44 @@ impl Queue {
         Ok(id)
     }
 
-    /// List undelivered notes for a lane, oldest first.
+    /// List undelivered notes for a lane, oldest first, ordered by numeric sequence.
     pub fn pending_notes(&self, lane: &str) -> Vec<(NoteId, String)> {
         let mut result = Vec::new();
         for (id, entry) in &self.notes {
-            if id.0.starts_with(&format!("{}-", lane)) && !entry.delivered {
+            if entry.lane == lane && !entry.delivered {
                 result.push((id.clone(), entry.text.clone()));
             }
         }
-        // Sort by note number (monotonic per lane)
-        result.sort_by(|a, b| a.0.cmp(&b.0));
+        // Sort by note number, extracting the numeric suffix from the id
+        result.sort_by(|a, b| {
+            let a_num =
+                a.0.0
+                    .split('-')
+                    .next_back()
+                    .and_then(|s| s.strip_prefix('n'))
+                    .and_then(|s| s.parse::<u64>().ok());
+            let b_num =
+                b.0.0
+                    .split('-')
+                    .next_back()
+                    .and_then(|s| s.strip_prefix('n'))
+                    .and_then(|s| s.parse::<u64>().ok());
+            a_num.cmp(&b_num)
+        });
         result
     }
 
-    /// Mark notes as delivered. Unknown or already-delivered IDs are an error
+    /// Mark notes as delivered. Unknown, already-delivered, or wrong-lane IDs are an error
     /// and write nothing.
     pub fn mark_notes_delivered(&mut self, lane: &str, ids: &[NoteId]) -> Result<(), String> {
-        // Verify all exist and belong to this lane
+        // Verify all exist, belong to this lane, and are not yet delivered
         for id in ids {
             match self.notes.get(id) {
                 None => {
                     return Err(format!("note {} unknown", id));
+                }
+                Some(entry) if entry.lane != lane => {
+                    return Err(format!("note {} does not belong to lane {}", id, lane));
                 }
                 Some(entry) if entry.delivered => {
                     return Err(format!("note {} already delivered", id));
@@ -3077,5 +3097,61 @@ mod tests {
             .mark_notes_delivered("lane1", &[unknown_id])
             .unwrap_err();
         assert!(err.contains("unknown"));
+    }
+
+    #[test]
+    fn pending_notes_for_lanes_a_and_a_b_only_returns_a_notes() {
+        // Lane `a` must not see lane `a-b`'s notes
+        let tmpdir = tempfile::TempDir::new().unwrap();
+        let clock = Box::new(TestClock::new());
+        let mut queue = Queue::new(tmpdir.path(), clock).unwrap();
+
+        queue.note("a-b", "belongs to a-b").unwrap();
+        queue.note("a", "belongs to a").unwrap();
+
+        let a_notes = queue.pending_notes("a");
+        assert_eq!(a_notes.len(), 1, "lane a should only see its own note");
+        assert_eq!(a_notes[0].1, "belongs to a");
+
+        let a_b_notes = queue.pending_notes("a-b");
+        assert_eq!(a_b_notes.len(), 1, "lane a-b should only see its own note");
+        assert_eq!(a_b_notes[0].1, "belongs to a-b");
+    }
+
+    #[test]
+    fn pending_notes_with_11_notes_returns_numeric_order() {
+        // Notes should be ordered by numeric sequence, not lexicographic
+        let tmpdir = tempfile::TempDir::new().unwrap();
+        let clock = Box::new(TestClock::new());
+        let mut queue = Queue::new(tmpdir.path(), clock).unwrap();
+
+        for i in 1..=11 {
+            queue.note("lane", &format!("note {i}")).unwrap();
+        }
+
+        let notes = queue.pending_notes("lane");
+        assert_eq!(notes.len(), 11);
+
+        let ids: Vec<String> = notes.iter().map(|(id, _)| id.0.clone()).collect();
+        let expected: Vec<String> = (1..=11).map(|i| format!("lane-n{i}")).collect();
+        assert_eq!(ids, expected, "notes should be in numeric order n1..n11");
+    }
+
+    #[test]
+    fn mark_notes_delivered_refuses_wrong_lane() {
+        // mark_notes_delivered should error if the note's recorded lane differs from the argument
+        let tmpdir = tempfile::TempDir::new().unwrap();
+        let clock = Box::new(TestClock::new());
+        let mut queue = Queue::new(tmpdir.path(), clock).unwrap();
+
+        let id_from_a = queue.note("a", "from a").unwrap();
+        queue.note("b", "from b").unwrap();
+
+        let err = queue.mark_notes_delivered("b", &[id_from_a]).unwrap_err();
+        assert!(err.contains("does not belong to lane"));
+
+        // Queue file should be unchanged
+        let a_notes = queue.pending_notes("a");
+        assert_eq!(a_notes.len(), 1, "note should still be pending");
     }
 }

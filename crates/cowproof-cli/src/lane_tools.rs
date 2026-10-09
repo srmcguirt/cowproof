@@ -41,13 +41,16 @@ impl Op {
     }
 }
 
-fn id_schema(what: &str) -> Value {
-    json!({
+fn id_schema(what: &str, optional: bool) -> Value {
+    let mut schema = json!({
         "type": "object",
         "properties": { "id": { "type": "string", "description": what } },
-        "required": ["id"],
         "additionalProperties": false,
-    })
+    });
+    if !optional {
+        schema["required"] = json!(["id"]);
+    }
+    schema
 }
 
 #[async_trait]
@@ -88,14 +91,17 @@ impl Tool for Forward {
             Op::CheckRuling => ToolSpec::new(
                 "check_ruling",
                 "Check whether an ask has been ruled. Also returns any notes the director sent \
-                 you since the last call; each note is returned once.",
-                id_schema("the id `ask` returned"),
+                 you since the last call; each note is returned once. Call with no id to receive notes without an escalation.",
+                id_schema(
+                    "the id `ask` returned, or omit to check for notes only",
+                    true,
+                ),
             ),
             Op::RunCheck => ToolSpec::new(
                 "run_check",
                 "Run one of the packet's declared checks in a fresh sandbox and return its exit \
                  status and output.",
-                id_schema("a check id declared in the packet"),
+                id_schema("a check id declared in the packet", false),
             ),
         }
     }
@@ -105,7 +111,14 @@ impl Tool for Forward {
         // Only the fields each op defines are forwarded.
         let request = match self.op {
             Op::Ask => json!({ "op": name, "ask": input }),
-            Op::CheckRuling | Op::RunCheck => json!({ "op": name, "id": input["id"] }),
+            Op::CheckRuling => {
+                if input.get("id").is_some() && input["id"] != json!(null) {
+                    json!({ "op": name, "id": input["id"] })
+                } else {
+                    json!({ "op": name })
+                }
+            }
+            Op::RunCheck => json!({ "op": name, "id": input["id"] }),
         };
         let mut response = round_trip(&self.socket, &request)
             .await
