@@ -316,11 +316,18 @@ pub fn outside_ownership(files: &[String], owns: &[String], protected: &[String]
 
 pub fn removed_lines(patch: &str, file: &str) -> usize {
     let mut active = false;
+    let mut in_hunk = false;
     let mut count = 0;
     for line in patch.lines() {
         if line.starts_with("diff --git ") {
             active = line.ends_with(&format!(" b/{file}"));
-        } else if active && line.starts_with('-') && !line.starts_with("---") {
+            in_hunk = false;
+        } else if !in_hunk && !line.starts_with("@@") {
+            // Skip lines outside hunks (headers and context)
+            continue;
+        } else if line.starts_with("@@") {
+            in_hunk = true;
+        } else if active && in_hunk && line.starts_with('-') {
             count += 1;
         }
     }
@@ -560,10 +567,34 @@ mod tests {
     }
     #[test]
     fn removed_line_count() {
-        let p = "diff --git a/x.test.mjs b/x.test.mjs\n--- a/x.test.mjs\n+++ b/x.test.mjs\n@@ -1 +1 @@\n-old\n+new\ndiff --git a/y b/y\n-a\n-b\n+c";
+        let p = "diff --git a/x.test.mjs b/x.test.mjs\n--- a/x.test.mjs\n+++ b/x.test.mjs\n@@ -1 +1 @@\n-old\n+new\ndiff --git a/y b/y\n--- a/y\n+++ b/y\n@@ -1,2 +1 @@\n-a\n-b\n+c";
         assert_eq!(removed_lines(p, "x.test.mjs"), 1);
         assert_eq!(removed_lines(p, "y"), 2);
         assert_eq!(removed_lines(p, "z"), 0);
+    }
+
+    #[test]
+    fn removed_line_with_sql_comment_is_counted() {
+        // Test: removing `-- assert balance >= 0` should count as 1 removed line
+        // In the patch, this appears as `--- assert balance >= 0` (dash marker + content starting with --)
+        let patch = "diff --git a/schema.sql b/schema.sql\n--- a/schema.sql\n+++ b/schema.sql\n@@ -1,3 +1,2 @@\n CREATE TABLE accounts (\n--- assert balance >= 0\n );";
+        assert_eq!(removed_lines(patch, "schema.sql"), 1);
+    }
+
+    #[test]
+    fn removed_line_starting_with_triple_dash_is_counted() {
+        // Test: removing `--- separator ---` in markdown counts as 1
+        // In the patch, this appears as `---- separator ---` (dash marker + content starting with ---)
+        let patch = "diff --git a/README.md b/README.md\n--- a/README.md\n+++ b/README.md\n@@ -1,3 +1,2 @@\n # Header\n---- separator ---\n some text";
+        assert_eq!(removed_lines(patch, "README.md"), 1);
+    }
+
+    #[test]
+    fn headers_not_counted_in_multi_file_patch() {
+        // Test: a patch with headers for two files counts only body lines
+        let patch = "diff --git a/file1.rs b/file1.rs\n--- a/file1.rs\n+++ b/file1.rs\n@@ -1 +1 @@\n-old1\n+new1\ndiff --git a/file2.rs b/file2.rs\n--- a/file2.rs\n+++ b/file2.rs\n@@ -1 +1 @@\n-old2\n+new2";
+        assert_eq!(removed_lines(patch, "file1.rs"), 1);
+        assert_eq!(removed_lines(patch, "file2.rs"), 1);
     }
     #[test]
     fn slot_capacity_is_shared_by_class_and_released() {
