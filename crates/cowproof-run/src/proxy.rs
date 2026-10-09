@@ -34,7 +34,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result, bail};
 use bytes::Bytes;
@@ -72,6 +72,7 @@ const MAX_METRIC_PATH: usize = 200;
 const MAX_CONNECTIONS: usize = 256;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(30);
+const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Configuration for the proxy.
 pub struct ProxyConfig {
@@ -82,6 +83,8 @@ pub struct ProxyConfig {
     upstream: Upstream,
     /// Per-lane placeholder the builder must present.
     placeholder_key: String,
+    /// Longest gap allowed between chunks while streaming a body in either direction.
+    idle_timeout: Duration,
 }
 
 impl ProxyConfig {
@@ -104,7 +107,14 @@ impl ProxyConfig {
             upstream_base,
             upstream,
             placeholder_key: format!("placeholder-{}", uuid::Uuid::new_v4()),
+            idle_timeout: DEFAULT_IDLE_TIMEOUT,
         })
+    }
+
+    /// Set the idle timeout (longest gap between chunks while streaming).
+    pub fn with_idle_timeout(mut self, timeout: Duration) -> Self {
+        self.idle_timeout = timeout;
+        self
     }
 
     /// The placeholder key (safe to give to the builder).
@@ -116,6 +126,11 @@ impl ProxyConfig {
     pub fn upstream_base(&self) -> &str {
         &self.upstream_base
     }
+
+    /// The idle timeout.
+    fn idle_timeout(&self) -> Duration {
+        self.idle_timeout
+    }
 }
 
 impl fmt::Debug for ProxyConfig {
@@ -124,6 +139,7 @@ impl fmt::Debug for ProxyConfig {
             .field("real_api_key", &"<redacted>")
             .field("upstream_base", &self.upstream_base)
             .field("placeholder_key", &self.placeholder_key)
+            .field("idle_timeout", &self.idle_timeout)
             .finish()
     }
 }
@@ -510,10 +526,14 @@ async fn handle(req: Request<Incoming>, state: Arc<State>) -> Response<ProxyBody
         return reject(&state, path, StatusCode::BAD_GATEWAY, "bad gateway\n");
     };
 
+    let request_id = format!("req-{}", uuid::Uuid::new_v4());
     let bytes_in = Arc::new(AtomicU64::new(0));
     let request_body = RequestTap {
         inner: body,
         seen: Arc::clone(&bytes_in),
+        idle_timeout: state.config.idle_timeout(),
+        request_id: request_id.clone(),
+        last_activity: Instant::now(),
     }
     .boxed_unsync();
     let mut upstream_request = Request::new(request_body);
@@ -569,6 +589,9 @@ async fn handle(req: Request<Incoming>, state: Arc<State>) -> Response<ProxyBody
         }),
         bytes_out: 0,
         captured: capture_usage.then(Vec::new),
+        idle_timeout: state.config.idle_timeout(),
+        request_id,
+        last_activity: Instant::now(),
     };
     let mut response = Response::new(tap.boxed_unsync());
     *response.status_mut() = response_parts.status;
@@ -609,9 +632,14 @@ fn parse_usage(body: &[u8]) -> (Option<u64>, Option<u64>) {
 }
 
 /// Counts request bytes as they stream to the upstream and refuses a body over the limit.
+/// Also enforces an idle timeout: if no data arrives within the configured idle timeout,
+/// the stream is closed with an error.
 struct RequestTap {
     inner: Incoming,
     seen: Arc<AtomicU64>,
+    idle_timeout: Duration,
+    request_id: String,
+    last_activity: Instant,
 }
 
 impl Body for RequestTap {
@@ -622,6 +650,15 @@ impl Body for RequestTap {
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Bytes>, BoxError>>> {
+        // Check for idle timeout before polling
+        if Instant::now().duration_since(self.last_activity) > self.idle_timeout {
+            eprintln!(
+                "proxy idle timeout: request_id={} direction=request",
+                self.request_id
+            );
+            return Poll::Ready(Some(Err("idle timeout".into())));
+        }
+
         match Pin::new(&mut self.inner).poll_frame(cx) {
             Poll::Ready(Some(Ok(frame))) => {
                 if let Some(data) = frame.data_ref() {
@@ -631,6 +668,8 @@ impl Body for RequestTap {
                         return Poll::Ready(Some(Err("request body too large".into())));
                     }
                 }
+                // Reset idle timeout on successful frame
+                self.last_activity = Instant::now();
                 Poll::Ready(Some(Ok(frame)))
             }
             Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(Box::new(e)))),
@@ -658,12 +697,17 @@ struct Report {
 
 /// Relays the upstream body frame by frame. Nothing is held back: a frame goes to the builder
 /// as soon as it arrives. The metric is written when the body ends, fails or is dropped.
+/// Also enforces an idle timeout: if no data arrives within the configured idle timeout,
+/// the stream is closed with an error.
 struct ResponseTap {
     inner: Incoming,
     report: Option<Report>,
     bytes_out: u64,
     /// Copy of the body for `usage`, kept only for plain JSON and only up to a cap.
     captured: Option<Vec<u8>>,
+    idle_timeout: Duration,
+    request_id: String,
+    last_activity: Instant,
 }
 
 impl ResponseTap {
@@ -701,6 +745,17 @@ impl Body for ResponseTap {
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Bytes>, BoxError>>> {
         let this = &mut *self;
+
+        // Check for idle timeout before polling
+        if Instant::now().duration_since(this.last_activity) > this.idle_timeout {
+            this.finish();
+            eprintln!(
+                "proxy idle timeout: request_id={} direction=response",
+                this.request_id
+            );
+            return Poll::Ready(Some(Err("idle timeout".into())));
+        }
+
         match Pin::new(&mut this.inner).poll_frame(cx) {
             Poll::Ready(Some(Ok(frame))) => {
                 if let Some(data) = frame.data_ref() {
@@ -713,6 +768,8 @@ impl Body for ResponseTap {
                         }
                     }
                 }
+                // Reset idle timeout on successful frame
+                this.last_activity = Instant::now();
                 // A body framed by Content-Length may never be polled again after its last
                 // frame, so the metric is written here as well as at the end of the stream.
                 if this.inner.is_end_stream() {
