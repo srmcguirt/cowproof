@@ -1138,6 +1138,16 @@ Actual answer: A) Add to backlog (D16, 2026-10-09)
 Accepted scope: a recurring item in docs/backlog.md: record the ported sandbox-runtime commit in NOTICE and review its releases and advisories at every cowproof release.
 History: pending until D16
 
+### R14: builders never write the real `~/.cargo` (reopens D10)
+Finding: B-1, P1, confidence 9/10, director review of lane/sandbox-policy (crates/cowproof-run/src/lib.rs:141, 223-235 granted read-write on the real `~/.cargo` to every policy); reviewer: director (post-review build)
+Plan baseline: D10 preserved "`~/.cargo` (read and write)" from the old runner; D6 forbids the verifier any builder-writable cache
+Runtime evidence: lane B's policies granted the real `~/.cargo` read-write to builder, run_check, verifier, capture and fetch; a builder could write `~/.cargo/bin` and plant a program that later runs unsandboxed
+Question D18 (asked 2026-10-09): Reopen D10: stop builders from writing your real ~/.cargo? Options: A) Lane-private cargo (recommended); B) Keep D10 as approved.
+State: approved
+Actual answer: A) Lane-private cargo (D18, 2026-10-09)
+Accepted scope: builders and run_check get `CARGO_HOME=<lane>/home/.cargo` (writable) with the real `~/.cargo/registry` and `~/.cargo/git` read-only; the real `~/.cargo` is never writable from any sandbox and its credentials stay denied; verifier, capture and dependency fetch use only the D6 caches and have no access to the real `~/.cargo`. Test: a sandboxed write to `~/.cargo/bin` (on a temporary fake home) fails. Supersedes the `~/.cargo` read-and-write clause of D10; the rest of D10 stands.
+History: D10 (approved earlier in this review) kept `~/.cargo` read and write; reopened after lane B exposed the persistence risk.
+
 Approval readiness: PASS. Checked: scope D2 (A), D3 (A); R1 D4 (A); R2 D5 (A); R3 D6 (A); R4 D7 (A, investigation only); R5 D8 (A); R6 D9 (A); R7 D10 (A, regression contract); R8 D11 (A); R9 D12 (A); R10 D13 (A); R11 D14 (A); R12 D15 (A); R13 D16 (A). Carried requirements A-3 and Q-2 implement approved contracts (Trust boundaries; cowproof-run owns the runner). Notes O-3 (D3 amendment), SC-4 and F-1 change no behavior.
 
 ## Engineering review: body
