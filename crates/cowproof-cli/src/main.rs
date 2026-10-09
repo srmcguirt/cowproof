@@ -3,8 +3,8 @@
 use anyhow::{Context, Result, anyhow, bail};
 use clap::Parser;
 use cowproof_core::{
-    Header, PORT_BASE, codex_isolation_args, outside_ownership, parse_header, release_slot,
-    remove_build_output, removed_lines, repo_rules, sandbox_command, sandbox_profile,
+    Header, PORT_BASE, codex_isolation_args, heldout, outside_ownership, parse_header,
+    release_slot, remove_build_output, removed_lines, repo_rules, sandbox_command, sandbox_profile,
     try_acquire_slot,
 };
 use cowproof_host::{
@@ -78,6 +78,8 @@ struct RunArgs {
     allow_lint_errors: bool,
     #[arg(long)]
     host: Option<String>,
+    #[arg(long)]
+    heldout: Option<PathBuf>,
     #[arg(required = true)]
     packets: Vec<PathBuf>,
 }
@@ -1233,6 +1235,26 @@ fn hosts_command() -> Result<()> {
 
 async fn run(args: RunArgs) -> Result<()> {
     let repo = std::env::current_dir()?.canonicalize()?;
+
+    // Check for held-out files in the repository
+    let heldout_files = heldout::scan_base_for_heldout(&repo)?;
+    if !heldout_files.is_empty() {
+        eprintln!("error: found .heldout.* files tracked in the repository:");
+        for file in &heldout_files {
+            eprintln!("  {}", file.display());
+        }
+        bail!("held-out checks must not be in the repository; dispatch refused");
+    }
+
+    // Validate held-out checks path if provided
+    if let Some(heldout_path) = &args.heldout {
+        let home_dir = home();
+        let repo_id = heldout::repo_id(&repo)?;
+        // Validate that the explicit path is outside the repo
+        let _resolved =
+            heldout::resolve(Some(heldout_path), &home_dir, &repo, &repo_id, "validation")?;
+    }
+
     let output_root = args.root.unwrap_or_else(|| home().join(".cache/cowproof"));
     fs::create_dir_all(&output_root)?;
     let output_root = output_root.canonicalize()?;

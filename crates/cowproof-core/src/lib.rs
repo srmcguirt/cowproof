@@ -8,6 +8,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
+pub mod heldout;
+
 pub const PORT_BASE: u16 = 57000;
 pub const SLOT_DIR: &str = "/tmp/cowproof-lanes/.slots";
 pub const DEFAULT_HANDOFF_DIR: &str = "docs/handoffs";
