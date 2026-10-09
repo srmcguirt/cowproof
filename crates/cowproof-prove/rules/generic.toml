@@ -1,0 +1,31 @@
+# Generic flaw rules that apply to any stack (no SQL dialect, auth system, or
+# runtime-specific constraints). Rules specific to one stack (Postgres RLS,
+# Supabase migrations, a project's auth guard) live in project-specific packs.
+
+[[rules]]
+pattern = "(?i)EXCEPTION\\s+WHEN\\s+OTHERS"
+files = ["**/*"]
+explanation = "This catches and can swallow every exception."
+
+[[rules]]
+pattern = "#\\[ignore\\]"
+files = ["**/*.rs"]
+explanation = "An ignored Rust test may hide a failing check."
+added_only = true
+
+[[rules]]
+pattern = "(?i)\\binnerHTML\\b|createContextualFragment|insertAdjacentHTML"
+files = ["**/*.js", "**/*.jsx", "**/*.ts", "**/*.tsx", "**/*.html"]
+explanation = "String based HTML rendering can introduce injection risk."
+
+[[rules]]
+pattern = ".*"
+files = ["**/*"]
+explanation = "A migration at or before the supplied baseline was changed."
+applied_migration = true
+
+[[rules]]
+pattern = "(?i)(postmaster\\.pid|pg_wal/|(^|/)target/|(^|/)tmp-[^/]+)"
+files = ["**/*"]
+explanation = "Build output or scratch files appear in the patch."
+path_only = true

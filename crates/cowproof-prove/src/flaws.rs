@@ -9,6 +9,8 @@ use cowproof_core::glob_matches;
 use regex::Regex;
 use serde::Deserialize;
 
+pub use cowproof_core::{PatchDelta, parse_patch};
+
 /// A flaw rule as defined in a flaws.toml file.
 #[derive(Clone, Debug, Deserialize)]
 pub struct FlawRule {
@@ -51,72 +53,6 @@ pub struct FlawFinding {
     pub line: Option<usize>,
     pub pattern: String,
     pub explanation: String,
-}
-
-/// A parsed delta from a unified diff patch.
-#[derive(Clone, Debug)]
-pub struct PatchDelta {
-    pub path: String,
-    pub added: Vec<(usize, String)>,
-    pub removed: Vec<(usize, String)>,
-    /// Unchanged lines shown in hunks, consulted by `requires`.
-    pub context: Vec<String>,
-}
-
-/// Parse a unified diff patch into deltas per file.
-pub fn parse_patch(patch: &str) -> Vec<PatchDelta> {
-    let mut out: Vec<PatchDelta> = Vec::new();
-    let mut new_line = 1usize;
-    // `---`/`+++` are file headers only before the first hunk. Inside a hunk
-    // an added line such as `++ x` renders as `+++ x` and must still count.
-    let mut in_hunk = false;
-    for line in patch.lines() {
-        if let Some(rest) = line.strip_prefix("diff --git a/") {
-            in_hunk = false;
-            let path = rest
-                .split_once(" b/")
-                .map(|(_, b)| b.to_string())
-                .unwrap_or_default();
-            out.push(PatchDelta {
-                path,
-                added: Vec::new(),
-                removed: Vec::new(),
-                context: Vec::new(),
-            });
-            new_line = 1;
-            continue;
-        }
-        let Some(d) = out.last_mut() else {
-            continue;
-        };
-        if line.starts_with('\\') {
-            continue;
-        }
-        if !in_hunk && !line.starts_with("@@") {
-            continue;
-        }
-        if line.starts_with("@@") {
-            in_hunk = true;
-            if let Some((_, rest)) = line.split_once('+') {
-                new_line = rest
-                    .split([',', ' '])
-                    .next()
-                    .and_then(|x| x.parse().ok())
-                    .unwrap_or(1);
-            }
-            continue;
-        }
-        if let Some(s) = line.strip_prefix('+') {
-            d.added.push((new_line, s.to_string()));
-            new_line += 1;
-        } else if let Some(s) = line.strip_prefix('-') {
-            d.removed.push((0, s.to_string()));
-        } else if let Some(s) = line.strip_prefix(' ') {
-            d.context.push(s.to_string());
-            new_line += 1;
-        }
-    }
-    out
 }
 
 fn finding(rule: &FlawRule, label: &str, file: &str, line: Option<usize>) -> FlawFinding {

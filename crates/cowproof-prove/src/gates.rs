@@ -3,9 +3,9 @@
 //! Gates load configuration from the base revision, never the patched tree.
 //! This prevents a patch from weakening its own checks.
 
-use crate::flaws::{check_rules, parse_patch, parse_rules};
+use crate::flaws::{check_rules, parse_rules};
 use anyhow::{Context, Result, bail};
-use cowproof_core::{glob_matches, outside_ownership, removed_lines};
+use cowproof_core::{glob_matches, outside_ownership, parse_patch, removed_lines};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -307,30 +307,40 @@ fn check_flaws(base_repo: &Path, base_commit: &str, lane_patch: &str) -> Result<
     let mut rules = Vec::new();
     let mut loaded = 0usize;
     let configured = configured_packs(base_repo, base_commit)?;
-    let mut sources: Vec<(String, bool)> = vec![(DEFAULT_FLAW_PACK.to_string(), false)];
+    let mut sources: Vec<(String, bool, bool)> =
+        vec![(DEFAULT_FLAW_PACK.to_string(), false, false)];
     sources.extend(
         configured
             .into_iter()
             .filter(|p| p != DEFAULT_FLAW_PACK)
-            .map(|p| (p, true)),
+            .map(|p| {
+                let is_generic = p == "generic";
+                (p, true, is_generic)
+            }),
     );
-    for (path, required) in sources {
-        match git_show_optional(base_repo, base_commit, &path)? {
+    for (pack_name, required, is_generic) in sources {
+        let text = if is_generic {
+            Some(include_str!("../rules/generic.toml").to_string())
+        } else {
+            git_show_optional(base_repo, base_commit, &pack_name)?
+        };
+
+        match text {
             None if required => {
                 failed = true;
                 evidence.push(format!(
-                    "Flaw pack {path} is named in cowproof.toml but missing from the base"
+                    "Flaw pack {pack_name} is named in cowproof.toml but missing from the base"
                 ));
             }
             None => {}
-            Some(text) => match parse_rules(&text) {
+            Some(file_text) => match parse_rules(&file_text) {
                 Ok(file) => {
                     loaded += 1;
                     rules.extend(file.rules);
                 }
                 Err(e) => {
                     failed = true;
-                    evidence.push(format!("Flaw pack {path}: {e}"));
+                    evidence.push(format!("Flaw pack {pack_name}: {e}"));
                 }
             },
         }
@@ -395,7 +405,6 @@ fn configured_packs(repo: &Path, commit: &str) -> Result<Vec<String>> {
         .into_iter()
         .flatten()
         .filter_map(|p| p.as_str())
-        .filter(|p| *p != "generic")
         .map(|p| p.trim_start_matches("./").to_string())
         .collect())
 }
@@ -506,6 +515,27 @@ explanation = "This catches and can swallow every exception."
         fn remove(&self, path: &str) -> Result<()> {
             fs::remove_file(self.path().join(path))?;
             Ok(())
+        }
+
+        /// Create a new repo with a cowproof.toml config that lists the given packs.
+        fn with_config(packs: &[&str]) -> Result<Self> {
+            let dir = TempDir::new()?;
+            let repo = dir.path();
+            git(repo, &["init", "-q"])?;
+            git(repo, &["config", "user.email", "test@test.local"])?;
+            git(repo, &["config", "user.name", "Test"])?;
+            let packs_list = packs
+                .iter()
+                .map(|p| format!("\"{}\"", p))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let config = format!("[proof]\npacks = [{}]\n", packs_list);
+            fs::write(repo.join("cowproof.toml"), &config)?;
+            fs::write(repo.join("README.md"), "# Test\n")?;
+            git(repo, &["add", "-A"])?;
+            git(repo, &["commit", "-q", "-m", "base"])?;
+            let base = git(repo, &["rev-parse", "HEAD"])?.trim().to_string();
+            Ok(TestRepo { dir, base })
         }
 
         /// The real patch: `git diff` of the working tree against the base.
@@ -1073,6 +1103,135 @@ explanation = "This has a broken pattern."
         )
         .unwrap_err();
         assert!(err.to_string().contains("not a commit"), "{err}");
+        Ok(())
+    }
+
+    #[test]
+    fn generic_pack_loads_when_named() -> Result<()> {
+        let repo = TestRepo::with_config(&["generic"])?;
+        // Generic pack has #[ignore] rule, not USING(true)
+        repo.write("test.rs", "#[ignore]\nfn test() {}")?;
+        let patch = repo.patch()?;
+
+        let report = run_gates(repo.path(), "HEAD", &patch, &packet(&["test.rs"]))?;
+        let flaws_gate = gate(&report, "flaws");
+        assert!(!flaws_gate.passed, "generic pack should catch #[ignore]");
+        Ok(())
+    }
+
+    #[test]
+    fn stack_specific_rules_not_in_generic() -> Result<()> {
+        let repo = TestRepo::with_config(&["generic"])?;
+        // USING(true) is Postgres-specific, not in generic pack
+        repo.write("policy.sql", "POLICY x AS (USING (true))")?;
+        let patch = repo.patch()?;
+
+        let report = run_gates(repo.path(), "HEAD", &patch, &packet(&["policy.sql"]))?;
+        let flaws = gate(&report, "flaws");
+        // Should pass because USING(true) is not in generic pack
+        assert!(
+            flaws.passed,
+            "USING(true) should not be in generic pack: {:?}",
+            flaws.evidence
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn unknown_pack_name_fails_the_gate() -> Result<()> {
+        let repo = TestRepo::with_config(&["nope"])?;
+        repo.write("test.rs", "fn foo() {}")?;
+        let patch = repo.patch()?;
+
+        let report = run_gates(repo.path(), "HEAD", &patch, &packet(&["test.rs"]))?;
+        let flaws = gate(&report, "flaws");
+        assert!(
+            !flaws.passed,
+            "unknown pack should fail the gate: {:?}",
+            flaws.evidence
+        );
+        assert!(
+            flaws
+                .evidence
+                .iter()
+                .any(|e| e.contains("nope") && e.contains("missing from the base")),
+            "should report pack as missing: {:?}",
+            flaws.evidence
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn empty_packs_list_passes() -> Result<()> {
+        let repo = TestRepo::with_config(&[])?;
+        repo.write("test.rs", "#[ignore]fn ok() {}")?;
+        let patch = repo.patch()?;
+
+        let report = run_gates(repo.path(), "HEAD", &patch, &packet(&["test.rs"]))?;
+        let flaws = gate(&report, "flaws");
+        // Empty packs list should pass (no rules configured, so no violations)
+        assert!(
+            flaws.passed,
+            "empty packs list should pass: {:?}",
+            flaws.evidence
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn removed_lines_agrees_with_parse_patch() -> Result<()> {
+        let tmpdir = tempfile::TempDir::new()?;
+        let repo = tmpdir.path();
+
+        // Initialize repo with two files
+        git(repo, &["init", "-q"])?;
+        git(repo, &["config", "user.email", "test@test.local"])?;
+        git(repo, &["config", "user.name", "Test"])?;
+        std::fs::write(repo.join("file1.txt"), "line1\nline2\nline3\n")?;
+        std::fs::write(repo.join("file2.txt"), "alpha\nbeta\ngamma\n")?;
+        git(repo, &["add", "-A"])?;
+        git(repo, &["commit", "-q", "-m", "base"])?;
+
+        // Modify both files: remove a line from each
+        std::fs::write(repo.join("file1.txt"), "line1\nline3\n")?; // removed line2
+        std::fs::write(repo.join("file2.txt"), "alpha\ngamma\n")?; // removed beta
+
+        // Generate diff
+        git(repo, &["add", "-A"])?;
+        let patch = git(
+            repo,
+            &[
+                "-c",
+                "diff.noprefix=false",
+                "-c",
+                "diff.mnemonicPrefix=false",
+                "diff",
+                "--cached",
+                "--no-color",
+                "--no-ext-diff",
+            ],
+        )?;
+
+        // Check agreement
+        let deltas = parse_patch(&patch);
+        assert_eq!(
+            removed_lines(&patch, "file1.txt"),
+            deltas
+                .iter()
+                .find(|d| d.path == "file1.txt")
+                .map(|d| d.removed.len())
+                .unwrap_or(0),
+            "removed_lines should match parse_patch for file1.txt"
+        );
+        assert_eq!(
+            removed_lines(&patch, "file2.txt"),
+            deltas
+                .iter()
+                .find(|d| d.path == "file2.txt")
+                .map(|d| d.removed.len())
+                .unwrap_or(0),
+            "removed_lines should match parse_patch for file2.txt"
+        );
         Ok(())
     }
 }

@@ -9,6 +9,9 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 pub mod heldout;
+pub mod patch;
+
+pub use patch::{PatchDelta, parse_patch};
 
 pub const PORT_BASE: u16 = 57000;
 pub const SLOT_DIR: &str = "/tmp/cowproof-lanes/.slots";
@@ -315,23 +318,11 @@ pub fn outside_ownership(files: &[String], owns: &[String], protected: &[String]
 }
 
 pub fn removed_lines(patch: &str, file: &str) -> usize {
-    let mut active = false;
-    let mut in_hunk = false;
-    let mut count = 0;
-    for line in patch.lines() {
-        if line.starts_with("diff --git ") {
-            active = line.ends_with(&format!(" b/{file}"));
-            in_hunk = false;
-        } else if !in_hunk && !line.starts_with("@@") {
-            // Skip lines outside hunks (headers and context)
-            continue;
-        } else if line.starts_with("@@") {
-            in_hunk = true;
-        } else if active && in_hunk && line.starts_with('-') {
-            count += 1;
-        }
-    }
-    count
+    parse_patch(patch)
+        .into_iter()
+        .find(|delta| delta.path == file)
+        .map(|delta| delta.removed.len())
+        .unwrap_or(0)
 }
 
 pub fn codex_isolation_args(copy: &Path, codex_home: &Path) -> Vec<String> {
