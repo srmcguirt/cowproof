@@ -66,6 +66,7 @@ pub fn lint_packet(packet_text: &str, repo_root: &Path, plans: &[Plan]) -> Vec<F
             &mut findings,
         );
     }
+    lint_packet_restates_protocol(packet_text, &mut findings);
     findings
 }
 
@@ -685,6 +686,37 @@ fn has_credential_value(value: &str) -> bool {
         && !value.starts_with("your_")
         && !value.eq_ignore_ascii_case("redacted")
         && !value.eq_ignore_ascii_case("placeholder")
+}
+
+/// Lint rule: detect when a packet restates the builder preamble's protocol text.
+/// Per D20 constraint, packets must not include the preamble's distinctive protocol phrases,
+/// because per-lane copies break the shared prompt cache and drift from the canonical protocol.
+fn lint_packet_restates_protocol(packet_text: &str, findings: &mut Vec<Finding>) {
+    use cowproof_core::PROTOCOL_MARKERS;
+
+    // Skip the JSON header (everything before the first blank line)
+    let packet_body = if let Some(pos) = packet_text.find("\n\n") {
+        &packet_text[pos + 2..]
+    } else {
+        packet_text
+    };
+
+    for marker in PROTOCOL_MARKERS {
+        if packet_body.contains(marker) {
+            findings.push(Finding {
+                severity: Severity::Error,
+                rule: "packet-restates-protocol",
+                line: None,
+                message: format!(
+                    "packet restates preamble protocol text: '{}' found in packet body. \
+                     The preamble states the protocol once and is shared across lanes for cache efficiency. \
+                     Do not paste Ask schema, escalate-early rules, or other protocol text into the packet.",
+                    marker
+                ),
+            });
+            return; // Report once per packet
+        }
+    }
 }
 
 #[cfg(test)]

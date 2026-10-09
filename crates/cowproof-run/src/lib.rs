@@ -12,6 +12,7 @@
 //! any caller edits to the policy, and only the resolved path is emitted.
 
 pub mod claude;
+pub mod prefix;
 pub mod proxy;
 
 use sha2::{Digest, Sha256};

@@ -15,6 +15,17 @@ pub const SLOT_DIR: &str = "/tmp/cowproof-lanes/.slots";
 pub const DEFAULT_HANDOFF_DIR: &str = "docs/handoffs";
 pub const ALWAYS_PROTECTED: [&str; 4] = [".env", ".env.*", "**/.env", "**/.env.*"];
 
+/// Marker strings that identify preamble protocol text.
+/// Used by lint to detect when a packet restates the preamble protocol (D20 constraint).
+/// These must match exactly between cowproof-run's preamble and cowproof-lint's checks.
+pub const PROTOCOL_MARKERS: &[&str] = &[
+    "Builder Preamble",         // preamble title
+    "run_check",                // specific tool name; packets should not restate the Ask schema
+    "blocking: false",          // protocol keyword from the Ask schema example
+    "same check failed twice",  // escalate-early rule phrase
+    "packet restates protocol", // lint rule name itself
+];
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct Header {
