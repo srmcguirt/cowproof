@@ -147,10 +147,13 @@ mod tests {
 
     #[test]
     fn test_preamble_mentions_tools() {
-        // Verify the preamble names the builder tools
-        assert!(PREAMBLE.contains("ask"));
-        assert!(PREAMBLE.contains("check_ruling"));
-        assert!(PREAMBLE.contains("run_check"));
+        // Verify the preamble names all six builder tools with their jobs
+        assert!(PREAMBLE.contains("`ask`"));
+        assert!(PREAMBLE.contains("`check_ruling`"));
+        assert!(PREAMBLE.contains("`run_check`"));
+        assert!(PREAMBLE.contains("`pk-read`"));
+        assert!(PREAMBLE.contains("`sym`"));
+        assert!(PREAMBLE.contains("`outline`"));
     }
 
     #[test]

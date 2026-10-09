@@ -1015,4 +1015,59 @@ mod tests {
         );
         assert_eq!(signatures(&findings), Vec::<String>::new());
     }
+
+    #[test]
+    fn packet_restates_protocol_when_pasting_ask_schema() {
+        let dir = root();
+        let text = format!(
+            "{}\n\nThe ask schema looks like this:\n```json\n{{\n  \"kind\": \"blocker | design | scope | environment\",\n  \"question\": \"a clear, specific question in one paragraph (max 4000 chars)\",\n  \"tried\": [\"what you attempted and what happened\"],\n  \"options\": [{{\"id\": \"option_id\", \"summary\": \"...\", \"cost\": \"...\"}}],\n  \"recommend\": \"option_id\",\n  \"blocking\": true\n}}\n```\n\nThe schema is strict and must be followed.",
+            packet(r#"{"id":"lane-x","owns":["x"]}"#, "cargo test")
+        );
+        assert!(has(
+            &lint_packet(&text, &dir, &[]),
+            "packet-restates-protocol"
+        ));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn packet_restates_protocol_not_triggered_by_normal_usage() {
+        let dir = root();
+        let text = format!(
+            "{}\n\nRun each check with run_check to ensure it passes. Use blocking true or false as needed for your asks.",
+            packet(r#"{"id":"lane-x","owns":["x"]}"#, "cargo test")
+        );
+        assert!(!has(
+            &lint_packet(&text, &dir, &[]),
+            "packet-restates-protocol"
+        ));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn protocol_markers_are_distinctive_phrases() {
+        // Verify markers are multi-word phrases, not bare tool names or common words
+        // that would create false positives in normal packets.
+        for marker in cowproof_core::PROTOCOL_MARKERS {
+            // Each marker should be multiple words or a distinctive phrase
+            let word_count = marker.split_whitespace().count();
+            assert!(
+                word_count >= 4,
+                "marker '{}' is too short ({} words); must be distinctive multi-word phrase",
+                marker,
+                word_count
+            );
+            // Markers should not be bare tool names
+            assert!(
+                !marker.eq_ignore_ascii_case("ask")
+                    && !marker.eq_ignore_ascii_case("check_ruling")
+                    && !marker.eq_ignore_ascii_case("run_check")
+                    && !marker.eq_ignore_ascii_case("pk-read")
+                    && !marker.eq_ignore_ascii_case("sym")
+                    && !marker.eq_ignore_ascii_case("outline"),
+                "marker '{}' is a bare tool name; must be a distinctive phrase",
+                marker
+            );
+        }
+    }
 }

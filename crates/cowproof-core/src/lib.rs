@@ -17,13 +17,16 @@ pub const ALWAYS_PROTECTED: [&str; 4] = [".env", ".env.*", "**/.env", "**/.env.*
 
 /// Marker strings that identify preamble protocol text.
 /// Used by lint to detect when a packet restates the preamble protocol (D20 constraint).
-/// These must match exactly between cowproof-run's preamble and cowproof-lint's checks.
+/// Markers are distinctive multi-word phrases that appear ONLY in the preamble's protocol
+/// sections (ask schema, check results, escalate-early, handback rules), never in normal
+/// packets. They must match exactly between cowproof-run's preamble and cowproof-lint's
+/// checks. See the preamble source for the exact sentences.
 pub const PROTOCOL_MARKERS: &[&str] = &[
-    "Builder Preamble",         // preamble title
-    "run_check",                // specific tool name; packets should not restate the Ask schema
-    "blocking: false",          // protocol keyword from the Ask schema example
-    "same check failed twice",  // escalate-early rule phrase
-    "packet restates protocol", // lint rule name itself
+    "The schema is strict",
+    "Read file ranges efficiently without re-reading",
+    "If the same check id fails, then passes, then fails again",
+    "You will be rejected at handback if you report stubs",
+    "Confirm that every check in the packet has a run_check result",
 ];
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
