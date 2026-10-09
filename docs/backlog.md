@@ -2,6 +2,8 @@
 
 Work the crate port (2026-10-09) deferred or exposed. Newest first.
 
+- **Handback report: malformed check lines are dropped silently.** The synthetic fixtures (2026-10-09) show that a table row with empty cells, a bullet without its separator, an arrow line with one space before `->`, and a fenced command outside the checks heading all vanish without a warning. The director reads a report that looks complete. Report them as unparsed lines in the report output.
+- **Handback report: failure words.** A result such as "Errors detected in test suite" classifies as `unclear`, not `fail` (fixture `arrow`). Widen the failure vocabulary and update the snapshot.
 - **`applied_migration` rules never fire in gates.** `GatePacket` has no migration baseline; add one (the report gets it from `--baseline`).
 - **Verifier: dependency prefetch has no caller (D6).** `dependency_cache_key` exists and nothing calls it; the per-lockfile prefetch (outside any builder, keyed by lockfile, registry configuration and target) is still to build. Out of scope of the verifier-wiring lane, which wired the class slot, the per-check timeout, the explicit `PATH` and made `ProcessRunner` test-only.
 
