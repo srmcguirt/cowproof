@@ -1683,12 +1683,24 @@ async fn run_in_slot(
     ] {
         fs::create_dir_all(lane.join(d))?;
     }
-    for d in [".cargo", ".rustup"] {
-        #[cfg(unix)]
-        std::os::unix::fs::symlink(home().join(d), lane.join("home").join(d))?;
-        #[cfg(not(unix))]
-        fs::create_dir_all(lane.join("home").join(d))?;
+    // D18: the builder's cargo home is lane-private and writable. The real
+    // registry and git caches are linked in read-only (the policy grants them
+    // read-only); the real ~/.cargo is never writable from the sandbox.
+    let lane_cargo = lane.join("home/.cargo");
+    fs::create_dir_all(&lane_cargo)?;
+    #[cfg(unix)]
+    {
+        for d in ["registry", "git"] {
+            let real = home().join(".cargo").join(d);
+            if real.exists() {
+                std::os::unix::fs::symlink(real, lane_cargo.join(d))?;
+            }
+        }
+        std::os::unix::fs::symlink(home().join(".rustup"), lane.join("home/.rustup"))?;
     }
+    #[cfg(not(unix))]
+    fs::create_dir_all(lane.join("home/.rustup"))?;
+    fs::create_dir_all(lane.join("control"))?;
     let scratch = PathBuf::from(format!("/tmp/cowproof/l{port}"));
     if scratch_busy(&scratch) {
         bail!(
@@ -1721,14 +1733,19 @@ async fn run_in_slot(
     if sccache.is_some() {
         extra.push(sccache_dir());
     }
+    // Legacy runner layout: the whole lane directory is the clone grant until
+    // the runner step moves to lane/clone + lane/control; `control` is already
+    // denied inside it (A-3).
     let lane_layout = LaneLayout {
         clone: lane.clone(),
-        home: home(),
+        home: lane.join("home"),
         scratch: scratch.clone(),
+        control: lane.join("control"),
+        real_home: home(),
     };
     let mut policy = SandboxPolicy::builder(&lane_layout, NetworkMode::Unrestricted);
     policy.rw_paths.extend(extra.clone());
-    let profile = render_macos_profile(&policy);
+    let profile = render_macos_profile(&policy)?;
     fs::write(lane.join("sandbox.sb"), profile)?;
     let branch = run_sync(
         "git",
@@ -1754,13 +1771,14 @@ async fn run_in_slot(
         text
     );
     fs::write(lane.join("prompt.md"), prompt)?;
-    let env = lane_env(
+    let mut env = lane_env(
         &lane,
         &scratch,
         port,
         (h.runner == "opencode").then_some(key.as_str()),
         sccache.is_some(),
     );
+    policy.apply_env(&mut env);
     let argv = if h.runner == "codex" {
         codex_argv(
             &h,
@@ -1780,7 +1798,7 @@ async fn run_in_slot(
         std::env::consts::OS
     };
     let profile_path = lane.join("sandbox.sb");
-    let (program, argv) = sandbox_command(&policy, &profile_path, &argv, platform);
+    let (program, argv) = sandbox_command(&policy, &profile_path, &argv, platform)?;
     eprintln!(
         "[{}] running {} {} (timeout {} min{})",
         h.id,
