@@ -88,36 +88,35 @@ pub fn repo_id(repo_root: &Path) -> Result<String> {
     Ok(id)
 }
 
-/// Resolves the held-out checks path from a given working directory.
-/// If explicit path is provided, uses it (after validation).
-/// Otherwise, uses the default store.
-/// Refuses paths inside the repository (including through symlinks).
-/// Internal helper for testing with custom working directories.
-fn resolve_from(
-    explicit: Option<&Path>,
-    home: &Path,
-    repo_root: &Path,
-    repo_id: &str,
-    lane_id: &str,
-    cwd: &Path,
-) -> Result<PathBuf> {
+/// Validates an explicit held-out checks path and refuses it if inside the repository.
+/// - Relative paths are joined with `cwd`, making them always inside or near the repo
+/// - Walks up to the nearest existing ancestor, canonicalizes it, re-adds components
+/// - Rejects paths containing `..` in the non-existent suffix
+/// - Rejects paths that resolve inside repo_root
+/// - Returns the canonical path outside the repository.
+pub fn resolve_outside_repo(path: &Path, repo_root: &Path, cwd: &Path) -> Result<PathBuf> {
     let repo_canonical = repo_root
         .canonicalize()
         .context("canonicalizing repository root")?;
 
-    let path = if let Some(explicit_path) = explicit {
-        if explicit_path.is_absolute() {
-            explicit_path.to_path_buf()
-        } else {
-            cwd.join(explicit_path)
-        }
+    let path = if path.is_absolute() {
+        path.to_path_buf()
     } else {
-        default_store(home, repo_id, lane_id)?
+        cwd.join(path)
     };
 
+    // Walk and canonicalize
+    let canonical = canonicalize_path_with_repo_check(&path, &repo_canonical)?;
+
+    Ok(canonical)
+}
+
+/// Helper to canonicalize a path by walking up to nearest existing ancestor,
+/// re-adding components, and checking it's outside the given repository.
+fn canonicalize_path_with_repo_check(path: &Path, repo_canonical: &Path) -> Result<PathBuf> {
     // Find the nearest existing ancestor, canonicalize it, then reconstruct the path.
     // This ensures relative paths are made absolute and symlinks are resolved properly.
-    let mut current = path.clone();
+    let mut current = path.to_path_buf();
     let mut components_to_add = Vec::new();
 
     // Walk up the path until we find an existing directory
@@ -149,7 +148,7 @@ fn resolve_from(
     }
 
     // Check if the resolved path is inside the repository
-    if let Ok(_rel) = canonical.strip_prefix(&repo_canonical) {
+    if let Ok(_rel) = canonical.strip_prefix(repo_canonical) {
         bail!(
             "held-out checks path {} is inside the repository",
             canonical.display()
@@ -157,6 +156,33 @@ fn resolve_from(
     }
 
     Ok(canonical)
+}
+
+/// Resolves the held-out checks path from a given working directory.
+/// If explicit path is provided, uses it (after validation).
+/// Otherwise, uses the default store.
+/// Refuses paths inside the repository (including through symlinks).
+/// Internal helper for testing with custom working directories.
+fn resolve_from(
+    explicit: Option<&Path>,
+    home: &Path,
+    repo_root: &Path,
+    repo_id: &str,
+    lane_id: &str,
+    cwd: &Path,
+) -> Result<PathBuf> {
+    let repo_canonical = repo_root
+        .canonicalize()
+        .context("canonicalizing repository root")?;
+
+    let path = if let Some(explicit_path) = explicit {
+        resolve_outside_repo(explicit_path, repo_root, cwd)?
+    } else {
+        let default_path = default_store(home, repo_id, lane_id)?;
+        canonicalize_path_with_repo_check(&default_path, &repo_canonical)?
+    };
+
+    Ok(path)
 }
 
 /// Resolves the held-out checks path.

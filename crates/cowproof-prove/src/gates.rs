@@ -226,115 +226,64 @@ fn check_protected_paths(
 /// - Valid held-out file with ≥1 check → pass with evidence naming the number of checks
 ///   (the checks themselves are RUN by the verifier, not here)
 /// - Empty held-out file → fail
-/// - Held-out path inside the repository → fail naming the path
+/// - Held-out path inside the repository or invalid → fail naming the path/problem
 /// - Invalid TOML or other load errors → fail naming the problem
 fn check_heldout(packet: &GatePacket, base_repo: &Path) -> GateResult {
-    let mut evidence = Vec::new();
-    let mut passed = true;
-    let mut warned = false;
-
-    match &packet.heldout_path {
+    let (passed, warned, evidence) = match &packet.heldout_path {
         None => {
             // No held-out path provided
             if packet.require_heldout {
-                passed = false;
-                evidence.push("Held-out checks required but not provided".to_string());
+                (
+                    false,
+                    false,
+                    vec!["Held-out checks required but not provided".to_string()],
+                )
             } else {
-                warned = true;
-                evidence.push("No held-out checks provided".to_string());
+                (true, true, vec!["No held-out checks provided".to_string()])
             }
         }
         Some(path) => {
-            // Validate that the path is not inside the repository
-            let repo_canonical = match base_repo.canonicalize() {
-                Ok(p) => p,
-                Err(e) => {
-                    passed = false;
-                    evidence.push(format!("Failed to canonicalize repository: {}", e));
-                    return GateResult {
-                        name: "held_out".to_string(),
-                        passed,
-                        warned,
-                        evidence,
-                    };
-                }
-            };
-
-            let path_canonical = match path.canonicalize() {
-                Ok(p) => p,
-                Err(_) => {
-                    // File doesn't exist yet or path is invalid. Check if the non-existent
-                    // path would be inside the repo by walking up to an existing ancestor.
-                    match check_path_not_in_repo(&repo_canonical, path) {
-                        Ok(()) => {
-                            // Path is valid and outside repo, but file doesn't exist
-                            passed = false;
-                            evidence.push(format!(
-                                "Held-out checks file not found: {}",
-                                path.display()
-                            ));
-                            return GateResult {
-                                name: "held_out".to_string(),
-                                passed,
-                                warned,
-                                evidence,
-                            };
+            // Resolve and validate the path using the core library function.
+            // Pass base_repo as both repo_root and cwd (relative paths resolve against repo root).
+            match cowproof_core::heldout::resolve_outside_repo(path, base_repo, base_repo) {
+                Ok(path_canonical) => {
+                    // Path is validated; now try to load the checks
+                    match cowproof_core::heldout::load(&path_canonical) {
+                        Ok(heldout) => {
+                            let check_count = heldout.check.len();
+                            if check_count == 0 {
+                                (
+                                    false,
+                                    false,
+                                    vec!["Held-out checks file is empty".to_string()],
+                                )
+                            } else {
+                                let evidence = vec![format!(
+                                    "Held-out checks present: {} check{}",
+                                    check_count,
+                                    if check_count == 1 { "" } else { "s" }
+                                )];
+                                (true, false, evidence)
+                            }
                         }
-                        Err(e) => {
-                            passed = false;
-                            evidence.push(e);
-                            return GateResult {
-                                name: "held_out".to_string(),
-                                passed,
-                                warned,
-                                evidence,
-                            };
-                        }
-                    }
-                }
-            };
-
-            // Check if the canonical path is inside the repository
-            if path_canonical.starts_with(&repo_canonical) {
-                passed = false;
-                evidence.push(format!(
-                    "Held-out checks path {} is inside the repository",
-                    path_canonical.display()
-                ));
-                return GateResult {
-                    name: "held_out".to_string(),
-                    passed,
-                    warned,
-                    evidence,
-                };
-            }
-
-            // Try to load the held-out checks file
-            match cowproof_core::heldout::load(&path_canonical) {
-                Ok(heldout) => {
-                    let check_count = heldout.check.len();
-                    if check_count == 0 {
-                        passed = false;
-                        evidence.push("Held-out checks file is empty".to_string());
-                    } else {
-                        evidence.push(format!(
-                            "Held-out checks present: {} check{}",
-                            check_count,
-                            if check_count == 1 { "" } else { "s" }
-                        ));
+                        Err(e) => (
+                            false,
+                            false,
+                            vec![format!(
+                                "Failed to load held-out checks from {}: {}",
+                                path_canonical.display(),
+                                e
+                            )],
+                        ),
                     }
                 }
                 Err(e) => {
-                    passed = false;
-                    evidence.push(format!(
-                        "Failed to load held-out checks from {}: {}",
-                        path_canonical.display(),
-                        e
-                    ));
+                    // Path resolution failed (inside repo, invalid, contains .., etc.)
+                    (false, false, vec![e.to_string()])
                 }
             }
         }
-    }
+    };
 
     GateResult {
         name: "held_out".to_string(),
@@ -342,46 +291,6 @@ fn check_heldout(packet: &GatePacket, base_repo: &Path) -> GateResult {
         warned,
         evidence,
     }
-}
-
-/// Check that a non-existent path would not be inside the repository.
-/// Returns Ok(()) if the path is valid and outside the repo.
-/// Returns Err(msg) if the path would be inside the repo or is invalid.
-fn check_path_not_in_repo(repo_canonical: &Path, path: &Path) -> Result<(), String> {
-    // Walk up the path to find the first existing ancestor
-    let mut current = path.to_path_buf();
-    let mut components_to_check = Vec::new();
-
-    while !current.exists() {
-        match current.file_name() {
-            Some(name) => {
-                components_to_check.push(name.to_os_string());
-                current.pop();
-            }
-            None => {
-                // Hit the filesystem root without finding anything
-                return Err(format!(
-                    "Cannot resolve held-out checks path: {}",
-                    path.display()
-                ));
-            }
-        }
-    }
-
-    // Canonicalize the existing ancestor
-    let canonical = current
-        .canonicalize()
-        .map_err(|e| format!("Failed to canonicalize path ancestor: {}", e))?;
-
-    // Check if it's inside the repo
-    if canonical.starts_with(repo_canonical) {
-        return Err(format!(
-            "Held-out checks path {} would be inside the repository",
-            path.display()
-        ));
-    }
-
-    Ok(())
 }
 
 /// Gate 5: Flaw rules - run flaw pack rules over the patch.
@@ -888,6 +797,46 @@ command = "echo test2"
         assert!(!result.passed);
         assert!(!result.warned);
         assert!(result.evidence[0].contains("Failed to load held-out checks"));
+        Ok(())
+    }
+
+    #[test]
+    fn heldout_fails_with_relative_path() -> Result<()> {
+        let repo = TestRepo::new(&[])?;
+        // A relative path x.heldout.toml resolves against cwd (repo.path())
+        // making it inside the repo, which should be rejected
+        let mut p = packet(&["src/**"]);
+        p.heldout_path = Some(PathBuf::from("x.heldout.toml"));
+
+        let result = check_heldout(&p, repo.path());
+        assert!(!result.passed);
+        assert!(!result.warned);
+        assert!(result.evidence[0].contains("inside the repository"));
+        Ok(())
+    }
+
+    #[test]
+    fn heldout_fails_with_dotdot_in_path() -> Result<()> {
+        let repo = TestRepo::new(&[])?;
+        // Create a path with .. that doesn't exist yet, which tries to escape the repo
+        let escaped_path = repo
+            .path()
+            .join("subdir")
+            .join("..")
+            .join("..")
+            .join("escape.toml");
+
+        let mut p = packet(&["src/**"]);
+        p.heldout_path = Some(escaped_path);
+
+        let result = check_heldout(&p, repo.path());
+        assert!(!result.passed);
+        assert!(!result.warned);
+        // Should fail with either ".." rejection or "inside repository" message
+        assert!(
+            result.evidence[0].contains("..")
+                || result.evidence[0].contains("inside the repository")
+        );
         Ok(())
     }
 
