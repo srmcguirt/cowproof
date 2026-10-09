@@ -1000,7 +1000,19 @@ impl Queue {
         delivery: &mut dyn Delivery,
     ) -> Result<DeliveryOutcome, RuleError> {
         self.rule(lane, id, verdict).map_err(RuleError::Ruling)?;
+        self.deliver_recorded(lane, id, verdict, delivery)
+    }
 
+    /// Deliver a recorded verdict: through the builder's session, or, when that session
+    /// is gone, through a fresh one (D9). The one delivery path for `rule_and_deliver`
+    /// and `redeliver`.
+    fn deliver_recorded(
+        &mut self,
+        lane: &str,
+        id: &EscalationId,
+        verdict: &Verdict,
+        delivery: &mut dyn Delivery,
+    ) -> Result<DeliveryOutcome, RuleError> {
         match delivery
             .deliver(lane, id, verdict)
             .map_err(RuleError::Delivery)?
@@ -1038,9 +1050,9 @@ impl Queue {
     ///
     /// 1. Checks that `id` is known, belongs to this lane, and has a ruling.
     /// 2. Checks that the ruling has not yet been delivered.
-    /// 3. Calls `delivery.deliver` with the recorded verdict (byte-identical).
-    /// 4. On success, records a `delivered` event (same as `rule_and_deliver`).
-    /// 5. On delivery failure, the state stays undelivered and the error is returned.
+    /// 3. Delivers the recorded verdict (byte-identical) through the same path as
+    ///    `rule_and_deliver`, including the fresh-session fallback (D9).
+    /// 4. On delivery failure, the state stays undelivered and the error is returned.
     pub fn redeliver(
         &mut self,
         lane: &str,
@@ -1071,23 +1083,10 @@ impl Queue {
             return Err(format!("escalation {} already delivered", id));
         }
 
-        // Attempt delivery with the recorded verdict
-        match delivery
-            .deliver(lane, id, verdict)
-            .map_err(|e| e.0.clone())?
-        {
-            DeliveryResult::Delivered => {
-                self.record_delivered(lane, id, false)
-                    .map_err(|e| e.to_string())?;
-                Ok(DeliveryOutcome::Delivered)
-            }
-            DeliveryResult::SessionGone => {
-                // Session gone during redelivery means the session was lost.
-                // We do not fall back to a fresh session during redelivery—that
-                // would be a separate escalation. Just return the error.
-                Err("session gone during redelivery".to_string())
-            }
-        }
+        // Deliver the recorded verdict through the shared path (D9 fallback included).
+        let verdict = verdict.clone();
+        self.deliver_recorded(lane, id, &verdict, delivery)
+            .map_err(|e| e.to_string())
     }
 
     fn record_delivered(
@@ -2535,6 +2534,30 @@ mod tests {
         assert!(queue.is_delivered(&id));
         assert_eq!(queue.get(&id).unwrap().2, Some(&verdict));
         // Should have exactly one Delivered event
+        assert_eq!(count_events(tmpdir.path(), "delivered"), 1);
+    }
+
+    #[test]
+    fn test_redeliver_when_session_gone_resumes_fresh() {
+        // A redelivery uses the same path as rule_and_deliver, so a lost session
+        // falls back to a fresh one (D9) instead of failing.
+        let tmpdir = tempfile::TempDir::new().unwrap();
+        let mut queue = Queue::new(tmpdir.path(), Box::new(TestClock::new())).unwrap();
+        let id = queue
+            .ask("lane1", &new_ask("test?"), Origin::Builder)
+            .unwrap();
+        let verdict = answer("after the pipe broke");
+        let mut broken = ScriptedDelivery::new(vec![Err(DeliveryError("pipe broke".to_string()))]);
+        queue
+            .rule_and_deliver("lane1", &id, &verdict, &mut broken)
+            .unwrap_err();
+
+        let mut gone = ScriptedDelivery::gone();
+        let outcome = queue.redeliver("lane1", &id, &mut gone).unwrap();
+
+        assert_eq!(outcome, DeliveryOutcome::FreshSession);
+        assert!(queue.is_delivered(&id));
+        assert_eq!(count_events(tmpdir.path(), "resume-fallback"), 1);
         assert_eq!(count_events(tmpdir.path(), "delivered"), 1);
     }
 
