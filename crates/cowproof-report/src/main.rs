@@ -1,7 +1,8 @@
 #![forbid(unsafe_code)]
 use anyhow::{Context, Result, bail};
+use cowproof_prove::flaws::{PatchDelta, check_rules, parse_patch, parse_rules};
 use regex::Regex;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::Value;
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -9,32 +10,6 @@ use std::{
     path::{Path, PathBuf},
 };
 
-#[derive(Debug, Deserialize)]
-struct RuleFile {
-    rules: Vec<Rule>,
-}
-#[derive(Debug, Deserialize)]
-struct Rule {
-    pattern: String,
-    files: Vec<String>,
-    explanation: String,
-    #[serde(default)]
-    added_only: bool,
-    #[serde(default)]
-    path_only: bool,
-    #[serde(default)]
-    path_or_content: bool,
-    requires: Option<String>,
-    #[serde(default)]
-    applied_migration: bool,
-}
-#[derive(Debug, Clone)]
-struct Delta {
-    path: String,
-    added: Vec<(usize, String)>,
-    removed: Vec<(usize, String)>,
-    context: Vec<String>,
-}
 #[derive(Debug, Serialize)]
 struct Finding {
     file: String,
@@ -81,72 +56,6 @@ fn value_str(v: &Value, keys: &[&str]) -> Option<String> {
 }
 fn value_num(v: &Value, keys: &[&str]) -> Option<u64> {
     keys.iter().find_map(|k| v.get(*k).and_then(Value::as_u64))
-}
-fn parse_patch(patch: &str) -> Vec<Delta> {
-    let mut out: Vec<Delta> = Vec::new();
-    let mut new_line = 1usize;
-    for line in patch.lines() {
-        if let Some(rest) = line.strip_prefix("diff --git a/") {
-            let path = rest
-                .split_once(" b/")
-                .map(|(_, b)| b.to_string())
-                .unwrap_or_default();
-            out.push(Delta {
-                path,
-                added: Vec::new(),
-                removed: Vec::new(),
-                context: Vec::new(),
-            });
-            new_line = 1;
-            continue;
-        }
-        if out.is_empty() {
-            continue;
-        }
-        let d = out.last_mut().unwrap();
-        if line.starts_with("+++") || line.starts_with("---") || line.starts_with("\\") {
-            continue;
-        }
-        if line.starts_with("@@") {
-            if let Some((_, rest)) = line.split_once('+') {
-                new_line = rest
-                    .split([',', ' '])
-                    .next()
-                    .and_then(|x| x.parse().ok())
-                    .unwrap_or(1);
-            }
-            continue;
-        }
-        if let Some(s) = line.strip_prefix('+') {
-            d.added.push((new_line, s.to_string()));
-            new_line += 1;
-        } else if let Some(s) = line.strip_prefix('-') {
-            d.removed.push((0, s.to_string()));
-        } else if let Some(s) = line.strip_prefix(' ') {
-            d.context.push(s.to_string());
-            new_line += 1;
-        }
-    }
-    out
-}
-fn glob_match(pattern: &str, text: &str) -> bool {
-    let mut re = String::from("^");
-    let chars: Vec<char> = pattern.chars().collect();
-    let mut i = 0;
-    while i < chars.len() {
-        match chars[i] {
-            '*' if i + 1 < chars.len() && chars[i + 1] == '*' => {
-                re.push_str(".*");
-                i += 1;
-            }
-            '*' => re.push_str("[^/]*"),
-            '?' => re.push_str("[^/]"),
-            c => re.push_str(&regex::escape(&c.to_string())),
-        }
-        i += 1;
-    }
-    re.push('$');
-    Regex::new(&re).map(|r| r.is_match(text)).unwrap_or(false)
 }
 fn parse_checks(text: &str) -> Vec<Check> {
     let mut checks = Vec::new();
@@ -485,7 +394,7 @@ fn main_report(args: &[String]) -> Result<Report> {
             .context("parse summary.json")?;
     let patch = fs::read_to_string(lane.join("lane.patch")).context("read lane.patch")?;
     let outside = fs::read_to_string(lane.join("outside-ownership.patch")).unwrap_or_default();
-    let deltas = parse_patch(&patch);
+    let deltas: Vec<PatchDelta> = parse_patch(&patch);
     let files = deltas
         .iter()
         .map(|d| d.path.as_str())
@@ -529,81 +438,21 @@ fn main_report(args: &[String]) -> Result<Report> {
         .into_iter()
         .filter(|c| !reported.contains(c.as_str()))
         .collect();
-    let rules: RuleFile =
-        toml::from_str(include_str!("../rules/flaws.toml")).context("parse flaw rules")?;
-    let mut flaws = Vec::new();
-    for d in &deltas {
-        for rule in &rules.rules {
-            if !rule.files.iter().any(|g| glob_match(g, &d.path)) {
-                continue;
-            }
-            let re = Regex::new(&rule.pattern)
-                .with_context(|| format!("bad rule pattern {}", rule.pattern))?;
-            if rule.applied_migration {
-                if let Some(base) = baseline.as_deref()
-                    && let Some(file) = d.path.split("/migrations/").nth(1)
-                    && let Some(file) = file.rsplit('/').next()
-                    && file <= base.rsplit('/').next().unwrap_or(base)
-                {
-                    flaws.push(Finding {
-                        file: d.path.clone(),
-                        line: None,
-                        pattern: format!("--baseline {base}"),
-                        explanation: rule.explanation.clone(),
-                    });
-                }
-                continue;
-            }
-            if rule.path_only {
-                if re.is_match(&d.path) {
-                    flaws.push(Finding {
-                        file: d.path.clone(),
-                        line: None,
-                        pattern: rule.pattern.clone(),
-                        explanation: rule.explanation.clone(),
-                    });
-                }
-                continue;
-            }
-            if rule.path_or_content && re.is_match(&d.path) {
-                flaws.push(Finding {
-                    file: d.path.clone(),
-                    line: None,
-                    pattern: rule.pattern.clone(),
-                    explanation: rule.explanation.clone(),
-                });
-            }
-            let lines: Vec<_> = if rule.path_or_content || rule.added_only {
-                d.added.to_vec()
-            } else {
-                d.added.iter().chain(d.removed.iter()).cloned().collect()
-            };
-            let requires_match = rule.requires.as_ref().is_none_or(|r| {
-                Regex::new(r).is_ok_and(|x| {
-                    x.is_match(
-                        &d.added
-                            .iter()
-                            .map(|(_, s)| s.as_str())
-                            .chain(d.context.iter().map(String::as_str))
-                            .collect::<Vec<_>>()
-                            .join("\n"),
-                    )
-                })
-            });
-            if requires_match {
-                for (n, line) in lines {
-                    if re.is_match(&line) {
-                        flaws.push(Finding {
-                            file: d.path.clone(),
-                            line: Some(n),
-                            pattern: rule.pattern.clone(),
-                            explanation: rule.explanation.clone(),
-                        });
-                    }
-                }
-            }
-        }
+    // One matcher for the whole workspace: cowproof_prove::flaws.
+    let rules = parse_rules(include_str!("../rules/flaws.toml")).map_err(anyhow::Error::msg)?;
+    let (found, errors) = check_rules(&rules.rules, &deltas, baseline.as_deref());
+    if !errors.is_empty() {
+        bail!("bad flaw rule: {}", errors.join("; "));
     }
+    let flaws: Vec<Finding> = found
+        .into_iter()
+        .map(|f| Finding {
+            file: f.file,
+            line: f.line,
+            pattern: f.pattern,
+            explanation: f.explanation,
+        })
+        .collect();
     let mut ac = BTreeMap::<String, (usize, usize)>::new();
     for d in &deltas {
         let rem = d.removed.iter().filter(|(_, s)| assertions(s) > 0).count();
@@ -774,63 +623,29 @@ mod tests {
     }
     #[test]
     fn flaw_rules_cover_seeded_classes_and_detect_hits() {
-        let rules: RuleFile = toml::from_str(include_str!("../rules/flaws.toml")).unwrap();
+        let rules = parse_rules(include_str!("../rules/flaws.toml")).unwrap();
         assert_eq!(rules.rules.len(), 13);
         let patch = fs::read_to_string(
             Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/flaw-classes.patch"),
         )
         .unwrap();
         let deltas = parse_patch(&patch);
-        let mut hits = Vec::new();
-        for d in &deltas {
-            for rule in &rules.rules {
-                if !rule.files.iter().any(|g| glob_match(g, &d.path)) {
-                    continue;
-                }
-                if rule.path_only && Regex::new(&rule.pattern).unwrap().is_match(&d.path) {
-                    hits.push(rule.explanation.clone());
-                    continue;
-                }
-                if rule.applied_migration
-                    && let Some(file) = d.path.split("/migrations/").nth(1)
-                    && let Some(file) = file.rsplit('/').next()
-                    && file <= "20260401_existing.sql"
-                {
-                    hits.push(rule.explanation.clone());
-                    continue;
-                }
-                let re = Regex::new(&rule.pattern).unwrap();
-                if rule.path_or_content && re.is_match(&d.path) {
-                    hits.push(rule.explanation.clone());
-                }
-                let requires = rule.requires.as_ref().is_none_or(|r| {
-                    Regex::new(r).unwrap().is_match(
-                        &d.added
-                            .iter()
-                            .map(|(_, s)| s.as_str())
-                            .collect::<Vec<_>>()
-                            .join("\n"),
-                    )
-                });
-                if requires {
-                    for (_, line) in &d.added {
-                        if re.is_match(line) {
-                            hits.push(rule.explanation.clone());
-                        }
-                    }
-                }
-            }
-        }
+        let (hits, errors) = check_rules(&rules.rules, &deltas, Some("20260401_existing.sql"));
+        assert!(errors.is_empty(), "{errors:?}");
         assert!(
             hits.len() >= 19,
             "detected only {} flaw examples",
             hits.len()
         );
         assert!(
-            hits.iter().any(|h| h.contains("current_setting('role')")),
+            hits.iter()
+                .any(|h| h.explanation.contains("current_setting('role')")),
             "the login-role guard rule must fire"
         );
-        assert!(glob_match("**/fixtures/**", "tests/fixtures/access.sql"));
+        assert!(cowproof_core::glob_matches(
+            "**/fixtures/**",
+            "tests/fixtures/access.sql"
+        ));
     }
     #[test]
     fn flaw_lane_fixture_runs_all_rules_including_baseline() {
