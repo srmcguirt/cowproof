@@ -16,7 +16,8 @@ use serde_json::{Value, json};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
+use std::sync::Mutex;
 use tempfile::TempDir;
 
 const REAL_KEY: &str = "sk-test-real-xyz";
@@ -40,14 +41,45 @@ const FAKE_STREAM: &str = concat!(
     r#"{"type":"result","subtype":"success","result":"done","num_turns":2}"#,
 );
 
+/// Linux refuses to exec a file that some process holds open for writing
+/// (ETXTBSY). Tests run on parallel threads: if one thread forks while another
+/// is writing an executable (the copied `cowproof` or a fake `claude`), the
+/// child inherits the write handle until it execs, and an exec of that file in
+/// the meantime fails with "Text file busy". Writing executables and forking
+/// both take this lock, so a fork never overlaps a write.
+static FORK_LOCK: Mutex<()> = Mutex::new(());
+
+fn fork_lock() -> std::sync::MutexGuard<'static, ()> {
+    FORK_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// `Command::output` with the spawn under `FORK_LOCK`. Only the fork is held,
+/// not the wait, so tests still run in parallel.
+fn output(cmd: &mut Command) -> Output {
+    let child = {
+        let _g = fork_lock();
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap()
+    };
+    child.wait_with_output().unwrap()
+}
+
 fn sandbox_available() -> bool {
     if cfg!(target_os = "macos") {
         return true;
     }
-    let reason = match Command::new("bwrap")
-        .args(["--ro-bind", "/", "/", "true"])
-        .output()
-    {
+    let probe = {
+        let _g = fork_lock();
+        Command::new("bwrap")
+            .args(["--ro-bind", "/", "/", "true"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+    };
+    let reason = match probe.and_then(|c| c.wait_with_output()) {
         Ok(o) if o.status.success() => return true,
         Ok(o) => format!(
             "bwrap cannot create a sandbox here: {}",
@@ -70,11 +102,11 @@ fn var_tmp(prefix: &str) -> TempDir {
 }
 
 fn git(repo: &Path, args: &[&str]) {
-    let out = Command::new("git")
-        .args(["-C", repo.to_str().unwrap()])
-        .args(args)
-        .output()
-        .unwrap();
+    let out = output(
+        Command::new("git")
+            .args(["-C", repo.to_str().unwrap()])
+            .args(args),
+    );
     assert!(
         out.status.success(),
         "git {args:?}: {}",
@@ -133,7 +165,10 @@ impl Harness {
         // the sandbox hides, so the copy is what runs (and what the
         // builder's MCP config names).
         let cowproof = work.path().join("cowproof");
-        fs::copy(env!("CARGO_BIN_EXE_cowproof"), &cowproof).unwrap();
+        {
+            let _g = fork_lock();
+            fs::copy(env!("CARGO_BIN_EXE_cowproof"), &cowproof).unwrap();
+        }
 
         let fake = work.path().join("fake-claude");
         let script = format!(
@@ -155,8 +190,11 @@ exit 0
             cowproof = cowproof.display(),
             stream = FAKE_STREAM,
         );
-        fs::write(&fake, script).unwrap();
-        fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
+        {
+            let _g = fork_lock();
+            fs::write(&fake, script).unwrap();
+            fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
+        }
 
         Harness {
             work,
@@ -185,12 +223,11 @@ exit 0
 
     /// Run the whole flow with the real key set, expecting success.
     fn run_ok(&self) -> Output {
-        let out = self
-            .command(self.lanes.path())
-            .env("ANTHROPIC_API_KEY", REAL_KEY)
-            .env("DIRECTOR_ONLY_SECRET", DIRECTOR_CANARY)
-            .output()
-            .unwrap();
+        let out = output(
+            self.command(self.lanes.path())
+                .env("ANTHROPIC_API_KEY", REAL_KEY)
+                .env("DIRECTOR_ONLY_SECRET", DIRECTOR_CANARY),
+        );
         assert!(
             out.status.success(),
             "cowproof run failed:\n{}",
@@ -547,11 +584,7 @@ fn a_lint_error_stops_the_run_before_any_lane_exists() {
     );
     fs::write(&h.packet, bad).unwrap();
     let lanes_root = h.work.path().join("never-created");
-    let out = h
-        .command(&lanes_root)
-        .env("ANTHROPIC_API_KEY", REAL_KEY)
-        .output()
-        .unwrap();
+    let out = output(h.command(&lanes_root).env("ANTHROPIC_API_KEY", REAL_KEY));
     assert!(!out.status.success());
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("masked-pipe-status"), "{stderr}");
@@ -564,7 +597,7 @@ fn a_lint_error_stops_the_run_before_any_lane_exists() {
 fn a_missing_api_key_stops_the_run_before_any_lane_exists() {
     let h = Harness::new("");
     let lanes_root = h.work.path().join("never-created");
-    let out = h.command(&lanes_root).output().unwrap();
+    let out = output(&mut h.command(&lanes_root));
     assert!(!out.status.success());
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("ANTHROPIC_API_KEY is not set"), "{stderr}");
