@@ -10,7 +10,10 @@
 //! - At most 3 escalations per lane → 4th ask yields LimitReached
 //! - Parked time limit 30 min default (with injected Clock trait)
 //! - record_check / record_cost triggers escalate-early
-//! - Delivery trait with deliver(lane, id, verdict); resume-fallback on SessionGone
+//! - Delivery trait with deliver(lane, id, verdict); `Queue::rule_and_deliver`
+//!   is the one path that rules and delivers. On SessionGone it records a
+//!   resume-fallback (counted against the escalation limit) and starts a fresh
+//!   session with a carry-over summary built from the queue.
 
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
@@ -45,6 +48,20 @@ pub enum LaneState {
     Refuted,
     Stopped,
     EscalationLimit,
+}
+
+impl LaneState {
+    /// Name used in errors and logs, matching the design's lane-state names.
+    pub fn name(self) -> &'static str {
+        match self {
+            LaneState::Running => "running",
+            LaneState::Finished => "finished",
+            LaneState::Proved => "proved",
+            LaneState::Refuted => "refuted",
+            LaneState::Stopped => "stopped",
+            LaneState::EscalationLimit => "escalation-limit",
+        }
+    }
 }
 
 /// Escalation ID, e.g. E1, E2. Monotonic per lane.
@@ -166,7 +183,7 @@ impl Ask {
 
         out.push_str("```builder\n");
         let q = if self.question.len() > 4000 {
-            format!("{}...[TRUNCATED]", &self.question[..4000])
+            format!("{}...[TRUNCATED]", cut(&self.question, 4000))
         } else {
             self.question.clone()
         };
@@ -179,7 +196,7 @@ impl Ask {
             out.push_str("**Tried:**\n");
             for t in &self.tried {
                 let t = if t.len() > 1000 {
-                    format!("{}...[TRUNCATED]", &t[..1000])
+                    format!("{}...[TRUNCATED]", cut(t, 1000))
                 } else {
                     t.clone()
                 };
@@ -192,7 +209,7 @@ impl Ask {
         out.push_str("**Options:**\n");
         for opt in &self.options {
             let summary = if opt.summary.len() > 1000 {
-                format!("{}...[TRUNCATED]", &opt.summary[..1000])
+                format!("{}...[TRUNCATED]", cut(&opt.summary, 1000))
             } else {
                 opt.summary.clone()
             };
@@ -256,62 +273,138 @@ pub enum DeliveryResult {
     SessionGone,
 }
 
-/// Trait for delivering verdicts to the builder.
-pub trait Delivery: Send + Sync {
-    /// Deliver the verdict to the builder. Returns SessionGone if the session
-    /// has expired and must be resumed fresh (D9).
-    fn deliver(&self, lane: &str, id: &EscalationId, verdict: &Verdict) -> DeliveryResult;
+/// A delivery failed for a reason other than a gone session (spawn failure,
+/// broken pipe, and so on). The message is for the director.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeliveryError(pub String);
 
-    /// Deliver fresh: start a new session with the verdict and carry-over summary.
+impl std::fmt::Display for DeliveryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "delivery failed: {}", self.0)
+    }
+}
+
+impl std::error::Error for DeliveryError {}
+
+/// Trait for delivering verdicts to the builder.
+pub trait Delivery: Send {
+    /// Deliver the verdict to the builder by resuming its parked session.
+    /// Returns `SessionGone` if the session is missing or expired (D9).
+    fn deliver(
+        &mut self,
+        lane: &str,
+        id: &EscalationId,
+        verdict: &Verdict,
+    ) -> Result<DeliveryResult, DeliveryError>;
+
+    /// Start a fresh session on the same model and clone with the verdict and
+    /// the runner's carry-over summary.
     fn deliver_fresh(
-        &self,
+        &mut self,
         lane: &str,
         id: &EscalationId,
         verdict: &Verdict,
         summary: &str,
-    ) -> DeliveryResult;
+    ) -> Result<(), DeliveryError>;
 }
 
-/// Recording delivery for tests.
+/// Recording delivery for tests and dry runs: always delivers to the live session.
+#[derive(Debug, Default)]
 pub struct RecordingDelivery {
-    pub delivered: std::sync::Mutex<Vec<(String, EscalationId, Verdict)>>,
-}
-
-impl Default for RecordingDelivery {
-    fn default() -> Self {
-        Self::new()
-    }
+    pub delivered: Vec<(String, EscalationId, Verdict)>,
+    pub fresh: Vec<(String, EscalationId, Verdict, String)>,
 }
 
 impl RecordingDelivery {
     pub fn new() -> Self {
-        RecordingDelivery {
-            delivered: std::sync::Mutex::new(Vec::new()),
-        }
+        Self::default()
     }
 }
 
 impl Delivery for RecordingDelivery {
-    fn deliver(&self, lane: &str, id: &EscalationId, verdict: &Verdict) -> DeliveryResult {
-        self.delivered
-            .lock()
-            .unwrap()
-            .push((lane.to_string(), id.clone(), verdict.clone()));
-        DeliveryResult::Delivered
-    }
-
-    fn deliver_fresh(
-        &self,
+    fn deliver(
+        &mut self,
         lane: &str,
         id: &EscalationId,
         verdict: &Verdict,
-        _summary: &str,
-    ) -> DeliveryResult {
+    ) -> Result<DeliveryResult, DeliveryError> {
         self.delivered
-            .lock()
-            .unwrap()
             .push((lane.to_string(), id.clone(), verdict.clone()));
-        DeliveryResult::Delivered
+        Ok(DeliveryResult::Delivered)
+    }
+
+    fn deliver_fresh(
+        &mut self,
+        lane: &str,
+        id: &EscalationId,
+        verdict: &Verdict,
+        summary: &str,
+    ) -> Result<(), DeliveryError> {
+        self.fresh.push((
+            lane.to_string(),
+            id.clone(),
+            verdict.clone(),
+            summary.to_string(),
+        ));
+        Ok(())
+    }
+}
+
+/// How `Queue::rule_and_deliver` got the ruling to the builder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeliveryOutcome {
+    /// The parked session was resumed with the ruling.
+    Delivered,
+    /// The session was gone; a fresh session started with the ruling and a
+    /// carry-over summary. Recorded as `resume-fallback` and counted against
+    /// the escalation limit.
+    FreshSession,
+    /// The session was gone and the fallback would exceed the escalation
+    /// limit: the lane ended as `escalation-limit`, no fresh session started.
+    EscalationLimit,
+}
+
+/// Why `Queue::rule_and_deliver` failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RuleError {
+    /// The ruling was rejected (duplicate, unknown id, wrong lane, terminal
+    /// lane state, park limit). Nothing was delivered.
+    Ruling(String),
+    /// The ruling is recorded but the delivery failed. The ruling stays
+    /// recorded, so a second ruling for the same id is still a duplicate.
+    Delivery(DeliveryError),
+    /// Writing a queue event failed after the ruling was accepted.
+    Record(String),
+}
+
+impl std::fmt::Display for RuleError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RuleError::Ruling(m) | RuleError::Record(m) => write!(f, "{}", m),
+            RuleError::Delivery(e) => write!(f, "{}", e),
+        }
+    }
+}
+
+impl std::error::Error for RuleError {}
+
+/// First `max` bytes of `s`, backed off to a char boundary (a byte slice
+/// through a multi-byte character would panic).
+fn cut(s: &str, max: usize) -> &str {
+    let mut end = max.min(s.len());
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
+fn describe_verdict(verdict: &Verdict) -> String {
+    match verdict {
+        Verdict::Answer { text } => format!("answer: {}", text),
+        Verdict::Redirect { packet_path } => format!("redirect to packet {}", packet_path),
+        Verdict::Reassign { model: Some(m) } => format!("reassign to {}", m),
+        Verdict::Reassign { model: None } => "reassign to the next model on the ladder".to_string(),
+        Verdict::Stop => "stop".to_string(),
     }
 }
 
@@ -339,6 +432,10 @@ enum QueueEvent {
         id: String,
         ask: Ask,
         origin: Origin,
+        /// Milliseconds since the Unix epoch when the lane parked. Lets a
+        /// rebuilt queue keep enforcing the park limit. 0 = unknown (old file).
+        #[serde(default)]
+        at_ms: u64,
     },
     #[serde(rename = "ruled")]
     Ruled {
@@ -352,15 +449,40 @@ enum QueueEvent {
         id: String,
         reason: String,
     },
+    /// The ruling reached the builder. `fresh` = through a fresh session.
+    #[serde(rename = "delivered")]
+    Delivered {
+        lane: String,
+        id: String,
+        #[serde(default)]
+        fresh: bool,
+    },
+    /// The parked session could not be resumed; counts as one escalation.
     #[serde(rename = "resume-fallback")]
     ResumeFallback { lane: String, id: String },
+    /// The lane ended as `escalation-limit`.
+    #[serde(rename = "lane-escalation-limit")]
+    LaneEscalationLimit {
+        lane: String,
+        #[serde(default)]
+        id: StdOption<String>,
+    },
+}
+
+/// One escalation held by the queue.
+struct Entry {
+    lane: String,
+    ask: Ask,
+    origin: Origin,
+    verdict: StdOption<Verdict>,
+    delivered: bool,
 }
 
 /// Escalation queue, file-backed and append-only.
 pub struct Queue {
     control_dir: PathBuf,
     // In-memory state rebuilt from the file
-    escalations: HashMap<EscalationId, (Ask, Origin, StdOption<Verdict>)>,
+    escalations: HashMap<EscalationId, Entry>,
     escalation_count: HashMap<String, usize>,
     park_times: HashMap<EscalationId, SystemTime>,
     clock: Box<dyn Clock>,
@@ -427,6 +549,14 @@ impl Queue {
         self.control_dir.join("escalations.jsonl")
     }
 
+    fn now_ms(&self) -> u64 {
+        self.clock
+            .now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
+    }
+
     /// Rebuild queue state from the file.
     fn rebuild_from_file(&mut self) -> std::io::Result<()> {
         let file = File::open(self.queue_path())?;
@@ -438,38 +568,60 @@ impl Queue {
                 continue;
             }
 
-            match serde_json::from_str::<QueueEvent>(&line) {
-                Ok(event) => match event {
-                    QueueEvent::Asked {
-                        lane,
-                        id,
-                        ask,
-                        origin,
-                    } => {
-                        let eid = EscalationId::from_string(id);
-                        *self.escalation_count.entry(lane).or_insert(0) += 1;
-                        self.escalations.insert(eid, (ask, origin, StdOption::None));
+            // Skip malformed lines
+            let Ok(event) = serde_json::from_str::<QueueEvent>(&line) else {
+                continue;
+            };
+            match event {
+                QueueEvent::Asked {
+                    lane,
+                    id,
+                    ask,
+                    origin,
+                    at_ms,
+                } => {
+                    let eid = EscalationId::from_string(id);
+                    *self.escalation_count.entry(lane.clone()).or_insert(0) += 1;
+                    if at_ms > 0 {
+                        self.park_times.insert(
+                            eid.clone(),
+                            SystemTime::UNIX_EPOCH + Duration::from_millis(at_ms),
+                        );
                     }
-                    QueueEvent::Ruled {
-                        lane: _,
-                        id,
-                        verdict,
-                    } => {
-                        let eid = EscalationId::from_string(id);
-                        if let StdOption::Some((_, _origin, ruled)) = self.escalations.get_mut(&eid)
-                        {
-                            *ruled = StdOption::Some(verdict);
-                        }
+                    self.escalations.insert(
+                        eid,
+                        Entry {
+                            lane,
+                            ask,
+                            origin,
+                            verdict: StdOption::None,
+                            delivered: false,
+                        },
+                    );
+                }
+                QueueEvent::Ruled {
+                    lane: _,
+                    id,
+                    verdict,
+                } => {
+                    if let Some(entry) = self.escalations.get_mut(&EscalationId::from_string(id)) {
+                        entry.verdict = StdOption::Some(verdict);
                     }
-                    QueueEvent::ResumeFallback { lane: _, id: _ } => {
-                        // Record for capsule
+                }
+                QueueEvent::Delivered { id, .. } => {
+                    if let Some(entry) = self.escalations.get_mut(&EscalationId::from_string(id)) {
+                        entry.delivered = true;
                     }
-                    QueueEvent::Rejected { .. } => {
-                        // Not part of active state
-                    }
-                },
-                Err(_) => {
-                    // Skip malformed lines
+                }
+                QueueEvent::ResumeFallback { lane, id: _ } => {
+                    // A fallback counts against the escalation limit.
+                    *self.escalation_count.entry(lane).or_insert(0) += 1;
+                }
+                QueueEvent::LaneEscalationLimit { lane, id: _ } => {
+                    self.lane_state.insert(lane, LaneState::EscalationLimit);
+                }
+                QueueEvent::Rejected { .. } => {
+                    // Not part of active state
                 }
             }
         }
@@ -477,14 +629,34 @@ impl Queue {
         Ok(())
     }
 
+    /// End a lane as `escalation-limit` and persist that, so a rebuilt queue
+    /// still refuses rulings for it.
+    fn end_lane_escalation_limit(
+        &mut self,
+        lane: &str,
+        id: StdOption<&EscalationId>,
+    ) -> Result<(), String> {
+        self.append_event(&QueueEvent::LaneEscalationLimit {
+            lane: lane.to_string(),
+            id: id.map(|i| i.0.clone()),
+        })?;
+        self.lane_state
+            .insert(lane.to_string(), LaneState::EscalationLimit);
+        Ok(())
+    }
+
     /// Record an ask in the queue. Returns the escalation ID.
+    ///
+    /// The lane's 4th escalation (counting forced ones and resume-fallbacks)
+    /// is refused and the lane ends as `escalation-limit`.
     pub fn ask(&mut self, lane: &str, ask: &Ask, origin: Origin) -> Result<EscalationId, String> {
         // Validate ask
         ask.validate()?;
 
         // Check escalation limit
-        let count = self.escalation_count.entry(lane.to_string()).or_insert(0);
-        if *count >= self.max_escalations {
+        let count = self.escalation_count.get(lane).copied().unwrap_or(0);
+        if count >= self.max_escalations {
+            self.end_lane_escalation_limit(lane, StdOption::None)?;
             return Err(format!(
                 "escalation limit reached for lane {} (max {})",
                 lane, self.max_escalations
@@ -492,90 +664,97 @@ impl Queue {
         }
 
         // Create the escalation ID
-        *count += 1;
-        let id = EscalationId::new(lane, *count);
+        let id = EscalationId::new(lane, count + 1);
 
-        // Record in file
+        // Record in file first: a failed write must not consume an escalation.
         let event = QueueEvent::Asked {
             lane: lane.to_string(),
             id: id.0.clone(),
             ask: ask.clone(),
             origin: origin.clone(),
+            at_ms: self.now_ms(),
         };
         self.append_event(&event)?;
 
         // Store in memory
-        self.escalations
-            .insert(id.clone(), (ask.clone(), origin, None));
+        *self.escalation_count.entry(lane.to_string()).or_insert(0) += 1;
+        self.escalations.insert(
+            id.clone(),
+            Entry {
+                lane: lane.to_string(),
+                ask: ask.clone(),
+                origin,
+                verdict: StdOption::None,
+                delivered: false,
+            },
+        );
         self.park_times.insert(id.clone(), self.clock.now());
 
         Ok(id)
     }
 
-    /// Record a ruling. Returns error if the escalation ID is unknown,
-    /// already ruled, or for an ended lane.
-    pub fn rule(&mut self, lane: &str, id: &EscalationId, verdict: &Verdict) -> Result<(), String> {
-        // Check lane terminal state
-        if let StdOption::Some(state) = self.lane_state.get(lane) {
-            match state {
-                LaneState::Running => {}
-                LaneState::Finished => {
-                    return Err(format!(
-                        "ruling for {} rejected: lane in terminal state finished",
-                        id
-                    ));
-                }
-                LaneState::Proved => {
-                    return Err(format!(
-                        "ruling for {} rejected: lane in terminal state proved",
-                        id
-                    ));
-                }
-                LaneState::Refuted => {
-                    return Err(format!(
-                        "ruling for {} rejected: lane in terminal state refuted",
-                        id
-                    ));
-                }
-                LaneState::Stopped => {
-                    return Err(format!(
-                        "ruling for {} rejected: lane in terminal state stopped",
-                        id
-                    ));
-                }
-                LaneState::EscalationLimit => {
-                    return Err(format!(
-                        "ruling for {} rejected: lane in terminal state escalation-limit",
-                        id
-                    ));
-                }
-            }
+    /// Check whether a ruling for `id` is acceptable right now.
+    fn check_ruling(&mut self, lane: &str, id: &EscalationId) -> Result<(), String> {
+        // Lane terminal state
+        if let StdOption::Some(state) = self.lane_state.get(lane)
+            && *state != LaneState::Running
+        {
+            return Err(format!(
+                "ruling for {} rejected: lane in terminal state {}",
+                id,
+                state.name()
+            ));
         }
 
-        // Check if already ruled
-        if let Some((_, _, ruled)) = self.escalations.get(id) {
-            if ruled.is_some() {
-                let existing = ruled.as_ref().unwrap();
+        // Unknown, wrong lane or already ruled
+        match self.escalations.get(id) {
+            None => return Err(format!("escalation {} unknown", id)),
+            Some(entry) if entry.lane != lane => {
+                return Err(format!(
+                    "escalation {} belongs to lane {}, not {}",
+                    id, entry.lane, lane
+                ));
+            }
+            Some(Entry {
+                verdict: StdOption::Some(existing),
+                ..
+            }) => {
                 return Err(format!("escalation {} already ruled: {:?}", id, existing));
             }
-        } else {
-            return Err(format!("escalation {} unknown", id));
+            Some(_) => {}
         }
 
-        // Check park limit
-        #[allow(clippy::collapsible_if)]
-        if let Some(parked_at) = self.park_times.get(id) {
-            if let Ok(elapsed) = self.clock.now().duration_since(*parked_at) {
-                if elapsed > self.park_limit {
-                    return Err(format!(
-                        "ruling for {} rejected: parked over limit ({:?} > {:?})",
-                        id, elapsed, self.park_limit
-                    ));
-                }
-            }
+        // Park limit: past it the lane ends as escalation-limit.
+        let over = self
+            .park_times
+            .get(id)
+            .and_then(|parked_at| self.clock.now().duration_since(*parked_at).ok())
+            .filter(|elapsed| *elapsed > self.park_limit);
+        if let StdOption::Some(elapsed) = over {
+            self.end_lane_escalation_limit(lane, StdOption::Some(id))?;
+            return Err(format!(
+                "ruling for {} rejected: parked over limit ({:?} > {:?}); lane in terminal state escalation-limit",
+                id, elapsed, self.park_limit
+            ));
         }
 
-        // Record in file
+        Ok(())
+    }
+
+    /// Record a ruling. Returns error if the escalation ID is unknown, belongs
+    /// to another lane, was already ruled (first ruling wins), or the lane has
+    /// ended. Rejections are logged in the queue file.
+    pub fn rule(&mut self, lane: &str, id: &EscalationId, verdict: &Verdict) -> Result<(), String> {
+        if let Err(reason) = self.check_ruling(lane, id) {
+            // Best effort: the rejection itself is what the caller gets back.
+            let _ = self.append_event(&QueueEvent::Rejected {
+                lane: lane.to_string(),
+                id: id.0.clone(),
+                reason: reason.clone(),
+            });
+            return Err(reason);
+        }
+
         let event = QueueEvent::Ruled {
             lane: lane.to_string(),
             id: id.0.clone(),
@@ -583,32 +762,119 @@ impl Queue {
         };
         self.append_event(&event)?;
 
-        // Store in memory
-        if let Some((_, _, ruled)) = self.escalations.get_mut(id) {
-            *ruled = StdOption::Some(verdict.clone());
+        if let Some(entry) = self.escalations.get_mut(id) {
+            entry.verdict = StdOption::Some(verdict.clone());
         }
 
         Ok(())
     }
 
-    /// Record a resume-fallback event (session expired, starting fresh).
-    pub fn record_resume_fallback(&mut self, lane: &str, id: &EscalationId) -> Result<(), String> {
-        // Check escalation limit (fallback counts against it)
-        let count = self.escalation_count.entry(lane.to_string()).or_insert(0);
-        if *count >= self.max_escalations {
-            return Err(format!(
-                "escalation limit reached (fallback would exceed {})",
-                self.max_escalations
-            ));
-        }
+    /// Rule on an escalation and get the ruling to the builder.
+    ///
+    /// 1. Applies every ruling rule (see [`Queue::rule`]) and records the ruling.
+    /// 2. Calls `delivery.deliver`.
+    /// 3. `Delivered`: records `delivered`.
+    /// 4. `SessionGone`: if a fallback would exceed the escalation limit the
+    ///    lane ends as `escalation-limit` and nothing more is delivered.
+    ///    Otherwise records `resume-fallback` (one more escalation against the
+    ///    limit) and calls `delivery.deliver_fresh` with the ruling plus a
+    ///    carry-over summary built from the queue.
+    /// 5. A delivery error is returned as [`RuleError::Delivery`]; the ruling
+    ///    and any fallback already recorded stay recorded.
+    pub fn rule_and_deliver(
+        &mut self,
+        lane: &str,
+        id: &EscalationId,
+        verdict: &Verdict,
+        delivery: &mut dyn Delivery,
+    ) -> Result<DeliveryOutcome, RuleError> {
+        self.rule(lane, id, verdict).map_err(RuleError::Ruling)?;
 
-        let event = QueueEvent::ResumeFallback {
+        match delivery
+            .deliver(lane, id, verdict)
+            .map_err(RuleError::Delivery)?
+        {
+            DeliveryResult::Delivered => {
+                self.record_delivered(lane, id, false)?;
+                Ok(DeliveryOutcome::Delivered)
+            }
+            DeliveryResult::SessionGone => {
+                let count = self.escalation_count.get(lane).copied().unwrap_or(0);
+                if count >= self.max_escalations {
+                    self.end_lane_escalation_limit(lane, StdOption::Some(id))
+                        .map_err(RuleError::Record)?;
+                    return Ok(DeliveryOutcome::EscalationLimit);
+                }
+
+                self.append_event(&QueueEvent::ResumeFallback {
+                    lane: lane.to_string(),
+                    id: id.0.clone(),
+                })
+                .map_err(RuleError::Record)?;
+                *self.escalation_count.entry(lane.to_string()).or_insert(0) += 1;
+
+                let summary = self.carry_over_summary(id, verdict);
+                delivery
+                    .deliver_fresh(lane, id, verdict, &summary)
+                    .map_err(RuleError::Delivery)?;
+                self.record_delivered(lane, id, true)?;
+                Ok(DeliveryOutcome::FreshSession)
+            }
+        }
+    }
+
+    fn record_delivered(
+        &mut self,
+        lane: &str,
+        id: &EscalationId,
+        fresh: bool,
+    ) -> Result<(), RuleError> {
+        self.append_event(&QueueEvent::Delivered {
             lane: lane.to_string(),
             id: id.0.clone(),
-        };
-        self.append_event(&event)?;
-
+            fresh,
+        })
+        .map_err(RuleError::Record)?;
+        if let Some(entry) = self.escalations.get_mut(id) {
+            entry.delivered = true;
+        }
         Ok(())
+    }
+
+    /// Whether the ruling for `id` reached the builder.
+    pub fn is_delivered(&self, id: &EscalationId) -> bool {
+        self.escalations.get(id).is_some_and(|e| e.delivered)
+    }
+
+    /// Number of escalations counted against the lane's limit (asks, forced
+    /// escalations and resume-fallbacks).
+    pub fn escalation_count(&self, lane: &str) -> usize {
+        self.escalation_count.get(lane).copied().unwrap_or(0)
+    }
+
+    /// State of the lane as far as the queue knows (`None` = never set).
+    pub fn lane_state(&self, lane: &str) -> StdOption<LaneState> {
+        self.lane_state.get(lane).copied()
+    }
+
+    /// What a fresh session needs: the question, what was tried, the ruling.
+    fn carry_over_summary(&self, id: &EscalationId, verdict: &Verdict) -> String {
+        let mut out = String::new();
+        out.push_str(&format!(
+            "Your previous session could not be resumed. Escalation {} is answered below.\n\n",
+            id
+        ));
+        if let Some(entry) = self.escalations.get(id) {
+            out.push_str(&format!("Question: {}\n", entry.ask.question));
+            if !entry.ask.tried.is_empty() {
+                out.push_str("Tried:\n");
+                for t in &entry.ask.tried {
+                    out.push_str(&format!("- {}\n", t));
+                }
+            }
+        }
+        out.push_str(&format!("Ruling: {}\n", describe_verdict(verdict)));
+        out
     }
 
     /// Record a check result. Two failures without a pass in between trigger a forced escalation.
@@ -795,7 +1061,7 @@ impl Queue {
     pub fn get(&self, id: &EscalationId) -> StdOption<(&Ask, &Origin, StdOption<&Verdict>)> {
         self.escalations
             .get(id)
-            .map(|(ask, origin, verdict)| (ask, origin, verdict.as_ref()))
+            .map(|e| (&e.ask, &e.origin, e.verdict.as_ref()))
     }
 
     /// Append an event to the queue file.
@@ -820,6 +1086,8 @@ impl Queue {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
+    use std::sync::Arc;
 
     struct TestClock {
         current_time: std::sync::Mutex<SystemTime>,
@@ -832,7 +1100,6 @@ mod tests {
             }
         }
 
-        #[allow(dead_code)]
         fn advance(&self, duration: Duration) {
             let mut t = self.current_time.lock().unwrap();
             *t += duration;
@@ -842,6 +1109,12 @@ mod tests {
     impl Clock for TestClock {
         fn now(&self) -> SystemTime {
             *self.current_time.lock().unwrap()
+        }
+    }
+
+    impl Clock for Arc<TestClock> {
+        fn now(&self) -> SystemTime {
+            TestClock::now(self)
         }
     }
 
@@ -999,18 +1272,58 @@ mod tests {
     #[test]
     fn test_queue_park_time_limit() {
         let tmpdir = tempfile::TempDir::new().unwrap();
-        let clock = Box::new(TestClock::new());
-        let mut queue =
-            Queue::with_limits(tmpdir.path(), clock, Duration::from_secs(30 * 60), 3).unwrap();
+        let clock = Arc::new(TestClock::new());
+        let mut queue = Queue::with_limits(
+            tmpdir.path(),
+            Box::new(clock.clone()),
+            Duration::from_secs(30 * 60),
+            3,
+        )
+        .unwrap();
 
         let ask = new_ask("test?");
-        let id = queue.ask("lane1", &ask, Origin::Builder).unwrap();
-
-        // For now, just verify the rule works within the limit
+        let early = queue.ask("lane1", &ask, Origin::Builder).unwrap();
+        let late = queue.ask("lane1", &ask, Origin::Builder).unwrap();
         let verdict = Verdict::Answer {
             text: "answer".to_string(),
         };
-        assert!(queue.rule("lane1", &id, &verdict).is_ok());
+
+        // Exactly at the limit is still fine.
+        clock.advance(Duration::from_secs(30 * 60));
+        queue.rule("lane1", &early, &verdict).unwrap();
+
+        // One second past the limit is rejected and ends the lane.
+        clock.advance(Duration::from_secs(1));
+        let err = queue.rule("lane1", &late, &verdict).unwrap_err();
+        assert!(err.contains("parked over limit"), "{err}");
+        assert!(err.contains("escalation-limit"), "{err}");
+        assert_eq!(queue.lane_state("lane1"), Some(LaneState::EscalationLimit));
+        assert!(queue.get(&late).unwrap().2.is_none());
+    }
+
+    #[test]
+    fn test_park_limit_survives_rebuild() {
+        let tmpdir = tempfile::TempDir::new().unwrap();
+        let clock = Arc::new(TestClock::new());
+        let mut queue = Queue::new(tmpdir.path(), Box::new(clock.clone())).unwrap();
+        let id = queue
+            .ask("lane1", &new_ask("test?"), Origin::Builder)
+            .unwrap();
+        drop(queue);
+
+        // The runner restarts 31 minutes later.
+        clock.advance(Duration::from_secs(31 * 60));
+        let mut queue = Queue::new(tmpdir.path(), Box::new(clock.clone())).unwrap();
+        let err = queue
+            .rule(
+                "lane1",
+                &id,
+                &Verdict::Answer {
+                    text: "late".to_string(),
+                },
+            )
+            .unwrap_err();
+        assert!(err.contains("parked over limit"), "{err}");
     }
 
     #[test]
@@ -1055,19 +1368,18 @@ mod tests {
 
     #[test]
     fn test_delivery_recording() {
-        let delivery = RecordingDelivery::new();
+        let mut delivery = RecordingDelivery::new();
         let id = EscalationId::from_string("E1".to_string());
         let verdict = Verdict::Answer {
             text: "test".to_string(),
         };
 
         let result = delivery.deliver("lane1", &id, &verdict);
-        assert_eq!(result, DeliveryResult::Delivered);
+        assert_eq!(result, Ok(DeliveryResult::Delivered));
 
-        let delivered = delivery.delivered.lock().unwrap();
-        assert_eq!(delivered.len(), 1);
-        assert_eq!(delivered[0].0, "lane1");
-        assert_eq!(delivered[0].1, id);
+        assert_eq!(delivery.delivered.len(), 1);
+        assert_eq!(delivery.delivered[0].0, "lane1");
+        assert_eq!(delivery.delivered[0].1, id);
     }
 
     #[test]
@@ -1345,20 +1657,386 @@ mod tests {
         assert!(result.unwrap_err().contains("escalation-limit"));
     }
 
-    #[test]
-    fn test_resume_fallback_with_delivery_session_gone() {
-        let tmpdir = tempfile::TempDir::new().unwrap();
-        let clock = Box::new(TestClock::new());
-        let mut queue = Queue::new(tmpdir.path(), clock).unwrap();
+    // ---- rule_and_deliver ----
 
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum Call {
+        Deliver {
+            lane: String,
+            id: EscalationId,
+            verdict: Verdict,
+        },
+        Fresh {
+            lane: String,
+            id: EscalationId,
+            verdict: Verdict,
+            summary: String,
+        },
+    }
+
+    /// Scripted Delivery double: answers `deliver` from a queue of results
+    /// and records every call in order.
+    struct ScriptedDelivery {
+        deliver_results: VecDeque<Result<DeliveryResult, DeliveryError>>,
+        fresh_result: Result<(), DeliveryError>,
+        calls: Vec<Call>,
+    }
+
+    impl ScriptedDelivery {
+        fn new(results: Vec<Result<DeliveryResult, DeliveryError>>) -> Self {
+            ScriptedDelivery {
+                deliver_results: results.into(),
+                fresh_result: Ok(()),
+                calls: Vec::new(),
+            }
+        }
+
+        fn gone() -> Self {
+            Self::new(vec![Ok(DeliveryResult::SessionGone)])
+        }
+    }
+
+    impl Delivery for ScriptedDelivery {
+        fn deliver(
+            &mut self,
+            lane: &str,
+            id: &EscalationId,
+            verdict: &Verdict,
+        ) -> Result<DeliveryResult, DeliveryError> {
+            self.calls.push(Call::Deliver {
+                lane: lane.to_string(),
+                id: id.clone(),
+                verdict: verdict.clone(),
+            });
+            self.deliver_results
+                .pop_front()
+                .expect("deliver called more often than scripted")
+        }
+
+        fn deliver_fresh(
+            &mut self,
+            lane: &str,
+            id: &EscalationId,
+            verdict: &Verdict,
+            summary: &str,
+        ) -> Result<(), DeliveryError> {
+            self.calls.push(Call::Fresh {
+                lane: lane.to_string(),
+                id: id.clone(),
+                verdict: verdict.clone(),
+                summary: summary.to_string(),
+            });
+            self.fresh_result.clone()
+        }
+    }
+
+    fn answer(text: &str) -> Verdict {
+        Verdict::Answer {
+            text: text.to_string(),
+        }
+    }
+
+    fn queue_lines(dir: &Path) -> Vec<String> {
+        std::fs::read_to_string(dir.join("escalations.jsonl"))
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    fn count_events(dir: &Path, name: &str) -> usize {
+        let needle = format!("\"event\":\"{}\"", name);
+        queue_lines(dir)
+            .iter()
+            .filter(|l| l.contains(&needle))
+            .count()
+    }
+
+    #[test]
+    fn test_rule_and_deliver_delivered_path() {
+        let tmpdir = tempfile::TempDir::new().unwrap();
+        let mut queue = Queue::new(tmpdir.path(), Box::new(TestClock::new())).unwrap();
+        let id = queue
+            .ask("lane1", &new_ask("test?"), Origin::Builder)
+            .unwrap();
+        let verdict = answer("use A");
+        let mut delivery = ScriptedDelivery::new(vec![Ok(DeliveryResult::Delivered)]);
+
+        let outcome = queue
+            .rule_and_deliver("lane1", &id, &verdict, &mut delivery)
+            .unwrap();
+
+        assert_eq!(outcome, DeliveryOutcome::Delivered);
+        // deliver called exactly once with the verdict; deliver_fresh never.
+        assert_eq!(
+            delivery.calls,
+            vec![Call::Deliver {
+                lane: "lane1".to_string(),
+                id: id.clone(),
+                verdict: verdict.clone(),
+            }]
+        );
+        assert!(queue.is_delivered(&id));
+        assert_eq!(queue.get(&id).unwrap().2, Some(&verdict));
+        assert_eq!(queue.escalation_count("lane1"), 1);
+        assert_eq!(count_events(tmpdir.path(), "resume-fallback"), 0);
+        assert_eq!(count_events(tmpdir.path(), "delivered"), 1);
+    }
+
+    #[test]
+    fn test_rule_and_deliver_session_gone_falls_back_to_fresh_session() {
+        let tmpdir = tempfile::TempDir::new().unwrap();
+        let mut queue = Queue::new(tmpdir.path(), Box::new(TestClock::new())).unwrap();
+        let id = queue
+            .ask(
+                "lane1",
+                &new_ask("Which parser should we use?"),
+                Origin::Builder,
+            )
+            .unwrap();
+        let verdict = answer("use the streaming parser");
+        let mut delivery = ScriptedDelivery::gone();
+
+        assert_eq!(queue.escalation_count("lane1"), 1);
+        let outcome = queue
+            .rule_and_deliver("lane1", &id, &verdict, &mut delivery)
+            .unwrap();
+        assert_eq!(queue.escalation_count("lane1"), 2);
+
+        assert_eq!(outcome, DeliveryOutcome::FreshSession);
+        // deliver, then deliver_fresh, in that order, nothing else.
+        assert_eq!(delivery.calls.len(), 2);
+        assert!(matches!(delivery.calls[0], Call::Deliver { .. }));
+        let Call::Fresh {
+            lane,
+            id: fresh_id,
+            verdict: fresh_verdict,
+            summary,
+        } = &delivery.calls[1]
+        else {
+            panic!("second call must be deliver_fresh: {:?}", delivery.calls[1]);
+        };
+        assert_eq!(lane, "lane1");
+        assert_eq!(fresh_id, &id);
+        assert_eq!(fresh_verdict, &verdict);
+        // Carry-over: the original question, what was tried, the ruling text.
+        assert!(summary.contains("Which parser should we use?"), "{summary}");
+        assert!(summary.contains("attempted X"), "{summary}");
+        assert!(summary.contains("use the streaming parser"), "{summary}");
+
+        assert_eq!(count_events(tmpdir.path(), "resume-fallback"), 1);
+        assert_eq!(count_events(tmpdir.path(), "delivered"), 1);
+        assert!(queue.is_delivered(&id));
+    }
+
+    #[test]
+    fn test_rule_and_deliver_session_gone_at_limit_ends_lane() {
+        let tmpdir = tempfile::TempDir::new().unwrap();
+        let mut queue = Queue::new(tmpdir.path(), Box::new(TestClock::new())).unwrap();
+        let ask = new_ask("test?");
+        queue.ask("lane1", &ask, Origin::Builder).unwrap();
+        queue.ask("lane1", &ask, Origin::Builder).unwrap();
+        let third = queue.ask("lane1", &ask, Origin::Builder).unwrap();
+        assert_eq!(queue.escalation_count("lane1"), 3);
+        let mut delivery = ScriptedDelivery::gone();
+
+        let outcome = queue
+            .rule_and_deliver("lane1", &third, &answer("go"), &mut delivery)
+            .unwrap();
+
+        assert_eq!(outcome, DeliveryOutcome::EscalationLimit);
+        assert_eq!(queue.lane_state("lane1"), Some(LaneState::EscalationLimit));
+        // deliver was tried; deliver_fresh was NOT called.
+        assert_eq!(delivery.calls.len(), 1);
+        assert!(matches!(delivery.calls[0], Call::Deliver { .. }));
+        // The count did not move past the limit and no fallback was recorded.
+        assert_eq!(queue.escalation_count("lane1"), 3);
+        assert_eq!(count_events(tmpdir.path(), "resume-fallback"), 0);
+        assert!(!queue.is_delivered(&third));
+        // The ruling itself stays recorded.
+        assert!(queue.get(&third).unwrap().2.is_some());
+    }
+
+    #[test]
+    fn test_rebuild_after_resume_fallback_reproduces_count_and_event() {
+        let tmpdir = tempfile::TempDir::new().unwrap();
+        let mut queue = Queue::new(tmpdir.path(), Box::new(TestClock::new())).unwrap();
         let ask = new_ask("test?");
         let id = queue.ask("lane1", &ask, Origin::Builder).unwrap();
+        let mut delivery = ScriptedDelivery::gone();
+        queue
+            .rule_and_deliver("lane1", &id, &answer("go"), &mut delivery)
+            .unwrap();
+        assert_eq!(queue.escalation_count("lane1"), 2);
+        drop(queue);
 
-        // Simulate delivery that returns SessionGone
-        queue.record_resume_fallback("lane1", &id).unwrap();
+        // The event is in the file.
+        assert_eq!(count_events(tmpdir.path(), "resume-fallback"), 1);
 
-        // Verify it was recorded
-        let event_count = queue.escalation_count.get("lane1").copied().unwrap_or(0);
-        assert_eq!(event_count, 1);
+        let mut queue = Queue::new(tmpdir.path(), Box::new(TestClock::new())).unwrap();
+        assert_eq!(queue.escalation_count("lane1"), 2);
+        assert!(queue.is_delivered(&id));
+        assert_eq!(queue.get(&id).unwrap().2, Some(&answer("go")));
+
+        // The rebuilt count is enforced: one more ask fits, the next does not.
+        queue.ask("lane1", &ask, Origin::Builder).unwrap();
+        assert!(queue.ask("lane1", &ask, Origin::Builder).is_err());
+    }
+
+    #[test]
+    fn test_rebuild_keeps_lane_ended_at_limit() {
+        let tmpdir = tempfile::TempDir::new().unwrap();
+        let mut queue = Queue::new(tmpdir.path(), Box::new(TestClock::new())).unwrap();
+        let ask = new_ask("test?");
+        queue.ask("lane1", &ask, Origin::Builder).unwrap();
+        queue.ask("lane1", &ask, Origin::Builder).unwrap();
+        let third = queue.ask("lane1", &ask, Origin::Builder).unwrap();
+        let mut delivery = ScriptedDelivery::gone();
+        queue
+            .rule_and_deliver("lane1", &third, &answer("go"), &mut delivery)
+            .unwrap();
+        drop(queue);
+
+        let queue = Queue::new(tmpdir.path(), Box::new(TestClock::new())).unwrap();
+        assert_eq!(queue.lane_state("lane1"), Some(LaneState::EscalationLimit));
+    }
+
+    #[test]
+    fn test_rule_and_deliver_delivery_error_keeps_ruling() {
+        let tmpdir = tempfile::TempDir::new().unwrap();
+        let mut queue = Queue::new(tmpdir.path(), Box::new(TestClock::new())).unwrap();
+        let id = queue
+            .ask("lane1", &new_ask("test?"), Origin::Builder)
+            .unwrap();
+        let mut delivery =
+            ScriptedDelivery::new(vec![Err(DeliveryError("pipe broke".to_string()))]);
+
+        let err = queue
+            .rule_and_deliver("lane1", &id, &answer("first"), &mut delivery)
+            .unwrap_err();
+
+        // Surfaced, not swallowed.
+        assert_eq!(
+            err,
+            RuleError::Delivery(DeliveryError("pipe broke".to_string()))
+        );
+        assert!(err.to_string().contains("pipe broke"));
+        // The ruling stays recorded and nothing counts as delivered.
+        assert_eq!(queue.get(&id).unwrap().2, Some(&answer("first")));
+        assert!(!queue.is_delivered(&id));
+        assert_eq!(count_events(tmpdir.path(), "ruled"), 1);
+        assert_eq!(count_events(tmpdir.path(), "delivered"), 0);
+
+        // A second ruling for the same id is still a duplicate, and it never
+        // reaches the delivery.
+        let mut delivery2 = ScriptedDelivery::new(vec![]);
+        let err2 = queue
+            .rule_and_deliver("lane1", &id, &answer("second"), &mut delivery2)
+            .unwrap_err();
+        assert!(
+            matches!(&err2, RuleError::Ruling(m) if m.contains("already ruled")),
+            "{err2:?}"
+        );
+        assert!(delivery2.calls.is_empty());
+    }
+
+    #[test]
+    fn test_rule_and_deliver_fresh_error_surfaced_fallback_stays_recorded() {
+        let tmpdir = tempfile::TempDir::new().unwrap();
+        let mut queue = Queue::new(tmpdir.path(), Box::new(TestClock::new())).unwrap();
+        let id = queue
+            .ask("lane1", &new_ask("test?"), Origin::Builder)
+            .unwrap();
+        let mut delivery = ScriptedDelivery::gone();
+        delivery.fresh_result = Err(DeliveryError("spawn failed".to_string()));
+
+        let err = queue
+            .rule_and_deliver("lane1", &id, &answer("go"), &mut delivery)
+            .unwrap_err();
+
+        assert_eq!(
+            err,
+            RuleError::Delivery(DeliveryError("spawn failed".to_string()))
+        );
+        assert_eq!(queue.escalation_count("lane1"), 2);
+        assert_eq!(count_events(tmpdir.path(), "resume-fallback"), 1);
+        assert!(!queue.is_delivered(&id));
+    }
+
+    #[test]
+    fn test_rule_and_deliver_rejected_ruling_never_delivers() {
+        let tmpdir = tempfile::TempDir::new().unwrap();
+        let mut queue = Queue::new(tmpdir.path(), Box::new(TestClock::new())).unwrap();
+        let id = queue
+            .ask("lane1", &new_ask("test?"), Origin::Builder)
+            .unwrap();
+        queue.set_lane_state("lane1", LaneState::Stopped);
+        let mut delivery = ScriptedDelivery::new(vec![]);
+
+        let err = queue
+            .rule_and_deliver("lane1", &id, &answer("late"), &mut delivery)
+            .unwrap_err();
+
+        assert!(
+            matches!(&err, RuleError::Ruling(m) if m.contains("stopped")),
+            "{err:?}"
+        );
+        assert!(delivery.calls.is_empty());
+        assert!(queue.get(&id).unwrap().2.is_none());
+    }
+
+    #[test]
+    fn test_rejected_ruling_is_logged() {
+        let tmpdir = tempfile::TempDir::new().unwrap();
+        let mut queue = Queue::new(tmpdir.path(), Box::new(TestClock::new())).unwrap();
+        let id = queue
+            .ask("lane1", &new_ask("test?"), Origin::Builder)
+            .unwrap();
+        queue.rule("lane1", &id, &answer("first")).unwrap();
+        assert!(queue.rule("lane1", &id, &answer("second")).is_err());
+
+        let rejected: Vec<String> = queue_lines(tmpdir.path())
+            .into_iter()
+            .filter(|l| l.contains("\"event\":\"rejected\""))
+            .collect();
+        assert_eq!(rejected.len(), 1);
+        assert!(rejected[0].contains("already ruled"), "{}", rejected[0]);
+    }
+
+    #[test]
+    fn test_ruling_for_another_lane_rejected() {
+        let tmpdir = tempfile::TempDir::new().unwrap();
+        let mut queue = Queue::new(tmpdir.path(), Box::new(TestClock::new())).unwrap();
+        let id = queue
+            .ask("lane1", &new_ask("test?"), Origin::Builder)
+            .unwrap();
+
+        let err = queue.rule("lane2", &id, &answer("wrong lane")).unwrap_err();
+        assert!(err.contains("belongs to lane lane1"), "{err}");
+        assert!(queue.get(&id).unwrap().2.is_none());
+    }
+
+    #[test]
+    fn test_ask_at_limit_ends_lane() {
+        let tmpdir = tempfile::TempDir::new().unwrap();
+        let mut queue = Queue::new(tmpdir.path(), Box::new(TestClock::new())).unwrap();
+        let ask = new_ask("test?");
+        let first = queue.ask("lane1", &ask, Origin::Builder).unwrap();
+        queue.ask("lane1", &ask, Origin::Builder).unwrap();
+        queue.ask("lane1", &ask, Origin::Builder).unwrap();
+        assert!(queue.ask("lane1", &ask, Origin::Builder).is_err());
+
+        assert_eq!(queue.lane_state("lane1"), Some(LaneState::EscalationLimit));
+        let err = queue.rule("lane1", &first, &answer("late")).unwrap_err();
+        assert!(err.contains("escalation-limit"), "{err}");
+    }
+
+    #[test]
+    fn test_render_truncates_on_char_boundary() {
+        // 4001 bytes of 2-byte characters: byte 4000 is a boundary, 3999 is not.
+        let mut ask = new_ask("x");
+        ask.question = format!("a{}", "\u{e9}".repeat(2000));
+        let rendered = ask.render_for_director();
+        assert!(rendered.contains("[TRUNCATED]"));
     }
 }
