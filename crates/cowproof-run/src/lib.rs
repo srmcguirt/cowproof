@@ -24,6 +24,7 @@ use std::collections::BTreeSet;
 use std::path::{Component, Path, PathBuf};
 
 pub mod escalate;
+pub mod watch;
 
 /// Network mode for sandbox policy.
 #[derive(Debug, Clone, PartialEq, Eq)]

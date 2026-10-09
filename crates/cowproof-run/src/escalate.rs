@@ -84,6 +84,26 @@ impl std::fmt::Display for EscalationId {
     }
 }
 
+/// Note ID, e.g. lane-n1, lane-n2. Monotonic per lane.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, PartialOrd, Ord)]
+pub struct NoteId(pub String);
+
+impl NoteId {
+    pub fn new(lane: &str, count: usize) -> Self {
+        NoteId(format!("{}-n{}", lane, count))
+    }
+
+    pub fn from_string(s: String) -> Self {
+        NoteId(s)
+    }
+}
+
+impl std::fmt::Display for NoteId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 /// Kind of escalation: what the builder is asking about.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -328,6 +348,7 @@ impl Ask {
 
 /// Origin of an escalation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Origin {
     Builder,
     Forced { reason: String },
@@ -566,7 +587,7 @@ impl Clock for SystemClock {
 /// Event stored in the queue.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "event")]
-enum QueueEvent {
+pub enum QueueEvent {
     #[serde(rename = "asked")]
     Asked {
         lane: String,
@@ -608,6 +629,23 @@ enum QueueEvent {
         #[serde(default)]
         id: StdOption<String>,
     },
+    /// A note sent to the builder: non-blocking guidance.
+    #[serde(rename = "note")]
+    Note {
+        lane: String,
+        id: String,
+        text: String,
+        #[serde(default)]
+        at_ms: u64,
+    },
+    /// A note was delivered to the builder.
+    #[serde(rename = "note-delivered")]
+    NoteDelivered {
+        lane: String,
+        id: String,
+        #[serde(default)]
+        at_ms: u64,
+    },
 }
 
 /// One escalation held by the queue.
@@ -616,6 +654,12 @@ struct Entry {
     ask: Ask,
     origin: Origin,
     verdict: StdOption<Verdict>,
+    delivered: bool,
+}
+
+/// One note held by the queue.
+struct NoteEntry {
+    text: String,
     delivered: bool,
 }
 
@@ -635,6 +679,9 @@ pub struct Queue {
     lane_state: HashMap<String, LaneState>,
     max_turns: usize,
     cost_limit_fraction: f64,
+    // Notes tracking
+    notes: HashMap<NoteId, NoteEntry>,
+    note_count: HashMap<String, usize>,
 }
 
 impl Queue {
@@ -675,6 +722,8 @@ impl Queue {
             lane_state: HashMap::new(),
             max_turns,
             cost_limit_fraction,
+            notes: HashMap::new(),
+            note_count: HashMap::new(),
         };
 
         // Rebuild from file if it exists
@@ -763,6 +812,27 @@ impl Queue {
                 }
                 QueueEvent::Rejected { .. } => {
                     // Not part of active state
+                }
+                QueueEvent::Note {
+                    lane,
+                    id,
+                    text,
+                    at_ms: _,
+                } => {
+                    let nid = NoteId::from_string(id);
+                    *self.note_count.entry(lane).or_insert(0) += 1;
+                    self.notes.insert(
+                        nid,
+                        NoteEntry {
+                            text,
+                            delivered: false,
+                        },
+                    );
+                }
+                QueueEvent::NoteDelivered { id, .. } => {
+                    if let Some(entry) = self.notes.get_mut(&NoteId::from_string(id)) {
+                        entry.delivered = true;
+                    }
                 }
             }
         }
@@ -1205,6 +1275,102 @@ impl Queue {
             .map(|e| (&e.ask, &e.origin, e.verdict.as_ref()))
     }
 
+    /// Record a note in the queue. Returns the note ID.
+    ///
+    /// Notes are non-blocking guidance. A note on a lane in a terminal state
+    /// is refused. Text must be non-empty and at most 4000 bytes (char-boundary safe).
+    pub fn note(&mut self, lane: &str, text: &str) -> Result<NoteId, String> {
+        // Reject terminal states
+        if let StdOption::Some(state) = self.lane_state.get(lane)
+            && *state != LaneState::Running
+        {
+            return Err(format!(
+                "note for {} rejected: lane in terminal state {}",
+                lane,
+                state.name()
+            ));
+        }
+
+        // Validate text
+        if text.is_empty() {
+            return Err("note text is empty".to_string());
+        }
+        if text.len() > 4000 {
+            return Err(format!("note text exceeds 4000 bytes: {}", text.len()));
+        }
+
+        let count = self.note_count.get(lane).copied().unwrap_or(0);
+        let id = NoteId::new(lane, count + 1);
+
+        let event = QueueEvent::Note {
+            lane: lane.to_string(),
+            id: id.0.clone(),
+            text: text.to_string(),
+            at_ms: self.now_ms(),
+        };
+        self.append_event(&event)?;
+
+        *self.note_count.entry(lane.to_string()).or_insert(0) += 1;
+        self.notes.insert(
+            id.clone(),
+            NoteEntry {
+                text: text.to_string(),
+                delivered: false,
+            },
+        );
+
+        Ok(id)
+    }
+
+    /// List undelivered notes for a lane, oldest first.
+    pub fn pending_notes(&self, lane: &str) -> Vec<(NoteId, String)> {
+        let mut result = Vec::new();
+        for (id, entry) in &self.notes {
+            if id.0.starts_with(&format!("{}-", lane)) && !entry.delivered {
+                result.push((id.clone(), entry.text.clone()));
+            }
+        }
+        // Sort by note number (monotonic per lane)
+        result.sort_by(|a, b| a.0.cmp(&b.0));
+        result
+    }
+
+    /// Mark notes as delivered. Unknown or already-delivered IDs are an error
+    /// and write nothing.
+    pub fn mark_notes_delivered(&mut self, lane: &str, ids: &[NoteId]) -> Result<(), String> {
+        // Verify all exist and belong to this lane
+        for id in ids {
+            match self.notes.get(id) {
+                None => {
+                    return Err(format!("note {} unknown", id));
+                }
+                Some(entry) if entry.delivered => {
+                    return Err(format!("note {} already delivered", id));
+                }
+                _ => {}
+            }
+        }
+
+        // Write delivery event for each
+        for id in ids {
+            let event = QueueEvent::NoteDelivered {
+                lane: lane.to_string(),
+                id: id.0.clone(),
+                at_ms: self.now_ms(),
+            };
+            self.append_event(&event)?;
+        }
+
+        // Update in-memory state
+        for id in ids {
+            if let Some(entry) = self.notes.get_mut(id) {
+                entry.delivered = true;
+            }
+        }
+
+        Ok(())
+    }
+
     /// Append an event to the queue file.
     fn append_event(&self, event: &QueueEvent) -> Result<(), String> {
         std::fs::create_dir_all(&self.control_dir)
@@ -1231,19 +1397,27 @@ mod tests {
     use std::sync::Arc;
 
     struct TestClock {
-        current_time: std::sync::Mutex<SystemTime>,
+        current_time: std::sync::Arc<std::sync::Mutex<SystemTime>>,
     }
 
     impl TestClock {
         fn new() -> Self {
             TestClock {
-                current_time: std::sync::Mutex::new(SystemTime::now()),
+                current_time: std::sync::Arc::new(std::sync::Mutex::new(SystemTime::now())),
             }
         }
 
         fn advance(&self, duration: Duration) {
             let mut t = self.current_time.lock().unwrap();
             *t += duration;
+        }
+    }
+
+    impl Clone for TestClock {
+        fn clone(&self) -> Self {
+            TestClock {
+                current_time: self.current_time.clone(),
+            }
         }
     }
 
@@ -2480,5 +2654,200 @@ mod tests {
         // Verify cost is inside fence
         let c_pos = rendered.find(&ask.options[0].cost).unwrap();
         assert!(c_pos > fence_start && c_pos < fence_end);
+    }
+
+    #[test]
+    fn test_note_then_pending_notes_returns_it() {
+        let tmpdir = tempfile::TempDir::new().unwrap();
+        let clock = Box::new(TestClock::new());
+        let mut queue = Queue::new(tmpdir.path(), clock).unwrap();
+
+        let note_id = queue.note("lane1", "test note").unwrap();
+        let pending = queue.pending_notes("lane1");
+
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].0, note_id);
+        assert_eq!(pending[0].1, "test note");
+    }
+
+    #[test]
+    fn test_note_mark_delivered_then_pending_is_empty() {
+        let tmpdir = tempfile::TempDir::new().unwrap();
+        let clock = Box::new(TestClock::new());
+        let mut queue = Queue::new(tmpdir.path(), clock).unwrap();
+
+        let note_id = queue.note("lane1", "test note").unwrap();
+        assert_eq!(queue.pending_notes("lane1").len(), 1);
+
+        queue.mark_notes_delivered("lane1", &[note_id]).unwrap();
+        assert_eq!(queue.pending_notes("lane1").len(), 0);
+    }
+
+    #[test]
+    fn test_note_second_mark_delivered_is_error_and_file_unchanged() {
+        let tmpdir = tempfile::TempDir::new().unwrap();
+        let clock = Box::new(TestClock::new());
+        let mut queue = Queue::new(tmpdir.path(), clock).unwrap();
+
+        let note_id = queue.note("lane1", "test note").unwrap();
+        queue
+            .mark_notes_delivered("lane1", std::slice::from_ref(&note_id))
+            .unwrap();
+
+        // Get file size before second mark attempt
+        let file_size_before = std::fs::metadata(tmpdir.path().join("escalations.jsonl"))
+            .unwrap()
+            .len();
+
+        let err = queue.mark_notes_delivered("lane1", &[note_id]).unwrap_err();
+        assert!(err.contains("already delivered"));
+
+        // Verify file is unchanged
+        let file_size_after = std::fs::metadata(tmpdir.path().join("escalations.jsonl"))
+            .unwrap()
+            .len();
+        assert_eq!(file_size_before, file_size_after);
+    }
+
+    #[test]
+    fn test_note_on_terminal_state_is_refused() {
+        let tmpdir = tempfile::TempDir::new().unwrap();
+        let clock = Box::new(TestClock::new());
+        let mut queue = Queue::new(tmpdir.path(), clock).unwrap();
+
+        queue.set_lane_state("lane1", LaneState::Finished);
+
+        let err = queue.note("lane1", "test note").unwrap_err();
+        assert!(err.contains("terminal state"));
+        assert!(err.contains("finished"));
+    }
+
+    #[test]
+    fn test_note_empty_text_is_refused() {
+        let tmpdir = tempfile::TempDir::new().unwrap();
+        let clock = Box::new(TestClock::new());
+        let mut queue = Queue::new(tmpdir.path(), clock).unwrap();
+
+        let err = queue.note("lane1", "").unwrap_err();
+        assert!(err.contains("empty"));
+    }
+
+    #[test]
+    fn test_note_4001_bytes_is_refused() {
+        let tmpdir = tempfile::TempDir::new().unwrap();
+        let clock = Box::new(TestClock::new());
+        let mut queue = Queue::new(tmpdir.path(), clock).unwrap();
+
+        let long_text = "x".repeat(4001);
+        let err = queue.note("lane1", &long_text).unwrap_err();
+        assert!(err.contains("exceeds 4000"));
+    }
+
+    #[test]
+    fn test_note_exactly_4000_bytes_is_accepted() {
+        let tmpdir = tempfile::TempDir::new().unwrap();
+        let clock = Box::new(TestClock::new());
+        let mut queue = Queue::new(tmpdir.path(), clock).unwrap();
+
+        let text = "x".repeat(4000);
+        let note_id = queue.note("lane1", &text).unwrap();
+        let pending = queue.pending_notes("lane1");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].0, note_id);
+    }
+
+    #[test]
+    fn test_notes_survive_reopen() {
+        let tmpdir = tempfile::TempDir::new().unwrap();
+        let clock = Box::new(TestClock::new());
+        let mut queue = Queue::new(tmpdir.path(), clock.clone()).unwrap();
+
+        let note_id = queue.note("lane1", "test note").unwrap();
+        drop(queue);
+
+        let queue = Queue::new(tmpdir.path(), clock).unwrap();
+        let pending = queue.pending_notes("lane1");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].0, note_id);
+        assert_eq!(pending[0].1, "test note");
+    }
+
+    #[test]
+    fn test_note_does_not_change_lane_state_or_escalation_count() {
+        let tmpdir = tempfile::TempDir::new().unwrap();
+        let clock = Box::new(TestClock::new());
+        let mut queue = Queue::new(tmpdir.path(), clock).unwrap();
+
+        let count_before = queue.escalation_count("lane1");
+        let state_before = queue.lane_state("lane1");
+
+        queue.note("lane1", "test note").unwrap();
+
+        let count_after = queue.escalation_count("lane1");
+        let state_after = queue.lane_state("lane1");
+
+        assert_eq!(count_before, count_after);
+        assert_eq!(state_before, state_after);
+    }
+
+    #[test]
+    fn test_note_text_validation_unicode_boundaries() {
+        let tmpdir = tempfile::TempDir::new().unwrap();
+        let clock = Box::new(TestClock::new());
+        let mut queue = Queue::new(tmpdir.path(), clock).unwrap();
+
+        // Text with multi-byte UTF-8 characters
+        let text = "hello 🎉 world".to_string(); // Contains emoji
+        let note_id = queue.note("lane1", &text).unwrap();
+        let pending = queue.pending_notes("lane1");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].0, note_id);
+    }
+
+    #[test]
+    fn test_note_multiple_notes_per_lane_ordered() {
+        let tmpdir = tempfile::TempDir::new().unwrap();
+        let clock = Box::new(TestClock::new());
+        let mut queue = Queue::new(tmpdir.path(), clock).unwrap();
+
+        let id1 = queue.note("lane1", "first").unwrap();
+        let id2 = queue.note("lane1", "second").unwrap();
+        let id3 = queue.note("lane1", "third").unwrap();
+
+        let pending = queue.pending_notes("lane1");
+        assert_eq!(pending.len(), 3);
+        assert_eq!(pending[0].0, id1);
+        assert_eq!(pending[1].0, id2);
+        assert_eq!(pending[2].0, id3);
+    }
+
+    #[test]
+    fn test_note_mark_some_delivered() {
+        let tmpdir = tempfile::TempDir::new().unwrap();
+        let clock = Box::new(TestClock::new());
+        let mut queue = Queue::new(tmpdir.path(), clock).unwrap();
+
+        let id1 = queue.note("lane1", "first").unwrap();
+        let id2 = queue.note("lane1", "second").unwrap();
+        let id3 = queue.note("lane1", "third").unwrap();
+
+        queue.mark_notes_delivered("lane1", &[id1, id3]).unwrap();
+
+        let pending = queue.pending_notes("lane1");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].0, id2);
+    }
+
+    #[test]
+    fn test_note_unknown_id_is_error() {
+        let tmpdir = tempfile::TempDir::new().unwrap();
+        let clock = Box::new(TestClock::new());
+        let mut queue = Queue::new(tmpdir.path(), clock).unwrap();
+
+        let unknown_id = NoteId::from_string("lane1-n999".to_string());
+        let err = queue
+            .mark_notes_delivered("lane1", &[unknown_id])
+            .unwrap_err();
+        assert!(err.contains("unknown"));
     }
 }
