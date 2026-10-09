@@ -116,6 +116,15 @@ pub fn resolve_outside_repo(path: &Path, repo_root: &Path, cwd: &Path) -> Result
 fn canonicalize_path_with_repo_check(path: &Path, repo_canonical: &Path) -> Result<PathBuf> {
     // Find the nearest existing ancestor, canonicalize it, then reconstruct the path.
     // This ensures relative paths are made absolute and symlinks are resolved properly.
+    // Refuse `..` anywhere: it is never needed to name a store file, and the
+    // walk below cannot see through it (`file_name` of `a/..` is `None`).
+    if path
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        bail!("held-out checks path contains ..: {}", path.display());
+    }
+
     let mut current = path.to_path_buf();
     let mut components_to_add = Vec::new();
 
@@ -139,11 +148,8 @@ fn canonicalize_path_with_repo_check(path: &Path, repo_canonical: &Path) -> Resu
         current.display()
     ))?;
 
-    // Re-add components in order, checking for .. attacks
+    // Re-add the missing components in order.
     for component in components_to_add.iter().rev() {
-        if component.as_os_str() == ".." {
-            bail!("held-out checks path contains ..: {}", path.display());
-        }
         canonical.push(component);
     }
 
@@ -707,7 +713,7 @@ command = "echo world"
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
         assert!(
-            err_msg.contains("..") || err_msg.contains("inside the repository"),
+            err_msg.contains("path contains ..:"),
             "error should mention .. or repo boundary, got: {}",
             err_msg
         );

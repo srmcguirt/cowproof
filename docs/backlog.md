@@ -3,7 +3,6 @@
 Work the crate port (2026-10-09) deferred or exposed. Newest first.
 
 - **Two unified-diff parsers.** `cowproof_core::removed_lines` and `cowproof_prove::flaws::parse_patch` both track hunk state to tell file headers from `---`/`+++` body lines (the append-only evasion fixed on 2026-10-09 was this bug in one of them). Move the hunk-aware parsing into `cowproof-core` and have `flaws.rs` use it, so the rule lives in one place.
-- **Held-out gate is a stub.** `gates::check_heldout` hard-codes `has_heldout = false`; wire it to `cowproof_core::heldout` (the director store, D5).
 - **Built-in `generic` flaw pack.** `[proof] packs = ["generic"]` has no path, so the gate skips it; move the built-in pack into `cowproof-prove` (embedded) so outside repos get it without configuration.
 - **`applied_migration` rules never fire in gates.** `GatePacket` has no migration baseline; add one (the report gets it from `--baseline`).
 - **Verifier slot (D12) not wired.** `SlotGuard` exists but `verify` does not acquire the lane's class slot; also no check timeout (`InfraError::Timeout` is never raised), `Command::output` blocks the async executor, and `PATH` under the hidden home cannot reach `~/.cargo/bin`. Dependency prefetch (D6) still has no caller for `dependency_cache_key`. Make `ProcessRunner` `#[cfg(test)]`-only (director ruling: yes).

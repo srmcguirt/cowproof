@@ -832,10 +832,12 @@ command = "echo test2"
         let result = check_heldout(&p, repo.path());
         assert!(!result.passed);
         assert!(!result.warned);
-        // Should fail with either ".." rejection or "inside repository" message
+        // The `..` rule refuses it; both messages print the path, so match the
+        // rule's own wording.
         assert!(
-            result.evidence[0].contains("..")
-                || result.evidence[0].contains("inside the repository")
+            result.evidence[0].contains("path contains ..:"),
+            "{:?}",
+            result.evidence
         );
         Ok(())
     }
