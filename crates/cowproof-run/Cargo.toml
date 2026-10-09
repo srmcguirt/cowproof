@@ -8,10 +8,11 @@ version.workspace = true
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-tokio = { workspace = true, features = ["net", "sync", "time"] }
+tokio = { workspace = true, features = ["net", "sync", "time", "io-util"] }
 hyper = { version = "1", features = ["http1", "server", "client"] }
-hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1"] }
-hyper-rustls = "0.27"
+hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", "tokio"] }
+# webpki roots only (no platform trust store): the upstream is a fixed public API host.
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "tls12", "aws-lc-rs", "webpki-tokio"] }
 http-body-util = "0.1"
 bytes = "1"
 uuid = { version = "1", features = ["v4"] }
