@@ -4,8 +4,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use clap::Parser;
 use cowproof_core::{
     Header, PORT_BASE, codex_isolation_args, heldout, outside_ownership, parse_header,
-    release_slot, remove_build_output, removed_lines, repo_rules, sandbox_command, sandbox_profile,
-    try_acquire_slot,
+    release_slot, remove_build_output, removed_lines, repo_rules, try_acquire_slot,
 };
 use cowproof_host::{
     SystemRunner, collect_facts, enforce_disk_floor, ensure_safe_to_stop, lane_status,
@@ -16,6 +15,7 @@ use cowproof_plan::{
     HostCapacity, LaneStateUpdate, PlanHostRunner, check_plans, choose_host, collect_running,
     duplicate_running_id, lanes as plan_lanes, load_plans, ready_next, set_lane_state,
 };
+use cowproof_run::{LaneLayout, SandboxPolicy, render_macos_profile, sandbox_command};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::collections::HashSet;
@@ -1721,7 +1721,14 @@ async fn run_in_slot(
     if sccache.is_some() {
         extra.push(sccache_dir());
     }
-    let profile = sandbox_profile(&lane, &extra, &home());
+    let lane_layout = LaneLayout {
+        clone: lane.clone(),
+        home: home(),
+        scratch: scratch.clone(),
+    };
+    let mut policy = SandboxPolicy::builder(&lane_layout);
+    policy.rw_paths.extend(extra.clone());
+    let profile = render_macos_profile(&policy);
     fs::write(lane.join("sandbox.sb"), profile)?;
     let branch = run_sync(
         "git",
@@ -1754,7 +1761,6 @@ async fn run_in_slot(
         (h.runner == "opencode").then_some(key.as_str()),
         sccache.is_some(),
     );
-    let extra_rw = extra;
     let argv = if h.runner == "codex" {
         codex_argv(
             &h,
@@ -1773,7 +1779,8 @@ async fn run_in_slot(
     } else {
         std::env::consts::OS
     };
-    let (program, argv) = sandbox_command(&lane, &extra_rw, &argv, platform, &home());
+    let profile_path = lane.join("sandbox.sb");
+    let (program, argv) = sandbox_command(&policy, &profile_path, &argv, platform);
     eprintln!(
         "[{}] running {} {} (timeout {} min{})",
         h.id,

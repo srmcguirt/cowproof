@@ -300,139 +300,6 @@ pub fn outside_ownership(files: &[String], owns: &[String], protected: &[String]
         .collect()
 }
 
-fn quote_json(s: &str) -> String {
-    serde_json::to_string(s).unwrap_or_else(|_| "\"\"".into())
-}
-pub fn sandbox_profile(lane_dir: &Path, extra: &[PathBuf], home: &Path) -> String {
-    let lane = lane_dir.to_string_lossy();
-    let home_s = home.to_string_lossy();
-    let mut ancestors = Vec::new();
-    let mut d = lane_dir.parent();
-    while let Some(p) = d {
-        if p.starts_with(home) {
-            ancestors.push(p.to_string_lossy().to_string());
-            d = p.parent();
-        } else {
-            break;
-        }
-    }
-    let metadata = ancestors
-        .iter()
-        .map(|a| format!(" (literal {})", quote_json(a)))
-        .collect::<String>();
-    let extra_rules = extra
-        .iter()
-        .map(|p| {
-            format!(
-                "(allow file-read* file-write* (subpath {}))\n",
-                quote_json(&p.to_string_lossy())
-            )
-        })
-        .collect::<String>();
-    format!(
-        "(version 1)\n(allow default)\n(deny file-read* file-write* (subpath {}))\n(allow file-read-metadata (literal {}){})\n(allow file-read* file-write* (subpath {}))\n(allow file-read* (subpath {}))\n(allow file-read* file-write* (subpath {}))\n(deny file-read* file-write* (literal {}) (literal {}))\n{}",
-        quote_json(&home_s),
-        quote_json(&home_s),
-        metadata,
-        quote_json(&lane),
-        quote_json(&home.join(".rustup").to_string_lossy()),
-        quote_json(&home.join(".cargo").to_string_lossy()),
-        quote_json(&home.join(".cargo/credentials.toml").to_string_lossy()),
-        quote_json(&home.join(".cargo/credentials").to_string_lossy()),
-        extra_rules
-    )
-}
-
-pub fn linux_sandbox_args(lane_dir: &Path, extra: &[PathBuf], home: &Path) -> Vec<String> {
-    let mut a = vec![
-        "--die-with-parent",
-        "--unshare-pid",
-        "--ro-bind",
-        "/",
-        "/",
-        "--dev",
-        "/dev",
-        "--proc",
-        "/proc",
-        "--bind",
-        "/tmp",
-        "/tmp",
-        "--tmpfs",
-    ]
-    .into_iter()
-    .map(str::to_owned)
-    .collect::<Vec<_>>();
-    a.push(home.to_string_lossy().into_owned());
-    a.extend([
-        "--bind".into(),
-        lane_dir.to_string_lossy().into_owned(),
-        lane_dir.to_string_lossy().into_owned(),
-    ]);
-    for (path, flag) in [
-        (home.join(".rustup"), "--ro-bind"),
-        (home.join(".cargo"), "--bind"),
-    ] {
-        if path.exists() {
-            a.extend([
-                flag.into(),
-                path.to_string_lossy().into_owned(),
-                path.to_string_lossy().into_owned(),
-            ]);
-        }
-    }
-    for cred in [
-        home.join(".cargo/credentials.toml"),
-        home.join(".cargo/credentials"),
-    ] {
-        if cred.exists() {
-            a.extend([
-                "--ro-bind".into(),
-                "/dev/null".into(),
-                cred.to_string_lossy().into_owned(),
-            ]);
-        }
-    }
-    let npm = home.join(".npm-global");
-    if npm.exists() {
-        a.extend([
-            "--ro-bind".into(),
-            npm.to_string_lossy().into_owned(),
-            npm.to_string_lossy().into_owned(),
-        ]);
-    }
-    for p in extra {
-        if p.exists() {
-            a.extend([
-                "--bind".into(),
-                p.to_string_lossy().into_owned(),
-                p.to_string_lossy().into_owned(),
-            ]);
-        }
-    }
-    a
-}
-
-pub fn sandbox_command(
-    lane_dir: &Path,
-    extra: &[PathBuf],
-    argv: &[String],
-    platform: &str,
-    home: &Path,
-) -> (String, Vec<String>) {
-    if platform == "darwin" {
-        let mut a = vec![
-            "-f".into(),
-            lane_dir.join("sandbox.sb").to_string_lossy().into_owned(),
-        ];
-        a.extend_from_slice(argv);
-        ("sandbox-exec".into(), a)
-    } else {
-        let mut a = linux_sandbox_args(lane_dir, extra, home);
-        a.extend_from_slice(argv);
-        ("bwrap".into(), a)
-    }
-}
-
 pub fn removed_lines(patch: &str, file: &str) -> usize {
     let mut active = false;
     let mut count = 0;
@@ -761,48 +628,6 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
     #[test]
-    fn sandbox_builders_include_expected_boundaries() {
-        let home = Path::new("/nonexistent-home-for-test");
-        let a = linux_sandbox_args(
-            Path::new("/lanes/l1"),
-            &[PathBuf::from("/extra-missing")],
-            home,
-        );
-        assert!(a.contains(&"--unshare-pid".into()));
-        assert_eq!(
-            a[a.iter().position(|x| x == "--tmpfs").unwrap() + 1],
-            home.to_string_lossy()
-        );
-        assert!(sandbox_profile(Path::new("/lanes/l1"), &[], home).contains("credentials.toml"));
-        assert_eq!(
-            sandbox_command(
-                Path::new("/l"),
-                &[],
-                &["codex".into(), "exec".into()],
-                "darwin",
-                home
-            ),
-            (
-                "sandbox-exec".into(),
-                vec![
-                    "-f".into(),
-                    "/l/sandbox.sb".into(),
-                    "codex".into(),
-                    "exec".into()
-                ]
-            )
-        );
-        let (cmd, args) = sandbox_command(
-            Path::new("/l"),
-            &[],
-            &["codex".into(), "exec".into()],
-            "linux",
-            home,
-        );
-        assert_eq!(cmd, "bwrap");
-        assert_eq!(&args[args.len() - 2..], ["codex", "exec"]);
-    }
-    #[test]
     fn parity_with_node_if_available() {
         parity_test();
     }
@@ -819,7 +644,7 @@ mod tests {
             return;
         };
         let node_src = format!(
-            "import {{parseHeader,globToRegExp,outsideOwnership,sandboxProfile,linuxSandboxArgs}} from {}; const h=parseHeader('<!-- lane {{\\\"id\\\":\\\"lane-a\\\",\\\"owns\\\":[\\\"src/**\\\"]}} -->'); console.log(JSON.stringify({{header:[h.runner,h.model,h.class,h.timeoutMin,h.maxCostUsd,h.wide],glob:globToRegExp('docs/**/x.md').source,owned:outsideOwnership(['src/a.rs','AGENTS.md'],['src/**']),profile:sandboxProfile('/x/l',[]),bubble:linuxSandboxArgs('/x/l',[],process.env.HOME)}}));",
+            "import {{parseHeader,globToRegExp,outsideOwnership}} from {}; const h=parseHeader('<!-- lane {{\\\"id\\\":\\\"lane-a\\\",\\\"owns\\\":[\\\"src/**\\\"]}} -->'); console.log(JSON.stringify({{header:[h.runner,h.model,h.class,h.timeoutMin,h.maxCostUsd,h.wide],glob:globToRegExp('docs/**/x.md').source,owned:outsideOwnership(['src/a.rs','AGENTS.md'],['src/**'])}}));",
             serde_json::to_string(&runner.to_string_lossy()).unwrap()
         );
         let out = StdCommand::new("node")
@@ -851,26 +676,6 @@ mod tests {
                 &["src/a.rs".into(), "AGENTS.md".into()],
                 &["src/**".into()],
                 &["AGENTS.md".into()]
-            ))
-        );
-        assert_eq!(
-            node["profile"],
-            sandbox_profile(
-                Path::new("/x/l"),
-                &[],
-                &std::env::var_os("HOME")
-                    .map(PathBuf::from)
-                    .unwrap_or_default()
-            )
-        );
-        assert_eq!(
-            node["bubble"],
-            json!(linux_sandbox_args(
-                Path::new("/x/l"),
-                &[],
-                &std::env::var_os("HOME")
-                    .map(PathBuf::from)
-                    .unwrap_or_default()
             ))
         );
     }

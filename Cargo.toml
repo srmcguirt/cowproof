@@ -1,6 +1,6 @@
 [workspace]
 members = [
-  "crates/cowproof-core", "crates/cowproof-cli", "crates/cowproof-report", "crates/cowproof-plan", "crates/cowproof-host", "crates/cowproof-lint",
+  "crates/cowproof-core", "crates/cowproof-cli", "crates/cowproof-report", "crates/cowproof-plan", "crates/cowproof-host", "crates/cowproof-lint", "crates/cowproof-run",
   "crates/portkit/core", "crates/portkit/mcp", "crates/portkit/port", "crates/portkit/cli", "crates/portkit/plugin", "crates/portkit/read", "crates/portkit/index"
 ]
 resolver = "3"

@@ -18,3 +18,4 @@ cowproof-core = { path = "../cowproof-core" }
 cowproof-host = { path = "../cowproof-host" }
 cowproof-plan = { path = "../cowproof-plan" }
 cowproof-lint = { path = "../cowproof-lint" }
+cowproof-run = { path = "../cowproof-run" }

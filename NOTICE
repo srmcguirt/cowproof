@@ -1,0 +1,12 @@
+cowproof
+=========
+
+This software includes components from the following project:
+
+anthropics/sandbox-runtime
+  - Source: https://github.com/anthropics/sandbox-runtime
+  - Commit: 344e5ea (as of 2026-10-09)
+  - License: Apache-2.0
+  - Attribution: cowproof's sandbox policy design (SandboxPolicy type in crates/cowproof-run/src/lib.rs)
+    follows the architecture and implementation patterns of sandbox-runtime's network sandbox
+    and process isolation mechanisms for macOS (sandbox-exec Seatbelt profiles) and Linux (bubblewrap).

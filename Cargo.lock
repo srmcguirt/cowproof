@@ -377,6 +377,7 @@ dependencies = [
  "cowproof-host",
  "cowproof-lint",
  "cowproof-plan",
+ "cowproof-run",
  "serde",
  "serde_json",
  "tokio",
@@ -436,6 +437,16 @@ dependencies = [
  "serde",
  "serde_json",
  "toml 0.8.23",
+]
+
+[[package]]
+name = "cowproof-run"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]
