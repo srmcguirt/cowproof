@@ -15,7 +15,7 @@ use cowproof_plan::{
     HostCapacity, LaneStateUpdate, PlanHostRunner, check_plans, choose_host, collect_running,
     duplicate_running_id, lanes as plan_lanes, load_plans, ready_next, set_lane_state,
 };
-use cowproof_run::{LaneLayout, SandboxPolicy, render_macos_profile, sandbox_command};
+use cowproof_run::{LaneLayout, NetworkMode, SandboxPolicy, render_macos_profile, sandbox_command};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::collections::HashSet;
@@ -1726,7 +1726,7 @@ async fn run_in_slot(
         home: home(),
         scratch: scratch.clone(),
     };
-    let mut policy = SandboxPolicy::builder(&lane_layout);
+    let mut policy = SandboxPolicy::builder(&lane_layout, NetworkMode::Unrestricted);
     policy.rw_paths.extend(extra.clone());
     let profile = render_macos_profile(&policy);
     fs::write(lane.join("sandbox.sb"), profile)?;
