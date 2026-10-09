@@ -1,25 +1,26 @@
-use crate::capsule::Capsule;
+use crate::capsule::{Capsule, CapsuleError, CheckResult};
 use crate::runner::CheckRunner;
-use anyhow::Result;
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::Command;
 use thiserror::Error;
 
 /// Errors that can occur during verification.
+///
+/// None of these is a refutation (design Note F-1): a verifier that cannot rebuild
+/// the tree or run a check says nothing about the lane's work.
 #[derive(Error, Debug)]
 pub enum VerifyError {
+    /// The verifier could not do its job: tree rebuild, patch apply or runner failure.
     #[error("Infrastructure error during verification: {0}")]
     Infrastructure(String),
 
     #[error("Verification failed: capsule is marked unsandboxed and cannot be proved")]
     UnsandboxedNotProved,
 
-    #[error("Failed to rebuild tree from git")]
-    TreeRebuilding(String),
-
-    #[error("Failed to apply patch: {0}")]
-    PatchApply(String),
+    /// The capsule itself is unreadable or fails its hash check. Nothing was run.
+    #[error("Capsule rejected: {0}")]
+    Capsule(#[from] CapsuleError),
 }
 
 /// Per-check verification result.
@@ -55,161 +56,83 @@ pub type Reproduced = ();
 /// Type alias for Diverged for backwards compatibility.
 pub type Diverged = Vec<String>;
 
-/// Verify a capsule by rebuilding the tree and re-running checks.
+/// Maximum attempts for a check marked flaky in the capsule.
+const FLAKY_ATTEMPTS: u32 = 3;
+
+/// Verify a capsule by rebuilding the tree from `source_repo` and re-running checks.
 ///
-/// This function:
-/// 1. Rebuilds the tree at the base commit
-/// 2. Applies base.patch (if present)
-/// 3. Applies launch.patch
-/// 4. Applies lane.patch
-/// 5. Runs each check through the CheckRunner
-/// 6. Compares results against the capsule
+/// The tree is always built the same way, into `workdir/tree` (which must not exist):
+/// 1. Clone `source_repo` and check out the capsule's base commit (its tree hash must
+///    match the capsule's `base_tree_hash`).
+/// 2. Apply `base.patch` (when present and non-empty).
+/// 3. Apply `launch.patch` (D13/R10: the pre-launch baseline the builder started from).
+/// 4. Apply `lane.patch`.
+/// 5. Run each recorded check's command through the `CheckRunner`.
+/// 6. Compare pass or fail per check id; durations and output hashes are never compared.
 ///
-/// Flaky checks (marked in the capsule) are retried up to 3 times.
-/// Infrastructure errors are returned as VerifyError::Infrastructure, never as divergence.
+/// Checks marked flaky in the capsule are retried up to three times. Any failure to
+/// rebuild the tree, apply a patch or run a check is `VerifyError::Infrastructure`,
+/// never a divergence (F-1).
 pub async fn verify(
     capsule_dir: &Path,
+    source_repo: &Path,
     workdir: &Path,
     runner: &dyn CheckRunner,
 ) -> Result<VerifyReport, VerifyError> {
-    // Read the capsule
-    let capsule =
-        Capsule::read(capsule_dir).map_err(|e| VerifyError::Infrastructure(e.to_string()))?;
+    let capsule = Capsule::read(capsule_dir)?;
 
-    // Check if capsule is unsandboxed
     if capsule.unsandboxed {
         return Err(VerifyError::UnsandboxedNotProved);
     }
 
-    // Determine the tree path to use
-    let tree = if workdir.join("tree").exists() {
-        // Prefer tree subdir if it exists (production path)
-        workdir.join("tree")
-    } else if workdir.exists() {
-        // Otherwise use workdir itself (testing path - tree pre-built in workdir)
-        workdir.to_path_buf()
-    } else {
-        // If workdir doesn't exist, try to clone
-        let tree = workdir.join("tree");
-        clone_at_commit(&capsule.base_commit, &tree).map_err(VerifyError::TreeRebuilding)?;
-        tree
-    };
+    let recorded = load_checks(capsule_dir)?;
 
-    // Apply base.patch if it exists and is non-empty
-    let base_patch = capsule_dir.join("base.patch");
-    if base_patch.exists() {
-        let patch_content = std::fs::read_to_string(&base_patch)
-            .map_err(|e| VerifyError::Infrastructure(e.to_string()))?;
-        if !patch_content.trim().is_empty() {
-            apply_patch(&tree, &base_patch)
-                .map_err(|e| VerifyError::PatchApply(format!("base.patch: {}", e)))?;
-        }
+    let tree = workdir.join("tree");
+    if tree.exists() {
+        return Err(infra(format!(
+            "refusing to reuse existing tree at {}",
+            tree.display()
+        )));
+    }
+    std::fs::create_dir_all(workdir).map_err(|e| infra(format!("workdir: {e}")))?;
+    clone_at_commit(source_repo, &capsule.base_commit, &tree)?;
+
+    let actual_tree_hash = git(&tree, &["rev-parse", "HEAD^{tree}"])?;
+    if actual_tree_hash.trim() != capsule.base_tree_hash {
+        return Err(infra(format!(
+            "base tree hash mismatch: capsule has {}, rebuilt tree has {}",
+            capsule.base_tree_hash,
+            actual_tree_hash.trim()
+        )));
     }
 
-    // Apply launch.patch (if non-empty)
-    let launch_patch = capsule_dir.join("launch.patch");
-    if launch_patch.exists() {
-        let patch_content = std::fs::read_to_string(&launch_patch)
-            .map_err(|e| VerifyError::Infrastructure(e.to_string()))?;
-        if !patch_content.trim().is_empty() {
-            apply_patch(&tree, &launch_patch)
-                .map_err(|e| VerifyError::PatchApply(format!("launch.patch: {}", e)))?;
-        }
+    for name in ["base.patch", "launch.patch", "lane.patch"] {
+        apply_patch_file(&tree, &capsule_dir.join(name), name)?;
     }
 
-    // Apply lane.patch (if non-empty)
-    let lane_patch = capsule_dir.join("lane.patch");
-    if lane_patch.exists() {
-        let patch_content = std::fs::read_to_string(&lane_patch)
-            .map_err(|e| VerifyError::Infrastructure(e.to_string()))?;
-        if !patch_content.trim().is_empty() {
-            apply_patch(&tree, &lane_patch)
-                .map_err(|e| VerifyError::PatchApply(format!("lane.patch: {}", e)))?;
-        }
-    }
-
-    // Load check results from the capsule
-    let checks_dir = capsule_dir.join("checks");
-    let mut capsule_checks: HashMap<String, i32> = HashMap::new();
-    let flaky_checks = capsule.flaky_checks.clone();
-
-    if checks_dir.exists() {
-        for entry in std::fs::read_dir(&checks_dir)
-            .map_err(|e| VerifyError::Infrastructure(e.to_string()))?
-        {
-            let entry = entry.map_err(|e| VerifyError::Infrastructure(e.to_string()))?;
-            let path = entry.path();
-
-            if path.extension().is_some_and(|ext| ext == "json") {
-                let check_id = path
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("")
-                    .to_string();
-
-                let content = std::fs::read_to_string(&path)
-                    .map_err(|e| VerifyError::Infrastructure(e.to_string()))?;
-                let check_data: serde_json::Value = serde_json::from_str(&content)
-                    .map_err(|e| VerifyError::Infrastructure(e.to_string()))?;
-
-                if let Some(exit_status) = check_data.get("exit_status").and_then(|v| v.as_i64()) {
-                    capsule_checks.insert(check_id.clone(), exit_status as i32);
-                }
-            }
-        }
-    }
-
-    // Run each check and compare
     let mut check_matches = Vec::new();
     let mut diverged_ids = Vec::new();
 
-    for (check_id, capsule_exit_status) in capsule_checks {
-        let max_attempts = if flaky_checks.contains(&check_id) {
-            3
+    for (check_id, check) in recorded {
+        let max_attempts = if capsule.flaky_checks.contains(&check_id) {
+            FLAKY_ATTEMPTS
         } else {
             1
         };
 
-        let mut actual_exit_status = None;
-        let mut last_error = None;
-
-        for attempt in 1..=max_attempts {
-            match runner.run(&tree, &check_id).await {
-                Ok(outcome) => {
-                    actual_exit_status = Some(outcome.exit_status);
-                    // If this succeeded, stop retrying (passing counts as pass)
-                    if outcome.exit_status == 0 {
-                        break;
-                    }
-                    // If this is not the last attempt, continue to retry
-                    if attempt < max_attempts {
-                        continue;
-                    }
-                }
-                Err(e) => {
-                    last_error = Some(e);
-                    // On infra error, return immediately
-                    if attempt == 1 {
-                        return Err(VerifyError::Infrastructure(last_error.unwrap().to_string()));
-                    }
-                }
+        let mut actual_exit = -1;
+        for _ in 0..max_attempts {
+            let outcome = runner
+                .run(&tree, &check.command)
+                .await
+                .map_err(|e| infra(format!("check {check_id}: {e}")))?;
+            actual_exit = outcome.exit_status;
+            if actual_exit == 0 {
+                break;
             }
         }
 
-        let actual_exit = match (actual_exit_status, last_error) {
-            (Some(status), _) => status,
-            (None, Some(err)) => {
-                return Err(VerifyError::Infrastructure(err.to_string()));
-            }
-            (None, None) => {
-                // Should not happen, but treat as error
-                return Err(VerifyError::Infrastructure(
-                    "Check execution inconclusive".to_string(),
-                ));
-            }
-        };
-
-        let matched = (capsule_exit_status == 0) == (actual_exit == 0);
+        let matched = (check.exit_status == 0) == (actual_exit == 0);
         if !matched {
             diverged_ids.push(check_id.clone());
         }
@@ -218,7 +141,7 @@ pub async fn verify(
             check_id,
             passed: actual_exit == 0,
             matched_capsule: matched,
-            capsule_exit_status,
+            capsule_exit_status: check.exit_status,
             actual_exit_status: actual_exit,
         });
     }
@@ -237,43 +160,105 @@ pub async fn verify(
     })
 }
 
-/// Clone a git repository at a specific commit.
-fn clone_at_commit(commit: &str, target: &Path) -> Result<(), String> {
-    // In a real implementation, this would clone from a remote.
-    // For testing, we'll use git worktree add from the current repo.
-    let output = Command::new("git")
-        .args(["worktree", "add", "--detach"])
-        .arg(target)
-        .arg(commit)
-        .output()
-        .map_err(|e| format!("Failed to create worktree: {}", e))?;
+fn infra(msg: String) -> VerifyError {
+    VerifyError::Infrastructure(msg)
+}
 
-    if !output.status.success() {
-        return Err(format!(
-            "git worktree add failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        ));
+/// Load `checks/<id>.json` files, keyed by check id (the file stem), in id order.
+fn load_checks(capsule_dir: &Path) -> Result<BTreeMap<String, CheckResult>, VerifyError> {
+    let mut checks = BTreeMap::new();
+    let checks_dir = capsule_dir.join("checks");
+    if !checks_dir.exists() {
+        return Ok(checks);
     }
+    let entries = std::fs::read_dir(&checks_dir).map_err(|e| infra(format!("checks/: {e}")))?;
+    for entry in entries {
+        let path = entry.map_err(|e| infra(format!("checks/: {e}")))?.path();
+        if path.extension().is_none_or(|ext| ext != "json") {
+            continue;
+        }
+        let id = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .ok_or_else(|| infra("check file name is not UTF-8".to_string()))?
+            .to_string();
+        let content =
+            std::fs::read_to_string(&path).map_err(|e| infra(format!("checks/{id}.json: {e}")))?;
+        let check: CheckResult =
+            serde_json::from_str(&content).map_err(|e| infra(format!("checks/{id}.json: {e}")))?;
+        checks.insert(id, check);
+    }
+    Ok(checks)
+}
 
+/// Run git in `dir` with hooks disabled; return stdout.
+fn git(dir: &Path, args: &[&str]) -> Result<String, VerifyError> {
+    let output = Command::new("git")
+        .args(["-c", "core.hooksPath=/dev/null", "-C"])
+        .arg(dir)
+        .args(args)
+        .output()
+        .map_err(|e| infra(format!("failed to run git: {e}")))?;
+    if !output.status.success() {
+        return Err(infra(format!(
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+/// Clone `source_repo` into `target` and check out `commit` detached.
+fn clone_at_commit(source_repo: &Path, commit: &str, target: &Path) -> Result<(), VerifyError> {
+    let output = Command::new("git")
+        .args([
+            "-c",
+            "core.hooksPath=/dev/null",
+            "clone",
+            "--quiet",
+            "--no-checkout",
+            "--",
+        ])
+        .arg(source_repo)
+        .arg(target)
+        .output()
+        .map_err(|e| infra(format!("failed to run git clone: {e}")))?;
+    if !output.status.success() {
+        return Err(infra(format!(
+            "git clone of {} failed: {}",
+            source_repo.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    git(target, &["checkout", "--quiet", "--detach", commit])?;
     Ok(())
 }
 
-/// Apply a patch to a git working tree.
-fn apply_patch(tree: &Path, patch_path: &Path) -> Result<(), String> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(tree)
-        .args(["apply", "--3way"])
-        .arg(patch_path)
-        .output()
-        .map_err(|e| format!("Failed to apply patch: {}", e))?;
-
-    if !output.status.success() {
-        return Err(format!(
-            "git apply failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        ));
+/// Apply one capsule patch to the tree. A missing or blank patch is skipped; a patch
+/// that does not apply is an infrastructure error naming the patch (F-1).
+fn apply_patch_file(tree: &Path, patch: &Path, name: &str) -> Result<(), VerifyError> {
+    if !patch.exists() {
+        return Ok(());
     }
-
+    let content = std::fs::read(patch).map_err(|e| infra(format!("{name}: {e}")))?;
+    if content.iter().all(u8::is_ascii_whitespace) {
+        return Ok(());
+    }
+    // Plain `git apply`: exact context only, no three-way fallback, so a replay
+    // never silently succeeds on a tree other than the one the patch was made on.
+    let output = Command::new("git")
+        .args(["-c", "core.hooksPath=/dev/null", "-C"])
+        .arg(tree)
+        .arg("apply")
+        .arg(patch)
+        .output()
+        .map_err(|e| infra(format!("{name}: failed to run git apply: {e}")))?;
+    if !output.status.success() {
+        return Err(infra(format!(
+            "{name} did not apply: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
     Ok(())
 }

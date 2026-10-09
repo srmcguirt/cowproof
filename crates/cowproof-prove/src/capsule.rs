@@ -6,6 +6,18 @@ use std::fs;
 use std::path::Path;
 use thiserror::Error;
 
+/// Files at the capsule root whose hashes `write` records.
+const CAPSULE_TOP_FILES: &[&str] = &[
+    "base.patch",
+    "launch.patch",
+    "lane.patch",
+    "gates.json",
+    "escalations.jsonl",
+];
+
+/// Capsule subdirectories whose files `write` hashes.
+const CAPSULE_SUBDIRS: &[&str] = &["packets", "checks", "applied"];
+
 /// Errors that can occur when reading/writing a capsule.
 #[derive(Error, Debug)]
 pub enum CapsuleError {
@@ -100,17 +112,37 @@ impl Capsule {
         }
     }
 
-    /// Write the capsule to a directory, computing and recording hashes of all files.
+    /// Write the capsule to a directory. Records the SHA256 of every capsule file
+    /// present in `dir` (patches, packets, checks, gates, escalations, applied
+    /// records) in `file_hashes` before writing `capsule.json`, which is itself never
+    /// hashed. Hashes already present are kept.
     pub fn write(&mut self, dir: &Path) -> Result<()> {
         fs::create_dir_all(dir)?;
+        for sub in CAPSULE_SUBDIRS {
+            fs::create_dir_all(dir.join(sub))?;
+        }
 
-        // Create subdirectories
-        fs::create_dir_all(dir.join("packets"))?;
-        fs::create_dir_all(dir.join("checks"))?;
-        fs::create_dir_all(dir.join("applied"))?;
+        for name in CAPSULE_TOP_FILES {
+            let path = dir.join(name);
+            if path.is_file() {
+                self.file_hashes
+                    .insert((*name).to_string(), Self::hash_file(&path)?);
+            }
+        }
+        for sub in CAPSULE_SUBDIRS {
+            for entry in fs::read_dir(dir.join(sub))? {
+                let path = entry?.path();
+                if path.is_file() {
+                    let name = path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .ok_or_else(|| anyhow::anyhow!("non-UTF-8 file name in {sub}"))?;
+                    self.file_hashes
+                        .insert(format!("{sub}/{name}"), Self::hash_file(&path)?);
+                }
+            }
+        }
 
-        // file_hashes should only contain hashes of OTHER files, not capsule.json itself
-        // (to avoid circular dependency in serialization)
         let capsule_json = serde_json::to_string_pretty(self)?;
         fs::write(dir.join("capsule.json"), &capsule_json)?;
 
@@ -130,7 +162,6 @@ impl Capsule {
         let capsule: Capsule =
             serde_json::from_str(&capsule_content).map_err(CapsuleError::JsonError)?;
 
-        // Verify all hashes in file_hashes
         for (file_path, expected_hash) in &capsule.file_hashes {
             let full_path = dir.join(file_path);
 
@@ -138,8 +169,8 @@ impl Capsule {
                 return Err(CapsuleError::MissingFile(file_path.clone()));
             }
 
-            let content = fs::read_to_string(&full_path).map_err(CapsuleError::IoError)?;
-            let actual_hash = Self::hash_string(&content);
+            let actual_hash = Self::hash_file(&full_path)
+                .map_err(|e| CapsuleError::InvalidFormat(format!("{file_path}: {e}")))?;
 
             if actual_hash != *expected_hash {
                 return Err(CapsuleError::HashMismatch(
@@ -151,13 +182,6 @@ impl Capsule {
         }
 
         Ok(capsule)
-    }
-
-    /// Compute the SHA256 hash of a string and return it as hex.
-    fn hash_string(content: &str) -> String {
-        let mut hasher = Sha256::new();
-        hasher.update(content.as_bytes());
-        format!("{:x}", hasher.finalize())
     }
 
     /// Compute the SHA256 hash of a file and return it as hex.
