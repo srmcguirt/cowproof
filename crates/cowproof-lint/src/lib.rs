@@ -54,6 +54,7 @@ pub fn lint_packet(packet_text: &str, repo_root: &Path, plans: &[Plan]) -> Vec<F
     if let Some(header) = header.as_ref() {
         lint_ownership(header, repo_root, &mut findings);
         lint_migrations(packet_text, header, repo_root, plans, &mut findings);
+        lint_header_checks(header, packet_text, &mut findings);
     }
     lint_secrets(packet_text, &mut findings);
     if let Some((start, section)) = checks_section(packet_text) {
@@ -77,6 +78,95 @@ fn error(rule: &'static str, line: Option<usize>, message: impl Into<String>) ->
         line,
         message: message.into(),
     }
+}
+
+fn warn(rule: &'static str, line: Option<usize>, message: impl Into<String>) -> Finding {
+    Finding {
+        severity: Severity::Warn,
+        rule,
+        line,
+        message: message.into(),
+    }
+}
+
+fn lint_header_checks(header: &Header, packet_text: &str, findings: &mut Vec<Finding>) {
+    if header.checks.is_empty() {
+        findings.push(warn(
+            "no-checks",
+            None,
+            "header declares no checks; a packet with no checks cannot be proven",
+        ));
+    } else {
+        // Check for duplicate check ids
+        let mut seen_ids = BTreeSet::new();
+        for check in &header.checks {
+            if !seen_ids.insert(&check.id) {
+                findings.push(error(
+                    "duplicate-check-id",
+                    None,
+                    format!("check id {:?} is duplicated", check.id),
+                ));
+            }
+            // Check id format: [a-z0-9][a-z0-9_-]{0,63}
+            if !is_valid_check_id(&check.id) {
+                findings.push(error(
+                    "invalid-check-id",
+                    None,
+                    format!(
+                        "check id {:?} must match [a-z0-9][a-z0-9_-]{{0,63}}",
+                        check.id
+                    ),
+                ));
+            }
+            // Check for empty command
+            if check.command.is_empty() {
+                findings.push(error(
+                    "empty-check-command",
+                    None,
+                    format!("check {:?} has an empty command", check.id),
+                ));
+            }
+            // Check for masked pipe in command
+            if has_masking_pipe(&check.command) {
+                findings.push(error(
+                    "masked-pipe-status",
+                    None,
+                    format!(
+                        "check {:?}: pipeline uses head, tail, or grep, which can hide the check command's exit status",
+                        check.id
+                    ),
+                ));
+            }
+        }
+
+        // Check that header checks match markdown section
+        if let Some((_start, section)) = checks_section(packet_text) {
+            for check in &header.checks {
+                if !section.contains(&check.command) {
+                    findings.push(warn(
+                        "check-section-mismatch",
+                        None,
+                        format!(
+                            "check {:?} command {:?} does not appear in ## Checks markdown section",
+                            check.id, check.command
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+}
+
+fn is_valid_check_id(id: &str) -> bool {
+    if id.is_empty() || id.len() > 64 {
+        return false;
+    }
+    let first = id.as_bytes()[0];
+    if !(first.is_ascii_lowercase() || first.is_ascii_digit()) {
+        return false;
+    }
+    id.bytes()
+        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
 }
 
 fn lint_ownership(header: &Header, root: &Path, findings: &mut Vec<Finding>) {
@@ -980,6 +1070,7 @@ mod tests {
                 "error [owns-parent-missing]: owned path \"tools/widget/evict.mjs\" does not exist and its parent folder is missing (\"tools/widget\"); create the folder or make the lane wide",
                 "error [owns-unmatched]: owns pattern \"tools/report/*.test.mjs\" matches no existing path while wide is false; add its existing parent directory to owns or make the lane wide",
                 "error [owns-parent-missing]: owned path \"docs/handoffs/handoff-lane-widget-cache.md\" does not exist and its parent folder is missing (\"docs/handoffs\"); create the folder or make the lane wide",
+                "warn [no-checks]: header declares no checks; a packet with no checks cannot be proven",
                 "error [check-path-missing] line 9: check references missing file \"tools/widget/cache.test.mjs\"",
                 "error [check-command-not-allowed] line 10: check command \"node tools/widget/evict.mjs --dry-run --scratch-parent /tmp/cowproof-$LANE_PORT_BASE\" is outside wide:false lane command permissions; add a matching allow entry or enable wide access",
                 "error [check-path-missing] line 10: check references missing file \"tools/widget/evict.mjs\"",
@@ -1000,7 +1091,8 @@ mod tests {
         assert_eq!(
             signatures(&findings),
             vec![
-                "error [owns-parent-missing]: owned path \"docs/reviews/2026-10-09/challenge/challenge-cache-design.md\" does not exist and its parent folder is missing (\"docs/reviews/2026-10-09/challenge\"); create the folder or make the lane wide"
+                "error [owns-parent-missing]: owned path \"docs/reviews/2026-10-09/challenge/challenge-cache-design.md\" does not exist and its parent folder is missing (\"docs/reviews/2026-10-09/challenge\"); create the folder or make the lane wide",
+                "warn [no-checks]: header declares no checks; a packet with no checks cannot be proven"
             ]
         );
         fs::remove_dir_all(dir).unwrap();
@@ -1013,7 +1105,12 @@ mod tests {
             &repository_root(),
             &[],
         );
-        assert_eq!(signatures(&findings), Vec::<String>::new());
+        assert_eq!(
+            signatures(&findings),
+            vec![
+                "warn [no-checks]: header declares no checks; a packet with no checks cannot be proven"
+            ]
+        );
     }
 
     #[test]

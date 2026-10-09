@@ -32,7 +32,7 @@ use cowproof_run::{
     stream::StreamMeter,
     tools::{self, CheckOutcome, CheckTable, RunCheck},
 };
-use serde_json::{Value, json};
+use serde_json::json;
 use std::collections::BTreeMap;
 use std::fs;
 use std::io;
@@ -170,70 +170,6 @@ fn lane_dir(layout: &LaneLayout) -> Result<PathBuf> {
         .parent()
         .map(Path::to_path_buf)
         .ok_or_else(|| anyhow!("lane clone {} has no parent", layout.clone.display()))
-}
-
-/// A check the packet declares: an id the builder passes to `run_check` and
-/// the command the runner runs for it. The command never reaches the builder
-/// through the tool; it is in the packet text the builder already reads.
-#[derive(Debug, PartialEq, Eq)]
-struct DeclaredCheck {
-    id: String,
-    command: String,
-}
-
-/// The `checks` array of the packet's lane header: `[{"id": ..., "command": ...}]`.
-///
-/// `cowproof_core::Header` has no `checks` field yet (backlog), so the raw
-/// header JSON is read here. An absent array declares no checks.
-fn declared_checks(packet: &str) -> Result<Vec<DeclaredCheck>> {
-    let start = packet
-        .find("<!--")
-        .and_then(|i| packet[i + 4..].find("lane").map(|j| i + 4 + j))
-        .ok_or_else(|| anyhow!("packet has no <!-- lane {{...}} --> header"))?;
-    let tail = &packet[start + 4..];
-    let open = tail
-        .find('{')
-        .ok_or_else(|| anyhow!("packet has no <!-- lane {{...}} --> header"))?;
-    let header: Value = serde_json::Deserializer::from_str(&tail[open..])
-        .into_iter::<Value>()
-        .next()
-        .ok_or_else(|| anyhow!("packet has no <!-- lane {{...}} --> header"))?
-        .context("invalid lane header JSON")?;
-    let Some(checks) = header.get("checks") else {
-        return Ok(Vec::new());
-    };
-    let checks = checks
-        .as_array()
-        .ok_or_else(|| anyhow!("header `checks` must be an array of {{\"id\",\"command\"}}"))?;
-    let mut declared: Vec<DeclaredCheck> = Vec::new();
-    for (i, check) in checks.iter().enumerate() {
-        let field = |name: &str| {
-            check
-                .get(name)
-                .and_then(Value::as_str)
-                .filter(|s| !s.trim().is_empty())
-                .ok_or_else(|| anyhow!("header check #{} needs a non-empty \"{name}\"", i + 1))
-        };
-        let id = field("id")?;
-        let command = field("command")?;
-        if id.len() > 64
-            || !id
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ':'))
-        {
-            bail!(
-                "header check id {id:?} must be at most 64 characters of letters, digits and _-.:"
-            );
-        }
-        if declared.iter().any(|d| d.id == id) {
-            bail!("header declares check id {id:?} twice");
-        }
-        declared.push(DeclaredCheck {
-            id: id.to_string(),
-            command: command.to_string(),
-        });
-    }
-    Ok(declared)
 }
 
 /// Resolve an executable once. A bare name is searched on `path` (absolute,
@@ -532,7 +468,7 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<()> {
         bail!("packet lint found errors");
     }
     let header = parse_header(&packet_text)?;
-    let checks = declared_checks(&packet_text)?;
+    let checks = &header.checks;
     if checks.is_empty() {
         eprintln!("warning: the packet declares no checks, so run_check will refuse every id");
     }
@@ -758,41 +694,29 @@ mod tests {
     }
 
     #[test]
-    fn declared_checks_reads_ids_and_commands() {
+    fn header_checks_parses_ids_and_commands() {
         let packet = r#"# T
-<!-- lane {"id":"t","owns":["a"],"checks":[{"id":"unit","command":"cargo test"},{"id":"fmt:all","command":"cargo fmt --check"}]} -->
+<!-- lane {"id":"test-id","owns":["a"],"checks":[{"id":"unit","command":"cargo test"},{"id":"fmt-all","command":"cargo fmt --check"}]} -->
 body"#;
-        assert_eq!(
-            declared_checks(packet).unwrap(),
-            [
-                DeclaredCheck {
-                    id: "unit".into(),
-                    command: "cargo test".into()
-                },
-                DeclaredCheck {
-                    id: "fmt:all".into(),
-                    command: "cargo fmt --check".into()
-                },
-            ]
-        );
-        let none = r#"<!-- lane {"id":"t","owns":["a"]} -->"#;
-        assert!(declared_checks(none).unwrap().is_empty());
+        let header = parse_header(packet).unwrap();
+        assert_eq!(header.checks.len(), 2);
+        assert_eq!(header.checks[0].id, "unit");
+        assert_eq!(header.checks[0].command, "cargo test");
+        assert!(!header.checks[0].flaky);
+        assert_eq!(header.checks[1].id, "fmt-all");
+        assert_eq!(header.checks[1].command, "cargo fmt --check");
+        assert!(!header.checks[1].flaky);
+
+        let none = r#"<!-- lane {"id":"test-id2","owns":["a"]} -->"#;
+        let header = parse_header(none).unwrap();
+        assert!(header.checks.is_empty());
     }
 
     #[test]
-    fn declared_checks_refuses_malformed_entries() {
-        let case = |checks: &str| {
-            declared_checks(&format!(
-                r#"<!-- lane {{"id":"t","owns":["a"],"checks":{checks}}} -->"#
-            ))
-            .unwrap_err()
-            .to_string()
-        };
-        assert!(case(r#"{"id":"a"}"#).contains("must be an array"));
-        assert!(case(r#"[{"id":"a"}]"#).contains("\"command\""));
-        assert!(case(r#"[{"id":"","command":"x"}]"#).contains("\"id\""));
-        assert!(case(r#"[{"id":"a b","command":"x"}]"#).contains("letters, digits"));
-        assert!(case(r#"[{"id":"a","command":"x"},{"id":"a","command":"y"}]"#).contains("twice"));
+    fn header_checks_defaults_flaky_to_false() {
+        let packet = r#"<!-- lane {"id":"test-id3","owns":["a"],"checks":[{"id":"c1","command":"cargo test"}]} -->"#;
+        let header = parse_header(packet).unwrap();
+        assert!(!header.checks[0].flaky);
     }
 
     #[test]

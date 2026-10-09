@@ -34,6 +34,15 @@ pub const PROTOCOL_MARKERS: &[&str] = &[
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
+pub struct Check {
+    pub id: String,
+    pub command: String,
+    #[serde(default)]
+    pub flaky: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
 pub struct Header {
     pub id: String,
     pub owns: Vec<String>,
@@ -67,6 +76,8 @@ pub struct Header {
     pub network: bool,
     #[serde(default)]
     pub web_search: bool,
+    #[serde(default)]
+    pub checks: Vec<Check>,
 }
 
 fn default_runner() -> String {
