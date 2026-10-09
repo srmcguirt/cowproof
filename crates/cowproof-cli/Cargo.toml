@@ -19,3 +19,8 @@ cowproof-host = { path = "../cowproof-host" }
 cowproof-plan = { path = "../cowproof-plan" }
 cowproof-lint = { path = "../cowproof-lint" }
 cowproof-run = { path = "../cowproof-run" }
+portkit-core.workspace = true
+portkit-mcp.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

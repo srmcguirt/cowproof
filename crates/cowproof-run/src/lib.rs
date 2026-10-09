@@ -16,6 +16,7 @@ pub mod lane;
 pub mod prefix;
 pub mod proxy;
 pub mod stream;
+pub mod tools;
 
 use sha2::{Digest, Sha256};
 
@@ -60,6 +61,12 @@ pub struct SandboxPolicy {
     /// The user's real home directory. It is hidden (denied on macOS, a tmpfs
     /// on Linux) except for the toolchain paths the policy grants back.
     pub home: PathBuf,
+    /// The one Unix socket the sandboxed process may connect to: the lane's
+    /// runner socket (D22). Only `builder` and `run_check` set it. The grant
+    /// covers the socket and nothing else: no other socket, and no other file
+    /// in the socket's directory (macOS: denied for reads; Linux: only the
+    /// socket file is bound in).
+    pub connect_socket: Option<PathBuf>,
 }
 
 impl SandboxPolicy {
@@ -86,6 +93,7 @@ impl SandboxPolicy {
             env_set: vec![cargo_home(&lane_cargo)],
             env_allowlist: None,
             home: lane.real_home.clone(),
+            connect_socket: Some(lane.sock.clone()),
         }
     }
 
@@ -107,11 +115,13 @@ impl SandboxPolicy {
             env_set: vec![cargo_home(&verifier_cargo)],
             env_allowlist: None,
             home: lane.real_home.clone(),
+            connect_socket: None,
         }
     }
 
     /// Run check: read-write to clone and scratch (and the lane's own cargo
-    /// home); no network.
+    /// home); no network, except the lane's runner socket (a check run through
+    /// `run_check` may itself call the builder tools).
     pub fn run_check(lane: &LaneLayout) -> Self {
         let lane_cargo = lane.home.join(".cargo");
         Self {
@@ -122,6 +132,7 @@ impl SandboxPolicy {
             env_set: vec![cargo_home(&lane_cargo)],
             env_allowlist: None,
             home: lane.real_home.clone(),
+            connect_socket: Some(lane.sock.clone()),
         }
     }
 
@@ -136,6 +147,7 @@ impl SandboxPolicy {
             env_set: vec![],
             env_allowlist: None,
             home: lane.real_home.clone(),
+            connect_socket: None,
         }
     }
 
@@ -149,6 +161,7 @@ impl SandboxPolicy {
             env_set: vec![],
             env_allowlist: None,
             home: lane.real_home.clone(),
+            connect_socket: None,
         }
     }
 
@@ -185,6 +198,10 @@ pub struct LaneLayout {
     pub control: PathBuf,
     /// The user's real home directory, hidden from the sandbox.
     pub real_home: PathBuf,
+    /// The runner socket FILE, `<lane>/sock/runner.sock` (D22). Its directory
+    /// is created by `prepare_lane` with mode 0700; the runner binds the
+    /// socket there before the builder starts.
+    pub sock: PathBuf,
 }
 
 /// Lockfiles, at the tree root only, that determine the dependencies (D11).
@@ -468,6 +485,8 @@ struct Resolved {
     ro: BTreeSet<PathBuf>,
     deny: BTreeSet<PathBuf>,
     credentials: Vec<PathBuf>,
+    /// The connectable socket file and its directory, resolved.
+    socket: Option<(PathBuf, PathBuf)>,
 }
 
 fn resolve_all(paths: &[PathBuf]) -> Result<BTreeSet<PathBuf>> {
@@ -495,12 +514,33 @@ fn resolve(policy: &SandboxPolicy) -> Result<Resolved> {
         .iter()
         .map(|c| canonicalize_for_sandbox(&home.join(c)))
         .collect::<Result<Vec<_>>>()?;
+    let socket = match &policy.connect_socket {
+        None => None,
+        Some(sock) => {
+            let sock = canonicalize_for_sandbox(sock)?;
+            let dir = sock
+                .parent()
+                .ok_or_else(|| anyhow!("socket {} has no directory", sock.display()))?
+                .to_path_buf();
+            // The directory is denied for reads and writes on macOS; a grant
+            // inside it would be cut off by that rule.
+            if let Some(p) = rw.iter().chain(ro.iter()).find(|p| p.starts_with(&dir)) {
+                bail!(
+                    "grant {} lies inside the socket directory {}",
+                    p.display(),
+                    dir.display()
+                );
+            }
+            Some((sock, dir))
+        }
+    };
     Ok(Resolved {
         home,
         rw,
         ro,
         deny,
         credentials,
+        socket,
     })
 }
 
@@ -567,6 +607,16 @@ pub fn render_macos_profile(policy: &SandboxPolicy) -> Result<String> {
         ));
     }
 
+    // The socket directory: nothing in it can be read or listed. Connecting to
+    // the one socket is a network operation and is granted below; Seatbelt
+    // does not need the file rules to allow it.
+    if let Some((_, dir)) = &r.socket {
+        out.push_str(&format!(
+            "(deny file-read* file-write* (subpath {}))\n",
+            sbpl(dir)?
+        ));
+    }
+
     match &policy.network {
         NetworkMode::None => out.push_str("(deny network*)\n"),
         NetworkMode::Proxy { port, .. } | NetworkMode::RegistryReadOnly { port, .. } => {
@@ -577,6 +627,20 @@ pub fn render_macos_profile(policy: &SandboxPolicy) -> Result<String> {
         }
         // Legacy: no network rules.
         NetworkMode::Unrestricted => {}
+    }
+
+    // The runner socket (D22): exactly this path, never the bare
+    // `(remote unix-socket)`, which would admit every Unix socket. It follows
+    // the `(deny network*)` above because Seatbelt applies the last matching
+    // rule. Unrestricted mode has no deny to carve an exception from, so the
+    // socket is already reachable and no network rule is written.
+    if let Some((sock, _)) = &r.socket
+        && policy.network != NetworkMode::Unrestricted
+    {
+        out.push_str(&format!(
+            "(allow network-outbound (remote unix-socket (path-literal {})))\n",
+            sbpl(sock)?
+        ));
     }
     Ok(out)
 }
@@ -633,6 +697,14 @@ pub fn render_bwrap_args(policy: &SandboxPolicy, cmd: &[String]) -> Result<Vec<S
         if p.exists() {
             bind(&mut args, "--ro-bind", p, p)?;
         }
+    }
+    // The runner socket file alone (D22), never its directory, so nothing else
+    // in the socket directory is visible. Bound when it exists, like the proxy
+    // socket: the runner binds it before the builder starts.
+    if let Some((sock, _)) = &r.socket
+        && sock.exists()
+    {
+        bind(&mut args, "--ro-bind", sock, sock)?;
     }
     for c in &r.credentials {
         if c.exists() {
@@ -712,6 +784,7 @@ mod tests {
             scratch: PathBuf::from("/nonexistent-cp/lanes/l1/scratch"),
             control: PathBuf::from("/nonexistent-cp/lanes/l1/control"),
             real_home: PathBuf::from("/nonexistent-cp/realhome"),
+            sock: PathBuf::from("/nonexistent-cp/lanes/l1/sock/runner.sock"),
         }
     }
 
@@ -773,6 +846,93 @@ mod tests {
             .unwrap();
         // Seatbelt applies the last matching rule: the allow must follow the deny.
         assert!(deny < allow, "{profile}");
+    }
+
+    #[test]
+    fn socket_grant_is_exact_path_after_the_network_deny_and_only_for_builder_and_run_check() {
+        let lane = test_lane();
+        let sock = "/nonexistent-cp/lanes/l1/sock/runner.sock";
+        let rule =
+            format!("(allow network-outbound (remote unix-socket (path-literal \"{sock}\")))");
+        for (name, p) in all_policies(&lane) {
+            let profile = render_macos_profile(&p).unwrap();
+            let owns = matches!(name, "builder" | "run_check");
+            assert_eq!(profile.contains(&rule), owns, "{name}\n{profile}");
+            assert_eq!(
+                profile.contains("unix-socket"),
+                owns,
+                "{name} mentions a socket it does not own\n{profile}"
+            );
+            // The directory is closed to reads and writes, for owners only.
+            let dir_deny =
+                "(deny file-read* file-write* (subpath \"/nonexistent-cp/lanes/l1/sock\"))";
+            assert_eq!(profile.contains(dir_deny), owns, "{name}\n{profile}");
+            // Never the bare form, which admits every Unix socket.
+            assert!(!profile.contains("(remote unix-socket)"), "{name}");
+        }
+        let profile =
+            render_macos_profile(&SandboxPolicy::builder(&lane, NetworkMode::None)).unwrap();
+        let deny = profile.find("(deny network*)").unwrap();
+        // Seatbelt applies the last matching rule: the allow must follow the deny.
+        assert!(
+            deny < profile.find("(remote unix-socket").unwrap(),
+            "{profile}"
+        );
+    }
+
+    #[test]
+    fn a_grant_inside_the_socket_directory_is_refused() {
+        let lane = test_lane();
+        let mut p = SandboxPolicy::builder(&lane, NetworkMode::None);
+        p.rw_paths.push(lane.sock.parent().unwrap().join("inner"));
+        let err = render_macos_profile(&p).unwrap_err().to_string();
+        assert!(err.contains("inside the socket directory"), "{err}");
+    }
+
+    #[test]
+    fn linux_binds_the_socket_file_alone_and_only_for_owners() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        for d in [
+            "lane/clone",
+            "lane/home",
+            "lane/scratch",
+            "lane/control",
+            "lane/sock",
+            "realhome/.rustup",
+        ] {
+            std::fs::create_dir_all(root.join(d)).unwrap();
+        }
+        let lane = LaneLayout {
+            clone: root.join("lane/clone"),
+            home: root.join("lane/home"),
+            scratch: root.join("lane/scratch"),
+            control: root.join("lane/control"),
+            real_home: root.join("realhome"),
+            sock: root.join("lane/sock/runner.sock"),
+        };
+        std::fs::write(&lane.sock, b"").unwrap();
+        let sock = lane.sock.to_str().unwrap().to_string();
+        let dir = lane.sock.parent().unwrap().to_str().unwrap().to_string();
+        let cache = root.join("cache");
+        for (name, p) in [
+            ("builder", SandboxPolicy::builder(&lane, NetworkMode::None)),
+            ("run_check", SandboxPolicy::run_check(&lane)),
+            ("verifier", SandboxPolicy::verifier(&lane, &cache)),
+            ("capture", SandboxPolicy::capture(&lane)),
+        ] {
+            let args = render_bwrap_args(&p, &[]).unwrap();
+            let bound = args
+                .windows(3)
+                .any(|w| w[0] == "--ro-bind" && w[1] == sock && w[2] == sock);
+            assert_eq!(
+                bound,
+                matches!(name, "builder" | "run_check"),
+                "{name}: {args:?}"
+            );
+            // Never the directory: nothing else in it may be visible.
+            assert!(!args.contains(&dir), "{name}: {args:?}");
+        }
     }
 
     #[test]
@@ -988,6 +1148,7 @@ mod tests {
             scratch: root.join("lane/scratch"),
             control: root.join("lane/control"),
             real_home: root.join("realhome"),
+            sock: root.join("lane/sock/runner.sock"),
         };
         let args =
             render_bwrap_args(&SandboxPolicy::builder(&lane, NetworkMode::None), &[]).unwrap();
@@ -1169,6 +1330,7 @@ mod tests {
             scratch: PathBuf::from("/tmp/cowproof-unit-l57000"), // does not exist yet
             control: spelled("lane/control"),
             real_home: spelled("realhome"),
+            sock: spelled("lane/sock/runner.sock"),
         };
         for (name, p) in all_policies(&lane) {
             let profile = render_macos_profile(&p).unwrap();

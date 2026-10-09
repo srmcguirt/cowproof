@@ -8,7 +8,9 @@
 //! a denial test pass: the allowed probes must succeed in the same run.
 
 use cowproof_run::{LaneLayout, NetworkMode, SandboxPolicy, render_macos_profile, sandbox_command};
+use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
+use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -16,6 +18,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 const CONTROL_SECRET: &str = "CONTROL-SECRET-4f1c";
 const CRED_SECRET: &str = "CRED-SECRET-77ab";
 const HOME_SECRET: &str = "HOME-SECRET-92de";
+const SOCK_DIR_SECRET: &str = "SOCK-DIR-SECRET-5c08";
 
 static COUNTER: AtomicU32 = AtomicU32::new(0);
 
@@ -40,6 +43,8 @@ impl Fixture {
         for d in [
             "lane/clone",
             "lane/control",
+            "lane/sock",
+            "other/sock",
             "lane/home/.cargo",
             "home/.cargo/bin",
             "home/.cargo/registry",
@@ -50,6 +55,7 @@ impl Fixture {
         let w = |p: PathBuf, s: &str| std::fs::write(p, s).unwrap();
         w(root.join("lane/control/secret"), CONTROL_SECRET);
         w(root.join("lane/clone/file"), "clone-original");
+        w(root.join("lane/sock/stray"), SOCK_DIR_SECRET);
         w(root.join("home/.cargo/registry/x"), "registry-x");
         w(root.join("home/.cargo/credentials.toml"), CRED_SECRET);
         w(root.join("home/.cargo/bin/tool"), "tool-original");
@@ -61,6 +67,7 @@ impl Fixture {
             scratch,
             control: lane_root.join("control"),
             real_home: fake_home,
+            sock: lane_root.join("sock/runner.sock"),
         };
         Fixture {
             _tmp: tmp,
@@ -436,6 +443,177 @@ fn live_macos_proxy_mode_allows_only_the_proxy_port() {
             "{mode:?}: another port was reachable\n{}",
             describe(&o)
         );
+    }
+}
+
+// ---------------------------------------------------------------- D22 socket
+
+/// Answers `pong` to a line on every connection and counts the connections.
+fn serve_pong(path: &Path) -> std::sync::Arc<AtomicU32> {
+    let listener = UnixListener::bind(path).unwrap();
+    let accepted = std::sync::Arc::new(AtomicU32::new(0));
+    let count = accepted.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { return };
+            count.fetch_add(1, Ordering::SeqCst);
+            let mut line = String::new();
+            let _ = BufReader::new(&stream).read_line(&mut line);
+            let _ = writeln!(stream, "pong");
+        }
+    });
+    accepted
+}
+
+/// Prints `CONNECTED:pong` after a ping round trip with the socket at
+/// `path`, or `REFUSED:...` when the connection is not allowed. perl is on
+/// every macOS and Linux host and speaks Unix sockets.
+fn socket_probe(tag: &str, path: &Path) -> String {
+    format!(
+        r#"perl -MSocket -e '$p = shift; socket(S, PF_UNIX, SOCK_STREAM, 0) or die; if (connect(S, sockaddr_un($p))) {{ select(S); $| = 1; print S "ping\n"; $l = <S>; select(STDOUT); print "{tag}_CONNECTED:$l" }} else {{ print "{tag}_REFUSED:$!\n" }}' '{}'"#,
+        path.display()
+    )
+}
+
+#[test]
+fn live_d22_builder_and_run_check_reach_their_own_runner_socket_only() {
+    if !sandbox_available() {
+        return;
+    }
+    let f = Fixture::new();
+    let own_hits = serve_pong(&f.lane.sock);
+    let other_sock = f.root.join("other/sock/runner.sock");
+    let other_hits = serve_pong(&other_sock);
+
+    let script = format!(
+        "echo START\n{}\n{}",
+        socket_probe("OWN", &f.lane.sock),
+        socket_probe("OTHER", &other_sock)
+    );
+    for (name, policy) in [
+        (
+            "builder",
+            SandboxPolicy::builder(&f.lane, NetworkMode::None),
+        ),
+        ("run_check", SandboxPolicy::run_check(&f.lane)),
+    ] {
+        let o = run(&policy, &f.lane_root, &script);
+        let out = stdout(&o);
+        let why = describe(&o);
+        assert!(out.contains("START"), "{name}: sandbox did not run\n{why}");
+        assert!(
+            out.contains("OWN_CONNECTED:pong"),
+            "{name}: its own runner socket must be reachable\n{why}"
+        );
+        assert!(
+            out.contains("OTHER_REFUSED:") && !out.contains("OTHER_CONNECTED"),
+            "{name}: another lane's socket was reachable\n{why}"
+        );
+    }
+    assert_eq!(
+        own_hits.load(Ordering::SeqCst),
+        2,
+        "one connection per policy"
+    );
+    assert_eq!(
+        other_hits.load(Ordering::SeqCst),
+        0,
+        "the other runner saw a connection"
+    );
+}
+
+#[test]
+fn live_d22_verifier_capture_and_dependency_fetch_get_no_socket() {
+    if !sandbox_available() {
+        return;
+    }
+    let f = Fixture::new();
+    let hits = serve_pong(&f.lane.sock);
+    let cache = f.root.join("cache");
+    std::fs::create_dir_all(cache.join(".cargo")).unwrap();
+    let script = format!("echo START\n{}", socket_probe("OWN", &f.lane.sock));
+    for (name, policy) in [
+        ("verifier", SandboxPolicy::verifier(&f.lane, &cache)),
+        ("capture", SandboxPolicy::capture(&f.lane)),
+        (
+            "dependency_fetch",
+            SandboxPolicy::dependency_fetch(&f.lane, &cache, NetworkMode::None),
+        ),
+    ] {
+        let o = run(&policy, &f.lane_root, &script);
+        let out = stdout(&o);
+        assert!(out.contains("START"), "{name}\n{}", describe(&o));
+        assert!(
+            out.contains("OWN_REFUSED:") && !out.contains("OWN_CONNECTED"),
+            "{name} reached the runner socket\n{}",
+            describe(&o)
+        );
+    }
+    assert_eq!(hits.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn live_d22_socket_grant_opens_neither_control_nor_the_rest_of_the_socket_dir() {
+    if !sandbox_available() {
+        return;
+    }
+    let f = Fixture::new();
+    serve_pong(&f.lane.sock);
+    let c = f.lane.control.display();
+    let d = f.lane.sock.parent().unwrap().display();
+    let script = format!(
+        r#"
+{probe}
+echo "R_CONTROL:$(cat '{c}/secret' 2>&1)"
+echo x > '{c}/new' 2>/dev/null; echo "W_CONTROL:$?"
+for e in $(ls '{c}' 2>/dev/null); do echo "LISTED_CONTROL:$e"; done
+echo "R_STRAY:$(cat '{d}/stray' 2>&1)"
+for e in $(ls '{d}' 2>/dev/null); do echo "LISTED_SOCK:$e"; done
+echo x > '{d}/planted' 2>/dev/null; echo "W_SOCK_DIR:$?"
+echo END
+"#,
+        probe = socket_probe("OWN", &f.lane.sock)
+    );
+    for (name, policy) in [
+        (
+            "builder",
+            SandboxPolicy::builder(&f.lane, NetworkMode::None),
+        ),
+        ("run_check", SandboxPolicy::run_check(&f.lane)),
+    ] {
+        let o = run(&policy, &f.lane_root, &script);
+        let out = stdout(&o);
+        let why = describe(&o);
+        // the socket grant works in the same sandbox, so the denials below
+        // are not a sandbox that failed to start
+        assert!(out.contains("OWN_CONNECTED:pong"), "{name}\n{why}");
+        assert!(out.contains("END"), "{name}\n{why}");
+        for secret in [CONTROL_SECRET, SOCK_DIR_SECRET] {
+            assert!(!out.contains(secret), "{name}: {secret} was read\n{why}");
+        }
+        assert!(!out.contains("W_CONTROL:0"), "{name}\n{why}");
+        assert!(
+            !out.contains("LISTED_CONTROL:"),
+            "{name}: control was listed\n{why}"
+        );
+        // The stray file is never listed. macOS denies the whole directory;
+        // on Linux only the socket file is bound into a fresh tmpfs, so the
+        // runner.sock entry is visible and a write there succeeds but never
+        // reaches the host (the file checks below).
+        assert!(
+            !out.contains("LISTED_SOCK:stray"),
+            "{name}: the socket directory exposed a file\n{why}"
+        );
+        if cfg!(target_os = "macos") {
+            assert!(!out.contains("LISTED_SOCK:"), "{name}: listed\n{why}");
+            assert!(!out.contains("W_SOCK_DIR:0"), "{name}\n{why}");
+        }
+        assert!(!f.lane.control.join("new").exists(), "{name}");
+        assert!(
+            !f.lane.sock.parent().unwrap().join("planted").exists(),
+            "{name}"
+        );
+        assert_eq!(read(f.lane.control.join("secret")), CONTROL_SECRET);
     }
 }
 

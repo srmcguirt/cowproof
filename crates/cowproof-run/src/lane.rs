@@ -1,7 +1,8 @@
 //! Lane preparation: an isolated clone of the base, the base patch, and the
 //! launch baseline (D2, R10/D13, R15).
 //!
-//! [`prepare_lane`] builds `<lanes_root>/<lane_id>/{clone,home,scratch,control}`.
+//! [`prepare_lane`] builds `<lanes_root>/<lane_id>/{clone,home,scratch,control,sock}`.
+//! `sock` is an owner-only (0700) directory for the runner socket (D22).
 //! The clone is a real, independent repository: no hardlinks to the source's
 //! objects, no alternates and no remotes, so nothing the builder does can reach
 //! the source repository. Uncommitted work (only with `allow_dirty`) is recorded
@@ -14,6 +15,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::Write;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
@@ -122,10 +124,17 @@ fn build_lane(
         real_home: std::env::var_os("HOME")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("/")),
+        sock: lane_dir.join("sock").join("runner.sock"),
     };
     for dir in [&layout.home, &layout.scratch, &layout.control] {
         fs::create_dir(dir).with_context(|| format!("creating {}", dir.display()))?;
     }
+    // The socket directory (D22): owner-only. The runner binds the socket in
+    // it; the sandbox gets that one file and nothing else in the directory.
+    let sock_dir = lane_dir.join("sock");
+    fs::create_dir(&sock_dir).with_context(|| format!("creating {}", sock_dir.display()))?;
+    fs::set_permissions(&sock_dir, fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("restricting {}", sock_dir.display()))?;
 
     let base_patch = if dirty {
         let patch = capture_base_patch(repo, &layout.scratch)?;
@@ -1024,6 +1033,23 @@ mod tests {
         assert_eq!(fs::read_to_string(repo.join("README.md")).unwrap(), "one");
         assert_eq!(git(&repo, &["status", "--porcelain"]), "");
         assert_eq!(git(&repo, &["log", "--format=%s"]), "initial\n");
+    }
+
+    #[test]
+    fn lane_gets_an_owner_only_socket_dir_and_a_socket_path_inside_it() {
+        let tmp = TempDir::new().unwrap();
+        let repo = repo_with(&tmp, &[("README.md", "one")]);
+        let lanes_root = tmp.path().join("lanes");
+
+        let lane = prepare_lane(&repo, &lanes_root, "l1", clean_opts()).unwrap();
+
+        let dir = lanes_root.join("l1/sock");
+        assert_eq!(lane.layout.sock, dir.join("runner.sock"));
+        let meta = fs::metadata(&dir).unwrap();
+        assert!(meta.is_dir());
+        assert_eq!(meta.permissions().mode() & 0o777, 0o700);
+        // The runner binds the socket; preparing the lane does not.
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 0);
     }
 
     #[test]

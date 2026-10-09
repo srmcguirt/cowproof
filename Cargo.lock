@@ -443,8 +443,11 @@ dependencies = [
  "cowproof-lint",
  "cowproof-plan",
  "cowproof-run",
+ "portkit-core",
+ "portkit-mcp",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
 ]
 

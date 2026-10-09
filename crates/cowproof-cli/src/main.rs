@@ -28,6 +28,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 
+mod lane_tools;
+
 #[derive(Parser)]
 #[command(name = "lanes", about = "Run isolated engineering lanes")]
 struct Args {
@@ -41,6 +43,17 @@ enum Action {
     Host(HostArgs),
     Hosts,
     Plan(PlanArgs),
+    /// The builder's tools (`ask`, `check_ruling`, `run_check`) as an MCP
+    /// stdio server. It runs inside the sandbox and is only a client of the
+    /// runner socket; the builder runtime launches it, people do not.
+    #[command(hide = true)]
+    LaneTools(LaneToolsArgs),
+}
+#[derive(Parser)]
+struct LaneToolsArgs {
+    /// The lane's runner socket, `<lane>/sock/runner.sock`.
+    #[arg(long)]
+    socket: PathBuf,
 }
 #[derive(Parser)]
 struct PlanArgs {
@@ -136,6 +149,7 @@ async fn main() -> Result<()> {
             PlanAction::Run { repo, max, dry_run } => plan_run(&repo, max, dry_run),
             PlanAction::Collect { repo } => plan_collect(&repo),
         },
+        Action::LaneTools(args) => lane_tools::run(args.socket).await,
     }
 }
 
@@ -1742,6 +1756,8 @@ async fn run_in_slot(
         scratch: scratch.clone(),
         control: lane.join("control"),
         real_home: home(),
+        // The legacy runner has no runner socket; the path never exists.
+        sock: lane.join("sock/runner.sock"),
     };
     let mut policy = SandboxPolicy::builder(&lane_layout, NetworkMode::Unrestricted);
     policy.rw_paths.extend(extra.clone());
