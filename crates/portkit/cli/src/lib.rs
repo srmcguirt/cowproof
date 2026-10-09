@@ -280,7 +280,11 @@ pub enum Shell {
 }
 
 impl Command {
-    pub async fn execute(self, registry: Registry, config: &Config) -> portkit_core::Result<ExitCode> {
+    pub async fn execute(
+        self,
+        registry: Registry,
+        config: &Config,
+    ) -> portkit_core::Result<ExitCode> {
         match self {
             Command::Tools { json } => commands::tools(&registry, json),
             Command::Schema { tool } => commands::schema(&registry, &tool),

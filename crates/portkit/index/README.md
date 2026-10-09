@@ -60,6 +60,7 @@ agents re-check it two more ways.
 ## Usage
 
 ```bash
+# pkx was removed in cowproof; these commands are kept for history
 pkx index <repo>      # build + persist to <repo>/.portkit/cache/
 pkx sym <name> [repo] # cold query
 pkx bench <repo>      # comparison harness vs grep
