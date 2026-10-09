@@ -653,15 +653,6 @@ impl Body for RequestTap {
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Bytes>, BoxError>>> {
-        // Check idle timeout before trying to read more data
-        if self.as_mut().idle_sleep.as_mut().poll(cx).is_ready() {
-            eprintln!(
-                "proxy idle timeout: request_id={} direction=request",
-                self.request_id
-            );
-            return Poll::Ready(Some(Err("idle timeout".into())));
-        }
-
         match Pin::new(&mut self.inner).poll_frame(cx) {
             Poll::Ready(Some(Ok(frame))) => {
                 if let Some(data) = frame.data_ref() {
@@ -671,13 +662,25 @@ impl Body for RequestTap {
                         return Poll::Ready(Some(Err("request body too large".into())));
                     }
                 }
-                // Reset idle timeout on successful frame
-                self.idle_sleep = Box::pin(tokio::time::sleep(self.idle_timeout));
+                // A frame resets the idle timer.
+                let deadline = tokio::time::Instant::now() + self.idle_timeout;
+                self.idle_sleep.as_mut().reset(deadline);
                 Poll::Ready(Some(Ok(frame)))
             }
             Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(Box::new(e)))),
             Poll::Ready(None) => Poll::Ready(None),
-            Poll::Pending => Poll::Pending,
+            // Only a body with nothing ready can be idle: polling the timer here
+            // registers the wakeup, and a frame that is ready always goes through.
+            Poll::Pending => {
+                if self.idle_sleep.as_mut().poll(cx).is_ready() {
+                    eprintln!(
+                        "proxy idle timeout: request_id={} direction=request",
+                        self.request_id
+                    );
+                    return Poll::Ready(Some(Err("idle timeout".into())));
+                }
+                Poll::Pending
+            }
         }
     }
 
@@ -749,16 +752,6 @@ impl Body for ResponseTap {
     ) -> Poll<Option<Result<Frame<Bytes>, BoxError>>> {
         let this = &mut *self;
 
-        // Check idle timeout before trying to read more data
-        if this.idle_sleep.as_mut().poll(cx).is_ready() {
-            this.finish();
-            eprintln!(
-                "proxy idle timeout: request_id={} direction=response",
-                this.request_id
-            );
-            return Poll::Ready(Some(Err("idle timeout".into())));
-        }
-
         match Pin::new(&mut this.inner).poll_frame(cx) {
             Poll::Ready(Some(Ok(frame))) => {
                 if let Some(data) = frame.data_ref() {
@@ -771,8 +764,9 @@ impl Body for ResponseTap {
                         }
                     }
                 }
-                // Reset idle timeout on successful frame
-                this.idle_sleep = Box::pin(tokio::time::sleep(this.idle_timeout));
+                // A frame resets the idle timer.
+                let deadline = tokio::time::Instant::now() + this.idle_timeout;
+                this.idle_sleep.as_mut().reset(deadline);
                 // A body framed by Content-Length may never be polled again after its last
                 // frame, so the metric is written here as well as at the end of the stream.
                 if this.inner.is_end_stream() {
@@ -788,7 +782,18 @@ impl Body for ResponseTap {
                 this.finish();
                 Poll::Ready(None)
             }
-            Poll::Pending => Poll::Pending,
+            // See RequestTap: the timer is checked only when nothing is ready.
+            Poll::Pending => {
+                if this.idle_sleep.as_mut().poll(cx).is_ready() {
+                    this.finish();
+                    eprintln!(
+                        "proxy idle timeout: request_id={} direction=response",
+                        this.request_id
+                    );
+                    return Poll::Ready(Some(Err("idle timeout".into())));
+                }
+                Poll::Pending
+            }
         }
     }
 
