@@ -1492,7 +1492,10 @@ mod tests {
             line.contains(&format!("(literal \"{}\")", lane_dir.display())),
             "{line}"
         );
-        assert!(!line.contains("subpath"), "metadata must be literal: {line}");
+        assert!(
+            !line.contains("subpath"),
+            "metadata must be literal: {line}"
+        );
     }
 
     #[test]
