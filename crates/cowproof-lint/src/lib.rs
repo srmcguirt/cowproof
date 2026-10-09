@@ -1114,6 +1114,132 @@ mod tests {
     }
 
     #[test]
+    fn header_checks_duplicate_id_is_error() {
+        let dir = root();
+        let text = packet(
+            r#"{"id":"test-dup","owns":["x"],"checks":[{"id":"unit","command":"cargo test"},{"id":"unit","command":"cargo fmt"}]}"#,
+            "",
+        );
+        let findings = lint_packet(&text, &dir, &[]);
+        assert!(has(&findings, "duplicate-check-id"));
+        assert!(
+            signatures(&findings)
+                .iter()
+                .any(|s| s.contains("\"unit\"") && s.contains("duplicated"))
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn header_checks_bad_id_is_error() {
+        let dir = root();
+        let long_id = "x".repeat(65);
+        let bad_ids = vec!["Bad Id", long_id.as_str(), "-invalid"];
+        for bad_id in bad_ids {
+            let text = packet(
+                &format!(
+                    r#"{{"id":"test-bad","owns":["x"],"checks":[{{"id":"{}","command":"cargo test"}}]}}"#,
+                    bad_id
+                ),
+                "",
+            );
+            let findings = lint_packet(&text, &dir, &[]);
+            assert!(
+                has(&findings, "invalid-check-id"),
+                "bad id {} should trigger invalid-check-id",
+                bad_id
+            );
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn header_checks_empty_command_is_error() {
+        let dir = root();
+        let text = packet(
+            r#"{"id":"test-empty","owns":["x"],"checks":[{"id":"unit","command":""}]}"#,
+            "",
+        );
+        let findings = lint_packet(&text, &dir, &[]);
+        assert!(has(&findings, "empty-check-command"));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn header_checks_masked_pipe_is_error() {
+        let dir = root();
+        let text = packet(
+            r#"{"id":"test-pipe","owns":["x"],"checks":[{"id":"unit","command":"cargo test | grep ok"}]}"#,
+            "",
+        );
+        let findings = lint_packet(&text, &dir, &[]);
+        assert!(has(&findings, "masked-pipe-status"));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn header_checks_no_checks_is_warning() {
+        let dir = root();
+        let text = packet(r#"{"id":"test-no-checks","owns":["x"]}"#, "");
+        let findings = lint_packet(&text, &dir, &[]);
+        assert!(has(&findings, "no-checks"));
+        let warns: Vec<_> = findings
+            .iter()
+            .filter(|f| f.severity == Severity::Warn && f.rule == "no-checks")
+            .collect();
+        assert_eq!(warns.len(), 1);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn header_checks_section_mismatch_is_warning() {
+        let dir = root();
+        let text = [
+            &packet(
+                r#"{"id":"test-mismatch","owns":["x"],"checks":[{"id":"unit","command":"cargo test"}]}"#,
+                ""
+            ),
+            "## Checks\n\n```\ncargo fmt --check\n```"
+        ].concat();
+        let findings = lint_packet(&text, &dir, &[]);
+        assert!(has(&findings, "check-section-mismatch"));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn header_checks_clean_packet_has_no_header_checks_findings() {
+        let dir = root();
+        let text = [
+            &packet(
+                r#"{"id":"test-clean","owns":["x"],"checks":[{"id":"unit","command":"cargo test"},{"id":"fmt","command":"cargo fmt --check"}]}"#,
+                ""
+            ),
+            "## Checks\n\n```\ncargo test\ncargo fmt --check\n```"
+        ].concat();
+        let findings = lint_packet(&text, &dir, &[]);
+        // Should have no header-checks specific error rules (allowed warnings for metadata)
+        let header_error_findings: Vec<_> = findings
+            .iter()
+            .filter(|f| {
+                f.severity == Severity::Error
+                    && matches!(
+                        f.rule,
+                        "duplicate-check-id"
+                            | "invalid-check-id"
+                            | "empty-check-command"
+                            | "masked-pipe-status"
+                    )
+            })
+            .collect();
+        assert_eq!(
+            header_error_findings.len(),
+            0,
+            "clean packet should have no header checks error findings"
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn packet_restates_protocol_when_pasting_ask_schema() {
         let dir = root();
         let text = format!(

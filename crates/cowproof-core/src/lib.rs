@@ -549,6 +549,30 @@ mod tests {
         assert!(c.is_wide());
         assert_eq!(parse_header("<!-- lane {\"id\":\"lane-f\",\"runner\":\"codex\",\"model\":\"gpt-6-terra\",\"allowHeavy\":true,\"owns\":[\"a\"]} -->").unwrap().model(),"gpt-6-terra");
     }
+
+    #[test]
+    fn header_checks_parses_to_exact_vec() {
+        let h = parse_header(
+            "<!-- lane {\"id\":\"test-checks\",\"owns\":[\"a\"],\"checks\":[{\"id\":\"unit\",\"command\":\"cargo test\"},{\"id\":\"fmt-all\",\"command\":\"cargo fmt --check\",\"flaky\":true}]} -->"
+        )
+        .unwrap();
+        assert_eq!(
+            h.checks,
+            vec![
+                Check {
+                    id: "unit".into(),
+                    command: "cargo test".into(),
+                    flaky: false,
+                },
+                Check {
+                    id: "fmt-all".into(),
+                    command: "cargo fmt --check".into(),
+                    flaky: true,
+                },
+            ]
+        );
+    }
+
     #[test]
     fn ownership_globs_and_split() {
         assert!(glob_matches("scripts/schema/*.mjs", "scripts/schema/a.mjs"));
