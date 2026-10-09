@@ -1,0 +1,47 @@
+{
+  "tool": "chunk_text",
+  "id": "non-ascii-counts-characters",
+  "input": {
+    "text": "héllo wörld, grüße aus zürich",
+    "size": 8,
+    "overlap": 2
+  },
+  "expected": {
+    "chunks": [
+      {
+        "index": 0,
+        "start": 0,
+        "end": 8,
+        "text": "héllo wö"
+      },
+      {
+        "index": 1,
+        "start": 6,
+        "end": 14,
+        "text": "wörld, g"
+      },
+      {
+        "index": 2,
+        "start": 12,
+        "end": 20,
+        "text": " grüße a"
+      },
+      {
+        "index": 3,
+        "start": 18,
+        "end": 26,
+        "text": " aus zür"
+      },
+      {
+        "index": 4,
+        "start": 24,
+        "end": 29,
+        "text": "ürich"
+      }
+    ],
+    "count": 5
+  },
+  "captured_at": "2026-09-09T15:54:28.210933Z",
+  "source": "python3 examples/python/agent.py",
+  "note": "Pins character indexing; byte slicing would disagree with Python and panic in Rust."
+}

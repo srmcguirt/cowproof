@@ -1,0 +1,41 @@
+{
+  "tool": "word_frequency",
+  "id": "repeated-words",
+  "input": {
+    "text": "the cat sat on the mat the cat was happy",
+    "top_k": 5
+  },
+  "expected": {
+    "total": 10,
+    "unique": 7,
+    "words": [
+      {
+        "word": "the",
+        "count": 3,
+        "share": 0.3
+      },
+      {
+        "word": "cat",
+        "count": 2,
+        "share": 0.2
+      },
+      {
+        "word": "happy",
+        "count": 1,
+        "share": 0.1
+      },
+      {
+        "word": "mat",
+        "count": 1,
+        "share": 0.1
+      },
+      {
+        "word": "on",
+        "count": 1,
+        "share": 0.1
+      }
+    ]
+  },
+  "captured_at": "2026-09-09T15:54:28.332827Z",
+  "source": "python3 examples/python/agent.py"
+}

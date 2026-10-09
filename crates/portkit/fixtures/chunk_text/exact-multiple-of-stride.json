@@ -1,0 +1,35 @@
+{
+  "tool": "chunk_text",
+  "id": "exact-multiple-of-stride",
+  "input": {
+    "text": "abcdefghijklmnopqrstuvwxyz",
+    "size": 10,
+    "overlap": 0
+  },
+  "expected": {
+    "chunks": [
+      {
+        "index": 0,
+        "start": 0,
+        "end": 10,
+        "text": "abcdefghij"
+      },
+      {
+        "index": 1,
+        "start": 10,
+        "end": 20,
+        "text": "klmnopqrst"
+      },
+      {
+        "index": 2,
+        "start": 20,
+        "end": 26,
+        "text": "uvwxyz"
+      }
+    ],
+    "count": 3
+  },
+  "captured_at": "2026-09-09T15:54:28.115049Z",
+  "source": "python3 examples/python/agent.py",
+  "note": "Stride divides the input exactly; the loop must not emit a trailing empty chunk."
+}

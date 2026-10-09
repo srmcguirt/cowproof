@@ -1,0 +1,17 @@
+
+!.env.example
+!.vscode/settings.json
+**/*.rs.bk
+*.iml
+*.pdb
+*.py[cod]
+.DS_Store
+.env
+.env.*
+.idea/
+.portkit/
+.venv/
+.vscode/*
+/.portkit/
+/target
+__pycache__/

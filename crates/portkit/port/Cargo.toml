@@ -1,0 +1,22 @@
+[package]
+name = "portkit-port"
+description = "Golden-fixture parity harness for portkit: capture I/O fixtures from a reference implementation (typically Python) and replay them against the Rust port."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+portkit-core.workspace = true
+portkit-mcp.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+time.workspace = true
+
+[dev-dependencies]
+async-trait.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

@@ -1,0 +1,26 @@
+[package]
+name = "portkit-read"
+description = "Session-aware file reader: returns only what the caller does not already have."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "pk-read"
+path = "src/main.rs"
+
+[lib]
+name = "portkit_read"
+path = "src/lib.rs"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+time.workspace = true
+blake3 = "1"
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -1,0 +1,27 @@
+{
+  "tool": "word_frequency",
+  "id": "punctuation-and-case",
+  "input": {
+    "text": "Don't stop! Don't. Stop? DON'T",
+    "top_k": 3
+  },
+  "expected": {
+    "total": 5,
+    "unique": 2,
+    "words": [
+      {
+        "word": "don't",
+        "count": 3,
+        "share": 0.6
+      },
+      {
+        "word": "stop",
+        "count": 2,
+        "share": 0.4
+      }
+    ]
+  },
+  "captured_at": "2026-09-09T15:54:28.480953Z",
+  "source": "python3 examples/python/agent.py",
+  "note": "Apostrophes are word characters; everything else splits."
+}

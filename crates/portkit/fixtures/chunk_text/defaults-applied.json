@@ -1,0 +1,20 @@
+{
+  "tool": "chunk_text",
+  "id": "defaults-applied",
+  "input": {
+    "text": "Defaults should apply when size and overlap are omitted, which is the common call shape from an agent."
+  },
+  "expected": {
+    "chunks": [
+      {
+        "index": 0,
+        "start": 0,
+        "end": 102,
+        "text": "Defaults should apply when size and overlap are omitted, which is the common call shape from an agent."
+      }
+    ],
+    "count": 1
+  },
+  "captured_at": "2026-09-09T15:54:28.272115Z",
+  "source": "python3 examples/python/agent.py"
+}

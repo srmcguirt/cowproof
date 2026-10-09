@@ -1,0 +1,31 @@
+{
+  "tool": "word_frequency",
+  "id": "shares-are-thirds",
+  "input": {
+    "text": "a b c a b c a b c"
+  },
+  "expected": {
+    "total": 9,
+    "unique": 3,
+    "words": [
+      {
+        "word": "a",
+        "count": 3,
+        "share": 0.3333333333333333
+      },
+      {
+        "word": "b",
+        "count": 3,
+        "share": 0.3333333333333333
+      },
+      {
+        "word": "c",
+        "count": 3,
+        "share": 0.3333333333333333
+      }
+    ]
+  },
+  "captured_at": "2026-09-09T15:54:28.38013Z",
+  "source": "python3 examples/python/agent.py",
+  "note": "1/3 is not representable in binary; this is the case that proves epsilon comparison is needed."
+}

@@ -1,0 +1,27 @@
+[package]
+name = "portkit-index"
+description = "PROTOTYPE: persistent symbol index to test whether a warm resident service beats grep on both latency and payload."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lib]
+name = "portkit_index"
+path = "src/lib.rs"
+
+[[bin]]
+name = "pkx"
+path = "src/main.rs"
+
+[dependencies]
+portkit-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+ignore = "0.4"
+memchr = "2"
+ast-grep-core = "0.45"
+ast-grep-language = "0.45"

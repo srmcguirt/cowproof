@@ -1,0 +1,15 @@
+# Cases fed to the reference implementation by `pk port capture`.
+# One JSON object per line: {"tool": …, "input": …}. Blank lines and #
+# comments are ignored, so you can group and annotate as the suite grows.
+
+{"tool": "chunk_text", "id": "short-text-single-chunk", "input": {"text": "A short passage that fits in one chunk.", "size": 120, "overlap": 20}}
+{"tool": "chunk_text", "id": "exact-multiple-of-stride", "input": {"text": "abcdefghijklmnopqrstuvwxyz", "size": 10, "overlap": 0}, "note": "Stride divides the input exactly; the loop must not emit a trailing empty chunk."}
+{"tool": "chunk_text", "id": "overlapping-windows", "input": {"text": "abcdefghijklmnopqrstuvwxyz", "size": 10, "overlap": 4}}
+{"tool": "chunk_text", "id": "non-ascii-counts-characters", "input": {"text": "héllo wörld, grüße aus zürich", "size": 8, "overlap": 2}, "note": "Pins character indexing; byte slicing would disagree with Python and panic in Rust."}
+{"tool": "chunk_text", "id": "defaults-applied", "input": {"text": "Defaults should apply when size and overlap are omitted, which is the common call shape from an agent."}}
+
+{"tool": "word_frequency", "id": "repeated-words", "input": {"text": "the cat sat on the mat the cat was happy", "top_k": 5}}
+{"tool": "word_frequency", "id": "shares-are-thirds", "input": {"text": "a b c a b c a b c"}, "note": "1/3 is not representable in binary; this is the case that proves epsilon comparison is needed."}
+{"tool": "word_frequency", "id": "ties-break-alphabetically", "input": {"text": "zebra yak xerus walrus"}}
+{"tool": "word_frequency", "id": "punctuation-and-case", "input": {"text": "Don't stop! Don't. Stop? DON'T", "top_k": 3}, "note": "Apostrophes are word characters; everything else splits."}
+{"tool": "word_frequency", "id": "empty-input", "input": {"text": "   "}, "note": "Must return zeros rather than dividing by zero."}

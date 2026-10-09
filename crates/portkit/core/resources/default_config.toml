@@ -1,0 +1,52 @@
+# Compiled into the binary. Override with `--config <file>` or PK_* env vars,
+# e.g. PK_PARITY__EPSILON=1e-6 or PK_LOG__LEVEL=debug.
+
+[log]
+# tracing-subscriber env-filter directive. Logs always go to stderr, never
+# stdout — stdout is the MCP protocol channel.
+level = "info"
+
+[server]
+# Name advertised to MCP clients during initialize.
+name = "portkit"
+# instructions = "Tools for ..."
+
+[parity]
+# Float tolerance when replaying reference fixtures. Python and Rust round
+# differently at the last place; demanding bit equality flags every port.
+epsilon = 1e-9
+epsilon_rel = 1e-9
+# JSON Pointer prefixes to exclude, e.g. ["/meta/generated_at"].
+ignore_paths = []
+# Compare arrays as multisets rather than sequences.
+unordered_arrays = false
+
+[output]
+# Default cap on tool output, in bytes of serialized JSON (~4 bytes/token).
+# Applied at the CLI and MCP boundaries, not inside Registry::call — the
+# parity harness must compare what a tool actually produced.
+max_bytes = 16384
+# Never trim an array below this; an empty list says less than three examples.
+min_items = 3
+
+[trace]
+# Record bytes produced vs delivered per tool call, so token cost is measured
+# rather than assumed. Off by default; `pk trace` reads what it writes.
+enabled = false
+dir = ".portkit/traces"
+
+[schema]
+# Committed snapshot files, loaded at startup so `tools/list` is already
+# grounded. Capture one with `pks pull`.
+snapshots = []
+
+[plugins]
+# External tools, declared explicitly — never discovered by scanning, which
+# would turn a dropped file into code execution. Absent file = no plugins.
+# Project is loaded after global, so a repo can override an inherited tool.
+global = "~/.portkit/plugins.toml"
+project = ".portkit/plugins.toml"
+
+[index]
+# Repository root for `sym` and `outline`. Empty string disables them.
+root = "."

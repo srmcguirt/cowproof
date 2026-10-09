@@ -1,0 +1,15 @@
+{
+  "tool": "word_frequency",
+  "id": "empty-input",
+  "input": {
+    "text": "   "
+  },
+  "expected": {
+    "total": 0,
+    "unique": 0,
+    "words": []
+  },
+  "captured_at": "2026-09-09T15:54:28.537614Z",
+  "source": "python3 examples/python/agent.py",
+  "note": "Must return zeros rather than dividing by zero."
+}

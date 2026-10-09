@@ -1,0 +1,22 @@
+{
+  "tool": "chunk_text",
+  "id": "short-text-single-chunk",
+  "input": {
+    "text": "A short passage that fits in one chunk.",
+    "size": 120,
+    "overlap": 20
+  },
+  "expected": {
+    "chunks": [
+      {
+        "index": 0,
+        "start": 0,
+        "end": 39,
+        "text": "A short passage that fits in one chunk."
+      }
+    ],
+    "count": 1
+  },
+  "captured_at": "2026-09-09T15:54:28.065247Z",
+  "source": "python3 examples/python/agent.py"
+}

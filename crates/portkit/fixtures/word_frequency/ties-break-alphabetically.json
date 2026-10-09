@@ -1,0 +1,35 @@
+{
+  "tool": "word_frequency",
+  "id": "ties-break-alphabetically",
+  "input": {
+    "text": "zebra yak xerus walrus"
+  },
+  "expected": {
+    "total": 4,
+    "unique": 4,
+    "words": [
+      {
+        "word": "walrus",
+        "count": 1,
+        "share": 0.25
+      },
+      {
+        "word": "xerus",
+        "count": 1,
+        "share": 0.25
+      },
+      {
+        "word": "yak",
+        "count": 1,
+        "share": 0.25
+      },
+      {
+        "word": "zebra",
+        "count": 1,
+        "share": 0.25
+      }
+    ]
+  },
+  "captured_at": "2026-09-09T15:54:28.434753Z",
+  "source": "python3 examples/python/agent.py"
+}

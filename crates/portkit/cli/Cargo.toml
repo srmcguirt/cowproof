@@ -1,0 +1,24 @@
+[package]
+name = "portkit-cli"
+description = "Clap-based command surface for portkit: turns a portkit-core Registry into a full CLI (run, tools, schema, serve, port capture/replay, completions)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+portkit-core.workspace = true
+portkit-mcp.workspace = true
+portkit-port.workspace = true
+portkit-read.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+clap.workspace = true
+clap_complete.workspace = true
+regex = "1"
+time.workspace = true

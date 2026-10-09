@@ -1,0 +1,40 @@
+{
+  "tool": "chunk_text",
+  "id": "overlapping-windows",
+  "input": {
+    "text": "abcdefghijklmnopqrstuvwxyz",
+    "size": 10,
+    "overlap": 4
+  },
+  "expected": {
+    "chunks": [
+      {
+        "index": 0,
+        "start": 0,
+        "end": 10,
+        "text": "abcdefghij"
+      },
+      {
+        "index": 1,
+        "start": 6,
+        "end": 16,
+        "text": "ghijklmnop"
+      },
+      {
+        "index": 2,
+        "start": 12,
+        "end": 22,
+        "text": "mnopqrstuv"
+      },
+      {
+        "index": 3,
+        "start": 18,
+        "end": 26,
+        "text": "stuvwxyz"
+      }
+    ],
+    "count": 4
+  },
+  "captured_at": "2026-09-09T15:54:28.165587Z",
+  "source": "python3 examples/python/agent.py"
+}

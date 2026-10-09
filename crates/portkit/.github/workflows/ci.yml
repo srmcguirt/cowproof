@@ -1,0 +1,79 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace --all-targets
+      # Doc examples are documentation users copy; they must compile.
+      - run: cargo test --workspace --doc
+      # Live introspection is feature-gated so the default install stays
+      # light; without this the gated path would rot unnoticed.
+      - run: cargo test -p portkit-schema --features postgres
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo clippy -p portkit-schema --features postgres --all-targets -- -D warnings
+
+  parity:
+    name: python parity
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: Swatinem/rust-cache@v2
+
+      # Re-capture from the Python reference rather than trusting the committed
+      # fixtures. This catches the case the harness exists for: the two
+      # implementations drifting apart after someone edits only one of them.
+      # Captured to a scratch directory, since `captured_at` changes every run
+      # and would otherwise read as drift.
+      - name: Re-capture from the Python reference
+        run: |
+          cargo run --bin pk -- port capture \
+            --cmd 'python3 examples/python/agent.py' \
+            --cases examples/cases.jsonl \
+            --out "$RUNNER_TEMP/fresh-fixtures"
+
+      - name: Fail if the committed fixtures are stale
+        run: python3 scripts/check_fixtures_fresh.py fixtures "$RUNNER_TEMP/fresh-fixtures"
+
+      - name: Replay against the Rust port
+        run: cargo run --bin pk -- port replay --fixtures fixtures
+
+  msrv:
+    name: minimum supported rust version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.90.0
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --workspace
