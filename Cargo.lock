@@ -502,6 +502,7 @@ dependencies = [
  "async-trait",
  "cowproof-core",
  "predicates",
+ "regex",
  "serde",
  "serde_json",
  "sha2",
@@ -509,6 +510,7 @@ dependencies = [
  "thiserror",
  "time",
  "tokio",
+ "toml 0.8.23",
  "tracing",
 ]
 
