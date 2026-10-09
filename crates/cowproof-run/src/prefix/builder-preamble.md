@@ -150,8 +150,9 @@ Report every check result you run. Do not claim a check passed unless `run_check
 
 The runner tracks two triggers:
 
-1. **Same check failed twice.** If the same check id fails, then passes, then fails again, the runner will force an escalation. You do not have to ask—the runner opens an escalation with the check's output and your attempt history.
-2. **Cost share exceeded.** If your total estimated cost reaches 40% of the lane's cost cap, the runner will force an escalation.
+1. **Same check failed twice in a row.** If the same check id fails twice with no pass in between, the runner forces an escalation. A pass resets the count. You do not have to ask: the runner opens an escalation with the check's output and your attempt history.
+2. **Cost share reached.** If your estimated cost reaches 40% of the lane's cost cap before any check has passed, the runner forces an escalation.
+3. **Turn budget reached.** If you reach the lane's turn budget before any check has passed, the runner forces an escalation.
 
 When a forced escalation happens, your session ends. The runner records what you tried and opens the escalation for the director.
 

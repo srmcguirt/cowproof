@@ -1045,6 +1045,18 @@ mod tests {
     }
 
     #[test]
+    fn protocol_markers_all_occur_in_the_preamble() {
+        // A marker that is not in the preamble can never match a pasted protocol section.
+        let preamble = include_str!("../../cowproof-run/src/prefix/builder-preamble.md");
+        for marker in cowproof_core::PROTOCOL_MARKERS {
+            assert!(
+                preamble.contains(marker),
+                "marker {marker:?} does not occur in the builder preamble"
+            );
+        }
+    }
+
+    #[test]
     fn protocol_markers_are_distinctive_phrases() {
         // Verify markers are multi-word phrases, not bare tool names or common words
         // that would create false positives in normal packets.
