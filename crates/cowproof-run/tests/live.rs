@@ -79,27 +79,30 @@ impl Drop for Fixture {
 
 /// Can this host run the sandbox at all? Linux needs bubblewrap and user
 /// namespaces; macOS always has sandbox-exec.
+/// Whether the live tests can create a sandbox here. With
+/// `COWPROOF_REQUIRE_SANDBOX=1` (set in CI) an unavailable sandbox is a test
+/// failure, not a skip, so a runner that cannot sandbox can never report these
+/// tests as passing.
 fn sandbox_available() -> bool {
     if cfg!(target_os = "macos") {
         return true;
     }
-    match Command::new("bwrap")
+    let reason = match Command::new("bwrap")
         .args(["--ro-bind", "/", "/", "true"])
         .output()
     {
-        Ok(o) if o.status.success() => true,
-        Ok(o) => {
-            eprintln!(
-                "SKIP: bwrap cannot create a sandbox here (user namespaces unavailable?): {}",
-                String::from_utf8_lossy(&o.stderr).trim()
-            );
-            false
-        }
-        Err(e) => {
-            eprintln!("SKIP: bwrap is not installed: {e}");
-            false
-        }
+        Ok(o) if o.status.success() => return true,
+        Ok(o) => format!(
+            "bwrap cannot create a sandbox here (user namespaces unavailable?): {}",
+            String::from_utf8_lossy(&o.stderr).trim()
+        ),
+        Err(e) => format!("bwrap is not installed: {e}"),
+    };
+    if std::env::var_os("COWPROOF_REQUIRE_SANDBOX").is_some_and(|v| v == "1") {
+        panic!("COWPROOF_REQUIRE_SANDBOX=1 but {reason}");
     }
+    eprintln!("SKIP: {reason}");
+    false
 }
 
 fn platform() -> &'static str {

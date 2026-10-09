@@ -34,9 +34,13 @@ jobs:
         with:
           components: clippy, rustfmt
 
-      - name: Install bubblewrap (Linux only)
+      - name: Install bubblewrap and allow user namespaces (Linux only)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y bubblewrap
+        run: |
+          sudo apt-get update && sudo apt-get install -y bubblewrap
+          # Ubuntu 24.04 restricts unprivileged user namespaces through AppArmor;
+          # the live sandbox tests need them to run instead of skipping.
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
 
       - uses: Swatinem/rust-cache@v2
 
@@ -47,6 +51,8 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Run tests
+        env:
+          COWPROOF_REQUIRE_SANDBOX: "1"
         run: cargo test --workspace --locked
 
   msrv:
