@@ -22,6 +22,31 @@ use serde::{Deserialize, Serialize};
 
 use std::option::Option as StdOption;
 
+/// Tracking state for a single check.
+#[derive(Debug, Clone)]
+struct CheckState {
+    consecutive_failures: usize,
+    last_pass: bool,
+}
+
+/// Segment state for cost and turn tracking per lane.
+#[derive(Debug, Clone)]
+struct SegmentState {
+    cost_triggered: bool,
+    turn_count: usize,
+}
+
+/// Lane lifecycle state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LaneState {
+    Running,
+    Finished,
+    Proved,
+    Refuted,
+    Stopped,
+    EscalationLimit,
+}
+
 /// Escalation ID, e.g. E1, E2. Monotonic per lane.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, PartialOrd, Ord)]
 pub struct EscalationId(pub String);
@@ -341,6 +366,12 @@ pub struct Queue {
     clock: Box<dyn Clock>,
     park_limit: Duration,
     max_escalations: usize,
+    // Escalate-early tracking
+    check_state: HashMap<String, HashMap<String, CheckState>>,
+    segment_state: HashMap<String, SegmentState>,
+    lane_state: HashMap<String, LaneState>,
+    max_turns: usize,
+    cost_limit_fraction: f64,
 }
 
 impl Queue {
@@ -356,6 +387,18 @@ impl Queue {
         park_limit: Duration,
         max_escalations: usize,
     ) -> std::io::Result<Self> {
+        Self::with_all_limits(control_dir, clock, park_limit, max_escalations, 100, 0.4)
+    }
+
+    /// Open or create a queue with all configurable limits.
+    pub fn with_all_limits(
+        control_dir: &Path,
+        clock: Box<dyn Clock>,
+        park_limit: Duration,
+        max_escalations: usize,
+        max_turns: usize,
+        cost_limit_fraction: f64,
+    ) -> std::io::Result<Self> {
         let mut queue = Queue {
             control_dir: control_dir.to_path_buf(),
             escalations: HashMap::new(),
@@ -364,6 +407,11 @@ impl Queue {
             clock,
             park_limit,
             max_escalations,
+            check_state: HashMap::new(),
+            segment_state: HashMap::new(),
+            lane_state: HashMap::new(),
+            max_turns,
+            cost_limit_fraction,
         };
 
         // Rebuild from file if it exists
@@ -467,6 +515,43 @@ impl Queue {
     /// Record a ruling. Returns error if the escalation ID is unknown,
     /// already ruled, or for an ended lane.
     pub fn rule(&mut self, lane: &str, id: &EscalationId, verdict: &Verdict) -> Result<(), String> {
+        // Check lane terminal state
+        if let StdOption::Some(state) = self.lane_state.get(lane) {
+            match state {
+                LaneState::Running => {}
+                LaneState::Finished => {
+                    return Err(format!(
+                        "ruling for {} rejected: lane in terminal state finished",
+                        id
+                    ));
+                }
+                LaneState::Proved => {
+                    return Err(format!(
+                        "ruling for {} rejected: lane in terminal state proved",
+                        id
+                    ));
+                }
+                LaneState::Refuted => {
+                    return Err(format!(
+                        "ruling for {} rejected: lane in terminal state refuted",
+                        id
+                    ));
+                }
+                LaneState::Stopped => {
+                    return Err(format!(
+                        "ruling for {} rejected: lane in terminal state stopped",
+                        id
+                    ));
+                }
+                LaneState::EscalationLimit => {
+                    return Err(format!(
+                        "ruling for {} rejected: lane in terminal state escalation-limit",
+                        id
+                    ));
+                }
+            }
+        }
+
         // Check if already ruled
         if let Some((_, _, ruled)) = self.escalations.get(id) {
             if ruled.is_some() {
@@ -500,7 +585,7 @@ impl Queue {
 
         // Store in memory
         if let Some((_, _, ruled)) = self.escalations.get_mut(id) {
-            *ruled = Some(verdict.clone());
+            *ruled = StdOption::Some(verdict.clone());
         }
 
         Ok(())
@@ -526,29 +611,184 @@ impl Queue {
         Ok(())
     }
 
-    /// Record a check result. Two failures without a pass in between trigger
-    /// a forced escalation.
+    /// Record a check result. Two failures without a pass in between trigger a forced escalation.
     pub fn record_check(
         &mut self,
-        _lane: &str,
-        _check_id: &str,
-        _passed: bool,
+        lane: &str,
+        check_id: &str,
+        passed: bool,
     ) -> Result<StdOption<EscalationId>, String> {
-        // Simplified: store last result per check
-        // This is a placeholder for a more complete check tracking system
-        // A full implementation would track check_id -> (last_passed, failures)
-        Ok(StdOption::None)
+        let lane_checks = self.check_state.entry(lane.to_string()).or_default();
+        let check = lane_checks
+            .entry(check_id.to_string())
+            .or_insert_with(|| CheckState {
+                consecutive_failures: 0,
+                last_pass: true,
+            });
+
+        if passed {
+            check.consecutive_failures = 0;
+            check.last_pass = true;
+            Ok(StdOption::None)
+        } else {
+            check.consecutive_failures += 1;
+            let should_force = check.consecutive_failures >= 2 && !check.last_pass;
+            check.last_pass = false;
+
+            if should_force {
+                // Two consecutive failures without a pass in between
+                let ask = Ask {
+                    kind: AskKind::Blocker,
+                    question: format!(
+                        "Check '{}' failed {} times consecutively",
+                        check_id, check.consecutive_failures
+                    ),
+                    tried: vec![format!(
+                        "Check {} failed attempts: {}",
+                        check_id, check.consecutive_failures
+                    )],
+                    options: vec![
+                        Opt {
+                            id: "retry".to_string(),
+                            summary: "Retry the check".to_string(),
+                            cost: "minimal".to_string(),
+                        },
+                        Opt {
+                            id: "skip".to_string(),
+                            summary: "Skip this check".to_string(),
+                            cost: "risk".to_string(),
+                        },
+                    ],
+                    recommend: "retry".to_string(),
+                    blocking: true,
+                };
+
+                let eid = self.ask(
+                    lane,
+                    &ask,
+                    Origin::Forced {
+                        reason: format!("check {} failed twice", check_id),
+                    },
+                )?;
+                Ok(StdOption::Some(eid))
+            } else {
+                Ok(StdOption::None)
+            }
+        }
     }
 
-    /// Record cost spent. Returns a trigger ID if we've hit the cost limit.
+    /// Record cost spent. Once spent ≥ 0.4 × cap with no passing check, force escalation (once per segment).
     pub fn record_cost(
         &mut self,
-        _lane: &str,
-        _spent: f64,
-        _cap: f64,
-    ) -> Result<StdOption<String>, String> {
-        // Placeholder: check if spent >= 0.4 * cap
-        Ok(StdOption::None)
+        lane: &str,
+        spent: f64,
+        cap: f64,
+    ) -> Result<StdOption<EscalationId>, String> {
+        let segment = self
+            .segment_state
+            .entry(lane.to_string())
+            .or_insert_with(|| SegmentState {
+                cost_triggered: false,
+                turn_count: 0,
+            });
+
+        if !segment.cost_triggered && spent >= (self.cost_limit_fraction * cap) {
+            segment.cost_triggered = true;
+
+            let ask = Ask {
+                kind: AskKind::Blocker,
+                question: format!(
+                    "Cost exceeded: {:.1}% of cap ({:.2} / {:.2})",
+                    (spent / cap) * 100.0,
+                    spent,
+                    cap
+                ),
+                tried: vec![format!("Builder spent {:.2} of {:.2}", spent, cap)],
+                options: vec![
+                    Opt {
+                        id: "continue".to_string(),
+                        summary: "Continue building".to_string(),
+                        cost: "higher cost".to_string(),
+                    },
+                    Opt {
+                        id: "stop".to_string(),
+                        summary: "Stop the lane".to_string(),
+                        cost: "none".to_string(),
+                    },
+                ],
+                recommend: "continue".to_string(),
+                blocking: true,
+            };
+
+            let eid = self.ask(
+                lane,
+                &ask,
+                Origin::Forced {
+                    reason: format!("cost {:.1}% of cap", (spent / cap) * 100.0),
+                },
+            )?;
+            Ok(StdOption::Some(eid))
+        } else {
+            Ok(StdOption::None)
+        }
+    }
+
+    /// Record a turn. Once turns ≥ max_turns with no passing check, force escalation.
+    pub fn record_turn(&mut self, lane: &str) -> Result<StdOption<EscalationId>, String> {
+        let segment = self
+            .segment_state
+            .entry(lane.to_string())
+            .or_insert_with(|| SegmentState {
+                cost_triggered: false,
+                turn_count: 0,
+            });
+
+        segment.turn_count += 1;
+        if segment.turn_count >= self.max_turns {
+            let ask = Ask {
+                kind: AskKind::Blocker,
+                question: format!("Turn budget exceeded: {} turns used", segment.turn_count),
+                tried: vec![format!("Builder used {} turns", segment.turn_count)],
+                options: vec![
+                    Opt {
+                        id: "continue".to_string(),
+                        summary: "Continue building".to_string(),
+                        cost: "more turns".to_string(),
+                    },
+                    Opt {
+                        id: "reassign".to_string(),
+                        summary: "Escalate to a stronger model".to_string(),
+                        cost: "higher cost".to_string(),
+                    },
+                ],
+                recommend: "reassign".to_string(),
+                blocking: true,
+            };
+
+            let eid = self.ask(
+                lane,
+                &ask,
+                Origin::Forced {
+                    reason: format!("turn budget {} reached", self.max_turns),
+                },
+            )?;
+            Ok(StdOption::Some(eid))
+        } else {
+            Ok(StdOption::None)
+        }
+    }
+
+    /// Reassign to a different model: reset attempt counters but NOT escalation count.
+    pub fn reassign(&mut self, lane: &str) -> Result<(), String> {
+        // Reset segment state (cost and turn tracking) but keep escalation_count
+        self.segment_state.remove(lane);
+        self.check_state.remove(lane);
+        Ok(())
+    }
+
+    /// Set the lane state.
+    pub fn set_lane_state(&mut self, lane: &str, state: LaneState) {
+        self.lane_state.insert(lane.to_string(), state);
     }
 
     /// Get an escalation by ID.
@@ -845,5 +1085,280 @@ mod tests {
         assert!(retrieved.is_some());
         let (_, retrieved_origin, _) = retrieved.unwrap();
         assert_eq!(retrieved_origin, &origin);
+    }
+
+    #[test]
+    fn test_record_check_two_failures_triggers_forced_escalation() {
+        let tmpdir = tempfile::TempDir::new().unwrap();
+        let clock = Box::new(TestClock::new());
+        let mut queue = Queue::new(tmpdir.path(), clock).unwrap();
+
+        // First failure
+        let result1 = queue.record_check("lane1", "check1", false);
+        assert!(result1.is_ok());
+        assert!(result1.unwrap().is_none());
+
+        // Second failure (no pass in between) → forced escalation
+        let result2 = queue.record_check("lane1", "check1", false);
+        assert!(result2.is_ok());
+        let eid = result2.unwrap();
+        assert!(eid.is_some());
+        let escalation_id = eid.unwrap();
+
+        // Verify the escalation was recorded
+        let retrieved = queue.get(&escalation_id);
+        assert!(retrieved.is_some());
+        let (ask, origin, _) = retrieved.unwrap();
+        assert!(ask.question.contains("check1"));
+        match origin {
+            Origin::Forced { reason } => assert!(reason.contains("check1")),
+            _ => panic!("Expected Forced origin"),
+        }
+    }
+
+    #[test]
+    fn test_record_check_pass_resets_failure_count() {
+        let tmpdir = tempfile::TempDir::new().unwrap();
+        let clock = Box::new(TestClock::new());
+        let mut queue = Queue::new(tmpdir.path(), clock).unwrap();
+
+        // First failure
+        queue.record_check("lane1", "check1", false).unwrap();
+        // Pass → resets counter
+        queue.record_check("lane1", "check1", true).unwrap();
+        // Another failure
+        let result = queue.record_check("lane1", "check1", false);
+        assert!(result.is_ok());
+        // Should not trigger yet (only 1 failure after the pass)
+        assert!(result.unwrap().is_none());
+    }
+
+    #[test]
+    fn test_forced_escalations_count_toward_limit() {
+        let tmpdir = tempfile::TempDir::new().unwrap();
+        let clock = Box::new(TestClock::new());
+        let mut queue =
+            Queue::with_limits(tmpdir.path(), clock, Duration::from_secs(30 * 60), 3).unwrap();
+
+        let ask = new_ask("test?");
+
+        // Two builder asks
+        queue.ask("lane1", &ask, Origin::Builder).unwrap();
+        queue.ask("lane1", &ask, Origin::Builder).unwrap();
+
+        // One forced escalation (from check failures)
+        queue.record_check("lane1", "check1", false).unwrap();
+        let _forced_eid = queue
+            .record_check("lane1", "check1", false)
+            .unwrap()
+            .unwrap();
+
+        // Fourth ask should fail (limit is 3)
+        let result = queue.ask("lane1", &ask, Origin::Builder);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("escalation limit"));
+    }
+
+    #[test]
+    fn test_record_cost_39_percent_no_trigger() {
+        let tmpdir = tempfile::TempDir::new().unwrap();
+        let clock = Box::new(TestClock::new());
+        let mut queue = Queue::new(tmpdir.path(), clock).unwrap();
+
+        let result = queue.record_cost("lane1", 39.0, 100.0);
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none());
+    }
+
+    #[test]
+    fn test_record_cost_40_percent_triggers_once() {
+        let tmpdir = tempfile::TempDir::new().unwrap();
+        let clock = Box::new(TestClock::new());
+        let mut queue = Queue::new(tmpdir.path(), clock).unwrap();
+
+        let result1 = queue.record_cost("lane1", 40.0, 100.0);
+        assert!(result1.is_ok());
+        let eid1 = result1.unwrap();
+        assert!(eid1.is_some());
+
+        // Second call at same cost should not trigger
+        let result2 = queue.record_cost("lane1", 40.0, 100.0);
+        assert!(result2.is_ok());
+        assert!(result2.unwrap().is_none());
+    }
+
+    #[test]
+    fn test_record_cost_60_percent_still_one_trigger() {
+        let tmpdir = tempfile::TempDir::new().unwrap();
+        let clock = Box::new(TestClock::new());
+        let mut queue = Queue::new(tmpdir.path(), clock).unwrap();
+
+        let result1 = queue.record_cost("lane1", 40.0, 100.0);
+        assert!(result1.is_ok());
+        assert!(result1.unwrap().is_some());
+
+        let result2 = queue.record_cost("lane1", 60.0, 100.0);
+        assert!(result2.is_ok());
+        assert!(result2.unwrap().is_none());
+    }
+
+    #[test]
+    fn test_record_turn_budget_trigger() {
+        let tmpdir = tempfile::TempDir::new().unwrap();
+        let clock = Box::new(TestClock::new());
+        let mut queue = Queue::with_all_limits(
+            tmpdir.path(),
+            clock,
+            Duration::from_secs(30 * 60),
+            3,
+            5,
+            0.4,
+        )
+        .unwrap();
+
+        for _ in 0..4 {
+            let result = queue.record_turn("lane1");
+            assert!(result.is_ok());
+            assert!(result.unwrap().is_none());
+        }
+
+        let result = queue.record_turn("lane1");
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_some());
+    }
+
+    #[test]
+    fn test_reassign_resets_attempts_keeps_escalation_count() {
+        let tmpdir = tempfile::TempDir::new().unwrap();
+        let clock = Box::new(TestClock::new());
+        let mut queue = Queue::new(tmpdir.path(), clock).unwrap();
+
+        let ask = new_ask("test?");
+        queue.ask("lane1", &ask, Origin::Builder).unwrap();
+        queue.record_check("lane1", "check1", false).unwrap();
+
+        // Reassign
+        queue.reassign("lane1").unwrap();
+
+        // Check that failure count is reset
+        let result = queue.record_check("lane1", "check1", false);
+        assert!(result.is_ok());
+        // Should not trigger yet (only 1 failure after reassign reset)
+        assert!(result.unwrap().is_none());
+
+        // But escalation count should still be 1
+        assert_eq!(queue.escalation_count.get("lane1").copied().unwrap_or(0), 1);
+    }
+
+    #[test]
+    fn test_ruling_rejected_for_finished_state() {
+        let tmpdir = tempfile::TempDir::new().unwrap();
+        let clock = Box::new(TestClock::new());
+        let mut queue = Queue::new(tmpdir.path(), clock).unwrap();
+
+        let ask = new_ask("test?");
+        let eid = queue.ask("lane1", &ask, Origin::Builder).unwrap();
+
+        queue.set_lane_state("lane1", LaneState::Finished);
+
+        let verdict = Verdict::Answer {
+            text: "answer".to_string(),
+        };
+        let result = queue.rule("lane1", &eid, &verdict);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("finished"));
+    }
+
+    #[test]
+    fn test_ruling_rejected_for_proved_state() {
+        let tmpdir = tempfile::TempDir::new().unwrap();
+        let clock = Box::new(TestClock::new());
+        let mut queue = Queue::new(tmpdir.path(), clock).unwrap();
+
+        let ask = new_ask("test?");
+        let eid = queue.ask("lane1", &ask, Origin::Builder).unwrap();
+
+        queue.set_lane_state("lane1", LaneState::Proved);
+
+        let verdict = Verdict::Answer {
+            text: "answer".to_string(),
+        };
+        let result = queue.rule("lane1", &eid, &verdict);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("proved"));
+    }
+
+    #[test]
+    fn test_ruling_rejected_for_refuted_state() {
+        let tmpdir = tempfile::TempDir::new().unwrap();
+        let clock = Box::new(TestClock::new());
+        let mut queue = Queue::new(tmpdir.path(), clock).unwrap();
+
+        let ask = new_ask("test?");
+        let eid = queue.ask("lane1", &ask, Origin::Builder).unwrap();
+
+        queue.set_lane_state("lane1", LaneState::Refuted);
+
+        let verdict = Verdict::Answer {
+            text: "answer".to_string(),
+        };
+        let result = queue.rule("lane1", &eid, &verdict);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("refuted"));
+    }
+
+    #[test]
+    fn test_ruling_rejected_for_stopped_state() {
+        let tmpdir = tempfile::TempDir::new().unwrap();
+        let clock = Box::new(TestClock::new());
+        let mut queue = Queue::new(tmpdir.path(), clock).unwrap();
+
+        let ask = new_ask("test?");
+        let eid = queue.ask("lane1", &ask, Origin::Builder).unwrap();
+
+        queue.set_lane_state("lane1", LaneState::Stopped);
+
+        let verdict = Verdict::Answer {
+            text: "answer".to_string(),
+        };
+        let result = queue.rule("lane1", &eid, &verdict);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("stopped"));
+    }
+
+    #[test]
+    fn test_ruling_rejected_for_escalation_limit_state() {
+        let tmpdir = tempfile::TempDir::new().unwrap();
+        let clock = Box::new(TestClock::new());
+        let mut queue = Queue::new(tmpdir.path(), clock).unwrap();
+
+        let ask = new_ask("test?");
+        let eid = queue.ask("lane1", &ask, Origin::Builder).unwrap();
+
+        queue.set_lane_state("lane1", LaneState::EscalationLimit);
+
+        let verdict = Verdict::Answer {
+            text: "answer".to_string(),
+        };
+        let result = queue.rule("lane1", &eid, &verdict);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("escalation-limit"));
+    }
+
+    #[test]
+    fn test_resume_fallback_with_delivery_session_gone() {
+        let tmpdir = tempfile::TempDir::new().unwrap();
+        let clock = Box::new(TestClock::new());
+        let mut queue = Queue::new(tmpdir.path(), clock).unwrap();
+
+        let ask = new_ask("test?");
+        let id = queue.ask("lane1", &ask, Origin::Builder).unwrap();
+
+        // Simulate delivery that returns SessionGone
+        queue.record_resume_fallback("lane1", &id).unwrap();
+
+        // Verify it was recorded
+        let event_count = queue.escalation_count.get("lane1").copied().unwrap_or(0);
+        assert_eq!(event_count, 1);
     }
 }
