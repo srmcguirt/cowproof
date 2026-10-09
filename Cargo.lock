@@ -533,6 +533,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bytes",
+ "cowproof-core",
  "http-body-util",
  "hyper",
  "hyper-rustls",

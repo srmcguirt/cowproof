@@ -17,6 +17,7 @@ http-body-util = "0.1"
 bytes = "1"
 uuid = { version = "1", features = ["v4"] }
 sha2.workspace = true
+cowproof-core = { version = "0.1.0", path = "../cowproof-core" }
 
 [dev-dependencies]
 tempfile.workspace = true
