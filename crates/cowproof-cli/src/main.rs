@@ -1750,7 +1750,10 @@ async fn run_in_slot(
     // Legacy runner layout: the whole lane directory is the clone grant until
     // the runner step moves to lane/clone + lane/control; `control` is already
     // denied inside it (A-3).
-    let lanes_root = lane.parent().unwrap_or_else(|| std::path::Path::new("/")).to_path_buf();
+    let lanes_root = lane
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("/"))
+        .to_path_buf();
     let lane_layout = LaneLayout {
         clone: lane.clone(),
         home: lane.join("home"),

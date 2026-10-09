@@ -1503,12 +1503,19 @@ mod tests {
         std::fs::create_dir_all(&repo_root).unwrap();
         // Initialize a minimal git repo
         std::process::Command::new("git")
-            .args(&["-C", repo_root.to_str().unwrap(), "init", "-q", "-b", "main"])
+            .args([
+                "-C",
+                repo_root.to_str().unwrap(),
+                "init",
+                "-q",
+                "-b",
+                "main",
+            ])
             .output()
             .unwrap();
         std::fs::write(repo_root.join("README.md"), "test").unwrap();
         std::process::Command::new("git")
-            .args(&[
+            .args([
                 "-C",
                 repo_root.to_str().unwrap(),
                 "-c",
@@ -1526,9 +1533,14 @@ mod tests {
 
         // Try to use lanes_root that contains the repo (parent of repo)
         let lanes_root = tmp.path();
-        let err = crate::lane::prepare_lane(&repo_root, lanes_root, "l1", crate::lane::PrepareOptions { allow_dirty: false })
-            .unwrap_err()
-            .to_string();
+        let err = crate::lane::prepare_lane(
+            &repo_root,
+            lanes_root,
+            "l1",
+            crate::lane::PrepareOptions { allow_dirty: false },
+        )
+        .unwrap_err()
+        .to_string();
         assert!(
             err.contains("lanes_root") && (err.contains("repository") || err.contains("repo")),
             "expected error about lanes_root containing repository, got: {err}"
@@ -1542,7 +1554,13 @@ mod tests {
         let root = std::fs::canonicalize(tmp.path()).unwrap();
 
         // Create required directories
-        for d in ["lane/clone", "lane/home", "lane/control", "lane/sock", "realhome/.rustup"] {
+        for d in [
+            "lane/clone",
+            "lane/home",
+            "lane/control",
+            "lane/sock",
+            "realhome/.rustup",
+        ] {
             std::fs::create_dir_all(root.join(d)).unwrap();
         }
 
@@ -1553,7 +1571,7 @@ mod tests {
             control: root.join("lane/control"),
             real_home: root.join("realhome"),
             sock: root.join("lane/sock/runner.sock"),
-            lanes_root: PathBuf::from("/"),  // Root is the special case
+            lanes_root: PathBuf::from("/"), // Root is the special case
         };
 
         std::fs::create_dir_all(&lane.scratch).unwrap();

@@ -85,7 +85,9 @@ pub fn prepare_lane(
         std::fs::canonicalize(lanes_root)
     } else {
         // lanes_root may not exist yet; canonicalize the parent instead.
-        let parent = lanes_root.parent().unwrap_or_else(|| std::path::Path::new("/"));
+        let parent = lanes_root
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("/"));
         match std::fs::canonicalize(parent) {
             Ok(parent_canonical) => {
                 Ok(parent_canonical.join(lanes_root.file_name().unwrap_or_default()))
@@ -94,8 +96,7 @@ pub fn prepare_lane(
         }
     }
     .context("canonicalizing lanes_root")?;
-    let repo_canonical = std::fs::canonicalize(repo)
-        .context("canonicalizing repo")?;
+    let repo_canonical = std::fs::canonicalize(repo).context("canonicalizing repo")?;
     if lanes_root_canonical == repo_canonical {
         bail!(
             "lanes_root {} must not equal the repository {}",

@@ -662,8 +662,8 @@ fn live_lanes_root_hide_other_lanes() {
         sock: lane_a_root.join("sock/runner.sock"),
         lanes_root: test_lanes.clone(),
     };
-    std::fs::write(&lane_a.clone.join("myfile"), "lane_a_secret").unwrap();
-    std::fs::write(&lane_a.control.join("control_file"), "lane_a_control").unwrap();
+    std::fs::write(lane_a.clone.join("myfile"), "lane_a_secret").unwrap();
+    std::fs::write(lane_a.control.join("control_file"), "lane_a_control").unwrap();
 
     // Create lane B with secrets
     let lane_b_root = test_lanes.join("lane_b");
@@ -686,10 +686,10 @@ fn live_lanes_root_hide_other_lanes() {
         sock: lane_b_root.join("sock/runner.sock"),
         lanes_root: test_lanes.clone(),
     };
-    std::fs::write(&lane_b.clone.join("secret"), "SECRET_B_CLONE").unwrap();
-    std::fs::write(&lane_b.control.join("secret"), "SECRET_B_CONTROL").unwrap();
+    std::fs::write(lane_b.clone.join("secret"), "SECRET_B_CLONE").unwrap();
+    std::fs::write(lane_b.control.join("secret"), "SECRET_B_CONTROL").unwrap();
     let sock_dir = lane_b.sock.parent().unwrap();
-    std::fs::write(&sock_dir.join("secret_file"), "SECRET_B_SOCK").unwrap();
+    std::fs::write(sock_dir.join("secret_file"), "SECRET_B_SOCK").unwrap();
 
     // Create the socket file itself
     std::fs::write(&lane_b.sock, "").unwrap();
@@ -718,8 +718,8 @@ fn live_lanes_root_hide_other_lanes() {
         let profile = render_macos_profile(&policy).unwrap();
         let profile_path = test_lanes.join("policy.sb");
         std::fs::write(&profile_path, profile).unwrap();
-        let (exe, args) = cowproof_run::sandbox_command(&policy, &profile_path, &cmd, "darwin")
-            .unwrap();
+        let (exe, args) =
+            cowproof_run::sandbox_command(&policy, &profile_path, &cmd, "darwin").unwrap();
         let o = Command::new(exe).args(&args).output().unwrap();
         describe(&o)
     } else {
