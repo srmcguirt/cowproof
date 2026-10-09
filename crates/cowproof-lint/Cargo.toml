@@ -1,0 +1,12 @@
+[package]
+name = "cowproof-lint"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+globset = "0.4"
+cowproof-core = { path = "../cowproof-core" }
+cowproof-plan = { path = "../cowproof-plan" }
+serde_json.workspace = true

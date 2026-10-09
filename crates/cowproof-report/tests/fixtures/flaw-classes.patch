@@ -1,0 +1,80 @@
+diff --git a/db/policy.sql b/db/policy.sql
+--- a/db/policy.sql
++++ b/db/policy.sql
+@@ -1,1 +1,3 @@
++CREATE POLICY x USING (true) TO PUBLIC;
++CREATE POLICY y USING (current_user = 'service_role');
++EXCEPTION WHEN OTHERS THEN NULL;
+diff --git a/tests/fixtures/access.sql b/tests/fixtures/access.sql
+--- a/tests/fixtures/access.sql
++++ b/tests/fixtures/access.sql
+@@ -1,1 +1,1 @@
++GRANT SELECT ON x TO anon;
+diff --git a/supabase/migrations/20260402_new.sql b/supabase/migrations/20260402_new.sql
+--- a/supabase/migrations/20260402_new.sql
++++ b/supabase/migrations/20260402_new.sql
+@@ -1,1 +1,5 @@
++-- transactional
++CREATE INDEX CONCURRENTLY ix ON x(id);
++ALTER TABLE x DISABLE ROW LEVEL SECURITY;
++ALTER TABLE x NO FORCE ROW LEVEL SECURITY;
++  IF current_setting('role',true) IS DISTINCT FROM 'app_api' THEN RAISE EXCEPTION 'denied'; END IF;
+diff --git a/src/view.ts b/src/view.ts
+--- a/src/view.ts
++++ b/src/view.ts
+@@ -1,1 +1,2 @@
++this.fetchImpl(url);
++element.innerHTML = input;
+diff --git a/src/test.rs b/src/test.rs
+--- a/src/test.rs
++++ b/src/test.rs
+@@ -1,1 +1,2 @@
++#[ignore]
++#[test]
+diff --git a/supabase/migrations.lock b/supabase/migrations.lock
+--- a/supabase/migrations.lock
++++ b/supabase/migrations.lock
+@@ -1,1 +1,1 @@
++changed
+diff --git a/db/more-policy.sql b/db/more-policy.sql
+--- a/db/more-policy.sql
++++ b/db/more-policy.sql
+@@ -1,1 +1,2 @@
++CREATE POLICY z WITH CHECK (true);
++CREATE ROLE x BYPASSRLS;
+diff --git a/db/ownership.sql b/db/ownership.sql
+--- a/db/ownership.sql
++++ b/db/ownership.sql
+@@ -1,1 +1,1 @@
++ALTER TABLE x OWNER TO postgres;
+diff --git a/src/view.ts b/src/view.ts
+--- a/src/view.ts
++++ b/src/view.ts
+@@ -1,1 +1,2 @@
++element.createContextualFragment(input);
++element.insertAdjacentHTML('beforeend', input);
+diff --git a/tmp-build/result.txt b/tmp-build/result.txt
+--- /dev/null
++++ b/tmp-build/result.txt
+@@ -0,0 +1,1 @@
++leftover
+diff --git a/supabase/migrations/20260401_existing.sql b/supabase/migrations/20260401_existing.sql
+--- a/supabase/migrations/20260401_existing.sql
++++ b/supabase/migrations/20260401_existing.sql
+@@ -1,1 +1,1 @@
++changed applied migration
+diff --git a/work/pg_wal/0001 b/work/pg_wal/0001
+--- /dev/null
++++ b/work/pg_wal/0001
+@@ -0,0 +1 @@
++wal output
+diff --git a/crates/demo/target/debug/demo b/crates/demo/target/debug/demo
+--- /dev/null
++++ b/crates/demo/target/debug/demo
+@@ -0,0 +1 @@
++binary
+diff --git a/tmp-db/postmaster.pid b/tmp-db/postmaster.pid
+--- /dev/null
++++ b/tmp-db/postmaster.pid
+@@ -0,0 +1 @@
++1234

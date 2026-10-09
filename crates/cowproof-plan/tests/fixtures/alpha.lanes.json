@@ -1,0 +1,42 @@
+{
+  "$schema": "../../../schema/plan.schema.json",
+  "version": 1,
+  "plan": "alpha",
+  "goal": "Representative reservations for plan validation.",
+  "owner": "Founder sets priority; director updates status.",
+  "baseline": {
+    "migration": 481,
+    "contract": "C1.33"
+  },
+  "numbering": {
+    "migrationGlob": "supabase/migrations/20260926000{n}_*.sql",
+    "contractPrefix": "C1."
+  },
+  "lanes": [
+    {
+      "id": "alpha-schema-followup",
+      "title": "Schema follow-up after applied baseline",
+      "priority": 2,
+      "status": "planned",
+      "dependsOn": [],
+      "reserves": {
+        "migration": 482,
+        "contract": "C1.34"
+      },
+      "notes": "The contract and migration reservations advance together."
+    },
+    {
+      "id": "alpha-api-work",
+      "title": "API work after schema follow-up",
+      "priority": 3,
+      "status": "planned",
+      "dependsOn": [
+        "alpha-schema-followup"
+      ],
+      "reserves": {
+        "migration": 483,
+        "contract": "C1.35"
+      }
+    }
+  ]
+}

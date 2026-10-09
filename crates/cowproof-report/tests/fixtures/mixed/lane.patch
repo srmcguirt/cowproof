@@ -1,0 +1,29 @@
+diff --git a/docs/handoffs/handoff-fixture-lane.md b/docs/handoffs/handoff-fixture-lane.md
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/docs/handoffs/handoff-fixture-lane.md
+@@ -0,0 +1,13 @@
++# Checks
++| Command | Result |
++| --- | --- |
++| `cargo test` | PASS |
++| `cargo clippy` | failed: warning |
++| `cargo fmt` | not run |
++
++# Limits
++- Only the synthetic fixture was checked.
++
++# Unverified
++- Real repository integration is unverified.
++
++# Questions
++- Should the director rerun the full suite?
+diff --git a/src/check.rs b/src/check.rs
+index 1111111..2222222 100644
+--- a/src/check.rs
++++ b/src/check.rs
+@@ -1,3 +1,3 @@
+-#[test]
+-fn assertion() { assert!(true); }
++fn assertion() { let _ = 1; }

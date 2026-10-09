@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# Fails if tracked or staged files carry private material that must not be
+# published: home paths, private host names, private repository references
+# outside attribution, email addresses, or credential-looking strings.
+# Run before every push; CI runs it too.
+set -euo pipefail
+cd "$(git rev-parse --show-toplevel)"
+
+# Files allowed to name private sources, for attribution only.
+allow='^(docs/provenance\.md|docs/design\.md|scripts/scrub-check)$'
+
+patterns=(
+  '/Users/[A-Za-z0-9._-]+'                 # macOS home paths
+  '/home/[a-z][a-z0-9._-]+/'               # Linux home paths
+  '\.ts\.net\b'                            # tailnet names
+  '\bwslbox\b|\bdesktop-[a-z0-9]{3,}\b'    # private host names
+  'Everydom/(lanes|platform)'              # private repositories
+  '[A-Za-z0-9._%+-]+@(gmail|everydom)\.com'  # personal and company email
+  'sk-(ant|or|proj)-[A-Za-z0-9_-]{16,}'    # API key prefixes
+  'ghp_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{30,}'
+  'BEGIN [A-Z ]*PRIVATE KEY'
+)
+
+status=0
+files=$(git ls-files --cached --others --exclude-standard | grep -Ev "$allow" || true)
+for p in "${patterns[@]}"; do
+  pattern=${p%%#*}; pattern=${pattern%"${pattern##*[![:space:]]}"}
+  # Judge by output, not exit status: grep exits 1 for every file without a
+  # match, which would hide real hits in the others.
+  hits=$(printf '%s\n' "$files" | tr '\n' '\0' | xargs -0 grep -HnE -- "$pattern" 2>/dev/null || true)
+  if [ -n "$hits" ]; then
+    echo "scrub-check: pattern /$pattern/ matched:"
+    printf '%s\n' "$hits" | head -20
+    status=1
+  fi
+done
+[ "$status" -eq 0 ] && echo "scrub-check: clean"
+exit "$status"

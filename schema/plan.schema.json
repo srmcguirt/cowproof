@@ -1,0 +1,191 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/srmcguirt/cowproof/schema/plan.schema.json",
+  "title": "Lanes plan file (*.lanes.json)",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "version",
+    "plan",
+    "lanes"
+  ],
+  "properties": {
+    "$schema": {
+      "type": "string"
+    },
+    "version": {
+      "const": 1
+    },
+    "plan": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9-]{0,63}$"
+    },
+    "goal": {
+      "type": "string",
+      "maxLength": 500
+    },
+    "owner": {
+      "type": "string",
+      "description": "Who sets priorities: a person or a director."
+    },
+    "baseline": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "What is already applied in the target environment; reserved numbers must come after it.",
+      "properties": {
+        "migration": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "contract": {
+          "type": "string"
+        }
+      }
+    },
+    "numbering": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "migrationGlob": {
+          "type": "string",
+          "description": "Where a reserved migration number must appear, with {n} for the number, e.g. supabase/migrations/20260920000{n}_*.sql"
+        },
+        "contractPrefix": {
+          "type": "string",
+          "description": "e.g. C1."
+        }
+      }
+    },
+    "lanes": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "title",
+          "priority",
+          "status"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^[a-z0-9][a-z0-9-]{0,79}$"
+          },
+          "title": {
+            "type": "string",
+            "maxLength": 200
+          },
+          "area": {
+            "type": "string",
+            "description": "Business area or workstream, for grouping."
+          },
+          "packet": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Packet path in the target repo; null while the lane is only planned."
+          },
+          "priority": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 9,
+            "description": "1 is most urgent."
+          },
+          "status": {
+            "enum": [
+              "idea",
+              "planned",
+              "packet",
+              "running",
+              "review",
+              "held",
+              "applied",
+              "shipped",
+              "dropped"
+            ]
+          },
+          "dependsOn": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "uniqueItems": true
+          },
+          "class": {
+            "enum": [
+              "light",
+              "crate",
+              "pg",
+              "rust"
+            ]
+          },
+          "host": {
+            "type": "string",
+            "description": "any, local, or a host alias from hosts.json"
+          },
+          "estimateHours": {
+            "type": "number",
+            "minimum": 0
+          },
+          "reserves": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "migration": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "contract": {
+                "type": "string"
+              }
+            }
+          },
+          "decision": {
+            "type": "string",
+            "description": "The founder or director ruling this lane carries, or where it is recorded."
+          },
+          "notes": {
+            "type": "string",
+            "maxLength": 2000
+          },
+          "commit": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Commit that applied it."
+          },
+          "release": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Bundle or release that shipped it."
+          },
+          "stage": {
+            "enum": [
+              "foundation",
+              "alpha",
+              "beta",
+              "ga",
+              "later"
+            ],
+            "description": "Release stage the work targets. A plan is a workstream; stage is a property, set as the plan's default and overridable per lane."
+          }
+        }
+      }
+    },
+    "stage": {
+      "enum": [
+        "foundation",
+        "alpha",
+        "beta",
+        "ga",
+        "later"
+      ],
+      "description": "Release stage the work targets. A plan is a workstream; stage is a property, set as the plan's default and overridable per lane."
+    }
+  }
+}

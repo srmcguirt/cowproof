@@ -1,0 +1,17 @@
+[package]
+name = "cowproof-report"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "cowproof-report"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+regex = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
