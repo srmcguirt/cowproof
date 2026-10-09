@@ -2,6 +2,11 @@
 
 Work the crate port (2026-10-09) deferred or exposed. Newest first.
 
+- **macOS profile is still allow-by-default for writes** (sandbox lane, open question 1). Writes outside the home and the grants are allowed; A-3 holds through the explicit control deny. Switch to deny-by-default writes with an allowlist (`/dev/null`, ttys and the like) as sandbox-runtime does, in the runner step (slice step 3) when the legacy Codex/opencode runners are replaced and can be tested.
+- **Legacy CLI runner under D18 is untested** (open question 2). It now runs with a lane-private `CARGO_HOME` whose `registry` and `git` are read-only symlinks to the real `~/.cargo`; cargo may fail to lock a read-only registry. It also still uses the whole lane directory as the clone until the runner step moves to `lane/clone` plus `lane/control`.
+- **`env_allowlist` is not enforced** by either renderer (open question 3). Enforce it when the runner builds the child environment, or remove the field.
+- **Linux proxy socket is untested** (open question 4): `NetworkMode::Proxy` binds the socket read-only; test that a client inside bwrap can still connect, when the egress proxy lands.
+
 - **Restore portkit's stdout-protocol test.** The portkit import (D15) dropped portkit's root package and its root tests, including `tests/mcp_stdio.rs`, which runs the MCP server with `RUST_LOG=debug` and fails if anything but JSON frames reaches stdout. Re-target it at the `pk` / `cowproof serve` binary when that lands (step 8), along with `tests/{cli,hook,trace,parity}.rs` (portkit-integration.md section 4.1).
 
 - **Recurring: track sandbox-runtime upstream fixes** (eng review D16). cowproof's sandbox and egress proxy follow anthropics/sandbox-runtime's design (D4). Record the ported upstream commit in NOTICE when step 4 lands, and at every cowproof release review sandbox-runtime's releases and security advisories, mapping each fix to `SandboxPolicy` and the proxy.
