@@ -1,0 +1,22 @@
+[package]
+name = "cowproof-prove"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+sha2 = "0.10"
+time.workspace = true
+async-trait.workspace = true
+cowproof-core = { version = "0.1.0", path = "../cowproof-core" }
+
+[dev-dependencies]
+tempfile.workspace = true
+assert_cmd.workspace = true
+predicates.workspace = true
