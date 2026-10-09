@@ -2,7 +2,7 @@
 
 Work the crate port (2026-10-09) deferred or exposed. Newest first.
 
-- **Append-only evasion in `cowproof_core::removed_lines` (security).** It skips any removed line starting `---`, so removing a line like `-- assert ...` (a SQL comment or a Lua/Haskell line) is not counted against the append-only limit. Same bug the gates lane fixed in `flaws::parse_patch`; apply the same in-hunk header tracking in core, with a real-git test.
+- **Two unified-diff parsers.** `cowproof_core::removed_lines` and `cowproof_prove::flaws::parse_patch` both track hunk state to tell file headers from `---`/`+++` body lines (the append-only evasion fixed on 2026-10-09 was this bug in one of them). Move the hunk-aware parsing into `cowproof-core` and have `flaws.rs` use it, so the rule lives in one place.
 - **Held-out gate is a stub.** `gates::check_heldout` hard-codes `has_heldout = false`; wire it to `cowproof_core::heldout` (the director store, D5).
 - **Built-in `generic` flaw pack.** `[proof] packs = ["generic"]` has no path, so the gate skips it; move the built-in pack into `cowproof-prove` (embedded) so outside repos get it without configuration.
 - **`applied_migration` rules never fire in gates.** `GatePacket` has no migration baseline; add one (the report gets it from `--baseline`).

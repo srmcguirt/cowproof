@@ -590,6 +590,15 @@ mod tests {
     }
 
     #[test]
+    fn removed_dash_lines_from_a_real_git_diff_are_counted() {
+        // Output of `git diff` after deleting `-- assert balance >= 0` and
+        // `--- separator ---` from a tracked file: they render as `--- ...`
+        // and `---- ...` inside the hunk and must count as removals.
+        let patch = "diff --git a/s.sql b/s.sql\nindex 1111111..2222222 100644\n--- a/s.sql\n+++ b/s.sql\n@@ -1,4 +1,2 @@\n CREATE TABLE a (\n--- assert balance >= 0\n---- separator ---\n );\n";
+        assert_eq!(removed_lines(patch, "s.sql"), 2);
+    }
+
+    #[test]
     fn headers_not_counted_in_multi_file_patch() {
         // Test: a patch with headers for two files counts only body lines
         let patch = "diff --git a/file1.rs b/file1.rs\n--- a/file1.rs\n+++ b/file1.rs\n@@ -1 +1 @@\n-old1\n+new1\ndiff --git a/file2.rs b/file2.rs\n--- a/file2.rs\n+++ b/file2.rs\n@@ -1 +1 @@\n-old2\n+new2";
