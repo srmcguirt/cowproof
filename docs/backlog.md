@@ -2,6 +2,11 @@
 
 Work the crate port (2026-10-09) deferred or exposed. Newest first.
 
+- **Wire the verifier sandbox** (next slice lane). `cowproof-prove`'s `ProcessRunner` runs checks unsandboxed; the verifier must run them under `SandboxPolicy::verifier` with the D6/D11/D14 dependency cache and its own compile cache, holding the lane's class slot (D12).
+- **Verifier owns retries** (capsule lane Q1, director ruling: accept the recommendation). `ProcessRunner::new(max_attempts)` also retries, so a flaky check can run 9 times under `verify`; build the production runner with 1 attempt and let `verify` own the 3 flaky retries. Remove the leftover public `Reproduced`/`Diverged` type aliases in `verify.rs` (Q3) in the same change.
+- **Egress proxy, live checks in the run slice** (proxy lane Q1, Q2). The https upstream path (webpki roots) and the request-header allowlist are untested against the real API; run one live smoke test through the proxy with a real key when the run slice lands, and widen the allowlist only for headers Claude Code actually needs.
+- **Egress proxy idle timeout** (Q3). Only connect (10 s) and header read (30 s) are bounded; add an idle timeout between body chunks (not an overall limit; long streams are legitimate). Q4 ruling: `ProxyConfig::new` returning `Result` (fail fast) is accepted.
+
 - **Escalation: Stop and Reassign bypass Delivery** (escalation lane, director ruling). `rule_and_deliver` delivers every verdict uniformly; the runner's caller must handle `Stop` (set the lane `stopped`) and `Reassign` (`Queue::reassign` plus a fresh session on the next model) itself and not route them through `Delivery`. Wire this in the runner step.
 - **Escalation: no redelivery after a delivery error.** The ruling stays recorded, so the director cannot re-rule. Add `redeliver(id)` that retries delivery of the recorded ruling.
 - **Escalation: builder text outside the fence (security).** `render_for_director` does not escape or cap an option's `id`, its `cost`, or `recommend`; these are builder text shown outside the fenced block. Cap and escape them (or render them inside the fence) before escalation reaches a real director. Required before slice step 4 goes live.
