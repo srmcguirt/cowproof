@@ -2,6 +2,10 @@
 
 Work the crate port (2026-10-09) deferred or exposed. Newest first.
 
+- **Escalation: Stop and Reassign bypass Delivery** (escalation lane, director ruling). `rule_and_deliver` delivers every verdict uniformly; the runner's caller must handle `Stop` (set the lane `stopped`) and `Reassign` (`Queue::reassign` plus a fresh session on the next model) itself and not route them through `Delivery`. Wire this in the runner step.
+- **Escalation: no redelivery after a delivery error.** The ruling stays recorded, so the director cannot re-rule. Add `redeliver(id)` that retries delivery of the recorded ruling.
+- **Escalation: builder text outside the fence (security).** `render_for_director` does not escape or cap an option's `id`, its `cost`, or `recommend`; these are builder text shown outside the fenced block. Cap and escape them (or render them inside the fence) before escalation reaches a real director. Required before slice step 4 goes live.
+
 - **macOS profile is still allow-by-default for writes** (sandbox lane, open question 1). Writes outside the home and the grants are allowed; A-3 holds through the explicit control deny. Switch to deny-by-default writes with an allowlist (`/dev/null`, ttys and the like) as sandbox-runtime does, in the runner step (slice step 3) when the legacy Codex/opencode runners are replaced and can be tested.
 - **Legacy CLI runner under D18 is untested** (open question 2). It now runs with a lane-private `CARGO_HOME` whose `registry` and `git` are read-only symlinks to the real `~/.cargo`; cargo may fail to lock a read-only registry. It also still uses the whole lane directory as the clone until the runner step moves to `lane/clone` plus `lane/control`.
 - **`env_allowlist` is not enforced** by either renderer (open question 3). Enforce it when the runner builds the child environment, or remove the field.
