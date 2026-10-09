@@ -15,6 +15,8 @@ use anyhow::{Context, Result, anyhow, bail};
 use std::collections::BTreeSet;
 use std::path::{Component, Path, PathBuf};
 
+pub mod escalate;
+
 /// Network mode for sandbox policy.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NetworkMode {
