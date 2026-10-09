@@ -29,6 +29,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 
 mod lane_tools;
+mod run;
 
 #[derive(Parser)]
 #[command(name = "lanes", about = "Run isolated engineering lanes")]
@@ -38,7 +39,10 @@ struct Args {
 }
 #[derive(clap::Subcommand)]
 enum Action {
-    Run(RunArgs),
+    /// Run one packet: lint, prepare the lane, start the proxy and tools, launch the sandboxed builder.
+    Run(RunOneArgs),
+    /// the multi-packet host runner ported from the source project; superseded by `cowproof run`
+    LegacyRun(RunArgs),
     Lint(LintArgs),
     Host(HostArgs),
     Hosts,
@@ -75,6 +79,31 @@ enum PlanAction {
         repo: PathBuf,
     },
 }
+#[derive(Parser)]
+struct RunOneArgs {
+    /// Packet file to run
+    #[arg(value_name = "PACKET")]
+    packet: PathBuf,
+    /// Repository to run the packet against (default: the current directory)
+    #[arg(long)]
+    repo: Option<PathBuf>,
+    /// Directory that holds the lanes (default: ~/.cache/cowproof/lanes)
+    #[arg(long)]
+    lanes_root: Option<PathBuf>,
+    /// Builder model
+    #[arg(long, default_value = "haiku")]
+    model: String,
+    /// Record uncommitted changes as the base patch instead of refusing a dirty tree
+    #[arg(long)]
+    allow_dirty: bool,
+    /// The Claude Code executable, resolved once on the director's PATH
+    #[arg(long, default_value = "claude")]
+    claude_bin: String,
+    /// Maximum builder turns
+    #[arg(long, default_value_t = 60)]
+    max_turns: u32,
+}
+
 #[derive(Parser)]
 struct RunArgs {
     #[arg(long)]
@@ -135,7 +164,8 @@ enum HostAction {
 #[tokio::main]
 async fn main() -> Result<()> {
     match Args::parse().command {
-        Action::Run(args) => {
+        Action::Run(args) => run::run_one(args).await,
+        Action::LegacyRun(args) => {
             lint_run_packets(&args)?;
             if let Some(host) = args.host.clone() {
                 return remote_run(args, &host).await;
@@ -436,7 +466,7 @@ fn host_run(
                 .map(|value| format!("--setenv=LANE_CLASS_LIMITS={value}")),
         )
         .arg(&exe)
-        .args(["run", "--root"])
+        .args(["legacy-run", "--root"])
         .arg(&root)
         .args(["--concurrency", "1"])
         .arg(&packet)
@@ -465,7 +495,7 @@ fn host_run(
             let err = log.try_clone()?;
             let child = std::process::Command::new("setsid")
                 .arg(exe)
-                .args(["run", "--root"])
+                .args(["legacy-run", "--root"])
                 .arg(&root)
                 .args(["--concurrency", "1"])
                 .arg(&packet)
