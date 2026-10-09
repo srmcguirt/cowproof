@@ -67,6 +67,9 @@ pub struct SandboxPolicy {
     /// in the socket's directory (macOS: denied for reads; Linux: only the
     /// socket file is bound in).
     pub connect_socket: Option<PathBuf>,
+    /// The directory that holds every lane. Hidden in the sandbox to prevent
+    /// cross-lane access.
+    pub lanes_root: PathBuf,
 }
 
 impl SandboxPolicy {
@@ -94,6 +97,7 @@ impl SandboxPolicy {
             env_allowlist: None,
             home: lane.real_home.clone(),
             connect_socket: Some(lane.sock.clone()),
+            lanes_root: lane.lanes_root.clone(),
         }
     }
 
@@ -116,6 +120,7 @@ impl SandboxPolicy {
             env_allowlist: None,
             home: lane.real_home.clone(),
             connect_socket: None,
+            lanes_root: lane.lanes_root.clone(),
         }
     }
 
@@ -133,6 +138,7 @@ impl SandboxPolicy {
             env_allowlist: None,
             home: lane.real_home.clone(),
             connect_socket: Some(lane.sock.clone()),
+            lanes_root: lane.lanes_root.clone(),
         }
     }
 
@@ -148,6 +154,7 @@ impl SandboxPolicy {
             env_allowlist: None,
             home: lane.real_home.clone(),
             connect_socket: None,
+            lanes_root: lane.lanes_root.clone(),
         }
     }
 
@@ -162,6 +169,7 @@ impl SandboxPolicy {
             env_allowlist: None,
             home: lane.real_home.clone(),
             connect_socket: None,
+            lanes_root: lane.lanes_root.clone(),
         }
     }
 
@@ -202,6 +210,9 @@ pub struct LaneLayout {
     /// is created by `prepare_lane` with mode 0700; the runner binds the
     /// socket there before the builder starts.
     pub sock: PathBuf,
+    /// The directory that holds every lane, with this lane at `<lanes_root>/<id>`.
+    /// Hidden in sandbox policies to prevent cross-lane access.
+    pub lanes_root: PathBuf,
 }
 
 /// Lockfiles, at the tree root only, that determine the dependencies (D11).
@@ -483,6 +494,7 @@ struct Resolved {
     home: PathBuf,
     rw: BTreeSet<PathBuf>,
     ro: BTreeSet<PathBuf>,
+    lanes_root: PathBuf,
     deny: BTreeSet<PathBuf>,
     credentials: Vec<PathBuf>,
     /// The connectable socket file and its directory, resolved.
@@ -514,6 +526,27 @@ fn resolve(policy: &SandboxPolicy) -> Result<Resolved> {
         .iter()
         .map(|c| canonicalize_for_sandbox(&home.join(c)))
         .collect::<Result<Vec<_>>>()?;
+
+    // Hide the lanes root to prevent cross-lane access (the backlog).
+    let lanes_root = canonicalize_for_sandbox(&policy.lanes_root)?;
+    if lanes_root == home {
+        bail!(
+            "lanes_root {} must not equal the home {}",
+            lanes_root.display(),
+            home.display()
+        );
+    }
+    if lanes_root == Path::new("/") {
+        bail!("lanes_root must not be the filesystem root /");
+    }
+    if home.starts_with(&lanes_root) {
+        bail!(
+            "lanes_root {} must not contain the home {}",
+            lanes_root.display(),
+            home.display()
+        );
+    }
+
     let socket = match &policy.connect_socket {
         None => None,
         Some(sock) => {
@@ -538,6 +571,7 @@ fn resolve(policy: &SandboxPolicy) -> Result<Resolved> {
         home,
         rw,
         ro,
+        lanes_root,
         deny,
         credentials,
         socket,
@@ -559,7 +593,8 @@ fn sbpl(path: &Path) -> Result<String> {
 /// Render a sandbox policy as a macOS Seatbelt profile.
 ///
 /// Seatbelt applies the last matching rule, so grants come before the denies
-/// that must win over them (credentials, then `deny_paths`).
+/// that must win over them (credentials, then `deny_paths`). The lanes_root deny
+/// is placed before the RW/RO allows so that specific grants override it.
 pub fn render_macos_profile(policy: &SandboxPolicy) -> Result<String> {
     let r = resolve(policy)?;
     let mut out = String::from("(version 1)\n(allow default)\n");
@@ -584,6 +619,13 @@ pub fn render_macos_profile(policy: &SandboxPolicy) -> Result<String> {
         out.push_str(&format!(" (literal {})", sbpl(m)?));
     }
     out.push_str(")\n");
+
+    // Hide the lanes root before granting access to this lane's paths,
+    // so the specific grants override this deny for this lane only.
+    out.push_str(&format!(
+        "(deny file-read* file-write* (subpath {}))\n",
+        sbpl(&r.lanes_root)?
+    ));
 
     for p in &r.rw {
         out.push_str(&format!(
@@ -659,9 +701,10 @@ fn bind(args: &mut Vec<String>, flag: &str, src: &Path, dest: &Path) -> Result<(
 /// Render a sandbox policy as bubblewrap arguments for Linux.
 ///
 /// The root is read-only, `/tmp` and the real home are empty tmpfs mounts, and
-/// only granted paths are bound back in. A path that does not exist on the
-/// host cannot be bound and is skipped, except a `deny_paths` entry: hiding it
-/// is required, so a missing one is an error.
+/// only granted paths are bound back in. The lanes root is a tmpfs (if it exists
+/// on the host) before this lane's paths are bound on top. A path that does not
+/// exist on the host cannot be bound and is skipped, except a `deny_paths`
+/// entry: hiding it is required, so a missing one is an error.
 pub fn render_bwrap_args(policy: &SandboxPolicy, cmd: &[String]) -> Result<Vec<String>> {
     let r = resolve(policy)?;
     let mut args: Vec<String> = [
@@ -687,6 +730,16 @@ pub fn render_bwrap_args(policy: &SandboxPolicy, cmd: &[String]) -> Result<Vec<S
             .ok_or_else(|| anyhow!("not UTF-8: {}", r.home.display()))?
             .to_string(),
     );
+
+    // Hide the lanes root with a tmpfs so other lanes' paths are not accessible,
+    // before binding this lane's paths on top of it.
+    let lr = r
+        .lanes_root
+        .to_str()
+        .ok_or_else(|| anyhow!("not UTF-8: {}", r.lanes_root.display()))?;
+    if r.lanes_root.exists() {
+        args.extend(["--tmpfs".into(), lr.into()]);
+    }
 
     for p in &r.rw {
         if p.exists() {
@@ -785,6 +838,7 @@ mod tests {
             control: PathBuf::from("/nonexistent-cp/lanes/l1/control"),
             real_home: PathBuf::from("/nonexistent-cp/realhome"),
             sock: PathBuf::from("/nonexistent-cp/lanes/l1/sock/runner.sock"),
+            lanes_root: PathBuf::from("/nonexistent-cp/lanes"),
         }
     }
 
@@ -910,6 +964,7 @@ mod tests {
             control: root.join("lane/control"),
             real_home: root.join("realhome"),
             sock: root.join("lane/sock/runner.sock"),
+            lanes_root: root.join("lane"),
         };
         std::fs::write(&lane.sock, b"").unwrap();
         let sock = lane.sock.to_str().unwrap().to_string();
@@ -1149,6 +1204,7 @@ mod tests {
             control: root.join("lane/control"),
             real_home: root.join("realhome"),
             sock: root.join("lane/sock/runner.sock"),
+            lanes_root: root.join("lane"),
         };
         let args =
             render_bwrap_args(&SandboxPolicy::builder(&lane, NetworkMode::None), &[]).unwrap();
@@ -1331,6 +1387,7 @@ mod tests {
             control: spelled("lane/control"),
             real_home: spelled("realhome"),
             sock: spelled("lane/sock/runner.sock"),
+            lanes_root: spelled("lane"),
         };
         for (name, p) in all_policies(&lane) {
             let profile = render_macos_profile(&p).unwrap();
@@ -1361,6 +1418,150 @@ mod tests {
                 "(allow file-read* file-write* (subpath \"/private/tmp/cowproof-unit-l57000\"))"
             ),
             "{builder}"
+        );
+    }
+
+    #[test]
+    fn lanes_root_deny_is_added_to_macos_profile() {
+        let lane = test_lane();
+        let policy = SandboxPolicy::builder(&lane, NetworkMode::None);
+        let profile = render_macos_profile(&policy).unwrap();
+        let lanes_root_deny = format!(
+            "(deny file-read* file-write* (subpath \"{}\"))",
+            lane.lanes_root.display()
+        );
+        assert!(
+            profile.contains(&lanes_root_deny),
+            "lanes_root deny missing: {profile}"
+        );
+        // The deny must come before the RW allows (so allows override it)
+        let deny_pos = profile.find(&lanes_root_deny).unwrap();
+        let rw_allow = format!(
+            "(allow file-read* file-write* (subpath \"{}\"))",
+            lane.clone.display()
+        );
+        let allow_pos = profile.find(&rw_allow).unwrap();
+        assert!(
+            deny_pos < allow_pos,
+            "lanes_root deny must come before RW allows"
+        );
+    }
+
+    #[test]
+    fn lanes_root_tmpfs_is_added_to_linux_args_before_binds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        for d in [
+            "lane/clone",
+            "lane/home",
+            "lane/scratch",
+            "lane/control",
+            "lane/sock",
+            "realhome/.rustup",
+        ] {
+            std::fs::create_dir_all(root.join(d)).unwrap();
+        }
+        let lane = LaneLayout {
+            clone: root.join("lane/clone"),
+            home: root.join("lane/home"),
+            scratch: root.join("lane/scratch"),
+            control: root.join("lane/control"),
+            real_home: root.join("realhome"),
+            sock: root.join("lane/sock/runner.sock"),
+            lanes_root: root.join("lane"),
+        };
+        std::fs::write(&lane.sock, b"").unwrap();
+
+        let policy = SandboxPolicy::builder(&lane, NetworkMode::None);
+        let args = render_bwrap_args(&policy, &[]).unwrap();
+
+        let lanes_root_str = lane.lanes_root.to_str().unwrap();
+        // Find the tmpfs index for lanes_root
+        let tmpfs_idx = args
+            .windows(2)
+            .position(|w| w[0] == "--tmpfs" && w[1] == lanes_root_str)
+            .expect("lanes_root tmpfs not found in args");
+
+        // Find the bind index for clone
+        let clone_str = lane.clone.to_str().unwrap();
+        let bind_idx = args
+            .windows(3)
+            .position(|w| w[0] == "--bind" && w[1] == clone_str)
+            .expect("clone bind not found in args");
+
+        // tmpfs should come before bind (tmpfs is at tmpfs_idx, bind starts at bind_idx*3)
+        assert!(
+            tmpfs_idx * 2 < bind_idx * 3,
+            "lanes_root tmpfs must come before RW binds"
+        );
+    }
+
+    #[test]
+    fn lanes_root_contain_repo_in_prepare_lane_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_root = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo_root).unwrap();
+        // Initialize a minimal git repo
+        std::process::Command::new("git")
+            .args(&["-C", repo_root.to_str().unwrap(), "init", "-q", "-b", "main"])
+            .output()
+            .unwrap();
+        std::fs::write(repo_root.join("README.md"), "test").unwrap();
+        std::process::Command::new("git")
+            .args(&[
+                "-C",
+                repo_root.to_str().unwrap(),
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@test.com",
+                "commit",
+                "-q",
+                "-m",
+                "init",
+                "-A",
+            ])
+            .output()
+            .unwrap();
+
+        // Try to use lanes_root that contains the repo (parent of repo)
+        let lanes_root = tmp.path();
+        let err = crate::lane::prepare_lane(&repo_root, lanes_root, "l1", crate::lane::PrepareOptions { allow_dirty: false })
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("lanes_root") && (err.contains("repository") || err.contains("repo")),
+            "expected error about lanes_root containing repository, got: {err}"
+        );
+    }
+
+    #[test]
+    fn lanes_root_equal_to_root_is_refused() {
+        // Test with real temp directories so canonicalization works
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+
+        // Create required directories
+        for d in ["lane/clone", "lane/home", "lane/control", "lane/sock", "realhome/.rustup"] {
+            std::fs::create_dir_all(root.join(d)).unwrap();
+        }
+
+        let lane = LaneLayout {
+            clone: root.join("lane/clone"),
+            home: root.join("lane/home"),
+            scratch: root.join("lane/scratch"),
+            control: root.join("lane/control"),
+            real_home: root.join("realhome"),
+            sock: root.join("lane/sock/runner.sock"),
+            lanes_root: PathBuf::from("/"),  // Root is the special case
+        };
+
+        std::fs::create_dir_all(&lane.scratch).unwrap();
+        let policy = SandboxPolicy::builder(&lane, NetworkMode::None);
+        let err = render_macos_profile(&policy).unwrap_err().to_string();
+        assert!(
+            err.contains("must not be the filesystem root"),
+            "expected error about lanes_root equal to root, got: {err}"
         );
     }
 }

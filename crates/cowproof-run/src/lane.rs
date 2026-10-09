@@ -80,6 +80,37 @@ pub fn prepare_lane(
 ) -> Result<PreparedLane> {
     validate_lane_id(lane_id)?;
 
+    // Validate lanes_root before creating anything.
+    let lanes_root_canonical = if lanes_root.exists() {
+        std::fs::canonicalize(lanes_root)
+    } else {
+        // lanes_root may not exist yet; canonicalize the parent instead.
+        let parent = lanes_root.parent().unwrap_or_else(|| std::path::Path::new("/"));
+        match std::fs::canonicalize(parent) {
+            Ok(parent_canonical) => {
+                Ok(parent_canonical.join(lanes_root.file_name().unwrap_or_default()))
+            }
+            Err(e) => Err(e),
+        }
+    }
+    .context("canonicalizing lanes_root")?;
+    let repo_canonical = std::fs::canonicalize(repo)
+        .context("canonicalizing repo")?;
+    if lanes_root_canonical == repo_canonical {
+        bail!(
+            "lanes_root {} must not equal the repository {}",
+            lanes_root_canonical.display(),
+            repo_canonical.display()
+        );
+    }
+    if repo_canonical.starts_with(&lanes_root_canonical) {
+        bail!(
+            "lanes_root {} must not contain the repository {}",
+            lanes_root_canonical.display(),
+            repo_canonical.display()
+        );
+    }
+
     let dirty = !git_source(repo, &["status", "--porcelain"])
         .context("checking the working tree")?
         .stdout
@@ -116,6 +147,10 @@ fn build_lane(
     base_commit: &str,
     dirty: bool,
 ) -> Result<PreparedLane> {
+    let lanes_root = lane_dir
+        .parent()
+        .ok_or_else(|| anyhow!("lane_dir has no parent"))?
+        .to_path_buf();
     let layout = LaneLayout {
         clone: lane_dir.join("clone"),
         home: lane_dir.join("home"),
@@ -125,6 +160,7 @@ fn build_lane(
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("/")),
         sock: lane_dir.join("sock").join("runner.sock"),
+        lanes_root,
     };
     for dir in [&layout.home, &layout.scratch, &layout.control] {
         fs::create_dir(dir).with_context(|| format!("creating {}", dir.display()))?;

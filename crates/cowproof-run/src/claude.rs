@@ -249,6 +249,7 @@ mod tests {
             control: PathBuf::from("/nonexistent-cp/lanes/l1/control"),
             real_home: PathBuf::from("/nonexistent-cp/realhome"),
             sock: PathBuf::from("/nonexistent-cp/lanes/l1/sock/runner.sock"),
+            lanes_root: PathBuf::from("/nonexistent-cp/lanes"),
         }
     }
 

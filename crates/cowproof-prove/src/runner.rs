@@ -645,6 +645,7 @@ impl SandboxFixture {
             control: root.join("lane/control"),
             real_home: root.join("realhome"),
             sock: root.join("lane/sock/runner.sock"),
+            lanes_root: root.join("lane"),
         };
         Self {
             _tmp: tmp,

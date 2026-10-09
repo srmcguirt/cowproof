@@ -68,6 +68,7 @@ impl Fixture {
             control: lane_root.join("control"),
             real_home: fake_home,
             sock: lane_root.join("sock/runner.sock"),
+            lanes_root: root.join("lane"),
         };
         Fixture {
             _tmp: tmp,
@@ -615,6 +616,145 @@ echo END
         );
         assert_eq!(read(f.lane.control.join("secret")), CONTROL_SECRET);
     }
+}
+
+// ------------------------------------------------- cross-lane isolation
+
+#[test]
+#[ignore]
+fn live_lanes_root_hide_other_lanes() {
+    if !sandbox_available() {
+        eprintln!("sandbox not available, skipping");
+        return;
+    }
+
+    // Create lanes in a directory outside /tmp and the home (to trigger the bug).
+    // On Linux use a directory under CARGO_TARGET_DIR or /var/tmp; on macOS use target dir.
+    let mut lanes_root = PathBuf::from("/var/tmp");
+    if !lanes_root.exists() {
+        lanes_root = PathBuf::from("/tmp");
+    }
+    let test_lanes = lanes_root.join(format!("cowproof-xlaneisolation-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&test_lanes);
+    std::fs::create_dir_all(&test_lanes).unwrap();
+
+    let fake_home = test_lanes.join("home");
+    std::fs::create_dir_all(&fake_home).unwrap();
+
+    // Create lane A
+    let lane_a_root = test_lanes.join("lane_a");
+    for d in [
+        "lane_a/clone",
+        "lane_a/home",
+        "lane_a/control",
+        "lane_a/sock",
+    ] {
+        std::fs::create_dir_all(test_lanes.join(d)).unwrap();
+    }
+    let scratch_a = test_lanes.join("scratch_a");
+    std::fs::create_dir_all(&scratch_a).unwrap();
+    let lane_a = LaneLayout {
+        clone: lane_a_root.join("clone"),
+        home: lane_a_root.join("home"),
+        scratch: scratch_a.clone(),
+        control: lane_a_root.join("control"),
+        real_home: fake_home.clone(),
+        sock: lane_a_root.join("sock/runner.sock"),
+        lanes_root: test_lanes.clone(),
+    };
+    std::fs::write(&lane_a.clone.join("myfile"), "lane_a_secret").unwrap();
+    std::fs::write(&lane_a.control.join("control_file"), "lane_a_control").unwrap();
+
+    // Create lane B with secrets
+    let lane_b_root = test_lanes.join("lane_b");
+    for d in [
+        "lane_b/clone",
+        "lane_b/home",
+        "lane_b/control",
+        "lane_b/sock",
+    ] {
+        std::fs::create_dir_all(test_lanes.join(d)).unwrap();
+    }
+    let scratch_b = test_lanes.join("scratch_b");
+    std::fs::create_dir_all(&scratch_b).unwrap();
+    let lane_b = LaneLayout {
+        clone: lane_b_root.join("clone"),
+        home: lane_b_root.join("home"),
+        scratch: scratch_b.clone(),
+        control: lane_b_root.join("control"),
+        real_home: fake_home.clone(),
+        sock: lane_b_root.join("sock/runner.sock"),
+        lanes_root: test_lanes.clone(),
+    };
+    std::fs::write(&lane_b.clone.join("secret"), "SECRET_B_CLONE").unwrap();
+    std::fs::write(&lane_b.control.join("secret"), "SECRET_B_CONTROL").unwrap();
+    let sock_dir = lane_b.sock.parent().unwrap();
+    std::fs::write(&sock_dir.join("secret_file"), "SECRET_B_SOCK").unwrap();
+
+    // Create the socket file itself
+    std::fs::write(&lane_b.sock, "").unwrap();
+
+    // Build a sandbox policy for lane A and run probes
+    let policy = SandboxPolicy::builder(&lane_a, NetworkMode::None);
+
+    // Create the profile (on macOS) or render args (on Linux)
+    let sock_dir = lane_b.sock.parent().unwrap();
+    let cmd = vec![
+        "/bin/sh".to_string(),
+        "-c".to_string(),
+        format!(
+            "cat {} 2>/dev/null || echo 'DENIED_B_CLONE:' && \
+             cat {} 2>/dev/null || echo 'DENIED_B_CONTROL:' && \
+             cat {} 2>/dev/null || echo 'DENIED_B_SOCK:' && \
+             cat {} 2>/dev/null && echo ':ALLOWED_A_CLONE'",
+            lane_b.clone.join("secret").display(),
+            lane_b.control.join("secret").display(),
+            sock_dir.join("secret_file").display(),
+            lane_a.clone.join("myfile").display()
+        ),
+    ];
+
+    let out = if cfg!(target_os = "macos") {
+        let profile = render_macos_profile(&policy).unwrap();
+        let profile_path = test_lanes.join("policy.sb");
+        std::fs::write(&profile_path, profile).unwrap();
+        let (exe, args) = cowproof_run::sandbox_command(&policy, &profile_path, &cmd, "darwin")
+            .unwrap();
+        let o = Command::new(exe).args(&args).output().unwrap();
+        describe(&o)
+    } else {
+        let args = cowproof_run::render_bwrap_args(&policy, &cmd).unwrap();
+        let o = Command::new("bwrap").args(&args).output().unwrap();
+        describe(&o)
+    };
+
+    // Lane A should NOT see lane B's files
+    assert!(
+        out.contains("DENIED_B_CLONE:"),
+        "lane_a could read lane_b's clone: {}",
+        out
+    );
+    assert!(
+        out.contains("DENIED_B_CONTROL:"),
+        "lane_a could read lane_b's control: {}",
+        out
+    );
+    assert!(
+        out.contains("DENIED_B_SOCK:"),
+        "lane_a could read lane_b's socket file: {}",
+        out
+    );
+    // Lane A SHOULD see its own file
+    assert!(
+        out.contains("lane_a_secret:ALLOWED_A_CLONE"),
+        "lane_a could not read its own clone: {}",
+        out
+    );
+
+    // Cleanup
+    let _ = std::fs::remove_dir_all(&test_lanes);
+    let _ = std::fs::remove_dir_all(&scratch_a);
+    let _ = std::fs::remove_dir_all(&scratch_b);
 }
 
 // ------------------------------------------------- the bug these tests guard
