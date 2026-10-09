@@ -1,5 +1,8 @@
 [workspace]
-members = ["crates/cowproof-core", "crates/cowproof-cli", "crates/cowproof-report", "crates/cowproof-plan", "crates/cowproof-host", "crates/cowproof-lint"]
+members = [
+  "crates/cowproof-core", "crates/cowproof-cli", "crates/cowproof-report", "crates/cowproof-plan", "crates/cowproof-host", "crates/cowproof-lint",
+  "crates/portkit/core", "crates/portkit/mcp", "crates/portkit/port", "crates/portkit/cli", "crates/portkit/plugin", "crates/portkit/read", "crates/portkit/index"
+]
 resolver = "3"
 
 [workspace.package]
@@ -13,3 +16,26 @@ clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["macros", "process", "rt-multi-thread", "time", "io-util", "fs", "signal"] }
+
+# Portkit workspace dependencies
+portkit-core = { version = "0.1.0", path = "crates/portkit/core" }
+portkit-mcp = { version = "0.1.0", path = "crates/portkit/mcp" }
+portkit-port = { version = "0.1.0", path = "crates/portkit/port" }
+portkit-cli = { version = "0.1.0", path = "crates/portkit/cli" }
+portkit-index = { version = "0.1.0", path = "crates/portkit/index" }
+portkit-plugin = { version = "0.1.0", path = "crates/portkit/plugin" }
+portkit-read = { version = "0.1.0", path = "crates/portkit/read" }
+
+thiserror = "2"
+jsonschema = { version = "0.55", default-features = false }
+async-trait = "0.1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap_complete = "4"
+config = { version = "0.15", default-features = false, features = ["toml"] }
+time = { version = "0.3", features = ["formatting", "macros"] }
+regex = "1"
+
+assert_cmd = "2"
+predicates = "3"
+tempfile = "3"
