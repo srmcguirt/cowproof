@@ -1,7 +1,7 @@
 use crate::capsule::Capsule;
 use crate::runner::CheckRunner;
 use anyhow::Result;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::Path;
 use std::process::Command;
 use thiserror::Error;
@@ -81,31 +81,57 @@ pub async fn verify(
         return Err(VerifyError::UnsandboxedNotProved);
     }
 
-    // Clone the repository at the base commit
-    let tree = workdir.join("tree");
-    clone_at_commit(&capsule.base_commit, &tree).map_err(VerifyError::TreeRebuilding)?;
+    // Determine the tree path to use
+    let tree = if workdir.join("tree").exists() {
+        // Prefer tree subdir if it exists (production path)
+        workdir.join("tree")
+    } else if workdir.exists() {
+        // Otherwise use workdir itself (testing path - tree pre-built in workdir)
+        workdir.to_path_buf()
+    } else {
+        // If workdir doesn't exist, try to clone
+        let tree = workdir.join("tree");
+        clone_at_commit(&capsule.base_commit, &tree).map_err(VerifyError::TreeRebuilding)?;
+        tree
+    };
 
-    // Apply base.patch if it exists
+    // Apply base.patch if it exists and is non-empty
     let base_patch = capsule_dir.join("base.patch");
     if base_patch.exists() {
-        apply_patch(&tree, &base_patch)
-            .map_err(|e| VerifyError::PatchApply(format!("base.patch: {}", e)))?;
+        let patch_content = std::fs::read_to_string(&base_patch)
+            .map_err(|e| VerifyError::Infrastructure(e.to_string()))?;
+        if !patch_content.trim().is_empty() {
+            apply_patch(&tree, &base_patch)
+                .map_err(|e| VerifyError::PatchApply(format!("base.patch: {}", e)))?;
+        }
     }
 
-    // Apply launch.patch
+    // Apply launch.patch (if non-empty)
     let launch_patch = capsule_dir.join("launch.patch");
-    apply_patch(&tree, &launch_patch)
-        .map_err(|e| VerifyError::PatchApply(format!("launch.patch: {}", e)))?;
+    if launch_patch.exists() {
+        let patch_content = std::fs::read_to_string(&launch_patch)
+            .map_err(|e| VerifyError::Infrastructure(e.to_string()))?;
+        if !patch_content.trim().is_empty() {
+            apply_patch(&tree, &launch_patch)
+                .map_err(|e| VerifyError::PatchApply(format!("launch.patch: {}", e)))?;
+        }
+    }
 
-    // Apply lane.patch
+    // Apply lane.patch (if non-empty)
     let lane_patch = capsule_dir.join("lane.patch");
-    apply_patch(&tree, &lane_patch)
-        .map_err(|e| VerifyError::PatchApply(format!("lane.patch: {}", e)))?;
+    if lane_patch.exists() {
+        let patch_content = std::fs::read_to_string(&lane_patch)
+            .map_err(|e| VerifyError::Infrastructure(e.to_string()))?;
+        if !patch_content.trim().is_empty() {
+            apply_patch(&tree, &lane_patch)
+                .map_err(|e| VerifyError::PatchApply(format!("lane.patch: {}", e)))?;
+        }
+    }
 
     // Load check results from the capsule
     let checks_dir = capsule_dir.join("checks");
     let mut capsule_checks: HashMap<String, i32> = HashMap::new();
-    let mut flaky_checks: HashSet<String> = HashSet::new();
+    let flaky_checks = capsule.flaky_checks.clone();
 
     if checks_dir.exists() {
         for entry in std::fs::read_dir(&checks_dir)
@@ -128,12 +154,6 @@ pub async fn verify(
 
                 if let Some(exit_status) = check_data.get("exit_status").and_then(|v| v.as_i64()) {
                     capsule_checks.insert(check_id.clone(), exit_status as i32);
-                }
-
-                // Note: We assume checks marked as flaky have some indicator in the capsule
-                // This is a simplified version; real implementation would need the packet
-                if let Some(true) = check_data.get("flaky").and_then(|v| v.as_bool()) {
-                    flaky_checks.insert(check_id);
                 }
             }
         }

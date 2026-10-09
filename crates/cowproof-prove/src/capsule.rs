@@ -1,7 +1,7 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 use thiserror::Error;
@@ -68,6 +68,8 @@ pub struct Capsule {
     pub local_replay_only: bool,
     pub unsandboxed: bool,
     pub file_hashes: HashMap<String, String>,
+    #[serde(default)]
+    pub flaky_checks: HashSet<String>,
 }
 
 impl Capsule {
@@ -94,6 +96,7 @@ impl Capsule {
             local_replay_only: false,
             unsandboxed: false,
             file_hashes: HashMap::new(),
+            flaky_checks: HashSet::new(),
         }
     }
 

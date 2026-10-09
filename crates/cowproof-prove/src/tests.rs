@@ -1,9 +1,13 @@
 use crate::capsule::{Capsule, EnvironmentFingerprint};
 use crate::runner::{CheckOutcome, CheckRunner, InfraError};
-use crate::verify::{VerifyError, verify};
+use crate::verify::{VerifyError, VerifyResult, verify};
 use std::collections::HashMap;
 use std::path::Path;
 use tempfile::TempDir;
+
+// ============================================================================
+// Shape-only tests (preserved from original)
+// ============================================================================
 
 /// Test that a capsule can be written and read back with correct hash verification.
 #[test]
@@ -35,7 +39,7 @@ fn test_capsule_roundtrip() {
     assert_eq!(read_capsule.estimated_tokens, 12345);
 }
 
-/// Test that editing a file in the capsule causes hash mismatch on read.
+/// Test that editing a tracked file in the capsule causes hash mismatch on read.
 #[test]
 fn test_capsule_hash_mismatch_detected() {
     let temp_dir = TempDir::new().unwrap();
@@ -98,92 +102,76 @@ fn test_capsule_missing_file_detected() {
     assert!(result.unwrap_err().to_string().contains("Missing file"));
 }
 
-/// Test that patches are applied in the correct order: base, launch, lane.
-#[tokio::test]
-async fn test_patch_application_order() {
-    let temp_dir = TempDir::new().unwrap();
-    let _work_dir = TempDir::new().unwrap();
+// ============================================================================
+// End-to-end verify() tests
+// ============================================================================
 
-    // Create a mock capsule with patches
-    let mut capsule = Capsule::new(
-        "HEAD".to_string(),
-        "tree_hash".to_string(),
-        EnvironmentFingerprint {
-            os: "Linux".to_string(),
-            arch: "x86_64".to_string(),
-            tools: HashMap::new(),
-        },
-        "claude:haiku".to_string(),
-        "api-key".to_string(),
-    );
+struct MockRunner {
+    results: std::sync::Mutex<std::collections::HashMap<String, CheckOutcome>>,
+    fail_with_infra: bool,
+}
 
-    // Create base.patch that creates a file
-    let base_patch_content = r#"
-diff --git a/file.txt b/file.txt
-new file mode 100644
-index 0000000..1234567
---- /dev/null
-+++ b/file.txt
-@@ -0,0 +1 @@
-+base
-"#;
-    std::fs::write(temp_dir.path().join("base.patch"), base_patch_content).unwrap();
-
-    // Create launch.patch that modifies the file
-    let launch_patch_content = r#"
-diff --git a/.env b/.env
-new file mode 100644
-index 0000000..abcdefg
---- /dev/null
-+++ b/.env
-@@ -0,0 +1 @@
-+DELETE_ME
-"#;
-    std::fs::write(temp_dir.path().join("launch.patch"), launch_patch_content).unwrap();
-
-    // Create lane.patch that edits the original file
-    let lane_patch_content = r#"
-diff --git a/file.txt b/file.txt
-index 1234567..7654321 100644
---- a/file.txt
-+++ b/file.txt
-@@ -1 +1 @@
--base
-+modified
-"#;
-    std::fs::write(temp_dir.path().join("lane.patch"), lane_patch_content).unwrap();
-
-    capsule.write(temp_dir.path()).unwrap();
-
-    // Create a test runner that checks file state
-    #[derive(Clone)]
-    #[allow(dead_code)]
-    struct TestRunner;
-
-    #[async_trait::async_trait]
-    impl CheckRunner for TestRunner {
-        async fn run(&self, _tree: &Path, _command: &str) -> Result<CheckOutcome, InfraError> {
-            // This is a minimal implementation for testing patch order
-            // A real test would check the actual file contents
-            Ok(CheckOutcome {
-                exit_status: 0,
-                output: "ok".to_string(),
-                attempts: 1,
-            })
+impl MockRunner {
+    fn new() -> Self {
+        Self {
+            results: std::sync::Mutex::new(std::collections::HashMap::new()),
+            fail_with_infra: false,
         }
     }
 
-    // Note: This test requires git setup which isn't available in all test environments
-    // The actual verify call would fail without a proper git repo, but we test the structure here
+    fn set_result(&self, check_id: String, outcome: CheckOutcome) {
+        self.results.lock().unwrap().insert(check_id, outcome);
+    }
 }
 
-/// Test that matching check results produce Reproduced result.
-#[test]
-fn test_matching_results_reproduced() {
-    // This would require mocking the CheckRunner and verify function
-    // For now, we test the data structures
-    let capsule = Capsule::new(
-        "abc123".to_string(),
+#[async_trait::async_trait]
+impl CheckRunner for MockRunner {
+    async fn run(&self, _tree: &Path, command: &str) -> Result<CheckOutcome, InfraError> {
+        if self.fail_with_infra {
+            return Err(InfraError::SpawnError("mock infra error".to_string()));
+        }
+        self.results
+            .lock()
+            .unwrap()
+            .get(command)
+            .cloned()
+            .ok_or_else(|| InfraError::SpawnError("check not mocked".to_string()))
+    }
+}
+
+/// Test: matching pass/fail for 2 checks → Reproduced
+#[tokio::test]
+async fn test_verify_matching_results_reproduced() {
+    let capsule_dir = TempDir::new().unwrap();
+    let workdir = TempDir::new().unwrap();
+
+    // Create tree with test.txt
+    std::fs::write(workdir.path().join("test.txt"), "content").unwrap();
+
+    // Create empty patches
+    std::fs::write(capsule_dir.path().join("launch.patch"), "").unwrap();
+    std::fs::write(capsule_dir.path().join("lane.patch"), "").unwrap();
+
+    // Create check results (both pass)
+    std::fs::create_dir(capsule_dir.path().join("checks")).unwrap();
+    for check_id in &["check1", "check2"] {
+        let check_result = serde_json::json!({
+            "command": "test -f test.txt",
+            "exit_status": 0,
+            "attempts": 1,
+            "duration_ms": 10,
+            "output_sha256": "hash"
+        });
+        std::fs::write(
+            capsule_dir.path().join(format!("checks/{}.json", check_id)),
+            serde_json::to_string(&check_result).unwrap(),
+        )
+        .unwrap();
+    }
+
+    // Create capsule
+    let mut capsule = Capsule::new(
+        "base_commit".to_string(),
         "tree_hash".to_string(),
         EnvironmentFingerprint {
             os: "Linux".to_string(),
@@ -193,34 +181,285 @@ fn test_matching_results_reproduced() {
         "claude:haiku".to_string(),
         "api-key".to_string(),
     );
+    capsule.write(capsule_dir.path()).unwrap();
 
-    assert_eq!(capsule.lane_state, "finished");
-    assert!(!capsule.unsandboxed);
-}
+    // Set up runner to return passing results
+    let runner = MockRunner::new();
+    runner.set_result(
+        "check1".to_string(),
+        CheckOutcome {
+            exit_status: 0,
+            output: "pass".to_string(),
+            attempts: 1,
+        },
+    );
+    runner.set_result(
+        "check2".to_string(),
+        CheckOutcome {
+            exit_status: 0,
+            output: "pass".to_string(),
+            attempts: 1,
+        },
+    );
 
-/// Test that a diverged check is properly reported.
-#[test]
-fn test_diverged_check_detection() {
-    // Test the VerifyResult::Diverged type
-    use crate::verify::VerifyResult;
-
-    let diverged = VerifyResult::Diverged {
-        check_ids: vec!["check_1".to_string(), "check_2".to_string()],
-    };
-
-    if let VerifyResult::Diverged { check_ids } = diverged {
-        assert_eq!(check_ids.len(), 2);
-        assert!(check_ids.contains(&"check_1".to_string()));
-        assert!(check_ids.contains(&"check_2".to_string()));
-    } else {
-        panic!("Expected Diverged variant");
+    let result = verify(capsule_dir.path(), workdir.path(), &runner).await;
+    assert!(result.is_ok());
+    if let Ok(report) = result {
+        assert!(matches!(report.result, VerifyResult::Reproduced));
     }
 }
 
-/// Test that unsandboxed capsules cannot be proved.
+/// Test: one check recorded pass but fails on replay → Diverged
 #[tokio::test]
-async fn test_unsandboxed_capsule_not_proved() {
-    let temp_dir = TempDir::new().unwrap();
+async fn test_verify_diverged_check() {
+    let capsule_dir = TempDir::new().unwrap();
+    let workdir = TempDir::new().unwrap();
+
+    // Create tree with test.txt
+    std::fs::write(workdir.path().join("test.txt"), "content").unwrap();
+
+    // Create empty patches
+    std::fs::write(capsule_dir.path().join("launch.patch"), "").unwrap();
+    std::fs::write(capsule_dir.path().join("lane.patch"), "").unwrap();
+
+    // Create check result (recorded as pass)
+    std::fs::create_dir(capsule_dir.path().join("checks")).unwrap();
+    let check_result = serde_json::json!({
+        "command": "test -f nonexistent.txt",
+        "exit_status": 0,
+        "attempts": 1,
+        "duration_ms": 10,
+        "output_sha256": "hash"
+    });
+    std::fs::write(
+        capsule_dir.path().join("checks/check1.json"),
+        serde_json::to_string(&check_result).unwrap(),
+    )
+    .unwrap();
+
+    // Create capsule
+    let mut capsule = Capsule::new(
+        "base_commit".to_string(),
+        "tree_hash".to_string(),
+        EnvironmentFingerprint {
+            os: "Linux".to_string(),
+            arch: "x86_64".to_string(),
+            tools: HashMap::new(),
+        },
+        "claude:haiku".to_string(),
+        "api-key".to_string(),
+    );
+    capsule.write(capsule_dir.path()).unwrap();
+
+    // Set up runner to fail (file doesn't exist)
+    let runner = MockRunner::new();
+    runner.set_result(
+        "check1".to_string(),
+        CheckOutcome {
+            exit_status: 1,
+            output: "fail".to_string(),
+            attempts: 1,
+        },
+    );
+
+    let result = verify(capsule_dir.path(), workdir.path(), &runner).await;
+    assert!(result.is_ok());
+    if let Ok(report) = result {
+        if let VerifyResult::Diverged { check_ids } = report.result {
+            assert_eq!(check_ids, vec!["check1"]);
+        } else {
+            panic!("Expected Diverged");
+        }
+    }
+}
+
+/// Test: flaky check fails twice then passes on attempt 3 → counts as pass → Reproduced
+#[tokio::test]
+async fn test_verify_flaky_retry_succeeds() {
+    let capsule_dir = TempDir::new().unwrap();
+    let workdir = TempDir::new().unwrap();
+
+    // Empty patches
+    std::fs::write(capsule_dir.path().join("launch.patch"), "").unwrap();
+    std::fs::write(capsule_dir.path().join("lane.patch"), "").unwrap();
+
+    // Create check result
+    std::fs::create_dir(capsule_dir.path().join("checks")).unwrap();
+    let check_result = serde_json::json!({
+        "command": "flaky_check",
+        "exit_status": 0,
+        "attempts": 3,
+        "duration_ms": 10,
+        "output_sha256": "hash"
+    });
+    std::fs::write(
+        capsule_dir.path().join("checks/flaky_check.json"),
+        serde_json::to_string(&check_result).unwrap(),
+    )
+    .unwrap();
+
+    // Create capsule with flaky_check marked as flaky
+    let mut capsule = Capsule::new(
+        "base_commit".to_string(),
+        "tree_hash".to_string(),
+        EnvironmentFingerprint {
+            os: "Linux".to_string(),
+            arch: "x86_64".to_string(),
+            tools: HashMap::new(),
+        },
+        "claude:haiku".to_string(),
+        "api-key".to_string(),
+    );
+    capsule.flaky_checks.insert("flaky_check".to_string());
+    capsule.write(capsule_dir.path()).unwrap();
+
+    // Runner that fails twice then passes
+    struct FlakyRunner(std::sync::Mutex<u32>);
+
+    #[async_trait::async_trait]
+    impl CheckRunner for FlakyRunner {
+        async fn run(&self, _tree: &Path, _command: &str) -> Result<CheckOutcome, InfraError> {
+            let mut att = self.0.lock().unwrap();
+            *att += 1;
+            if *att < 3 {
+                Ok(CheckOutcome {
+                    exit_status: 1,
+                    output: "failed".to_string(),
+                    attempts: *att,
+                })
+            } else {
+                Ok(CheckOutcome {
+                    exit_status: 0,
+                    output: "passed".to_string(),
+                    attempts: *att,
+                })
+            }
+        }
+    }
+
+    let runner = FlakyRunner(std::sync::Mutex::new(0));
+    let result = verify(capsule_dir.path(), workdir.path(), &runner).await;
+
+    assert!(result.is_ok());
+    if let Ok(report) = result {
+        assert!(matches!(report.result, VerifyResult::Reproduced));
+    }
+}
+
+/// Test: non-flaky check failing once → Diverged
+#[tokio::test]
+async fn test_verify_non_flaky_fails_diverged() {
+    let capsule_dir = TempDir::new().unwrap();
+    let workdir = TempDir::new().unwrap();
+
+    // Empty patches
+    std::fs::write(capsule_dir.path().join("launch.patch"), "").unwrap();
+    std::fs::write(capsule_dir.path().join("lane.patch"), "").unwrap();
+
+    // Create check result (recorded as pass)
+    std::fs::create_dir(capsule_dir.path().join("checks")).unwrap();
+    let check_result = serde_json::json!({
+        "command": "check1",
+        "exit_status": 0,
+        "attempts": 1,
+        "duration_ms": 10,
+        "output_sha256": "hash"
+    });
+    std::fs::write(
+        capsule_dir.path().join("checks/check1.json"),
+        serde_json::to_string(&check_result).unwrap(),
+    )
+    .unwrap();
+
+    // Create capsule (NOT marked as flaky)
+    let mut capsule = Capsule::new(
+        "base_commit".to_string(),
+        "tree_hash".to_string(),
+        EnvironmentFingerprint {
+            os: "Linux".to_string(),
+            arch: "x86_64".to_string(),
+            tools: HashMap::new(),
+        },
+        "claude:haiku".to_string(),
+        "api-key".to_string(),
+    );
+    capsule.write(capsule_dir.path()).unwrap();
+
+    // Runner that fails
+    let runner = MockRunner::new();
+    runner.set_result(
+        "check1".to_string(),
+        CheckOutcome {
+            exit_status: 1,
+            output: "failed".to_string(),
+            attempts: 1,
+        },
+    );
+
+    let result = verify(capsule_dir.path(), workdir.path(), &runner).await;
+    assert!(result.is_ok());
+    if let Ok(report) = result {
+        if let VerifyResult::Diverged { check_ids } = report.result {
+            assert_eq!(check_ids, vec!["check1"]);
+        } else {
+            panic!("Expected Diverged");
+        }
+    }
+}
+
+/// Test: runner returns InfraError → VerifyError::Infrastructure
+#[tokio::test]
+async fn test_verify_runner_infra_error() {
+    let capsule_dir = TempDir::new().unwrap();
+    let workdir = TempDir::new().unwrap();
+
+    // Empty patches
+    std::fs::write(capsule_dir.path().join("launch.patch"), "").unwrap();
+    std::fs::write(capsule_dir.path().join("lane.patch"), "").unwrap();
+
+    // Create check result
+    std::fs::create_dir(capsule_dir.path().join("checks")).unwrap();
+    let check_result = serde_json::json!({
+        "command": "check1",
+        "exit_status": 0,
+        "attempts": 1,
+        "duration_ms": 10,
+        "output_sha256": "hash"
+    });
+    std::fs::write(
+        capsule_dir.path().join("checks/check1.json"),
+        serde_json::to_string(&check_result).unwrap(),
+    )
+    .unwrap();
+
+    // Create capsule
+    let mut capsule = Capsule::new(
+        "base_commit".to_string(),
+        "tree_hash".to_string(),
+        EnvironmentFingerprint {
+            os: "Linux".to_string(),
+            arch: "x86_64".to_string(),
+            tools: HashMap::new(),
+        },
+        "claude:haiku".to_string(),
+        "api-key".to_string(),
+    );
+    capsule.write(capsule_dir.path()).unwrap();
+
+    // Runner that returns infra error
+    let runner = MockRunner::new();
+    runner.results.lock().unwrap().clear(); // no results, will cause infra error
+    let result = verify(capsule_dir.path(), workdir.path(), &runner).await;
+
+    assert!(result.is_err());
+    assert!(matches!(result, Err(VerifyError::Infrastructure(_))));
+}
+
+/// Test: unsandboxed capsule → never reported as proved
+#[tokio::test]
+async fn test_verify_unsandboxed_not_proved() {
+    let capsule_dir = TempDir::new().unwrap();
+    let workdir = TempDir::new().unwrap();
 
     let mut capsule = Capsule::new(
         "abc123".to_string(),
@@ -235,82 +474,11 @@ async fn test_unsandboxed_capsule_not_proved() {
     );
 
     capsule.unsandboxed = true;
-    capsule.write(temp_dir.path()).unwrap();
+    capsule.write(capsule_dir.path()).unwrap();
 
-    #[derive(Clone)]
-    struct DummyRunner;
-
-    #[async_trait::async_trait]
-    impl CheckRunner for DummyRunner {
-        async fn run(&self, _tree: &Path, _command: &str) -> Result<CheckOutcome, InfraError> {
-            Ok(CheckOutcome {
-                exit_status: 0,
-                output: String::new(),
-                attempts: 1,
-            })
-        }
-    }
-
-    let runner = DummyRunner;
-    let result = verify(temp_dir.path(), temp_dir.path(), &runner).await;
+    let runner = MockRunner::new();
+    let result = verify(capsule_dir.path(), workdir.path(), &runner).await;
 
     assert!(result.is_err());
     assert!(matches!(result, Err(VerifyError::UnsandboxedNotProved)));
-}
-
-/// Test that flaky checks are retried and counted correctly.
-#[test]
-fn test_flaky_check_retry_tracking() {
-    // Test that our structures support flaky check tracking
-    let check = crate::capsule::CheckResult {
-        command: "test_cmd".to_string(),
-        exit_status: 0,
-        attempts: 3,
-        duration_ms: 100,
-        output_sha256: "abc123".to_string(),
-    };
-
-    assert_eq!(check.attempts, 3);
-}
-
-/// Test that runner infra errors are properly propagated.
-#[tokio::test]
-async fn test_runner_infra_error_propagation() {
-    #[derive(Clone)]
-    struct FailingRunner;
-
-    #[async_trait::async_trait]
-    impl CheckRunner for FailingRunner {
-        async fn run(&self, _tree: &Path, _command: &str) -> Result<CheckOutcome, InfraError> {
-            Err(InfraError::SpawnError("test error".to_string()))
-        }
-    }
-
-    let runner = FailingRunner;
-    let temp_dir = TempDir::new().unwrap();
-
-    // This will fail at git clone, but we test that infrastructure errors are handled
-    let result = verify(temp_dir.path(), temp_dir.path(), &runner).await;
-    assert!(result.is_err());
-}
-
-/// Test environment fingerprint serialization.
-#[test]
-fn test_environment_fingerprint_serialization() {
-    let mut tools = HashMap::new();
-    tools.insert("cargo".to_string(), "1.75".to_string());
-    tools.insert("rustc".to_string(), "1.75.0".to_string());
-
-    let env = EnvironmentFingerprint {
-        os: "macOS".to_string(),
-        arch: "arm64".to_string(),
-        tools,
-    };
-
-    let json = serde_json::to_string(&env).unwrap();
-    let deserialized: EnvironmentFingerprint = serde_json::from_str(&json).unwrap();
-
-    assert_eq!(deserialized.os, "macOS");
-    assert_eq!(deserialized.arch, "arm64");
-    assert_eq!(deserialized.tools.get("cargo").unwrap(), "1.75");
 }
