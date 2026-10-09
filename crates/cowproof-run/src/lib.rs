@@ -628,6 +628,24 @@ pub fn render_macos_profile(policy: &SandboxPolicy) -> Result<String> {
         "(deny file-read* file-write* (subpath {}))\n",
         sbpl(&r.lanes_root)?
     ));
+    // The deny above also hides metadata on the lanes root and on this lane's
+    // own directories inside it, so a path walk to a grant (git's realpath,
+    // `mkdir -p`, `test -S`) fails. Allow metadata only, as `literal`, on exactly
+    // those directories: it permits `stat` but not listing or reading.
+    let mut lane_metadata = BTreeSet::new();
+    lane_metadata.insert(r.lanes_root.clone());
+    for p in r.rw.iter().chain(r.ro.iter()) {
+        for a in p.ancestors().skip(1) {
+            if a.starts_with(&r.lanes_root) {
+                lane_metadata.insert(a.to_path_buf());
+            }
+        }
+    }
+    out.push_str("(allow file-read-metadata");
+    for m in &lane_metadata {
+        out.push_str(&format!(" (literal {})", sbpl(m)?));
+    }
+    out.push_str(")\n");
 
     for p in &r.rw {
         out.push_str(&format!(
@@ -1447,6 +1465,34 @@ mod tests {
             deny_pos < allow_pos,
             "lanes_root deny must come before RW allows"
         );
+    }
+
+    #[test]
+    fn lanes_root_metadata_is_literal_and_follows_the_deny() {
+        // A path walk to this lane's grants (git's realpath, `mkdir -p`) needs
+        // `stat` on the lanes root and the lane directory. The allow must follow
+        // the lanes-root deny (the last matching rule wins) and be `literal`, so
+        // it never lets a builder list or read another lane.
+        let lane = test_lane();
+        let policy = SandboxPolicy::builder(&lane, NetworkMode::None);
+        let profile = render_macos_profile(&policy).unwrap();
+        let deny = format!(
+            "(deny file-read* file-write* (subpath \"{}\"))",
+            lane.lanes_root.display()
+        );
+        let deny_pos = profile.find(&deny).expect("lanes_root deny");
+        let line = profile[deny_pos..]
+            .lines()
+            .find(|l| l.starts_with("(allow file-read-metadata"))
+            .expect("a metadata allow after the lanes-root deny");
+        let root = format!("(literal \"{}\")", lane.lanes_root.display());
+        assert!(line.contains(&root), "{line}");
+        let lane_dir = lane.clone.parent().unwrap();
+        assert!(
+            line.contains(&format!("(literal \"{}\")", lane_dir.display())),
+            "{line}"
+        );
+        assert!(!line.contains("subpath"), "metadata must be literal: {line}");
     }
 
     #[test]
