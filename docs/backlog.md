@@ -2,6 +2,8 @@
 
 Work the crate port (2026-10-09) deferred or exposed. Newest first.
 
+- **Recurring: track sandbox-runtime upstream fixes** (eng review D16). cowproof's sandbox and egress proxy follow anthropics/sandbox-runtime's design (D4). Record the ported upstream commit in NOTICE when step 4 lands, and at every cowproof release review sandbox-runtime's releases and security advisories, mapping each fix to `SandboxPolicy` and the proxy.
+
 - **Rebuild handback-report snapshot fixtures synthetically.** The original `lanes-report` tests snapshot-checked reports for five real lane handbacks (four full snapshots and one fenced "arrow-format" check parse). Those fixtures were lane patches of the source platform's product code, which the relicensing does not cover, so they and their tests were not ported. Recreate the same coverage with synthetic handbacks: a checks table, bullet checks, fenced commands with the result in the following paragraph, the arrow format (`command -> result`), questions, limits, unverified and deferred sections, and a migration-baseline case.
 - **Node parity test is opt-in.** `cowproof-core`'s `parity_with_node_if_available` now runs only when `COWPROOF_REFERENCE_RUNNER` points at a `run-lane.mjs`. It passed against the source runner on 2026-10-09. Replace it with portkit parity fixtures captured from that runner (design step 3), committed here, so parity no longer needs the runner present.
 - **Config file rename.** The crates still read `lanes.config.json` and the `LANES_HOSTS_FILE` and `LANES_WSL_DISTRO` variables. Move to `cowproof.toml` and `COWPROOF_*` names with a compatibility read of the old ones.

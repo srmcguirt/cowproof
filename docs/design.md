@@ -241,14 +241,12 @@ A Rust workspace. The six `lanes-*` crates were ported on 2026-10-09 as `cowproo
 | --- | --- | --- |
 | `portkit-core`, `-mcp`, `-port`, `-cli`, `-plugin`, `-read`, `-index` (under `crates/portkit/`) | `srmcguirt/portkit` | tool registry and MCP server, parity harness, usage tracing, `pk-read`, symbol index |
 | `cowproof-core` | `lanes-core` | packet, header, config, status classes |
-| `cowproof-run` | port of `run-lane.mjs` | clone, sandbox, slots, builder runtimes, diagnostics |
-| `cowproof-escalate` | new | queue, verdicts, builder MCP tool, `ask` |
+| `cowproof-run` | port of `run-lane.mjs` | clone, `SandboxPolicy` (D8), egress proxy (D4), slots, builder runtimes, diagnostics, and the escalation queue, socket and verdicts (folded in by D3) |
 | `cowproof-prove` | `lanes-report` | verifier, gates, flaw packs, capsule, `verify` |
-| `cowproof-watch` | new | TUI and event stream |
 | `cowproof-lint` | `lanes-lint` | packet lint |
 | `cowproof-host` | `lanes-host` | host facts; remote hosts later |
 | `cowproof-plan` | `lanes-plan` | plan files, later |
-| `cowproof-cli` | `lanes-cli` | the `cowproof` binary |
+| `cowproof-cli` | `lanes-cli` | the `cowproof` binary, including `watch` and `watch --events` (folded in by D3) |
 
 Per-repository `cowproof.toml`:
 
@@ -311,18 +309,20 @@ Shipped in the repository, installable as a Claude Code plugin, with an `.agents
 
 ## Next Steps
 
+Amended by the engineering review (2026-10-09); each change cites its decision in the ledger below. Ledger records written before this amendment use the earlier numbering: earlier steps 4, 5, 6 and 8 are now 3, 4, 5 and 8; earlier step 3 is now 7.
+
 1. **Repo, provenance, crates.** Done 2026-10-09: public repository, MIT, relicensing recorded, the six lane crates ported (54 tests), `scripts/scrub-check`. Next: the CI job for the scrub check and tests, and the synthetic replacements in `docs/backlog.md`.
-2. **Bring portkit in** (P0 in portkit-integration.md): subtree import, drop `demo/` and `schema/`, make `Command::execute` public, fix G5 and G6, its tests green in the workspace.
-3. **Reference runner and fixtures** (P1, P2): add the Node runner and its adapter under `reference/node-runner/`, build the fake-worker harness, and capture fixtures for port steps 1 to 10, with portkit's G2 (pinned `cwd` and env) and G4 (error cases) first.
-4. **Slice: run.** `cowproof run packet.md` with committed-base dispatch, COW clone, fail-closed sandbox on both platforms, the control directory, the egress proxy, a Haiku builder through headless Claude Code, portkit hooks. Ported pure units must pass `pk port replay`; effectful units pass their translated tests.
-5. **Slice: escalate.** Runner-owned queue, `ask` / `check_ruling` / `run_check` tools and CLI mirrors, end-and-resume delivery, escalate-early triggers, `cowproof rule` with all four verdicts, `watch --events`.
-6. **Slice: prove.** Verifier in a fresh no-network sandbox, held-out checks from the control directory, ownership, append-only and protected-path gates, generic flaw pack, capsule bundle, `cowproof verify` on pass or fail per check.
-7. **Prove the slice** against the first two success criteria (synthetic packet; adversarial packet).
-8. **Fold the runner in:** classes and slots, diagnostics and host breaker, Codex and OpenRouter builders, `watch` TUI, preflight.
+2. **Bring in the portkit the slice needs** (D15): subtree import, drop `demo/` and `schema/`, make `Command::execute` public (G1), with `portkit-core` and `portkit-mcp` green and used by the slice's escalation tools.
+3. **Slice: run** (API-key builders only, D2). Opens with the `--bare` probe (D7). `cowproof run packet.md` with committed-base dispatch, held-out checks stored outside the repository (D5), COW clone, `SandboxPolicy` ported from sandbox-runtime's design with the D10 regression contract and control-directory denial (D4, D8, A-3), the egress proxy holding the key, the control directory, a Haiku builder through headless Claude Code, one runner (Q-2).
+4. **Slice: escalate.** Runner-owned queue in `cowproof-run` (D3), `ask` / `check_ruling` / `run_check` tools served through portkit's MCP server, sandboxed `run_check`, end-and-resume delivery, escalate-early triggers, duplicate and late rulings rejected and resume fallback (D9), `cowproof rule` with all four verdicts, `cowproof watch --events` (D3).
+5. **Slice: prove.** Verifier in a fresh no-network sandbox holding its lane's class slot (D12), dependencies pre-fetched outside any builder and keyed by lockfile, registry configuration and target (D6, D11, D14), its own compile cache, held-out checks from the director store, gates loading packs from the base, `launch.patch` recorded and replayed (D13), capsule bundle, `cowproof verify` on pass or fail per check, infrastructure failures never `refuted` (F-1).
+6. **Prove the slice** against the first two success criteria (synthetic packet; adversarial packet).
+7. **Reference runner and fixtures** (moved after the slice by D15): the Node runner and its adapter under `reference/node-runner/`, the fake-worker harness, and fixtures for port steps 1 to 10, with portkit's G2 and G4 first.
+8. **Fold the runner in:** subscription mode (D2, with `--setting-sources` and `--strict-mcp-config`, SC-4), portkit hooks, trace fixes G5 and G6 and the usage monitor (D15), classes and slots, diagnostics and host breaker, Codex and OpenRouter builders, `watch` TUI, preflight.
 9. **First release:** binaries, plugin, README with honest cost, sizing and credential notes, port packets with Node and Python adapters. Remote hosts, plan files and shell process capture are not in it.
 10. **After the first release:** shell and other-language process capture (`pk port exec`, Linux first), remote hosts, plan files.
 
-From step 4 on, cowproof builds itself: once `run` works, its own lanes carry the remaining steps.
+From step 3 on, cowproof builds itself: once `run` works, its own lanes carry the remaining steps.
 
 ## The Assignment
 
@@ -710,3 +710,569 @@ Stop: CONVERGENCE
 
 > The third 'What I noticed' observation is unchanged.
 <!-- gstack:office-hours:concerns:end -->
+
+## Engineering review (2026-10-09)
+
+Target: `docs/design.md` (this file, Status: APPROVED) with `docs/portkit-integration.md`, reviewed by /plan-eng-review. The design above is unchanged except where an approved decision below amends it.
+
+### Scope record
+
+feature answers: D2 = A (defer subscription-mode builders from the slice, Next Steps 4 to 6, to step 8; still ships in the first release); structure: A (smaller arrangement, D3): `cowproof-escalate` folds into `cowproof-run` (queue, socket and rulings as modules) and `cowproof-watch` folds into `cowproof-cli` (a subcommand reading lane files), giving 7 cowproof crates (core, run, prove, lint, host, plan, cli) plus the 7 portkit crates; accepted scope: the approved design's features, contracts and approved fixes, with the slice built on API-key builders only and the 14-crate arrangement; pending remedies: SC-1, A-1 to A-5.
+
+Scope Challenge result: scope reduced per recommendation (subscription mode moved out of the slice).
+
+## Decision ledger
+
+### Note O-3: architecture table reconciled with D3 (outside voice, factual)
+Finding: O-3, Medium, Codex outside voice (gpt-6-luna), design.md Architecture table listed `cowproof-escalate` and `cowproof-watch` after D3 folded them. Disposition: authorized amendment under D3: the table now lists 7 cowproof crates, with the escalation queue in `cowproof-run` and `watch` in `cowproof-cli`.
+
+### R1: sandbox and egress proxy design source (SC-1)
+Finding: SC-1, P2, confidence 8/10, design.md Trust boundaries and Dispatch; crates/cowproof-core/src/lib.rs:303; reviewer: plan-eng-review
+Plan baseline: approved design: cowproof writes its own sandbox profiles (ported from run-lane.mjs) and its own local egress proxy; no named reference implementation
+Runtime evidence: `sandbox_profile` builds sandbox-exec profiles with file rules only and no network rules (lib.rs:303-341); anthropics/sandbox-runtime is Apache-2.0, TypeScript, maintained (pushed 2026-10-09), and implements deny-by-default network through a host proxy (macOS: one localhost port; Linux: Unix socket bind-mounted, network namespace removed) plus a macOS violation-log tap
+Comparison grid:
+| Choice | Current | A | B | C |
+|---|---|---|---|---|
+| R1 design source for sandbox + proxy | own design, no reference | port sandbox-runtime's design to Rust with attribution (NOTICE), checked by parity tests against its profiles where portable | own design as approved | depend on sandbox-runtime at runtime (Node) |
+| No-Node-for-users constraint | approved | kept | kept | broken |
+| Credential injection in proxy | approved (API-key mode) | kept, added on top | kept | kept, added as a wrapper |
+| Subscription mode in slice | deferred (D2) | unchanged | unchanged | unchanged |
+Question D4:
+D4 — Use Anthropic's sandbox-runtime as the reference design for cowproof's sandbox and egress proxy?
+Project/branch/task: cowproof main, approved design Trust boundaries and Dispatch; crates/cowproof-core/src/lib.rs:303.
+ELI10: cowproof needs every builder locked in a box with no network except a proxy that only talks to the model provider. Anthropic already publishes an open-source tool that does exactly this box-plus-proxy on macOS and Linux, and it is battle-tested. We can't ship it inside cowproof (it needs Node, and outside users shouldn't need Node), but we can copy its proven design into Rust instead of inventing our own, and credit it.
+Stakes if we pick wrong: a home-grown sandbox repeats escape bugs the reference already fixed; a Node dependency breaks the one-install promise.
+Recommendation: A because it reuses a proven design without breaking the no-Node constraint, and the Apache-2.0 license allows it with attribution.
+Completeness: A=9/10, B=6/10, C=7/10
+Header: Sandbox ref
+Options:
+A) Port its design (recommended)
+Port sandbox-runtime's sandbox and proxy design to Rust in cowproof-run with Apache-2.0 attribution in NOTICE; credential injection added on top; its profiles used as test references. (human ~3 days / CC ~1 hr extra over B; low maintenance: track upstream fixes)
+B) Own design as approved
+Keep the approved plan: extend the ported sandbox_profile with network rules and write the proxy from scratch, no named reference. (no extra effort now; higher risk of repeating known escape bugs)
+C) Depend on it (Node)
+Shell out to the srt binary at runtime and wrap it with a credential-injecting layer. (human ~1 day / CC ~20 min; breaks no-Node-for-users and adds a second install)
+
+State: approved
+Actual answer: A) Port its design (D4, 2026-10-09)
+Accepted scope: cowproof-run's sandbox and egress proxy follow anthropics/sandbox-runtime's design (deny-by-default network through a host proxy: one localhost port on macOS, a bind-mounted Unix socket with the network namespace removed on Linux), ported to Rust with Apache-2.0 attribution in a NOTICE file; credential injection added on top in the proxy; sandbox-runtime's generated profiles used as test references where portable. No-Node-for-users stays; subscription mode stays out of the slice (D2).
+History: pending until D4
+
+### Carried requirement A-3: sandbox grants only clone, home and scratch
+Finding: A-3, P1, confidence 8/10, crates/cowproof-core/src/lib.rs:337 (`(allow file-read* file-write* (subpath {lane}))`); reviewer: plan-eng-review
+Plan baseline: approved Trust boundaries: `lane/control/` is neither readable nor writable from inside the sandbox
+Runtime evidence: the ported profile builder grants the entire lane directory read and write
+Disposition: required implementation of the approved contract (no new choice). The macOS profile and Linux bubblewrap arguments grant only `lane/clone`, `lane/home` and the lane scratch directory; live tests on both platforms assert that a sandboxed process cannot read or write `lane/control/`.
+
+### R2: where held-out checks live before dispatch (A-1)
+Finding: A-1, P1, confidence 8/10, design.md L88 and L91; reviewer: plan-eng-review
+Plan baseline: approved: `packet.heldout.toml` lives only in the lane's control directory and never in the clone; its location before dispatch is unspecified
+Runtime evidence: dispatch clones the committed base (design L91); the ported runner copies the repository working tree; any held-out file stored in the repository would be in the clone
+Comparison grid:
+| Choice | Current | A | B |
+|---|---|---|---|
+| R2 held-out storage before dispatch | unspecified | outside the repository: a director store `~/.cowproof/heldout/<repo-id>/<lane-id>.toml` or an explicit `--heldout <path>`; dispatch refuses a path inside the repository and refuses to start if any file in the base matches `*.heldout.*` | inside the repository, excluded from the clone by name |
+| Held-out in capsule | approved | unchanged | unchanged |
+| Sandbox grants (A-3) | carried requirement | unchanged | unchanged |
+Question D5:
+D5 — Where do held-out checks live before a lane is dispatched?
+Project/branch/task: cowproof main, approved design L88 (Packet) and L91 (Dispatch).
+ELI10: Held-out checks are the secret test the builder never sees. The design says they are kept away from the builder's copy, but never says where the director writes them first. If they sit in the repository, the builder's copy of the repository includes them and the secret is gone. Keeping them outside the repository makes a leak impossible by construction; keeping them inside and filtering them out relies on a filename rule never being missed.
+Stakes if we pick wrong: a builder reads the held-out checks and games them, and the gate reports a proof that isn't one.
+Recommendation: A because a store outside the repository cannot leak through cloning, and the refusal check catches mistakes.
+Completeness: A=10/10, B=6/10
+Header: Held-out home
+Options:
+A) Outside the repo (recommended)
+Held-out checks live in ~/.cowproof/heldout/<repo-id>/<lane-id>.toml or a --heldout path outside the repository; dispatch refuses a path inside the repo and refuses to start if the base contains any *.heldout.* file. Tests: dispatch rejects an in-repo path; a base containing a held-out file is refused; the clone never contains it. (human ~half day / CC ~15 min; no ongoing maintenance)
+B) In repo, filtered
+Held-out files stay beside packets in the repository and the clone step skips files matching *.heldout.*. (human ~2 hrs / CC ~5 min; one missed pattern or rename leaks the checks)
+
+State: approved
+Actual answer: A) Outside the repo (D5, 2026-10-09)
+Accepted scope: held-out checks are stored outside the repository, in `~/.cowproof/heldout/<repo-id>/<lane-id>.toml` or an explicit `--heldout <path>` outside the repository; dispatch refuses an in-repository path and refuses to start if any file in the base matches `*.heldout.*`; tests: in-repo path rejected, base containing a held-out file refused, clone never contains it. Capsule handling of held-out checks and the A-3 sandbox requirement unchanged.
+History: pending until D5
+
+### R3: how the verifier gets dependencies and build caches (A-4)
+Finding: A-4, P1, confidence 7/10, design.md L159 ("inside a sandbox with no network and no credentials"); crates/cowproof-cli (shared `.cache/cowproof-sccache` given to every lane); reviewer: plan-eng-review
+Plan baseline: approved: the verifier builds a fresh clone of base plus patch and runs checks with no network and no credentials; dependency and cache handling unspecified
+Runtime evidence: the ported runner gives every lane a shared, writable sccache directory; a fresh clone of a cargo or npm project cannot build without fetched dependencies
+Comparison grid:
+| Choice | Current | A | B | C |
+|---|---|---|---|---|
+| R3 verifier dependency source | unspecified (no network) | runner pre-fetches dependencies for the base lockfiles outside any builder (cargo fetch, npm ci --ignore-scripts, and the like per detected ecosystem) into a per-base cache mounted read-only into the verifier; if the patch changes a lockfile the packet owns, a separate fetch step runs through the proxy with registry read-only access, outside the builder | verifier gets read-only registry access through the proxy at verify time | as approved: no network, no prepared cache |
+| R3 verifier compile cache | unspecified | its own compile cache that builders never write; never the builders' shared sccache | its own compile cache | none |
+| Verifier network for checks | none (approved) | none | registry read-only | none |
+| Held-out storage (D5) | approved | unchanged | unchanged | unchanged |
+Question D6:
+D6 — How does the verifier get dependencies and build caches without trusting the builder?
+Project/branch/task: cowproof main, approved design L159 (Verifier).
+ELI10: The verifier re-runs the checks in a clean copy with no network, so a builder can't fake the result. But a clean copy of a real project usually can't build offline, and the fast shared build cache the runner uses today is writable by builders, so a builder could plant bad build artifacts the verifier would trust. The verifier needs dependencies prepared from the trusted base, and a cache no builder can touch.
+Stakes if we pick wrong: either the verifier fails on every real project (no dependencies) or it trusts files a builder wrote (proof is fake).
+Recommendation: A because it keeps the verifier offline and builder-proof while still building real projects.
+Completeness: A=9/10, B=7/10, C=3/10
+Header: Verifier deps
+Options:
+A) Trusted pre-fetch (recommended)
+The runner fetches dependencies for the base lockfiles outside any builder into a read-only per-base cache; a lockfile change the packet owns triggers a separate read-only registry fetch outside the builder; the verifier has its own compile cache builders never write. Tests: verifier runs offline on a cargo and an npm fixture; a builder-written cache entry is never read by the verifier. (human ~3 days / CC ~1 hr; maintenance: one fetch adapter per ecosystem)
+B) Registry at verify time
+The verifier gets read-only registry access through the proxy and its own compile cache. (human ~1 day / CC ~20 min; verify depends on registry availability; install scripts run with network)
+C) As approved
+No network and no prepared cache; projects that need fetched dependencies fail verification. (no extra work; most real projects cannot be proven)
+
+State: approved
+Actual answer: A) Trusted pre-fetch (D6, 2026-10-09)
+Accepted scope: the runner fetches dependencies for the base lockfiles outside any builder (one fetch adapter per detected ecosystem, starting with cargo and npm with install scripts disabled) into a per-base cache mounted read-only into the verifier; when the patch changes a lockfile the packet owns, a separate fetch step runs outside the builder through the proxy with read-only registry access; the verifier uses its own compile cache that builders never write, never the builders' shared sccache; verifier checks keep no network. Tests: the verifier runs offline on a cargo fixture and an npm fixture; a cache entry written by a builder is never read by the verifier. Held-out storage (D5) unchanged.
+History: pending until D6
+
+### R4: whether `--bare` keeps cowproof's hooks and session resume (A-2)
+Finding: A-2, P1, confidence 6/10 (medium; verify), design.md L232 ("Builders run with `--bare`; cowproof supplies its own settings and tools with `--settings`"); `claude --help` v2.1.295: `--bare` "skip hooks (those defined in settings and by installed plugins ...)" and also lists `--settings` under "Explicitly provide context via"; reviewer: plan-eng-review
+Plan baseline: approved: API-key builders run with `--bare`, get portkit hooks through `--settings`, and are resumed with `claude -p --resume <session-id>`
+Runtime evidence: unknown. No API key is available in this session, so the probe could not run. The help text is ambiguous for hooks; resume under `--bare` is undocumented in the help. The CLI also has `--setting-sources` and `--strict-mcp-config`, which could isolate a non-bare session.
+Comparison grid:
+| Choice | Current | A | B |
+|---|---|---|---|
+| R4 verification of `--bare` hooks and resume | unverified assumption | bounded probe first: at the start of Next Step 4, one run with an API key checks (1) a PostToolUse hook from `--settings` fires under `--bare`, (2) `--resume <session-id>` continues a `--bare -p` session, (3) a `--mcp-config` server is reachable; result recorded here; if either fails, this record reopens with the evidence to choose an isolation recipe | assume both work as approved; discover during the slice |
+| Builder isolation recipe | `--bare` (approved) | unchanged until the probe; no fallback approved now | unchanged |
+| Subscription mode in slice | deferred (D2) | unchanged | unchanged |
+Question D7:
+D7 — Probe whether --bare keeps cowproof's hooks and session resume before building on it?
+Project/branch/task: cowproof main, approved design L232 (Auth and cost); Claude Code CLI 2.1.295 help text.
+ELI10: The design runs API-key builders in Claude Code's minimal "--bare" mode and counts on two things still working there: cowproof's monitoring hooks, and resuming a parked session with the director's ruling. The CLI's own help says bare mode skips hooks defined in settings, while also listing --settings as a way to supply context, so it's unclear. I couldn't test it here without an API key. A ten-minute probe at the start of the build settles it before anything depends on it.
+Stakes if we pick wrong: the escalation loop's resume step or the usage monitor silently doesn't work, found only after the slice is built on it.
+Recommendation: A because a short bounded probe removes the biggest unverified assumption in the slice; no fix is chosen until the evidence is in.
+Note: options differ in kind, not coverage — no completeness score.
+Header: Bare probe
+Options:
+A) Probe first (recommended)
+At the start of Next Step 4, one run with an API key checks that a --settings PostToolUse hook fires under --bare, that --resume continues a --bare -p session, and that a --mcp-config server is reachable; results recorded in this record; if anything fails, this record reopens with the evidence. Approves no fallback now. (human ~1 hr / CC ~10 min)
+B) Assume it works
+Build the slice on --bare as approved and find out during implementation. (no upfront cost; if it fails, rework lands mid-slice)
+
+State: approved (investigation only)
+Actual answer: A) Probe first (D7, 2026-10-09)
+Accepted scope: a bounded probe at the start of Next Step 4: one run with an API key checks that a `--settings` PostToolUse hook fires under `--bare`, that `--resume <session-id>` continues a `--bare -p` session, and that a `--mcp-config` server is reachable; results recorded in this record. No fallback is approved; if any check fails, this record reopens with the evidence. Builder isolation stays `--bare` as approved until then; subscription mode stays out of the slice (D2).
+History: pending until D7
+
+### Note SC-4: CLI controls for subscription-mode isolation (factual, step 8)
+Finding: SC-4, P3, confidence 9/10, design.md Trust boundaries ("uses CLI controls that ignore project sources where the documentation confirms them"); reviewer: plan-eng-review
+Evidence: `claude --help` v2.1.295 lists `--setting-sources <sources>` ("Comma-separated list of setting sources to load (user, project, local)") and `--strict-mcp-config` ("Only use MCP servers from --mcp-config"). Disposition: factual note for Next Step 8 (subscription mode, deferred by D2); no behavior change now. CLAUDE.md auto-discovery is not covered by these flags and still needs the approved launch-baseline handling.
+
+### Note F-1: verifier infrastructure failures are not refutations (clarification)
+Finding: F-1, P2, confidence 8/10, design.md Lane states ("`refuted` (a gate or the verifier failed)"); reviewer: plan-eng-review
+Disposition: clarification of the approved states, no new behavior: a verifier that cannot run (dependency fetch failed, sandbox unavailable, proxy down) ends the lane in the existing runner or host failure classes, never `refuted`; `refuted` means a check or gate ran and failed.
+
+### Carried requirement Q-2: one runner
+Finding: Q-2, P2, confidence 8/10, crates/cowproof-cli/src/main.rs (2,499 lines; its own lane loop `run_worker` / `consume_event`); reviewer: plan-eng-review
+Disposition: required by the approved design (cowproof-run owns the runner). The change that wires `cowproof run` to `cowproof-run` deletes the CLI's lane loop in the same commit; `git grep run_worker crates/cowproof-cli` is empty afterwards.
+
+### R5: one sandbox policy type for every sandboxed caller (Q-1)
+Finding: Q-1, P2, confidence 8/10, crates/cowproof-core/src/lib.rs:303 (`pub fn sandbox_profile(lane_dir: &Path, extra: &[PathBuf], home: &Path)`), :343 (`linux_sandbox_args`), :412 (`sandbox_command`); reviewer: plan-eng-review
+Plan baseline: approved: builders, `run_check`, the verifier, the dependency fetch (D6) and portkit capture all run sandboxed with different filesystem and network policies; no shared policy type specified
+Runtime evidence: three existing builders take `(lane_dir, extra, home)` and grant the whole lane directory; none expresses network policy
+Comparison grid:
+| Choice | Current | A | B |
+|---|---|---|---|
+| R5 sandbox construction | three functions with positional paths | one `SandboxPolicy` value in cowproof-run (read-write paths, read-only paths, network: none, proxy-only or registry-read-only, env allowlist) rendered to a macOS profile or bubblewrap arguments, used by all five callers; the three existing functions removed | each caller builds its own profile from the existing functions plus additions |
+| Design source (D4) | approved | unchanged | unchanged |
+| A-3 grants | carried requirement | expressed as a policy and tested once | implemented per caller |
+Question D8:
+D8 — Build one sandbox policy type that every sandboxed step uses?
+Project/branch/task: cowproof main, crates/cowproof-core/src/lib.rs:303-431 and the approved Verifier, run_check and D6 fetch.
+ELI10: Five different steps will run code in a sandbox: the builder, each check, the verifier, the dependency fetch, and script capture for porting. They need slightly different rules (which folders are writable, whether there's any network). If each one builds its own sandbox rules, the security boundary exists in five hand-edited copies and one will drift. One policy type, tested once per platform, keeps the boundary in a single place.
+Stakes if we pick wrong: one copy of the sandbox rules quietly grants too much and a builder escapes through it.
+Recommendation: A because the sandbox is the security boundary, and one tested definition beats five copies.
+Completeness: A=9/10, B=6/10
+Header: Sandbox policy
+Options:
+A) One policy type (recommended)
+SandboxPolicy in cowproof-run (rw paths, ro paths, network none / proxy-only / registry-read-only, env allowlist) rendered per platform and used by builder, run_check, verifier, D6 fetch and capture; the three existing functions removed. Tests: one table-driven test per platform over all five policies, plus the A-3 live denial test. (human ~1 day / CC ~30 min; one place to maintain)
+B) Per-caller profiles
+Each caller extends the existing functions with its own additions. (human ~half day / CC ~15 min now; five copies of the boundary to keep in sync)
+
+State: approved
+Actual answer: A) One policy type (D8, 2026-10-09)
+Accepted scope: one `SandboxPolicy` value in cowproof-run (read-write paths, read-only paths, network none / proxy-only / registry-read-only, env allowlist), rendered to a macOS profile or bubblewrap arguments, used by the builder, `run_check`, the verifier, the D6 dependency fetch and portkit capture; `sandbox_profile`, `linux_sandbox_args` and `sandbox_command` removed. Tests: one table-driven test per platform over all five policies, plus the A-3 live denial test. Design source (D4) unchanged.
+History: pending until D8
+
+### R6: escalation edge cases (Q-3)
+Finding: Q-3, P2, confidence 7/10, design.md L119-140 (escalation protocol and verdict table); reviewer: plan-eng-review
+Plan baseline: approved: one ruling per escalation, delivered by end-and-resume; no rule for duplicate or late rulings or a failed resume
+Runtime evidence: none (proposed behavior); the queue does not exist yet
+Comparison grid:
+| Choice | Current | A | B |
+|---|---|---|---|
+| R6a duplicate ruling | unspecified | every escalation has an id; the first ruling for an id wins; later ones are rejected with an error naming the first and logged | same |
+| R6b ruling for an ended lane or after the park limit | unspecified | rejected with an error naming the lane state; logged | same |
+| R6c resume failure (session missing or expired) | unspecified | the runner starts a fresh session for the same model on the same clone with the ruling plus its carry-over summary (the reassign mechanism without changing model); counted against the escalation limit; capsule records `resume-fallback` | the lane ends as `stopped` with work kept; the director re-dispatches |
+| Escalation limits | approved (3, 30 min) | unchanged | unchanged |
+Question D9:
+D9 — How should the runner handle duplicate rulings, late rulings and a failed resume?
+Project/branch/task: cowproof main, approved design L119-140 (escalation protocol).
+ELI10: Three awkward cases will happen in real use: the director answers the same question twice, answers after the lane already ended, or rules but the builder's parked session can't be resumed (it expired or was cleaned up). Duplicate and late rulings should simply be rejected with a clear message. For a failed resume, the runner can either restart the builder fresh with the ruling and a summary of its progress, or stop the lane and let the director re-dispatch.
+Stakes if we pick wrong: rulings get silently lost, or lanes die on a routine session expiry and waste the work done so far.
+Recommendation: A because a fresh session with the carry-over summary reuses the reassign mechanism the design already has, and keeps the lane's work moving.
+Completeness: A=9/10, B=7/10
+Header: Ruling edges
+Options:
+A) Reject dupes, restart (recommended)
+Escalation ids; first ruling wins, duplicates and rulings for ended or over-limit lanes are rejected with an error and logged; a failed resume starts a fresh session on the same model and clone with the ruling and carry-over summary, counted against the limit, recorded as resume-fallback. Tests: duplicate rejected; ended-lane ruling rejected; expired session falls back and the capsule says so. (human ~1 day / CC ~30 min)
+B) Reject dupes, stop lane
+Same rejections; a failed resume ends the lane as stopped with its work kept, and the director re-dispatches. (human ~half day / CC ~15 min; more director time on routine expiries)
+
+State: approved
+Actual answer: A) Reject dupes, restart (D9, 2026-10-09)
+Accepted scope: every escalation has an id; the first ruling for an id wins and later ones are rejected with an error naming the first, and logged; rulings for an ended lane or after the park limit are rejected with an error naming the lane state, and logged; a failed resume starts a fresh session on the same model and clone with the ruling and the runner's carry-over summary, counted against the escalation limit, recorded in the capsule as `resume-fallback`. Tests: duplicate ruling rejected; ruling for an ended lane rejected; an expired session falls back and the capsule records it. Escalation limits unchanged.
+History: pending until D9
+
+### R7: regression contract for the sandbox rewrite (D8, A-3)
+Finding: T-1, P1 (regression risk), confidence 9/10, crates/cowproof-core/src/lib.rs:762-801 (`sandbox_builders_include_expected_boundaries`: `assert!(a.contains(&"--unshare-pid".into()))`, HOME as `--tmpfs`, profile contains `credentials.toml`, `sandbox-exec -f <lane>/sandbox.sb <cmd>`, `bwrap ... <cmd>`); reviewer: plan-eng-review
+Plan baseline: approved D8 (one SandboxPolicy, old functions removed) and carried A-3 (grant only clone, home, scratch); no explicit regression contract
+Runtime evidence: the existing test above passes today (54 tests green, 2026-10-09)
+Comparison grid:
+| Choice | Current | A | B |
+|---|---|---|---|
+| R7 behaviors preserved by the rewrite | asserted by lib.rs:762 | preserved with tests carried into the SandboxPolicy suite: Linux PID namespace (`--unshare-pid`); HOME hidden (tmpfs on Linux, denied on macOS) except toolchain paths (`~/.rustup` read, `~/.cargo` read and write); `~/.cargo/credentials*` denied on both; command passthrough as the final arguments; the profile written inside the lane, never in the clone | preserve only what the new policy suite happens to cover |
+| R7 intended differences | none | lane grant narrows to clone, home, scratch (A-3); network rules added (D4, D8); profile file moves out of the builder-writable area | same intended differences, not enumerated |
+| D8 policy type | approved | unchanged | unchanged |
+Question D10:
+D10 — What must the sandbox rewrite preserve from today's tested behavior?
+Project/branch/task: cowproof main, crates/cowproof-core/src/lib.rs:762-801 versus approved D8 and A-3.
+ELI10: The current sandbox code has a test that pins down several protections: builders get their own process namespace on Linux, can't see your home folder except the Rust toolchain, and can never read your cargo publish credentials. The rewrite into one policy type (D8) and the narrower folder grant (A-3) change this code. Writing down exactly which protections must survive, and which changes are intended, turns the rewrite into a checked migration instead of a hope.
+Stakes if we pick wrong: the rewrite silently drops a protection, such as hiding cargo credentials, and nothing fails.
+Recommendation: A because each listed protection is security-relevant and already tested, so carrying the assertions forward costs little.
+Completeness: A=10/10, B=5/10
+Header: Sandbox regress
+Options:
+A) Preserve listed (recommended)
+Carry these into the SandboxPolicy suite: Linux --unshare-pid; HOME hidden except ~/.rustup (read) and ~/.cargo (read/write); ~/.cargo/credentials* denied on both platforms; command passed through as final arguments; profile file written inside the lane, never the clone. Intended differences: lane grant narrows (A-3), network rules added (D4, D8), profile moves out of the builder-writable area. (human ~2 hrs / CC ~10 min)
+B) Policy suite only
+Rely on the new table-driven policy tests and drop the old assertions without mapping them. (no extra work; a dropped protection would go unnoticed)
+
+State: approved
+Actual answer: A) Preserve listed (D10, 2026-10-09)
+Accepted scope: regression contract for the D8 rewrite: the SandboxPolicy suite asserts Linux `--unshare-pid`; HOME hidden (tmpfs on Linux, denied on macOS) except `~/.rustup` (read) and `~/.cargo` (read and write); `~/.cargo/credentials*` denied on both platforms; the command passed through as the final arguments; the profile file written inside the lane, never in the clone. Intended differences: the lane grant narrows to clone, home and scratch (A-3); network rules are added (D4, D8); the profile moves out of the builder-writable area.
+History: pending until D10
+
+### R8: verifier dependency cache key (P-1, refines D6)
+Finding: P-1, P2, confidence 7/10, R3 accepted scope ("into a per-base cache mounted read-only into the verifier"); reviewer: plan-eng-review
+Plan baseline: approved D6: per-base dependency cache, fetched outside any builder, read-only in the verifier
+Runtime evidence: none (proposed); scale estimate: one full fetch per new base commit; a large cargo workspace fetch is minutes and hundreds of MB
+Comparison grid:
+| Choice | Current | A | B |
+|---|---|---|---|
+| R8 cache key | per base revision (D6) | per lockfile content hash per ecosystem (Cargo.lock, package-lock.json and the like); a base whose lockfiles are unchanged reuses the cache; entries are written only by the runner's fetch step | per base revision as approved |
+| D6 trust rules | approved | unchanged | unchanged |
+Question D11:
+D11 — Key the verifier's dependency cache by lockfile hash instead of by base commit?
+Project/branch/task: cowproof main, approved D6 (R3) verifier dependency cache.
+ELI10: D6 has the runner download a project's dependencies once per base commit so the verifier can build offline. But most commits don't change dependencies, so keying the cache by commit re-downloads the same files over and over. Keying it by the lockfile's content reuses the download until the dependencies actually change, with the same trust rules.
+Stakes if we pick wrong: every lane on a new commit pays minutes of re-downloading, or a cache key bug serves the wrong dependencies.
+Recommendation: A because lockfile content is exactly what determines the dependencies, so it is both faster and still exact.
+Completeness: A=9/10, B=7/10
+Header: Cache key
+Options:
+A) Key by lockfile hash (recommended)
+Cache entries keyed per ecosystem by lockfile content hash; unchanged lockfiles reuse the cache across commits; only the runner's fetch step writes entries. Tests: two bases with the same lockfile share one fetch; a changed lockfile fetches anew. (human ~2 hrs / CC ~10 min)
+B) Key by base commit
+Keep D6 as approved: one fetch per base commit. (no extra work; repeated fetches on every new commit)
+
+State: approved
+Actual answer: A) Key by lockfile hash (D11, 2026-10-09)
+Accepted scope: the D6 verifier dependency cache is keyed per ecosystem by lockfile content hash (Cargo.lock, package-lock.json and the like) instead of by base revision; unchanged lockfiles reuse the cache across commits; only the runner's fetch step writes entries; D6 trust rules unchanged. Tests: two bases with the same lockfile share one fetch; a changed lockfile fetches anew.
+History: pending until D11
+
+### R9: verifier runs count against machine slots (P-2)
+Finding: P-2, P2, confidence 7/10, crates/cowproof-core/src/lib.rs:542 (`pub fn try_acquire_slot(class: &str, limit: usize, dir: &Path)`), used only for builder lanes; reviewer: plan-eng-review
+Plan baseline: approved: machine-wide class slots cap builders (rust 2, pg 3, light 6); verifier concurrency unspecified
+Runtime evidence: slots are acquired per builder lane only; the runner's own sizing notes say a 10-core, 24 GB machine runs at most 2 Rust lanes that compile
+Comparison grid:
+| Choice | Current | A | B |
+|---|---|---|---|
+| R9 verifier concurrency | uncounted | the verifier holds a slot of its lane's class while it runs (acquired after the builder releases its slot), so builds never exceed the class limit | a separate `verify` class with its own limit (default 1 per class) |
+| Class limits | approved | unchanged | unchanged plus a verify limit |
+Question D12:
+D12 — Should verifier runs count against the same machine slots as builders?
+Project/branch/task: cowproof main, crates/cowproof-core/src/lib.rs:542 (try_acquire_slot) and the approved Verifier.
+ELI10: The runner limits how many heavy builds run at once (two Rust builds on a typical laptop) so the machine doesn't grind to a halt. But the new verifier also does a full build in a fresh copy, and nothing counts it, so two builders plus two verifiers could run four heavy builds at once. The verifier can either share its lane's slot (taking it over when the builder finishes) or get its own separate limit.
+Stakes if we pick wrong: the machine oversubscribes and lanes time out or stall, or verification queues up behind new builders.
+Recommendation: A because the verifier runs after the builder finishes, so handing over the same slot keeps the proven limit without a new knob.
+Completeness: A=9/10, B=8/10
+Header: Verify slots
+Options:
+A) Share lane's slot (recommended)
+The verifier acquires a slot of its lane's class after the builder releases its own, so total heavy builds never exceed the class limit. Test: with rust=2, two finished lanes verifying plus a queued builder never run three Rust builds at once. (human ~2 hrs / CC ~10 min)
+B) Separate verify class
+Add a verify class with its own limit (default 1 per class); verifiers do not compete with builders. (human ~3 hrs / CC ~15 min; one more limit to tune; total load can exceed the class limit)
+
+State: approved
+Actual answer: A) Share lane's slot (D12, 2026-10-09)
+Accepted scope: the verifier acquires a slot of its lane's class after the builder releases its own, so total heavy builds never exceed the class limit; class limits unchanged. Test: with rust=2, two finished lanes verifying plus a queued builder never run three Rust builds at once.
+History: pending until D12
+
+### R10: replay must include the launch baseline (O-1)
+Finding: O-1, High (P1), confidence 8/10, Codex outside voice (gpt-6-luna); design.md Trust boundaries ("Anything the runner changes in the clone before the builder starts (neutralized files, removed `.env*`) is committed in the clone as the launch baseline. The lane patch is computed against that baseline") and Proof capsule ("`base.patch` (only when dispatched with `--allow-dirty`) and `lane.patch`"; "`cowproof verify <capsule>` rebuilds the base, applies `lane.patch`")
+Plan baseline: approved: capsule holds `base.patch` and `lane.patch`; replay = base (+ base.patch) + lane.patch; launch-baseline changes are not recorded
+Runtime evidence: none (proposed); `.env*` removal happens in both auth modes, so the gap exists in the API-key slice
+Comparison grid:
+| Choice | Current | A | B | C | D |
+|---|---|---|---|---|---|
+| R10 replay input | base (+ base.patch) + lane.patch | the runner records its pre-launch changes as `launch.patch` in the capsule; the verifier and `cowproof verify` build base (+ base.patch) + launch.patch + lane.patch, the same tree the builder started from | as approved | investigate which pre-launch changes exist in the slice, then decide; no change approved | defer this change only |
+| Subscription mode in slice | deferred (D2) | unchanged | unchanged | unchanged | unchanged |
+Question D13:
+D13 — Record the runner's pre-launch changes so a replay rebuilds the tree the builder actually started from?
+Project/branch/task: cowproof main, approved design Trust boundaries (launch baseline) and Proof capsule.
+ELI10: Before a builder starts, the runner tidies its copy (for example removing .env files). The builder's patch is measured from that tidied copy. But the proof capsule only stores the original base and the builder's patch, so someone replaying it rebuilds a slightly different tree than the builder had. Storing the runner's tidy-up as its own small patch makes the replay exact.
+Stakes if we pick wrong: a replay passes or fails for reasons unrelated to the builder's work, and "anyone can replay the proof" stops being true.
+Recommendation: A because the replay promise only holds if the replay starts from the same tree the builder did.
+Completeness: A=10/10, B=5/10, C=6/10, D=5/10
+Header: Launch patch
+Options:
+A) Apply this change (recommended)
+The runner records its pre-launch changes as launch.patch in the capsule; the verifier and cowproof verify build base (+ base.patch) + launch.patch + lane.patch. Test: a base containing a .env file replays to the same tree the builder saw. (human ~2 hrs / CC ~10 min)
+B) Keep current value
+Replay stays base (+ base.patch) + lane.patch; runner changes are not recorded. (no work; replays can differ from the builder's tree)
+C) Investigate first
+List exactly which pre-launch changes the slice makes, then decide; no change approved now. (human ~30 min / CC ~5 min)
+D) Defer this change
+Leave this row unresolved for a later decision; scope and other choices unchanged.
+
+State: approved
+Actual answer: A) Apply this change (D13, 2026-10-09)
+Accepted scope: the runner records its pre-launch changes as `launch.patch` in the capsule; the verifier and `cowproof verify` build base (+ base.patch) + launch.patch + lane.patch, the tree the builder started from. Test: a base containing a `.env` file replays to the same tree the builder saw. Subscription mode stays out of the slice (D2).
+History: pending until D13
+
+### R11: dependency cache key covers registry configuration and target (O-2, refines D11)
+Finding: O-2, Medium (P2), confidence 7/10, Codex outside voice (gpt-6-luna); R8 accepted scope ("keyed per ecosystem by lockfile content hash")
+Plan baseline: approved D11: cache keyed by lockfile content hash per ecosystem
+Runtime evidence: none (proposed); cargo and npm resolve differently with registry and source configuration (for example `.cargo/config.toml` source replacement, `.npmrc` registry) and per-target platform dependencies, none of which is in the lockfile hash
+Comparison grid:
+| Choice | Current | A | B | C | D |
+|---|---|---|---|---|---|
+| R11 cache key inputs | lockfile hash (D11) | lockfile hash + hash of the ecosystem's registry and source configuration files at the base (`.cargo/config.toml`, `.npmrc` and the like) + target triple | lockfile hash only, as D11 | investigate which inputs cargo and npm actually use, then decide; no change approved | defer this change only |
+| D6 trust rules | approved | unchanged | unchanged | unchanged | unchanged |
+| Protection of registry config files | covered by the approved protected-by-default list (build configuration, package manifests) | unchanged | unchanged | unchanged | unchanged |
+Question D14:
+D14 — Add registry configuration and target platform to the dependency cache key?
+Project/branch/task: cowproof main, approved D11 (R8) verifier dependency cache key.
+ELI10: D11 reuses downloaded dependencies whenever the lockfile is unchanged. But the same lockfile can fetch different files if the project points at a different package registry or builds for a different platform. Adding those settings to the cache key means a cache is only reused when the download would really be identical.
+Stakes if we pick wrong: the verifier builds with dependencies from the wrong registry or platform and the proof is about a different build.
+Recommendation: A because it keeps D11's speed and closes the cases where the lockfile alone is not enough.
+Completeness: A=9/10, B=6/10, C=7/10, D=5/10
+Header: Cache inputs
+Options:
+A) Apply this change (recommended)
+Cache key = lockfile hash + hash of the ecosystem's registry and source config files at the base + target triple. Tests: changing .npmrc registry or the target triple misses the cache; identical inputs hit it. (human ~2 hrs / CC ~10 min)
+B) Keep current value
+Key stays lockfile hash only (D11). (no work; registry or platform changes can reuse a wrong cache)
+C) Investigate first
+Confirm which inputs cargo and npm resolution depend on, then decide; no change approved now. (human ~1 hr / CC ~10 min)
+D) Defer this change
+Leave this row unresolved for a later decision; scope and other choices unchanged.
+
+State: approved
+Actual answer: A) Apply this change (D14, 2026-10-09)
+Accepted scope: the D11 dependency cache key becomes lockfile hash + hash of the ecosystem's registry and source configuration files at the base (`.cargo/config.toml`, `.npmrc` and the like) + target triple. Tests: changing the `.npmrc` registry or the target triple misses the cache; identical inputs hit it. D6 trust rules and the approved protection of build configuration unchanged.
+History: pending until D14
+
+### R12: what the slice needs before it starts (O-4)
+Finding: O-4, Medium (P2), confidence 7/10, Codex outside voice (gpt-6-luna); design.md Next Steps 2 and 3 ("Bring portkit in ... fix G5 and G6"; "Reference runner and fixtures ... capture fixtures for port steps 1 to 10") precede the slice (steps 4 to 6)
+Plan baseline: approved order: full portkit import with fixes (2), Node reference runner, fake-worker harness and parity fixtures for port steps 1 to 10 (3), then the slice (4 to 6)
+Runtime evidence: the slice's pure units (header parsing, ownership, append-only) already exist in `cowproof-core` with tests; the sandbox is rewritten under D8 with the D10 regression contract, not ported by parity; Claude builders are a new runtime the Node runner never ran, so its supervision parity does not apply to the slice's builder; the slice's escalation tools need portkit's `Tool`/`Registry` and MCP server
+Comparison grid:
+| Choice | Current | A | B | C | D |
+|---|---|---|---|---|---|
+| R12 slice prerequisites | full portkit import + fixes (step 2) and reference runner, fake worker, fixtures for port steps 1-10 (step 3) | step 2 narrows to the portkit subtree import with `demo/` and `schema/` dropped, G1 (`Command::execute` public), and `portkit-core` plus `portkit-mcp` green and used by the slice's tools; portkit hooks, trace (G5, G6) and the usage monitor move to step 8; step 3 (reference runner, fake worker, parity fixtures) moves after step 7 and before step 8 | as approved | investigate the slice's exact portkit dependencies, then decide; no change approved | defer this change only |
+| Slice content (4 to 6) | approved | unchanged | unchanged | unchanged | unchanged |
+| D8, D10 sandbox work | approved | unchanged, still in the slice | unchanged | unchanged | unchanged |
+Question D15:
+D15 — Start the slice after only the portkit pieces it needs, moving the porting work behind it?
+Project/branch/task: cowproof main, approved design Next Steps 2 to 4.
+ELI10: The plan makes the core proof slice wait for two big jobs: importing all of portkit with its fixes, and setting up the Node reference runner and recorded fixtures for porting. But the slice only needs portkit's tool server (to serve the builder's escalation tools); the porting fixtures are for moving the old runner's features in later, and the sandbox is being rewritten with its own regression tests anyway. Starting the slice right after the minimal portkit import proves the core promise weeks sooner.
+Stakes if we pick wrong: the defining loop is validated only after an unrelated porting project, or porting work starts without the fixtures it needs.
+Recommendation: A because nothing in the slice depends on the Node parity fixtures, and it gets the escalation-and-proof loop in front of real use sooner.
+Completeness: A=9/10, B=7/10, C=7/10, D=5/10
+Header: Slice order
+Options:
+A) Apply this change (recommended)
+Step 2 becomes: portkit subtree import, drop demo/ and schema/, G1, with portkit-core and portkit-mcp green and used by the slice's tools. Hooks, trace fixes (G5, G6) and the usage monitor move to step 8. Step 3 (reference runner, fake worker, parity fixtures) moves after step 7, before step 8. Slice content and D8/D10 unchanged. (saves human ~1-2 weeks / CC ~1 day before the slice)
+B) Keep current value
+Keep the approved order: full portkit work and parity fixtures before the slice.
+C) Investigate first
+Map the slice's exact portkit dependencies, then decide; no change approved now. (human ~1 hr / CC ~10 min)
+D) Defer this change
+Leave this row unresolved for a later decision; scope and other choices unchanged.
+
+State: approved
+Actual answer: A) Apply this change (D15, 2026-10-09)
+Accepted scope: Next Step 2 narrows to the portkit subtree import with `demo/` and `schema/` dropped, G1 (`Command::execute` public), and `portkit-core` plus `portkit-mcp` green and used by the slice's escalation tools; portkit hooks, the trace fixes (G5, G6) and the usage monitor move to step 8; Next Step 3 (Node reference runner, fake-worker harness, parity fixtures for port steps 1 to 10) moves after step 7 and before step 8. Slice content (steps 4 to 6) and the D8/D10 sandbox work unchanged.
+History: pending until D15
+
+### R13: TODO — track sandbox-runtime upstream fixes (from D4)
+Finding: TODO-1, P3, confidence 8/10, follows D4 (port anthropics/sandbox-runtime's design); search evidence: public reports of Claude Code network-sandbox bypasses patched upstream in 2026; reviewer: plan-eng-review
+Plan baseline: D4 approved porting the design; no process for picking up later upstream fixes
+Runtime evidence: sandbox-runtime is actively maintained (pushed 2026-10-09)
+What: a recurring check of sandbox-runtime releases and security advisories, mapping each fix to cowproof's ported SandboxPolicy and proxy. Why: a ported design silently goes stale when the reference fixes an escape. Pros: escape fixes reach cowproof; the NOTICE attribution stays accurate. Cons: recurring maintenance time. Context: start from the commit ported in step 4; record it in NOTICE. Depends on: D4 port landing.
+Comparison grid:
+| Choice | Current | A | B | C |
+|---|---|---|---|---|
+| R13 upstream tracking | none | add to docs/backlog.md as a recurring item (record the ported upstream commit; check releases each cowproof release) | skip | build now: a CI job that alerts on new upstream releases |
+Question D16:
+D16 — Add a TODO to track sandbox-runtime's upstream fixes?
+Project/branch/task: cowproof main, follows D4 (sandbox design ported from anthropics/sandbox-runtime).
+ELI10: We're copying sandbox-runtime's design into cowproof. When Anthropic fixes a sandbox escape in their version, our copy won't get the fix unless someone looks. A backlog item that records which upstream version we copied and checks for new fixes each release keeps our copy current.
+Stakes if we pick wrong: a publicly known escape fixed upstream stays open in cowproof.
+Recommendation: A because a recurring check at each release is cheap and the sandbox is the security boundary.
+Note: options differ in kind, not coverage — no completeness score.
+Header: Upstream TODO
+Options:
+A) Add to backlog (recommended)
+Add a recurring item to docs/backlog.md: record the ported sandbox-runtime commit in NOTICE and review its releases and advisories at every cowproof release. (human ~15 min per release / CC ~5 min)
+B) Skip
+No tracking; upstream fixes are picked up only if someone notices.
+C) Build it now
+Add a CI job that opens an issue when sandbox-runtime publishes a new release. (human ~2 hrs / CC ~15 min)
+
+State: approved
+Actual answer: A) Add to backlog (D16, 2026-10-09)
+Accepted scope: a recurring item in docs/backlog.md: record the ported sandbox-runtime commit in NOTICE and review its releases and advisories at every cowproof release.
+History: pending until D16
+
+Approval readiness: PASS. Checked: scope D2 (A), D3 (A); R1 D4 (A); R2 D5 (A); R3 D6 (A); R4 D7 (A, investigation only); R5 D8 (A); R6 D9 (A); R7 D10 (A, regression contract); R8 D11 (A); R9 D12 (A); R10 D13 (A); R11 D14 (A); R12 D15 (A); R13 D16 (A). Carried requirements A-3 and Q-2 implement approved contracts (Trust boundaries; cowproof-run owns the runner). Notes O-3 (D3 amendment), SC-4 and F-1 change no behavior.
+
+## Engineering review: body
+
+### NOT in scope
+- Subscription-mode builders in the slice: deferred to step 8 (D2); still in the first release.
+- Portkit hooks, trace fixes G5 and G6, and the usage monitor in the slice: moved to step 8 (D15).
+- Node reference runner, fake-worker harness and parity fixtures before the slice: moved after it (D15).
+- A runtime dependency on sandbox-runtime: rejected (D4, option C) to keep "no Node for users".
+- Remote hosts, plan files and shell process capture: after the first release (approved design).
+- The 24 minor office-hours review concerns not addressed in the revision: remain recorded in the concerns section above.
+
+### What already exists
+- `cowproof-core`: header parsing, globs and ownership split, removed-line counting, slots, build cleanup, Codex isolation, sandbox builders (lib.rs:303-431, to be replaced by `SandboxPolicy`, D8) — reused.
+- `cowproof-lint`, `cowproof-plan`, `cowproof-host`, `cowproof-report` (to become `cowproof-prove`) — reused as ported.
+- portkit `Tool`/`Registry` and MCP server — reused for the escalation tools (D15).
+- anthropics/sandbox-runtime — design reference for the sandbox and proxy (D4), not a dependency.
+- The Node runner — reference for port steps after the slice (D15), not used by the slice.
+
+### Diagrams
+```
+lane states
+queued ─► running ──ask(blocking)──► parked ──rule answer──► running (resume or resume-fallback, D9)
+   │         │  └─escalate-early──► parked                    
+   │         ├─idle past threshold─► stalled
+   │         └─handback──► finished ─► verify (holds class slot, D12) ─┬─► proved
+   │                                                                   ├─► refuted (a check or gate failed)
+   │                                                                   └─► runner/host failure class (F-1)
+   └─ dispatch refused: held-out in repo (D5), sandbox unavailable (fail closed)
+escalation-limit and stopped are reachable from running or parked.
+
+replay
+base commit (+ base.patch) ─► + launch.patch (D13) ─► + lane.patch ─► checks in no-net sandbox ─► pass/fail per check id
+```
+Inline diagram to keep with code: `cowproof-run`'s lane state machine (the first block) above the state enum.
+
+### Failure modes
+| Path | Realistic failure | Test or handling | Visible to the director |
+|---|---|---|---|
+| Egress proxy | proxy process dies mid-lane | builder model calls fail; lane ends in a runner failure class (F-1 pattern) | yes, lane state |
+| Runner socket | runner restarts while a builder is parked | queue and rulings are file-backed in the control directory; resume or resume-fallback (D9) | yes |
+| Resume | session expired after the park | resume-fallback with carry-over (D9), recorded in the capsule | yes |
+| Verifier fetch | registry down during pre-fetch | runner failure class, never `refuted` (F-1) | yes |
+| Held-out | director stores held-out checks in the repository | dispatch refuses (D5) | yes, at dispatch |
+| Sandbox | user namespaces disabled on a Linux host | fail closed: lane does not run | yes |
+| `--bare` | hooks or resume do not work under `--bare` | probe before the slice (D7) | yes, probe result |
+Critical gaps (untested, unhandled and silent): none.
+
+### Worktree parallelization strategy
+| Step | Modules touched | Depends on |
+|------|----------------|------------|
+| Portkit minimal import (D15) | crates/portkit/ | — |
+| `--bare` probe (D7) | none (investigation) | — |
+| SandboxPolicy + proxy (D4, D8, D10, A-3) | crates/cowproof-run/ (sandbox, proxy), crates/cowproof-core/ | — |
+| Held-out store and dispatch refusals (D5) | crates/cowproof-run/ (dispatch), crates/cowproof-cli/ | — |
+| Escalation queue and tools (D9) | crates/cowproof-run/ (escalate), crates/cowproof-cli/ | portkit import, SandboxPolicy |
+| Verifier, gates, capsule (D6, D11-D14, F-1) | crates/cowproof-prove/ | SandboxPolicy |
+| One runner (Q-2) | crates/cowproof-cli/ | escalation queue |
+Parallel lanes: Lane A: portkit import; Lane B: SandboxPolicy + proxy → verifier (cowproof-prove); Lane C: held-out store; Lane D: `--bare` probe. Then escalation (needs A and B), then the CLI lane-loop removal.
+Execution order: launch A + B + C + D. Merge A and B. Then escalation and the verifier in parallel (disjoint crates). Then Q-2.
+Conflict flags: `cowproof-run` is touched by B, C and escalation; sequence C's dispatch module and escalation behind B's sandbox module or give each its own module file.
+
+## Implementation Tasks
+Synthesized from this review's findings. Each task derives from a specific finding above. Run with Claude Code or Codex; checkbox as you ship.
+
+- [ ] **T1 (P1, human: ~3 days / CC: ~1 hr)** — cowproof-run — Port sandbox-runtime's sandbox design into one `SandboxPolicy`
+  - Surfaced by: Scope Challenge SC-1 (D4), Code quality Q-1 (D8), Architecture A-3, Test T-1 (D10)
+  - Files: crates/cowproof-run/src/sandbox/, crates/cowproof-core/src/lib.rs (remove old builders), NOTICE
+  - Verify: table-driven policy tests on macOS and Linux; D10 regression assertions; live test that `lane/control/` is unreadable
+- [ ] **T2 (P1, human: ~2 days / CC: ~45 min)** — cowproof-run — Egress proxy holding the API key
+  - Surfaced by: Scope Challenge SC-1 (D4); approved Trust boundaries
+  - Files: crates/cowproof-run/src/proxy/
+  - Verify: placeholder key in the builder; foreign credential rejected; non-allowlisted endpoint rejected
+- [ ] **T3 (P1, human: ~half day / CC: ~15 min)** — cowproof-run dispatch — Held-out store outside the repository
+  - Surfaced by: Architecture A-1 (D5)
+  - Files: crates/cowproof-run/src/dispatch.rs, crates/cowproof-cli/src/main.rs
+  - Verify: in-repo path rejected; base with `*.heldout.*` refused; clone never contains held-out files
+- [ ] **T4 (P1, human: ~1 hr / CC: ~10 min)** — investigation — `--bare` probe
+  - Surfaced by: Architecture A-2 (D7)
+  - Files: docs/design.md (R4 record)
+  - Verify: hook marker written under `--bare`; `--resume` continues; MCP server reachable; results recorded
+- [ ] **T5 (P1, human: ~3 days / CC: ~1 hr)** — cowproof-run escalate — Queue, tools, resume and edge cases
+  - Surfaced by: Code quality Q-3 (D9); Scope D3; approved escalation protocol
+  - Files: crates/cowproof-run/src/escalate/, crates/cowproof-cli/src/main.rs
+  - Verify: duplicate and late rulings rejected; expired session falls back; same-check-twice forces escalation; `run_check` sandboxed
+- [ ] **T6 (P1, human: ~3 days / CC: ~1 hr)** — cowproof-prove — Verifier with trusted dependencies, launch patch and slot
+  - Surfaced by: Architecture A-4 (D6), Performance P-1 (D11), P-2 (D12), Outside voice O-1 (D13), O-2 (D14), F-1
+  - Files: crates/cowproof-prove/
+  - Verify: offline verify on cargo and npm fixtures; builder cache never read; cache key misses on registry or target change; `.env` base replays exactly; slot limit held; infra failure not `refuted`
+- [ ] **T7 (P2, human: ~1 day / CC: ~30 min)** — crates/portkit — Minimal portkit import
+  - Surfaced by: Outside voice O-4 (D15)
+  - Files: crates/portkit/, Cargo.toml
+  - Verify: portkit-core and portkit-mcp tests green in the workspace; `demo/` and `schema/` absent
+- [ ] **T8 (P2, human: ~2 hrs / CC: ~10 min)** — cowproof-cli — Remove the CLI's lane loop
+  - Surfaced by: Code quality Q-2
+  - Files: crates/cowproof-cli/src/main.rs
+  - Verify: `git grep run_worker crates/cowproof-cli` is empty; `cowproof run` goes through cowproof-run
+- [ ] **T9 (P1, human: ~1 day / CC: ~30 min)** — e2e — Synthetic and adversarial slice runs
+  - Surfaced by: Test review (critical paths)
+  - Files: tests/e2e/
+  - Verify: synthetic packet reaches `proved` and replays on a second machine; adversarial packet is `refuted` by gates
+
+### Unresolved decisions
+None in this review.
+
+### Completion summary
+- Step 0: Scope Challenge — scope reduced per recommendation (subscription mode moved out of the slice, D2; smaller crate arrangement, D3)
+- Architecture Review: 4 issues found (A-1 to A-4), plus notes SC-4 and F-1
+- Code Quality Review: 3 issues found (Q-1 to Q-3)
+- Test Review: diagram produced, 34 gaps identified (all required proof for approved contracts) plus 1 regression contract (T-1)
+- Performance Review: 2 issues found (P-1, P-2)
+- NOT in scope: written
+- What already exists: written
+- TODOS.md updates: 1 item proposed to user (accepted into docs/backlog.md)
+- Failure modes: 0 critical gaps flagged
+- Unresolved decisions: 0 in this review
+- Outside voice: Codex (gpt-6-luna, after gpt-6-astra was unavailable on this account), completed, 4 findings (3 accepted, 1 applied under D3)
+- Parallelization: 4 lanes, 4 parallel at start / 2 sequential after
+- Lake Score: 3/11 (D5, D10, D13 chose a 10/10 option; the others chose 9/10 options)
+
+### Suppressed findings
+- (confidence 4/10) Watch polling of lane files may lag at high lane counts; no evidence at 10 to 20 lanes. Not reported.
+
+## GSTACK REVIEW REPORT
+
+| Review | Trigger | Why | Runs | Status | Findings |
+|--------|---------|-----|------|--------|----------|
+| CEO Review | `/plan-ceo-review` | Scope & strategy | 0 | — | — |
+| Outside Review | Codex CLI (gpt-6-luna) via /plan-eng-review | Independent 2nd opinion | 1 | completed | 4 findings: 3 accepted (D13, D14, D15), 1 applied under D3 |
+| Eng Review | `/plan-eng-review` | Architecture & tests (required) | 1 | ISSUES OPEN | 9 issues + 1 regression contract, 0 critical gaps; all resolved by decisions D2 to D16 |
+| Design Review | `/plan-design-review` | UI/UX gaps | 0 | — | — |
+| DX Review | `/plan-devex-review` | Developer experience gaps | 0 | — | — |
+
+- **OUTSIDE COVERAGE:** codex, plan-review phase, completed (model gpt-6-luna; the catalog default gpt-6-astra is not available on this account), 4 findings.
+- **CROSS-MODEL:** the native review and Codex agreed on the replay and caching area from different angles (native: cache key per base, D11; Codex: key inputs, D14). Codex alone found the launch-baseline replay gap (D13) and the slice prerequisites (D15); the native review alone found the trust-boundary items (D5, D6, D8, D10, A-3).
+- **VERDICT:** no reviews CLEAR yet: Eng Review has open issues mapped to approved work (status issues_open); eng review required to clear after implementation.
+
+NO UNRESOLVED DECISIONS
