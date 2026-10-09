@@ -142,7 +142,9 @@ pub fn claude_command(spec: &ClaudeSpec) -> Result<ClaudeInvocation> {
     }
     for entry in spec.path.split(':') {
         if entry.is_empty() {
-            continue; // Empty entries in PATH are allowed (current directory equivalent)
+            // An empty entry means the current directory, which is the builder's
+            // clone: a builder could plant a fake `git` or `cargo` there.
+            bail!("path has an empty entry (it would search the current directory)");
         }
         let entry_path = PathBuf::from(entry);
         if !entry_path.is_absolute() {
@@ -617,9 +619,12 @@ mod tests {
 
     #[test]
     fn validation_path_with_empty_entries() {
-        // Empty entries (from ::) are allowed in PATH
-        let mut spec = test_spec();
-        spec.path = "/usr/bin::/bin".to_string();
-        assert!(claude_command(&spec).is_ok());
+        // Empty entries search the current directory (the builder's clone); rejected.
+        for path in ["/usr/bin::/bin", ":/usr/bin", "/usr/bin:"] {
+            let mut spec = test_spec();
+            spec.path = path.to_string();
+            let err = claude_command(&spec).unwrap_err();
+            assert!(err.to_string().contains("empty entry"), "{path}: {err}");
+        }
     }
 }
