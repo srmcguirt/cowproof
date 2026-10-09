@@ -502,6 +502,7 @@ dependencies = [
  "async-trait",
  "cowproof-core",
  "cowproof-run",
+ "libc",
  "predicates",
  "regex",
  "serde",

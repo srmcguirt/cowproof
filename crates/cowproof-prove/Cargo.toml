@@ -19,6 +19,7 @@ cowproof-core = { version = "0.1.0", path = "../cowproof-core" }
 regex.workspace = true
 toml.workspace = true
 cowproof-run = { version = "0.1.0", path = "../cowproof-run" }
+libc = "0.2"
 
 [dev-dependencies]
 tempfile.workspace = true

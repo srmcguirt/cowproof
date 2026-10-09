@@ -4,8 +4,8 @@
 //! - `Capsule`: structured representation of a lane's proof capsule
 //! - `Capsule::write()` and `Capsule::read()`: persistence with hash verification
 //! - `verify()`: rebuild and replay a capsule's checks to reproduce the lane's results
-//! - `CheckRunner` trait, `SandboxedRunner` (the production runner, D6) and `ProcessRunner`
-//!   (unsandboxed, for tests only)
+//! - `CheckRunner` trait and `SandboxedRunner` (the production runner, D6); the unsandboxed
+//!   `ProcessRunner` exists only in test builds
 //! - `run_gates()`: mechanical proof gates that load configuration from the base revision
 //! - `flaws`: shared flaw rule types and matching logic for gates and report
 
@@ -19,9 +19,9 @@ pub use capsule::{Capsule, CapsuleError};
 pub use flaws::{FlawFinding, FlawRule, PatchDelta, RuleFile};
 pub use gates::{GatePacket, GateReport, GateResult, run_gates};
 pub use runner::{
-    CheckOutcome, CheckRunner, ProcessRunner, SandboxedRunner, SlotGuard, host_platform,
+    CheckOutcome, CheckRunner, InfraError, SandboxedRunner, SlotGuard, acquire_slot, host_platform,
 };
-pub use verify::{VerifyError, VerifyReport, VerifyResult, verify};
+pub use verify::{VerifyError, VerifyOptions, VerifyReport, VerifyResult, verify};
 
 #[cfg(test)]
 mod tests;

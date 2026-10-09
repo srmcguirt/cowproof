@@ -2,11 +2,13 @@ use crate::capsule::{Capsule, CapsuleError, CheckResult, EnvironmentFingerprint}
 use crate::runner::{
     CheckOutcome, CheckRunner, InfraError, ProcessRunner, SandboxFixture, sandbox_available,
 };
-use crate::verify::{VerifyError, VerifyResult, verify};
+use crate::verify::{VerifyError, VerifyOptions, VerifyResult, verify};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 use tempfile::TempDir;
 
 // ============================================================================
@@ -271,7 +273,12 @@ impl ScriptedRunner {
 
 #[async_trait::async_trait]
 impl CheckRunner for ScriptedRunner {
-    async fn run(&self, _tree: &Path, command: &str) -> Result<CheckOutcome, InfraError> {
+    async fn run(
+        &self,
+        _tree: &Path,
+        command: &str,
+        _timeout: Duration,
+    ) -> Result<CheckOutcome, InfraError> {
         self.calls.lock().unwrap().push(command.to_string());
         if self.infra_failure {
             return Err(InfraError::SpawnError("scripted infra failure".to_string()));
@@ -318,6 +325,17 @@ fn dirs() -> (TempDir, TempDir) {
     (TempDir::new().unwrap(), TempDir::new().unwrap())
 }
 
+/// Options whose slots live under the test's own work dir, so tests never share the
+/// machine-wide slots with each other or with real lanes.
+fn test_opts(work: &Path) -> VerifyOptions {
+    VerifyOptions {
+        slot_dir: work.join(".slots"),
+        slot_class: "rust".to_string(),
+        slot_limit: 2,
+        default_timeout: Duration::from_secs(60),
+    }
+}
+
 /// 1. Order: launch.patch (deletes .env, rewrites src.txt) then lane.patch (edits the
 /// rewritten line), checked by a real process on the rebuilt tree.
 #[tokio::test]
@@ -339,7 +357,8 @@ async fn test_replay_order_launch_then_lane_reproduces() {
         capsule_dir.path(),
         c.repo.path(),
         work.path(),
-        &ProcessRunner::new(1),
+        &ProcessRunner::new(),
+        test_opts(work.path()),
     )
     .await
     .unwrap();
@@ -370,7 +389,15 @@ async fn test_empty_launch_patch_makes_lane_patch_fail_as_infrastructure() {
     );
     let runner = ScriptedRunner::new(&[("true", &[0])]);
 
-    match verify(capsule_dir.path(), c.repo.path(), work.path(), &runner).await {
+    match verify(
+        capsule_dir.path(),
+        c.repo.path(),
+        work.path(),
+        &runner,
+        test_opts(work.path()),
+    )
+    .await
+    {
         Err(VerifyError::Infrastructure(msg)) => {
             assert!(msg.contains("lane.patch"), "should name lane.patch: {msg}")
         }
@@ -396,7 +423,15 @@ async fn test_missing_launch_patch_makes_lane_patch_fail_as_infrastructure() {
     );
     let runner = ScriptedRunner::new(&[("true", &[0])]);
 
-    match verify(capsule_dir.path(), c.repo.path(), work.path(), &runner).await {
+    match verify(
+        capsule_dir.path(),
+        c.repo.path(),
+        work.path(),
+        &runner,
+        test_opts(work.path()),
+    )
+    .await
+    {
         Err(VerifyError::Infrastructure(msg)) => {
             assert!(msg.contains("lane.patch"), "should name lane.patch: {msg}")
         }
@@ -439,7 +474,8 @@ async fn test_base_patch_applied_before_launch_patch() {
         capsule_dir.path(),
         repo.path(),
         work.path(),
-        &ProcessRunner::new(1),
+        &ProcessRunner::new(),
+        test_opts(work.path()),
     )
     .await
     .unwrap();
@@ -464,7 +500,8 @@ async fn test_base_patch_applied_before_launch_patch() {
         capsule_dir2.path(),
         repo.path(),
         work2.path(),
-        &ProcessRunner::new(1),
+        &ProcessRunner::new(),
+        test_opts(work2.path()),
     )
     .await
     {
@@ -493,7 +530,8 @@ async fn test_matching_pass_and_fail_reproduced() {
         capsule_dir.path(),
         c.repo.path(),
         work.path(),
-        &ProcessRunner::new(1),
+        &ProcessRunner::new(),
+        test_opts(work.path()),
     )
     .await
     .unwrap();
@@ -526,7 +564,8 @@ async fn test_recorded_pass_failing_on_replay_diverges() {
         capsule_dir.path(),
         c.repo.path(),
         work.path(),
-        &ProcessRunner::new(1),
+        &ProcessRunner::new(),
+        test_opts(work.path()),
     )
     .await
     .unwrap();
@@ -554,9 +593,15 @@ async fn test_flaky_check_passing_on_third_attempt_reproduced() {
     );
     let runner = ScriptedRunner::new(&[("wobbly-cmd", &[1, 1, 0])]);
 
-    let report = verify(capsule_dir.path(), c.repo.path(), work.path(), &runner)
-        .await
-        .unwrap();
+    let report = verify(
+        capsule_dir.path(),
+        c.repo.path(),
+        work.path(),
+        &runner,
+        test_opts(work.path()),
+    )
+    .await
+    .unwrap();
 
     assert!(
         matches!(report.result, VerifyResult::Reproduced),
@@ -582,9 +627,15 @@ async fn test_non_flaky_check_failing_once_diverges() {
     );
     let runner = ScriptedRunner::new(&[("steady-cmd", &[1, 0, 0])]);
 
-    let report = verify(capsule_dir.path(), c.repo.path(), work.path(), &runner)
-        .await
-        .unwrap();
+    let report = verify(
+        capsule_dir.path(),
+        c.repo.path(),
+        work.path(),
+        &runner,
+        test_opts(work.path()),
+    )
+    .await
+    .unwrap();
 
     match report.result {
         VerifyResult::Diverged { check_ids } => assert_eq!(check_ids, vec!["steady".to_string()]),
@@ -610,7 +661,15 @@ async fn test_runner_infra_error_is_infrastructure_not_divergence() {
     );
     let runner = ScriptedRunner::failing_infra();
 
-    match verify(capsule_dir.path(), c.repo.path(), work.path(), &runner).await {
+    match verify(
+        capsule_dir.path(),
+        c.repo.path(),
+        work.path(),
+        &runner,
+        test_opts(work.path()),
+    )
+    .await
+    {
         Err(VerifyError::Infrastructure(msg)) => {
             assert!(msg.contains("scripted infra failure"), "{msg}")
         }
@@ -635,7 +694,14 @@ async fn test_unsandboxed_capsule_never_proved() {
     );
     let runner = ScriptedRunner::new(&[("true", &[0])]);
 
-    let result = verify(capsule_dir.path(), c.repo.path(), work.path(), &runner).await;
+    let result = verify(
+        capsule_dir.path(),
+        c.repo.path(),
+        work.path(),
+        &runner,
+        test_opts(work.path()),
+    )
+    .await;
 
     assert!(
         matches!(result, Err(VerifyError::UnsandboxedNotProved)),
@@ -671,7 +737,15 @@ async fn test_tampered_lane_patch_rejected_before_anything_runs() {
     }
 
     let runner = ScriptedRunner::new(&[("true", &[0])]);
-    match verify(capsule_dir.path(), c.repo.path(), work.path(), &runner).await {
+    match verify(
+        capsule_dir.path(),
+        c.repo.path(),
+        work.path(),
+        &runner,
+        test_opts(work.path()),
+    )
+    .await
+    {
         Err(VerifyError::Capsule(CapsuleError::HashMismatch(file, _, _))) => {
             assert_eq!(file, "lane.patch")
         }
@@ -700,7 +774,15 @@ async fn test_base_tree_hash_mismatch_is_infrastructure() {
     );
     let runner = ScriptedRunner::new(&[("true", &[0])]);
 
-    match verify(capsule_dir.path(), c.repo.path(), work.path(), &runner).await {
+    match verify(
+        capsule_dir.path(),
+        c.repo.path(),
+        work.path(),
+        &runner,
+        test_opts(work.path()),
+    )
+    .await
+    {
         Err(VerifyError::Infrastructure(msg)) => assert!(msg.contains("tree hash"), "{msg}"),
         other => panic!("expected Infrastructure, got {other:?}"),
     }
@@ -727,7 +809,15 @@ async fn test_existing_tree_is_refused_not_reused() {
     std::fs::create_dir_all(&prebuilt).unwrap();
     let runner = ScriptedRunner::new(&[("true", &[0])]);
 
-    match verify(capsule_dir.path(), c.repo.path(), work.path(), &runner).await {
+    match verify(
+        capsule_dir.path(),
+        c.repo.path(),
+        work.path(),
+        &runner,
+        test_opts(work.path()),
+    )
+    .await
+    {
         Err(VerifyError::Infrastructure(msg)) => assert!(msg.contains("existing tree"), "{msg}"),
         other => panic!("expected Infrastructure, got {other:?}"),
     }
@@ -777,9 +867,15 @@ async fn test_sandboxed_verify_reproduces_a_recorded_pass() {
         },
     );
 
-    let report = verify(capsule_dir.path(), repo.path(), work.path(), &fx.runner())
-        .await
-        .unwrap();
+    let report = verify(
+        capsule_dir.path(),
+        repo.path(),
+        work.path(),
+        &fx.runner(),
+        test_opts(work.path()),
+    )
+    .await
+    .unwrap();
 
     assert!(
         matches!(report.result, VerifyResult::Reproduced),
@@ -813,9 +909,15 @@ async fn test_sandboxed_verify_diverges_when_the_replayed_tree_lacks_the_file() 
         },
     );
 
-    let report = verify(capsule_dir.path(), repo.path(), work.path(), &fx.runner())
-        .await
-        .unwrap();
+    let report = verify(
+        capsule_dir.path(),
+        repo.path(),
+        work.path(),
+        &fx.runner(),
+        test_opts(work.path()),
+    )
+    .await
+    .unwrap();
 
     match &report.result {
         VerifyResult::Diverged { check_ids } => {
@@ -828,4 +930,214 @@ async fn test_sandboxed_verify_diverges_when_the_replayed_tree_lacks_the_file() 
     assert!(!report.checks[0].passed);
     assert!(work.path().join("tree/other").is_file());
     assert!(!work.path().join("tree/newfile").exists());
+}
+
+// ============================================================================
+// Class slot (D12) and per-check timeout
+// ============================================================================
+
+/// Runner whose one check takes 600 ms and which records how many checks are inside
+/// `run` at once.
+struct SlowRunner {
+    inside: AtomicUsize,
+    max_inside: AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl CheckRunner for SlowRunner {
+    async fn run(
+        &self,
+        _tree: &Path,
+        _command: &str,
+        _timeout: Duration,
+    ) -> Result<CheckOutcome, InfraError> {
+        let now = self.inside.fetch_add(1, Ordering::SeqCst) + 1;
+        self.max_inside.fetch_max(now, Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        self.inside.fetch_sub(1, Ordering::SeqCst);
+        Ok(CheckOutcome {
+            exit_status: 0,
+            output: String::new(),
+            attempts: 1,
+        })
+    }
+}
+
+/// A capsule over the shared chain whose one recorded check is `true` (passed).
+fn passing_capsule(c: &Chain) -> TempDir {
+    let capsule_dir = TempDir::new().unwrap();
+    write_capsule(
+        capsule_dir.path(),
+        &CapsuleSpec {
+            base: &c.base,
+            patches: &[("launch.patch", &c.launch), ("lane.patch", &c.lane)],
+            checks: &[("slow", "true", 0)],
+            flaky: &[],
+            unsandboxed: false,
+        },
+    );
+    capsule_dir
+}
+
+/// With a class of capacity 2, three concurrent verifications (one task, so a verify
+/// that blocked the executor while waiting for a slot would deadlock the test) never
+/// have more than two checks running, and all three finish.
+#[tokio::test]
+async fn test_class_slot_caps_concurrent_verifications() {
+    let c = chain();
+    let capsule_dir = passing_capsule(&c);
+    let slots = TempDir::new().unwrap();
+    let works = [
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+    ];
+    let runner = SlowRunner {
+        inside: AtomicUsize::new(0),
+        max_inside: AtomicUsize::new(0),
+    };
+    let opts = || VerifyOptions {
+        slot_dir: slots.path().to_path_buf(),
+        slot_class: "rust".to_string(),
+        slot_limit: 2,
+        default_timeout: Duration::from_secs(60),
+    };
+
+    let (a, b, d) = tokio::join!(
+        verify(
+            capsule_dir.path(),
+            c.repo.path(),
+            works[0].path(),
+            &runner,
+            opts()
+        ),
+        verify(
+            capsule_dir.path(),
+            c.repo.path(),
+            works[1].path(),
+            &runner,
+            opts()
+        ),
+        verify(
+            capsule_dir.path(),
+            c.repo.path(),
+            works[2].path(),
+            &runner,
+            opts()
+        ),
+    );
+
+    for report in [a.unwrap(), b.unwrap(), d.unwrap()] {
+        assert!(
+            matches!(report.result, VerifyResult::Reproduced),
+            "{report:?}"
+        );
+    }
+    assert_eq!(
+        runner.max_inside.load(Ordering::SeqCst),
+        2,
+        "capacity 2 allows two checks at once and never three"
+    );
+    // Every slot was released.
+    for n in 0..2 {
+        assert!(!slots.path().join(format!("rust-{n}")).exists());
+    }
+}
+
+/// A check that overruns `default_timeout` is an infrastructure error naming the
+/// check's id (never a divergence), the slot is released, and the whole group was
+/// killed.
+#[tokio::test]
+async fn test_check_timeout_is_infrastructure_naming_the_check_and_frees_the_slot() {
+    let c = chain();
+    let (capsule_dir, work) = dirs();
+    write_capsule(
+        capsule_dir.path(),
+        &CapsuleSpec {
+            base: &c.base,
+            patches: &[("launch.patch", &c.launch), ("lane.patch", &c.lane)],
+            checks: &[("hangs", "sleep 30 & echo $! > ../bg.pid; wait", 0)],
+            flaky: &[],
+            unsandboxed: false,
+        },
+    );
+    let mut opts = test_opts(work.path());
+    opts.slot_limit = 1;
+    opts.default_timeout = Duration::from_millis(500);
+    let slot_dir = opts.slot_dir.clone();
+
+    let started = std::time::Instant::now();
+    let result = verify(
+        capsule_dir.path(),
+        c.repo.path(),
+        work.path(),
+        &ProcessRunner::new(),
+        opts,
+    )
+    .await;
+
+    match result {
+        Err(VerifyError::Infrastructure(msg)) => {
+            assert!(msg.contains("check hangs"), "must name the check id: {msg}");
+            assert!(msg.contains("Timeout"), "{msg}");
+        }
+        other => panic!("expected Infrastructure, got {other:?}"),
+    }
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "{:?}",
+        started.elapsed()
+    );
+    let pid: libc::pid_t = std::fs::read_to_string(work.path().join("bg.pid"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    crate::runner::tests::assert_process_gone(pid);
+    assert!(
+        cowproof_core::try_acquire_slot("rust", 1, &slot_dir)
+            .unwrap()
+            .is_some(),
+        "the timed-out verify still holds its slot"
+    );
+}
+
+/// The slot is also released when the verifier fails before running any check.
+#[tokio::test]
+async fn test_slot_is_released_when_verification_errors() {
+    let c = chain();
+    let (capsule_dir, work) = dirs();
+    write_capsule(
+        capsule_dir.path(),
+        &CapsuleSpec {
+            base: &c.base,
+            patches: &[("launch.patch", &c.launch), ("lane.patch", &c.lane)],
+            checks: &[("order", "true", 0)],
+            flaky: &[],
+            unsandboxed: false,
+        },
+    );
+    let mut opts = test_opts(work.path());
+    opts.slot_limit = 1;
+    let slot_dir = opts.slot_dir.clone();
+
+    let result = verify(
+        capsule_dir.path(),
+        c.repo.path(),
+        work.path(),
+        &ScriptedRunner::failing_infra(),
+        opts,
+    )
+    .await;
+
+    assert!(
+        matches!(result, Err(VerifyError::Infrastructure(_))),
+        "{result:?}"
+    );
+    assert!(
+        cowproof_core::try_acquire_slot("rust", 1, &slot_dir)
+            .unwrap()
+            .is_some(),
+        "the failed verify still holds its slot"
+    );
 }

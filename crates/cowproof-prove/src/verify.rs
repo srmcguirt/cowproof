@@ -1,29 +1,50 @@
 use crate::capsule::{Capsule, CapsuleError, CheckResult};
-use crate::runner::CheckRunner;
+use crate::runner::{CheckRunner, acquire_slot};
 use std::collections::BTreeMap;
-use std::path::Path;
-use std::process::Command;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 use thiserror::Error;
+use tokio::process::Command;
 
-/// Errors that can occur during verification.
-///
-/// None of these is a refutation (design Note F-1): a verifier that cannot rebuild
-/// the tree or run a check says nothing about the lane's work.
+/// How `verify` holds the machine's class slots and bounds its checks.
+pub struct VerifyOptions {
+    /// Directory holding the machine-wide slots, shared with the builders.
+    pub slot_dir: PathBuf,
+    /// The class of the lane being verified (`rust`, `pg`, `light`). The verifier takes a
+    /// slot of this class after the builder has released its own (D12).
+    pub slot_class: String,
+    /// The class's limit.
+    pub slot_limit: usize,
+    /// Per-check time limit. A recorded check carries no limit of its own yet, so this
+    /// applies to every check.
+    pub default_timeout: Duration,
+}
+
+impl Default for VerifyOptions {
+    /// The machine-wide slot directory, the `rust` class at its usual limit of two, and
+    /// a 20 minute limit per check.
+    fn default() -> Self {
+        Self {
+            slot_dir: PathBuf::from(cowproof_core::SLOT_DIR),
+            slot_class: "rust".to_string(),
+            slot_limit: 2,
+            default_timeout: Duration::from_secs(20 * 60),
+        }
+    }
+}
+
 #[derive(Error, Debug)]
 pub enum VerifyError {
-    /// The verifier could not do its job: tree rebuild, patch apply or runner failure.
     #[error("Infrastructure error during verification: {0}")]
     Infrastructure(String),
 
     #[error("Verification failed: capsule is marked unsandboxed and cannot be proved")]
     UnsandboxedNotProved,
 
-    /// The capsule itself is unreadable or fails its hash check. Nothing was run.
     #[error("Capsule rejected: {0}")]
     Capsule(#[from] CapsuleError),
 }
 
-/// Per-check verification result.
 #[derive(Debug, Clone)]
 pub struct CheckMatch {
     pub check_id: String,
@@ -33,27 +54,26 @@ pub struct CheckMatch {
     pub actual_exit_status: i32,
 }
 
-/// Enum for overall verification result.
 #[derive(Debug)]
 pub enum VerifyResult {
-    /// All checks reproduced successfully.
     Reproduced,
-
-    /// Some checks diverged from the capsule.
     Diverged { check_ids: Vec<String> },
 }
 
-/// Report from verifying a capsule.
 #[derive(Debug)]
 pub struct VerifyReport {
     pub result: VerifyResult,
     pub checks: Vec<CheckMatch>,
 }
 
-/// Maximum attempts for a check marked flaky in the capsule.
 const FLAKY_ATTEMPTS: u32 = 3;
 
 /// Verify a capsule by rebuilding the tree from `source_repo` and re-running checks.
+///
+/// Before it builds anything, `verify` waits for a slot of `opts.slot_class` and holds it
+/// until it returns, on every path: success, divergence, error or check timeout (D12).
+/// Every check runs under `opts.default_timeout`; one that overruns is an
+/// infrastructure error naming the check, never a divergence.
 ///
 /// The tree is always built the same way, into `workdir/tree` (which must not exist):
 /// 1. Clone `source_repo` and check out the capsule's base commit (its tree hash must
@@ -72,12 +92,17 @@ pub async fn verify(
     source_repo: &Path,
     workdir: &Path,
     runner: &dyn CheckRunner,
+    opts: VerifyOptions,
 ) -> Result<VerifyReport, VerifyError> {
     let capsule = Capsule::read(capsule_dir)?;
 
     if capsule.unsandboxed {
         return Err(VerifyError::UnsandboxedNotProved);
     }
+
+    let _slot = acquire_slot(&opts.slot_class, opts.slot_limit, &opts.slot_dir)
+        .await
+        .map_err(|e| infra(format!("could not acquire a {} slot: {e}", opts.slot_class)))?;
 
     let recorded = load_checks(capsule_dir)?;
 
@@ -89,9 +114,9 @@ pub async fn verify(
         )));
     }
     std::fs::create_dir_all(workdir).map_err(|e| infra(format!("workdir: {e}")))?;
-    clone_at_commit(source_repo, &capsule.base_commit, &tree)?;
+    clone_at_commit(source_repo, &capsule.base_commit, &tree).await?;
 
-    let actual_tree_hash = git(&tree, &["rev-parse", "HEAD^{tree}"])?;
+    let actual_tree_hash = git(&tree, &["rev-parse", "HEAD^{tree}"]).await?;
     if actual_tree_hash.trim() != capsule.base_tree_hash {
         return Err(infra(format!(
             "base tree hash mismatch: capsule has {}, rebuilt tree has {}",
@@ -101,7 +126,7 @@ pub async fn verify(
     }
 
     for name in ["base.patch", "launch.patch", "lane.patch"] {
-        apply_patch_file(&tree, &capsule_dir.join(name), name)?;
+        apply_patch_file(&tree, &capsule_dir.join(name), name).await?;
     }
 
     let mut check_matches = Vec::new();
@@ -117,7 +142,7 @@ pub async fn verify(
         let mut actual_exit = -1;
         for _ in 0..max_attempts {
             let outcome = runner
-                .run(&tree, &check.command)
+                .run(&tree, &check.command, opts.default_timeout)
                 .await
                 .map_err(|e| infra(format!("check {check_id}: {e}")))?;
             actual_exit = outcome.exit_status;
@@ -158,7 +183,6 @@ fn infra(msg: String) -> VerifyError {
     VerifyError::Infrastructure(msg)
 }
 
-/// Load `checks/<id>.json` files, keyed by check id (the file stem), in id order.
 fn load_checks(capsule_dir: &Path) -> Result<BTreeMap<String, CheckResult>, VerifyError> {
     let mut checks = BTreeMap::new();
     let checks_dir = capsule_dir.join("checks");
@@ -185,13 +209,13 @@ fn load_checks(capsule_dir: &Path) -> Result<BTreeMap<String, CheckResult>, Veri
     Ok(checks)
 }
 
-/// Run git in `dir` with hooks disabled; return stdout.
-fn git(dir: &Path, args: &[&str]) -> Result<String, VerifyError> {
+async fn git(dir: &Path, args: &[&str]) -> Result<String, VerifyError> {
     let output = Command::new("git")
         .args(["-c", "core.hooksPath=/dev/null", "-C"])
         .arg(dir)
         .args(args)
         .output()
+        .await
         .map_err(|e| infra(format!("failed to run git: {e}")))?;
     if !output.status.success() {
         return Err(infra(format!(
@@ -203,8 +227,11 @@ fn git(dir: &Path, args: &[&str]) -> Result<String, VerifyError> {
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
-/// Clone `source_repo` into `target` and check out `commit` detached.
-fn clone_at_commit(source_repo: &Path, commit: &str, target: &Path) -> Result<(), VerifyError> {
+async fn clone_at_commit(
+    source_repo: &Path,
+    commit: &str,
+    target: &Path,
+) -> Result<(), VerifyError> {
     let output = Command::new("git")
         .args([
             "-c",
@@ -217,6 +244,7 @@ fn clone_at_commit(source_repo: &Path, commit: &str, target: &Path) -> Result<()
         .arg(source_repo)
         .arg(target)
         .output()
+        .await
         .map_err(|e| infra(format!("failed to run git clone: {e}")))?;
     if !output.status.success() {
         return Err(infra(format!(
@@ -225,13 +253,11 @@ fn clone_at_commit(source_repo: &Path, commit: &str, target: &Path) -> Result<()
             String::from_utf8_lossy(&output.stderr).trim()
         )));
     }
-    git(target, &["checkout", "--quiet", "--detach", commit])?;
+    git(target, &["checkout", "--quiet", "--detach", commit]).await?;
     Ok(())
 }
 
-/// Apply one capsule patch to the tree. A missing or blank patch is skipped; a patch
-/// that does not apply is an infrastructure error naming the patch (F-1).
-fn apply_patch_file(tree: &Path, patch: &Path, name: &str) -> Result<(), VerifyError> {
+async fn apply_patch_file(tree: &Path, patch: &Path, name: &str) -> Result<(), VerifyError> {
     if !patch.exists() {
         return Ok(());
     }
@@ -239,14 +265,13 @@ fn apply_patch_file(tree: &Path, patch: &Path, name: &str) -> Result<(), VerifyE
     if content.iter().all(u8::is_ascii_whitespace) {
         return Ok(());
     }
-    // Plain `git apply`: exact context only, no three-way fallback, so a replay
-    // never silently succeeds on a tree other than the one the patch was made on.
     let output = Command::new("git")
         .args(["-c", "core.hooksPath=/dev/null", "-C"])
         .arg(tree)
         .arg("apply")
         .arg(patch)
         .output()
+        .await
         .map_err(|e| infra(format!("{name}: failed to run git apply: {e}")))?;
     if !output.status.success() {
         return Err(infra(format!(
