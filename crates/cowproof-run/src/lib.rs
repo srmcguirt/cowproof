@@ -11,6 +11,8 @@
 //! therefore resolved by [`canonicalize_for_sandbox`] at render time, after
 //! any caller edits to the policy, and only the resolved path is emitted.
 
+pub mod proxy;
+
 use anyhow::{Context, Result, anyhow, bail};
 use std::collections::BTreeSet;
 use std::path::{Component, Path, PathBuf};

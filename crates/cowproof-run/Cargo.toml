@@ -8,7 +8,13 @@ version.workspace = true
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["net", "sync", "time"] }
+hyper = { version = "1", features = ["http1", "server", "client"] }
+hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1"] }
+hyper-rustls = "0.27"
+http-body-util = "0.1"
+bytes = "1"
+uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 tempfile.workspace = true
