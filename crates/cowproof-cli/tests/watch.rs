@@ -30,7 +30,7 @@ fn test_watch_table_with_parked_escalation() {
 
     // Create two lanes: one with run.json (finished), one without (running)
     let lane1 = lanes_root.join("lane-1");
-    fs::create_dir_all(&lane1.join("control")).unwrap();
+    fs::create_dir_all(lane1.join("control")).unwrap();
 
     // Write a run.json with exit code 0
     fs::write(lane1.join("control/run.json"), r#"{"exit_code": 0}"#).unwrap();
@@ -42,11 +42,11 @@ fn test_watch_table_with_parked_escalation() {
     ).unwrap();
 
     let lane2 = lanes_root.join("lane-2");
-    fs::create_dir_all(&lane2.join("control")).unwrap();
+    fs::create_dir_all(lane2.join("control")).unwrap();
 
     // Run the command and capture output
     let output = std::process::Command::new(&bin)
-        .args(&[
+        .args([
             "watch",
             "--lanes-root",
             lanes_root.to_str().unwrap(),
@@ -79,7 +79,7 @@ fn test_watch_events_ask_ruling_note_in_order() {
     let lanes_root = tmpdir.path();
 
     let lane1 = lanes_root.join("lane-1");
-    fs::create_dir_all(&lane1.join("control")).unwrap();
+    fs::create_dir_all(lane1.join("control")).unwrap();
 
     // Write escalations.jsonl with ask, ruling, and note
     fs::write(
@@ -91,7 +91,7 @@ fn test_watch_events_ask_ruling_note_in_order() {
     ).unwrap();
 
     let output = std::process::Command::new(&bin)
-        .args(&[
+        .args([
             "watch",
             "--lanes-root",
             lanes_root.to_str().unwrap(),
@@ -141,7 +141,7 @@ fn test_watch_events_line_is_truncated_to_300_chars() {
     let lanes_root = tmpdir.path();
 
     let lane1 = lanes_root.join("very-long-lane-name-to-test-truncation");
-    fs::create_dir_all(&lane1.join("control")).unwrap();
+    fs::create_dir_all(lane1.join("control")).unwrap();
 
     // Create an event with a long note text to test truncation
     fs::write(
@@ -155,7 +155,7 @@ fn test_watch_events_line_is_truncated_to_300_chars() {
     .unwrap();
 
     let output = std::process::Command::new(&bin)
-        .args(&[
+        .args([
             "watch",
             "--lanes-root",
             lanes_root.to_str().unwrap(),
@@ -191,7 +191,7 @@ fn test_watch_events_new_lane_dir_is_picked_up() {
     let lanes_root = tmpdir.path();
 
     let lane1 = lanes_root.join("lane-1");
-    fs::create_dir_all(&lane1.join("control")).unwrap();
+    fs::create_dir_all(lane1.join("control")).unwrap();
     fs::write(
         lane1.join("control/escalations.jsonl"),
         r#"{"event":"asked","lane":"lane-1","id":"lane-1:E1","ask":{"kind":"blocker","question":"test?","tried":[],"options":[{"id":"a","summary":"do A","cost":"1h"}],"recommend":"a","blocking":true},"origin":"builder","at_ms":1000}
@@ -199,7 +199,7 @@ fn test_watch_events_new_lane_dir_is_picked_up() {
     ).unwrap();
 
     let lane2 = lanes_root.join("lane-2");
-    fs::create_dir_all(&lane2.join("control")).unwrap();
+    fs::create_dir_all(lane2.join("control")).unwrap();
     fs::write(
         lane2.join("control/escalations.jsonl"),
         r#"{"event":"note","lane":"lane-2","id":"lane-2-n1","text":"hello","at_ms":2000}
@@ -208,7 +208,7 @@ fn test_watch_events_new_lane_dir_is_picked_up() {
     .unwrap();
 
     let output = std::process::Command::new(&bin)
-        .args(&[
+        .args([
             "watch",
             "--lanes-root",
             lanes_root.to_str().unwrap(),
@@ -222,6 +222,52 @@ fn test_watch_events_new_lane_dir_is_picked_up() {
     // Should have events from both lanes
     assert!(stdout.contains("lane-1"));
     assert!(stdout.contains("lane-2"));
+}
+
+#[test]
+fn test_watch_events_ask_never_includes_question_text() {
+    let bin = cowproof_bin();
+    if !bin.exists() {
+        eprintln!(
+            "Skipping test: cowproof binary not found at {}",
+            bin.display()
+        );
+        return;
+    }
+
+    let tmpdir = TempDir::new().unwrap();
+    let lanes_root = tmpdir.path();
+
+    let lane1 = lanes_root.join("lane-1");
+    fs::create_dir_all(lane1.join("control")).unwrap();
+
+    // Write escalations.jsonl with an ask that has question text
+    fs::write(
+        lane1.join("control/escalations.jsonl"),
+        r#"{"event":"asked","lane":"lane-1","id":"lane-1:E1","ask":{"kind":"blocker","question":"What is the answer to life?","tried":[],"options":[{"id":"a","summary":"do A","cost":"1h"}],"recommend":"a","blocking":true},"origin":"builder","at_ms":1000}
+"#,
+    )
+    .unwrap();
+
+    let output = std::process::Command::new(&bin)
+        .args([
+            "watch",
+            "--lanes-root",
+            lanes_root.to_str().unwrap(),
+            "--events",
+        ])
+        .output()
+        .expect("failed to run cowproof watch --events");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // Should have the ask event but NOT the question text
+    assert!(stdout.contains("asked"));
+    assert!(stdout.contains("lane-1:E1"));
+    assert!(
+        !stdout.contains("What is the answer"),
+        "Question text must not appear in event output"
+    );
 }
 
 #[test]
@@ -239,10 +285,10 @@ fn test_watch_table_shows_table_format() {
     let lanes_root = tmpdir.path();
 
     let lane1 = lanes_root.join("test-lane");
-    fs::create_dir_all(&lane1.join("control")).unwrap();
+    fs::create_dir_all(lane1.join("control")).unwrap();
 
     let output = std::process::Command::new(&bin)
-        .args(&["watch", "--lanes-root", lanes_root.to_str().unwrap()])
+        .args(["watch", "--lanes-root", lanes_root.to_str().unwrap()])
         .output()
         .expect("failed to run cowproof watch");
 
@@ -268,10 +314,10 @@ fn test_watch_unreadable_control_dir_is_skipped() {
 
     let lane1 = lanes_root.join("lane-1");
     fs::create_dir_all(&lane1).unwrap();
-    fs::create_dir_all(&lane1.join("control")).unwrap();
+    fs::create_dir_all(lane1.join("control")).unwrap();
 
     let output = std::process::Command::new(&bin)
-        .args(&[
+        .args([
             "watch",
             "--lanes-root",
             lanes_root.to_str().unwrap(),

@@ -5,7 +5,7 @@
 //! - With `--events`: stream events as RFC3339-timestamped lines (one event per line, max 300 chars).
 //! - With `--follow`: keep running and emit events as they are appended to the queue.
 
-use anyhow::{Result, bail};
+use anyhow::{Result, anyhow, bail};
 use cowproof_run::watch::parked;
 use std::collections::HashMap;
 use std::fs;
@@ -122,14 +122,15 @@ fn truncate_line(s: &str, max_chars: usize) -> String {
 }
 
 fn expand_lanes_root(root: &Option<PathBuf>) -> Result<PathBuf> {
-    if let Some(explicit) = root {
-        return Ok(explicit.to_path_buf());
-    }
-
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/"));
-    Ok(home.join(".cache/cowproof/lanes"))
+    let real_home =
+        PathBuf::from(std::env::var_os("HOME").ok_or_else(|| anyhow!("HOME is not set"))?);
+    Ok(match root {
+        Some(p) => {
+            let cwd = std::env::current_dir()?;
+            cwd.join(p)
+        }
+        None => real_home.join(".cache/cowproof/lanes"),
+    })
 }
 
 pub async fn watch(args: WatchArgs) -> Result<()> {
