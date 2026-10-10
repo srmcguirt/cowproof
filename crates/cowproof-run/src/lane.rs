@@ -7,8 +7,8 @@
 //! objects, no alternates and no remotes, so nothing the builder does can reach
 //! the source repository. Uncommitted work (only with `allow_dirty`) is recorded
 //! as `base.patch` and committed on top of the base. Files that must not reach
-//! the builder are then removed and committed as the launch baseline; the diff
-//! of that one commit is `launch.patch`, which the verifier replays (D13).
+//! the builder are then removed and committed as the launch baseline; the list
+//! of removed paths is recorded in `control/lane.json`, which the verifier replays (D13).
 
 use crate::LaneLayout;
 use anyhow::{Context, Result, anyhow, bail};
@@ -36,8 +36,9 @@ pub struct PreparedLane {
     pub base_commit: String,
     /// The base patch, when `allow_dirty` was set and the tree had changes.
     pub base_patch: Option<Vec<u8>>,
-    /// `git diff --binary <pre_launch> <launch>`: empty when nothing was removed.
-    pub launch_patch: Vec<u8>,
+    /// Files removed for the launch baseline, relative to the clone, sorted.
+    /// Never includes the content of removed files.
+    pub launch_removed: Vec<String>,
     /// The launch baseline commit; the lane patch is computed against it.
     pub launch_commit: String,
 }
@@ -187,31 +188,14 @@ fn build_lane(
         commit_all(&layout.clone, "cowproof: base patch")?;
     }
 
-    let pre_launch = git_text(&git_clone_read(&layout.clone, &["rev-parse", "HEAD"])?)?;
     let removed_paths = remove_launch_baseline(&layout.clone)?;
     commit_all(&layout.clone, "cowproof: launch baseline")?;
     let launch_commit = git_text(&git_clone_read(&layout.clone, &["rev-parse", "HEAD"])?)?;
-    let launch_patch = git_clone_read(
-        &layout.clone,
-        &[
-            "diff",
-            "--binary",
-            "--no-color",
-            "--no-ext-diff",
-            "--no-textconv",
-            "--no-renames",
-            "--src-prefix=a/",
-            "--dst-prefix=b/",
-            &pre_launch,
-            &launch_commit,
-        ],
-    )?
-    .stdout;
 
     let control = LaneControl {
         base_commit: base_commit.to_string(),
         launch_commit: launch_commit.clone(),
-        removed_paths,
+        removed_paths: removed_paths.clone(),
     };
     let path = layout.control.join("lane.json");
     fs::write(
@@ -224,7 +208,7 @@ fn build_lane(
         layout,
         base_commit: base_commit.to_string(),
         base_patch,
-        launch_patch,
+        launch_removed: removed_paths,
         launch_commit,
     })
 }
@@ -796,7 +780,7 @@ mod tests {
     ];
 
     #[test]
-    fn launch_baseline_removes_exactly_the_ruled_set_and_launch_patch_matches() {
+    fn launch_baseline_removes_exactly_the_ruled_set() {
         let tmp = TempDir::new().unwrap();
         let repo = repo_with(&tmp, PACKET_TREE);
 
@@ -839,10 +823,7 @@ mod tests {
         // The emptied .claude/hooks directory is gone with its only file.
         assert!(!clone.join(".claude/hooks").exists());
 
-        assert_eq!(
-            patch_paths(&lane.launch_patch),
-            expected.iter().cloned().collect::<BTreeSet<_>>()
-        );
+        assert_eq!(lane.launch_removed, expected);
         // The source still has every file.
         for (rel, content) in PACKET_TREE {
             assert_eq!(&fs::read_to_string(repo.join(rel)).unwrap(), content);
@@ -919,14 +900,11 @@ mod tests {
             outside.join("settings.json").exists(),
             "the target is untouched"
         );
-        assert_eq!(
-            patch_paths(&lane.launch_patch),
-            BTreeSet::from([".claude".to_string()])
-        );
+        assert_eq!(lane.launch_removed, vec![".claude".to_string()]);
     }
 
     /// Rebuild the base in a fresh clone of the source, apply `base.patch` (if
-    /// any) and `launch.patch` with `git apply`, and return its tree hash.
+    /// any), replay the launch baseline by deleting paths, and return its tree hash.
     fn replay_tree(tmp: &TempDir, repo: &Path, lane: &PreparedLane) -> String {
         let fresh = tmp.path().join("replay");
         git(
@@ -940,30 +918,33 @@ mod tests {
             ],
         );
         git(&fresh, &["checkout", "-q", &lane.base_commit]);
-        for (name, patch) in [
-            ("base.patch", lane.base_patch.as_deref()),
-            ("launch.patch", Some(lane.launch_patch.as_slice())),
-        ] {
-            let Some(patch) = patch.filter(|p| !p.is_empty()) else {
-                continue;
-            };
-            let file = tmp.path().join(name);
+        if let Some(patch) = lane.base_patch.as_deref().filter(|p| !p.is_empty()) {
+            let file = tmp.path().join("base.patch");
             fs::write(&file, patch).unwrap();
             git(&fresh, &["apply", file.to_str().unwrap()]);
+        }
+        // Replay launch baseline by deleting the removed paths.
+        for rel in &lane.launch_removed {
+            let path = fresh.join(rel);
+            if path.is_file() {
+                fs::remove_file(&path).expect("removing file");
+            } else if path.is_dir() {
+                fs::remove_dir_all(&path).expect("removing directory");
+            }
         }
         git(&fresh, &["add", "-A"]);
         git(&fresh, &["write-tree"]).trim().to_string()
     }
 
     #[test]
-    fn replay_of_base_and_launch_patch_rebuilds_the_launch_tree_clean() {
+    fn replay_of_base_and_launch_baseline_rebuilds_the_launch_tree_clean() {
         let tmp = TempDir::new().unwrap();
         let repo = repo_with(&tmp, PACKET_TREE);
 
         let lane = prepare_lane(&repo, &tmp.path().join("lanes"), "l1", clean_opts()).unwrap();
 
         assert!(lane.base_patch.is_none());
-        assert!(!lane.launch_patch.is_empty());
+        assert!(!lane.launch_removed.is_empty());
         let launch_tree = git(&lane.layout.clone, &["rev-parse", "HEAD^{tree}"]);
         let base_tree = git(&repo, &["rev-parse", "HEAD^{tree}"]);
         assert_ne!(
@@ -974,7 +955,7 @@ mod tests {
     }
 
     #[test]
-    fn replay_of_base_and_launch_patch_rebuilds_the_launch_tree_with_a_base_patch() {
+    fn replay_of_base_and_launch_baseline_rebuilds_the_launch_tree_with_a_base_patch() {
         let tmp = TempDir::new().unwrap();
         let repo = repo_with(&tmp, PACKET_TREE);
         // Dirty: a modified tracked file, a new file, and a change to a file the
@@ -996,8 +977,8 @@ mod tests {
                 "src/new.rs".to_string()
             ])
         );
-        // The launch patch removes the dirty .env too, so it is not empty.
-        assert!(patch_paths(&lane.launch_patch).contains("added/.env.test"));
+        // The launch baseline removes both added/.env.test and the modified .env.
+        assert!(lane.launch_removed.contains(&"added/.env.test".to_string()));
         let launch_tree = git(&lane.layout.clone, &["rev-parse", "HEAD^{tree}"]);
         assert_eq!(replay_tree(&tmp, &repo, &lane), launch_tree.trim());
         assert_eq!(
@@ -1033,8 +1014,8 @@ mod tests {
         let lane = prepare_lane(&repo, &tmp.path().join("lanes"), "l1", clean_opts()).unwrap();
 
         assert!(
-            lane.launch_patch.is_empty(),
-            "the last source commit must not leak in"
+            lane.launch_removed.is_empty(),
+            "no paths were removed, so launch_removed is empty"
         );
         assert_ne!(lane.launch_commit, lane.base_commit);
         let parent = git(
@@ -1170,5 +1151,93 @@ mod tests {
             "the lane dir must be removed"
         );
         assert_eq!(fs::read_dir(&lanes_root).unwrap().count(), 0);
+    }
+
+    /// The first file under `dir` holding `needle`, skipping every `.git` (the clone's
+    /// own object store legitimately holds the base commit's blobs) and never following
+    /// a symlink.
+    fn find_bytes_in_tree(dir: &Path, needle: &[u8]) -> Option<PathBuf> {
+        for entry in fs::read_dir(dir).unwrap().filter_map(Result::ok) {
+            let path = entry.path();
+            let kind = entry.file_type().unwrap();
+            if kind.is_dir() {
+                if entry.file_name() != ".git"
+                    && let Some(found) = find_bytes_in_tree(&path, needle)
+                {
+                    return Some(found);
+                }
+            } else if kind.is_file() {
+                let content = fs::read(&path).unwrap();
+                if content.windows(needle.len()).any(|w| w == needle) {
+                    return Some(path);
+                }
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn secret_in_env_file_does_not_appear_in_any_lane_file() {
+        let tmp = TempDir::new().unwrap();
+        let repo = repo_with(
+            &tmp,
+            &[("README.md", "safe"), (".env", "SECRET=CANARY-7f3a")],
+        );
+
+        let lane = prepare_lane(&repo, &tmp.path().join("lanes"), "l1", clean_opts()).unwrap();
+
+        // The secret must not be in the clone's tree.
+        assert!(!lane.layout.clone.join(".env").exists());
+
+        // The secret must not be in any file of the lane directory (control, home, scratch,
+        // clone working tree), outside the clone's own .git.
+        let secret = b"CANARY-7f3a";
+        if let Some(found) = find_bytes_in_tree(lane.layout.control.parent().unwrap(), secret) {
+            panic!("secret found in: {}", found.display());
+        }
+
+        // The secret must not be in the launch_removed list (only paths).
+        assert!(!lane.launch_removed.join("\n").contains("CANARY-7f3a"));
+        assert!(lane.launch_removed.contains(&".env".to_string()));
+    }
+
+    #[test]
+    fn multiple_removed_files_with_secrets_leave_no_secrets_in_lane() {
+        let tmp = TempDir::new().unwrap();
+        let repo = repo_with(
+            &tmp,
+            &[
+                ("README.md", "safe"),
+                (".env", "API_KEY=secret-key-xyz"),
+                ("config/.env.local", "DB_PASS=password123"),
+                ("CLAUDE.md", "# Config with token: secret-token-abc"),
+            ],
+        );
+
+        let lane = prepare_lane(&repo, &tmp.path().join("lanes"), "l1", clean_opts()).unwrap();
+
+        // None of these secrets should appear in the lane directory.
+        let secrets = [
+            b"secret-key-xyz".as_slice(),
+            b"password123".as_slice(),
+            b"secret-token-abc".as_slice(),
+        ];
+        for secret in &secrets {
+            if let Some(found) = find_bytes_in_tree(lane.layout.control.parent().unwrap(), secret) {
+                panic!(
+                    "secret {:?} found in: {}",
+                    String::from_utf8_lossy(secret),
+                    found.display()
+                );
+            }
+        }
+
+        // The launch_removed contains paths, not content.
+        assert!(lane.launch_removed.contains(&".env".to_string()));
+        assert!(
+            lane.launch_removed
+                .contains(&"config/.env.local".to_string())
+        );
+        assert!(lane.launch_removed.contains(&"CLAUDE.md".to_string()));
     }
 }

@@ -111,7 +111,8 @@ fn test_capsule_missing_file_detected() {
 // ============================================================================
 // End-to-end verify() tests. Every test builds a real git repo, authors real
 // patches, writes a real capsule and calls verify(), which always clones the
-// source repo at the base commit and applies base, launch, lane in order.
+// source repo at the base commit, applies base.patch, replays the launch baseline
+// (deleting `launch_removed`), then applies lane.patch.
 // ============================================================================
 
 /// A real git repository in a temp dir, used both to author patches and as the
@@ -196,8 +197,10 @@ type Recorded<'a> = (&'a str, &'a str, i32);
 
 struct CapsuleSpec<'a> {
     base: &'a (String, String),
-    /// (file name, content), for base.patch / launch.patch / lane.patch.
+    /// (file name, content), for base.patch / lane.patch.
     patches: &'a [(&'a str, &'a str)],
+    /// Paths removed during the launch baseline, sorted.
+    launch_removed: &'a [&'a str],
     checks: &'a [Recorded<'a>],
     flaky: &'a [&'a str],
     unsandboxed: bool,
@@ -234,6 +237,11 @@ fn write_capsule(dir: &Path, spec: &CapsuleSpec) {
         .iter()
         .map(|s| (*s).to_string())
         .collect::<HashSet<_>>();
+    capsule.launch_removed = spec
+        .launch_removed
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
     capsule.unsandboxed = spec.unsandboxed;
     capsule.write(dir).unwrap();
 }
@@ -298,27 +306,23 @@ impl CheckRunner for ScriptedRunner {
     }
 }
 
-/// The three-patch chain shared by the order tests. Each patch only applies on top of
-/// the one before it: launch.patch rewrites `line=base` and deletes `.env`; lane.patch
-/// rewrites the line launch.patch produced.
+/// The chain shared by the order tests. The launch baseline deletes `.env` only (it is
+/// `launch_removed`, never a patch); lane.patch, authored against the tree after that
+/// deletion, edits src.txt from "line=base" to "line=edited".
 struct Chain {
     repo: Repo,
     base: (String, String),
-    launch: String,
     lane: String,
 }
 
 fn chain() -> Chain {
     let repo = Repo::new();
     let base = repo.base(&[(".env", "SECRET=1\n"), ("src.txt", "line=base\n")]);
-    let launch = repo.change(&[(".env", None), ("src.txt", Some("line=launch\n"))]);
+    // Apply only the launch baseline deletion (no content changes).
+    repo.change(&[(".env", None)]);
+    // Now create lane.patch from this state (after launch baseline, before lane patch).
     let lane = repo.change(&[("src.txt", Some("line=edited\n"))]);
-    Chain {
-        repo,
-        base,
-        launch,
-        lane,
-    }
+    Chain { repo, base, lane }
 }
 
 fn dirs() -> (TempDir, TempDir) {
@@ -336,8 +340,8 @@ fn test_opts(work: &Path) -> VerifyOptions {
     }
 }
 
-/// 1. Order: launch.patch (deletes .env, rewrites src.txt) then lane.patch (edits the
-/// rewritten line), checked by a real process on the rebuilt tree.
+/// 1. Order: launch baseline (deletes .env) then lane.patch (edits src.txt),
+/// checked by a real process on the rebuilt tree.
 #[tokio::test]
 async fn test_replay_order_launch_then_lane_reproduces() {
     let c = chain();
@@ -346,7 +350,8 @@ async fn test_replay_order_launch_then_lane_reproduces() {
         capsule_dir.path(),
         &CapsuleSpec {
             base: &c.base,
-            patches: &[("launch.patch", &c.launch), ("lane.patch", &c.lane)],
+            patches: &[("lane.patch", &c.lane)],
+            launch_removed: &[".env"],
             checks: &[("order", "test ! -f .env && grep -q edited src.txt", 0)],
             flaky: &[],
             unsandboxed: false,
@@ -371,98 +376,30 @@ async fn test_replay_order_launch_then_lane_reproduces() {
     assert!(report.checks[0].passed);
 }
 
-/// 2a. An EMPTY launch.patch leaves lane.patch without its context: infrastructure
-/// error naming lane.patch, never a divergence, and no check runs.
-#[tokio::test]
-async fn test_empty_launch_patch_makes_lane_patch_fail_as_infrastructure() {
-    let c = chain();
-    let (capsule_dir, work) = dirs();
-    write_capsule(
-        capsule_dir.path(),
-        &CapsuleSpec {
-            base: &c.base,
-            patches: &[("launch.patch", ""), ("lane.patch", &c.lane)],
-            checks: &[("order", "true", 0)],
-            flaky: &[],
-            unsandboxed: false,
-        },
-    );
-    let runner = ScriptedRunner::new(&[("true", &[0])]);
-
-    match verify(
-        capsule_dir.path(),
-        c.repo.path(),
-        work.path(),
-        &runner,
-        test_opts(work.path()),
-    )
-    .await
-    {
-        Err(VerifyError::Infrastructure(msg)) => {
-            assert!(msg.contains("lane.patch"), "should name lane.patch: {msg}")
-        }
-        other => panic!("expected Infrastructure, got {other:?}"),
-    }
-    assert_eq!(runner.call_count(), 0);
+/// Order matters. The builder wrote its own `.env` after the launch baseline removed
+/// the base's: lane.patch CREATES `.env`, so it applies only on a tree where the
+/// baseline has already deleted the base's `.env`.
+fn recreate_chain() -> Chain {
+    let repo = Repo::new();
+    let base = repo.base(&[(".env", "SECRET=1\n"), ("src.txt", "line=base\n")]);
+    repo.change(&[(".env", None)]);
+    let lane = repo.change(&[(".env", Some("builder=1\n"))]);
+    Chain { repo, base, lane }
 }
 
-/// 2b. A capsule with no launch.patch at all behaves the same.
 #[tokio::test]
-async fn test_missing_launch_patch_makes_lane_patch_fail_as_infrastructure() {
-    let c = chain();
+async fn test_lane_patch_creating_a_removed_path_applies_after_the_baseline() {
+    let c = recreate_chain();
     let (capsule_dir, work) = dirs();
     write_capsule(
         capsule_dir.path(),
         &CapsuleSpec {
             base: &c.base,
             patches: &[("lane.patch", &c.lane)],
-            checks: &[("order", "true", 0)],
-            flaky: &[],
-            unsandboxed: false,
-        },
-    );
-    let runner = ScriptedRunner::new(&[("true", &[0])]);
-
-    match verify(
-        capsule_dir.path(),
-        c.repo.path(),
-        work.path(),
-        &runner,
-        test_opts(work.path()),
-    )
-    .await
-    {
-        Err(VerifyError::Infrastructure(msg)) => {
-            assert!(msg.contains("lane.patch"), "should name lane.patch: {msg}")
-        }
-        other => panic!("expected Infrastructure, got {other:?}"),
-    }
-    assert_eq!(runner.call_count(), 0);
-}
-
-/// 3. base.patch (dirty base) is applied before launch.patch, which only applies on
-/// top of it; lane.patch then adds a file.
-#[tokio::test]
-async fn test_base_patch_applied_before_launch_patch() {
-    let repo = Repo::new();
-    let base = repo.base(&[(".env", "SECRET=1\n"), ("src.txt", "line=base\n")]);
-    let base_patch = repo.change(&[("src.txt", Some("line=dirty\n"))]);
-    let launch = repo.change(&[(".env", None), ("src.txt", Some("line=launched\n"))]);
-    let lane = repo.change(&[("lane.txt", Some("new\n"))]);
-
-    let (capsule_dir, work) = dirs();
-    write_capsule(
-        capsule_dir.path(),
-        &CapsuleSpec {
-            base: &base,
-            patches: &[
-                ("base.patch", &base_patch),
-                ("launch.patch", &launch),
-                ("lane.patch", &lane),
-            ],
+            launch_removed: &[".env"],
             checks: &[(
-                "chain",
-                "grep -q launched src.txt && test -f lane.txt && test ! -f .env",
+                "order",
+                "grep -q builder=1 .env && ! grep -q SECRET .env",
                 0,
             )],
             flaky: &[],
@@ -470,6 +407,171 @@ async fn test_base_patch_applied_before_launch_patch() {
         },
     );
 
+    let report = verify(
+        capsule_dir.path(),
+        c.repo.path(),
+        work.path(),
+        &ProcessRunner::new(),
+        test_opts(work.path()),
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(report.result, VerifyResult::Reproduced),
+        "{report:?}"
+    );
+}
+
+/// Without the baseline replay, lane.patch has no context (`.env` still exists):
+/// infrastructure error naming lane.patch, never a divergence, and no check runs.
+#[tokio::test]
+async fn test_empty_launch_removed_leaves_lane_patch_without_its_context() {
+    let c = recreate_chain();
+    let (capsule_dir, work) = dirs();
+    write_capsule(
+        capsule_dir.path(),
+        &CapsuleSpec {
+            base: &c.base,
+            patches: &[("lane.patch", &c.lane)],
+            launch_removed: &[],
+            checks: &[("order", "true", 0)],
+            flaky: &[],
+            unsandboxed: false,
+        },
+    );
+    let runner = ScriptedRunner::new(&[("true", &[0])]);
+
+    match verify(
+        capsule_dir.path(),
+        c.repo.path(),
+        work.path(),
+        &runner,
+        test_opts(work.path()),
+    )
+    .await
+    {
+        Err(VerifyError::Infrastructure(msg)) => {
+            assert!(msg.contains("lane.patch"), "should name lane.patch: {msg}")
+        }
+        other => panic!("expected Infrastructure, got {other:?}"),
+    }
+    assert_eq!(runner.call_count(), 0);
+}
+
+/// base.patch (a dirty base that adds `.env.local`) is applied BEFORE the baseline,
+/// which deletes `.env.local` and so needs it present; lane.patch then adds a file.
+fn dirty_chain() -> (Chain, String) {
+    let repo = Repo::new();
+    let base = repo.base(&[(".env", "SECRET=1\n"), ("src.txt", "line=base\n")]);
+    let base_patch = repo.change(&[(".env.local", Some("DIRTY=1\n"))]);
+    repo.change(&[(".env", None), (".env.local", None)]);
+    let lane = repo.change(&[("lane.txt", Some("new\n"))]);
+    (Chain { repo, base, lane }, base_patch)
+}
+
+#[tokio::test]
+async fn test_base_patch_applied_before_the_launch_baseline() {
+    let (c, base_patch) = dirty_chain();
+    let (capsule_dir, work) = dirs();
+    write_capsule(
+        capsule_dir.path(),
+        &CapsuleSpec {
+            base: &c.base,
+            patches: &[("base.patch", &base_patch), ("lane.patch", &c.lane)],
+            launch_removed: &[".env", ".env.local"],
+            checks: &[(
+                "chain",
+                "test ! -e .env && test ! -e .env.local && test -f lane.txt",
+                0,
+            )],
+            flaky: &[],
+            unsandboxed: false,
+        },
+    );
+    let report = verify(
+        capsule_dir.path(),
+        c.repo.path(),
+        work.path(),
+        &ProcessRunner::new(),
+        test_opts(work.path()),
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(report.result, VerifyResult::Reproduced),
+        "{report:?}"
+    );
+
+    // Without base.patch, `.env.local` was never there to remove: infrastructure naming it.
+    let (capsule_dir2, work2) = dirs();
+    write_capsule(
+        capsule_dir2.path(),
+        &CapsuleSpec {
+            base: &c.base,
+            patches: &[("lane.patch", &c.lane)],
+            launch_removed: &[".env", ".env.local"],
+            checks: &[("chain", "true", 0)],
+            flaky: &[],
+            unsandboxed: false,
+        },
+    );
+    match verify(
+        capsule_dir2.path(),
+        c.repo.path(),
+        work2.path(),
+        &ProcessRunner::new(),
+        test_opts(work2.path()),
+    )
+    .await
+    {
+        Err(VerifyError::Infrastructure(msg)) => assert!(msg.contains(".env.local"), "{msg}"),
+        other => panic!("expected Infrastructure, got {other:?}"),
+    }
+}
+
+/// The rebuilt tree's hash (`git write-tree`, the index the baseline commit left;
+/// lane.patch only touches the working tree) equals the launch tree of a base with
+/// `.env`, a nested `.env.local`, and two `CLAUDE.md`.
+#[tokio::test]
+async fn test_rebuilt_tree_hash_equals_the_launch_tree() {
+    let repo = Repo::new();
+    std::fs::create_dir_all(repo.path().join("sub")).unwrap();
+    std::fs::create_dir_all(repo.path().join("docs")).unwrap();
+    let base = repo.base(&[
+        (".env", "SECRET=1\n"),
+        ("sub/.env.local", "SECRET=2\n"),
+        ("CLAUDE.md", "root\n"),
+        ("docs/CLAUDE.md", "docs\n"),
+        ("sub/keep.txt", "keep\n"),
+        ("src.txt", "line=base\n"),
+    ]);
+    repo.change(&[
+        (".env", None),
+        ("sub/.env.local", None),
+        ("CLAUDE.md", None),
+        ("docs/CLAUDE.md", None),
+    ]);
+    let launch_tree = repo.git(&["rev-parse", "HEAD^{tree}"]).trim().to_string();
+    assert_ne!(launch_tree, base.1);
+    let lane = repo.change(&[("src.txt", Some("line=edited\n"))]);
+
+    let (capsule_dir, work) = dirs();
+    write_capsule(
+        capsule_dir.path(),
+        &CapsuleSpec {
+            base: &base,
+            patches: &[("lane.patch", &lane)],
+            // Sorted, as the runner records them.
+            launch_removed: &[".env", "CLAUDE.md", "docs/CLAUDE.md", "sub/.env.local"],
+            checks: &[(
+                "tree",
+                &format!("test \"$(git write-tree)\" = {launch_tree} && grep -q edited src.txt"),
+                0,
+            )],
+            flaky: &[],
+            unsandboxed: false,
+        },
+    );
     let report = verify(
         capsule_dir.path(),
         repo.path(),
@@ -483,31 +585,334 @@ async fn test_base_patch_applied_before_launch_patch() {
         matches!(report.result, VerifyResult::Reproduced),
         "{report:?}"
     );
+    let tree = work.path().join("tree");
+    assert!(!tree.join("docs").exists(), "the emptied directory is gone");
+    assert!(tree.join("sub/keep.txt").exists());
+}
 
-    // Without base.patch, launch.patch has no context: infrastructure naming it.
-    let (capsule_dir2, work2) = dirs();
+// ---------------------------------------------------------------------------
+// The capsule is untrusted input: `launch_removed` names files to DELETE. Every refusal
+// is an Infrastructure error naming the path, with nothing deleted from the tree.
+// ---------------------------------------------------------------------------
+
+/// Run verify over `c` with `.env` (which is valid and listed FIRST) followed by `removed`,
+/// expect an Infrastructure error whose message contains `names`, and prove nothing was
+/// deleted: `.env` is still there, HEAD is still the base commit and the tree is clean.
+async fn assert_refused_untouched(c: &Chain, work: &TempDir, removed: &[&str], names: &[&str]) {
+    let capsule_dir = TempDir::new().unwrap();
+    let mut all = vec![".env"];
+    all.extend_from_slice(removed);
     write_capsule(
-        capsule_dir2.path(),
+        capsule_dir.path(),
         &CapsuleSpec {
-            base: &base,
-            patches: &[("launch.patch", &launch), ("lane.patch", &lane)],
-            checks: &[("chain", "true", 0)],
+            base: &c.base,
+            patches: &[("lane.patch", &c.lane)],
+            launch_removed: &all,
+            checks: &[("any", "true", 0)],
             flaky: &[],
             unsandboxed: false,
         },
     );
+    let runner = ScriptedRunner::new(&[("true", &[0])]);
     match verify(
-        capsule_dir2.path(),
-        repo.path(),
-        work2.path(),
-        &ProcessRunner::new(),
-        test_opts(work2.path()),
+        capsule_dir.path(),
+        c.repo.path(),
+        work.path(),
+        &runner,
+        test_opts(work.path()),
     )
     .await
     {
-        Err(VerifyError::Infrastructure(msg)) => assert!(msg.contains("launch.patch"), "{msg}"),
-        other => panic!("expected Infrastructure, got {other:?}"),
+        Err(VerifyError::Infrastructure(msg)) => {
+            for name in names {
+                assert!(msg.contains(name), "should contain {name:?}: {msg}");
+            }
+        }
+        other => panic!("expected Infrastructure for {removed:?}, got {other:?}"),
     }
+    assert_eq!(runner.call_count(), 0);
+    let tree = work.path().join("tree");
+    assert_eq!(
+        std::fs::read_to_string(tree.join(".env")).unwrap(),
+        "SECRET=1\n",
+        "the valid path listed first must not be deleted either"
+    );
+    let git = |args: &[&str]| {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(&tree)
+            .args(args)
+            .output()
+            .unwrap();
+        String::from_utf8(out.stdout).unwrap()
+    };
+    assert_eq!(
+        git(&["status", "--porcelain"]),
+        "",
+        "tree must be unchanged"
+    );
+    assert_eq!(git(&["rev-parse", "HEAD"]).trim(), c.base.0);
+}
+
+#[tokio::test]
+async fn test_launch_path_with_dotdot_is_refused_and_nothing_outside_is_deleted() {
+    let c = chain();
+    let work = TempDir::new().unwrap();
+    // `tree/../outside` is `work/outside`.
+    let outside = work.path().join("outside");
+    std::fs::write(&outside, "precious").unwrap();
+
+    assert_refused_untouched(&c, &work, &["../outside"], &["../outside"]).await;
+
+    assert_eq!(std::fs::read_to_string(&outside).unwrap(), "precious");
+}
+
+#[tokio::test]
+async fn test_absolute_launch_path_is_refused_and_the_target_survives() {
+    let c = chain();
+    let work = TempDir::new().unwrap();
+    let outside_dir = TempDir::new().unwrap();
+    let outside = outside_dir.path().join("secret.txt");
+    std::fs::write(&outside, "precious").unwrap();
+    let abs = outside.to_str().unwrap().to_string();
+
+    assert_refused_untouched(&c, &work, &[&abs], &[&abs]).await;
+
+    assert_eq!(std::fs::read_to_string(&outside).unwrap(), "precious");
+}
+
+/// The base commit holds `link`, a symlink to a directory outside the tree; the capsule
+/// asks to delete `link/file`, which would remove the outside file if followed.
+#[tokio::test]
+async fn test_launch_path_through_a_symlink_is_refused_and_the_target_survives() {
+    let outside_dir = TempDir::new().unwrap();
+    let outside = outside_dir.path().join("file");
+    std::fs::write(&outside, "precious").unwrap();
+    let repo = Repo::new();
+    std::os::unix::fs::symlink(outside_dir.path(), repo.path().join("link")).unwrap();
+    let base = repo.base(&[(".env", "SECRET=1\n"), ("src.txt", "line=base\n")]);
+    repo.change(&[(".env", None)]);
+    let lane = repo.change(&[("src.txt", Some("line=edited\n"))]);
+    let c = Chain { repo, base, lane };
+    let work = TempDir::new().unwrap();
+
+    assert_refused_untouched(&c, &work, &["link/file"], &["link/file"]).await;
+
+    assert_eq!(std::fs::read_to_string(&outside).unwrap(), "precious");
+}
+
+#[tokio::test]
+async fn test_launch_path_that_does_not_exist_is_refused() {
+    let c = chain();
+    let work = TempDir::new().unwrap();
+
+    assert_refused_untouched(
+        &c,
+        &work,
+        &["nope/missing.txt"],
+        &["nope/missing.txt", "does not exist"],
+    )
+    .await;
+}
+
+/// The remaining malformed shapes, each refused naming itself with nothing deleted.
+#[tokio::test]
+async fn test_malformed_launch_paths_are_refused() {
+    let repo = Repo::new();
+    std::fs::create_dir_all(repo.path().join("sub")).unwrap();
+    let base = repo.base(&[
+        (".env", "SECRET=1\n"),
+        ("src.txt", "line=base\n"),
+        ("sub/x.txt", "x\n"),
+    ]);
+    repo.change(&[(".env", None)]);
+    let lane = repo.change(&[("src.txt", Some("line=edited\n"))]);
+    let c = Chain { repo, base, lane };
+
+    for (path, why) in [
+        ("./src.txt", "`.` or `..`"),
+        ("sub/../src.txt", "`.` or `..`"),
+        ("sub//x.txt", "empty path component"),
+        ("src.txt/", "empty path component"),
+        ("", "empty path component"),
+        (".git/config", "`.git`"),
+        (".GIT/config", "`.git`"),
+        ("sub", "a directory is not a recorded removal"),
+        ("src.txt/x", "non-directory"),
+        (".env", "duplicate"),
+    ] {
+        let work = TempDir::new().unwrap();
+        // `.env` is always listed first, so the duplicate case lists it twice.
+        assert_refused_untouched(&c, &work, &[path], &[path, why]).await;
+    }
+}
+
+/// A file or directory name that merely CONTAINS two dots is not a `..` component.
+#[tokio::test]
+async fn test_a_name_containing_two_dots_is_a_legitimate_removal() {
+    let repo = Repo::new();
+    let base = repo.base(&[("a..b", "x\n"), ("src.txt", "line=base\n")]);
+    repo.change(&[("a..b", None)]);
+    let lane = repo.change(&[("src.txt", Some("line=edited\n"))]);
+    let (capsule_dir, work) = dirs();
+    write_capsule(
+        capsule_dir.path(),
+        &CapsuleSpec {
+            base: &base,
+            patches: &[("lane.patch", &lane)],
+            launch_removed: &["a..b"],
+            checks: &[("gone", "test ! -e a..b && grep -q edited src.txt", 0)],
+            flaky: &[],
+            unsandboxed: false,
+        },
+    );
+    let report = verify(
+        capsule_dir.path(),
+        repo.path(),
+        work.path(),
+        &ProcessRunner::new(),
+        test_opts(work.path()),
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(report.result, VerifyResult::Reproduced),
+        "{report:?}"
+    );
+}
+
+/// The runner removes a symlink standing in for `.claude` (it records `.claude`). Verify
+/// must unlink that symlink and leave what it points at alone.
+#[tokio::test]
+async fn test_a_recorded_symlink_is_unlinked_not_followed() {
+    let outside_dir = TempDir::new().unwrap();
+    let outside = outside_dir.path().join("settings.json");
+    std::fs::write(&outside, "precious").unwrap();
+    let repo = Repo::new();
+    std::os::unix::fs::symlink(outside_dir.path(), repo.path().join(".claude")).unwrap();
+    let base = repo.base(&[("src.txt", "line=base\n")]);
+    repo.change(&[(".claude", None)]);
+    let lane = repo.change(&[("src.txt", Some("line=edited\n"))]);
+    let (capsule_dir, work) = dirs();
+    write_capsule(
+        capsule_dir.path(),
+        &CapsuleSpec {
+            base: &base,
+            patches: &[("lane.patch", &lane)],
+            launch_removed: &[".claude"],
+            checks: &[("gone", "test ! -e .claude && test ! -L .claude", 0)],
+            flaky: &[],
+            unsandboxed: false,
+        },
+    );
+    let report = verify(
+        capsule_dir.path(),
+        repo.path(),
+        work.path(),
+        &ProcessRunner::new(),
+        test_opts(work.path()),
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(report.result, VerifyResult::Reproduced),
+        "{report:?}"
+    );
+    assert_eq!(std::fs::read_to_string(&outside).unwrap(), "precious");
+}
+
+// ---------------------------------------------------------------------------
+// The launch baseline lives in a hashed capsule file, not in the unhashed capsule.json.
+// ---------------------------------------------------------------------------
+
+fn capsule_with_removed(dir: &Path, removed: &[&str]) {
+    let mut capsule = Capsule::new(
+        "abc".to_string(),
+        "def".to_string(),
+        fingerprint(),
+        "claude:haiku".to_string(),
+        "api-key".to_string(),
+    );
+    capsule.launch_removed = removed.iter().map(|s| (*s).to_string()).collect();
+    capsule.write(dir).unwrap();
+}
+
+#[test]
+fn test_launch_removed_round_trips_and_is_not_duplicated_in_capsule_json() {
+    let dir = TempDir::new().unwrap();
+    capsule_with_removed(dir.path(), &[".env", "sub/CLAUDE.md"]);
+
+    let read = Capsule::read(dir.path()).unwrap();
+    assert_eq!(read.launch_removed, vec![".env", "sub/CLAUDE.md"]);
+    assert!(read.file_hashes.contains_key("launch_removed.json"));
+    // A second, unhashed copy in capsule.json could be edited without detection.
+    let json = std::fs::read_to_string(dir.path().join("capsule.json")).unwrap();
+    assert!(!json.contains("\"launch_removed\""), "{json}");
+    assert!(!json.contains("CLAUDE.md"), "{json}");
+}
+
+#[test]
+fn test_editing_launch_removed_after_write_makes_read_fail() {
+    let dir = TempDir::new().unwrap();
+    capsule_with_removed(dir.path(), &[".env"]);
+    std::fs::write(dir.path().join("launch_removed.json"), r#"["src.txt"]"#).unwrap();
+
+    match Capsule::read(dir.path()) {
+        Err(CapsuleError::HashMismatch(file, _, _)) => assert_eq!(file, "launch_removed.json"),
+        other => panic!("expected HashMismatch, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_deleting_launch_removed_after_write_makes_read_fail() {
+    let dir = TempDir::new().unwrap();
+    capsule_with_removed(dir.path(), &[".env"]);
+    std::fs::remove_file(dir.path().join("launch_removed.json")).unwrap();
+
+    match Capsule::read(dir.path()) {
+        Err(CapsuleError::MissingFile(file)) => assert_eq!(file, "launch_removed.json"),
+        other => panic!("expected MissingFile, got {other:?}"),
+    }
+}
+
+/// An edited baseline stops `verify` before it builds a tree, let alone deletes a file.
+#[tokio::test]
+async fn test_verify_rejects_an_edited_launch_removed_before_building_anything() {
+    let c = chain();
+    let (capsule_dir, work) = dirs();
+    write_capsule(
+        capsule_dir.path(),
+        &CapsuleSpec {
+            base: &c.base,
+            patches: &[("lane.patch", &c.lane)],
+            launch_removed: &[".env"],
+            checks: &[("any", "true", 0)],
+            flaky: &[],
+            unsandboxed: false,
+        },
+    );
+    std::fs::write(
+        capsule_dir.path().join("launch_removed.json"),
+        r#"["src.txt"]"#,
+    )
+    .unwrap();
+    let runner = ScriptedRunner::new(&[("true", &[0])]);
+
+    match verify(
+        capsule_dir.path(),
+        c.repo.path(),
+        work.path(),
+        &runner,
+        test_opts(work.path()),
+    )
+    .await
+    {
+        Err(VerifyError::Capsule(CapsuleError::HashMismatch(file, _, _))) => {
+            assert_eq!(file, "launch_removed.json")
+        }
+        other => panic!("expected Capsule(HashMismatch), got {other:?}"),
+    }
+    assert!(!work.path().join("tree").exists());
 }
 
 /// 4a. Two checks, one recorded pass and one recorded fail, both repeat: Reproduced.
@@ -519,7 +924,8 @@ async fn test_matching_pass_and_fail_reproduced() {
         capsule_dir.path(),
         &CapsuleSpec {
             base: &c.base,
-            patches: &[("launch.patch", &c.launch), ("lane.patch", &c.lane)],
+            patches: &[("lane.patch", &c.lane)],
+            launch_removed: &[".env"],
             checks: &[("passes", "true", 0), ("fails", "false", 1)],
             flaky: &[],
             unsandboxed: false,
@@ -553,7 +959,8 @@ async fn test_recorded_pass_failing_on_replay_diverges() {
         capsule_dir.path(),
         &CapsuleSpec {
             base: &c.base,
-            patches: &[("launch.patch", &c.launch), ("lane.patch", &c.lane)],
+            patches: &[("lane.patch", &c.lane)],
+            launch_removed: &[".env"],
             checks: &[("steady", "true", 0), ("liar", "false", 0)],
             flaky: &[],
             unsandboxed: false,
@@ -585,7 +992,8 @@ async fn test_flaky_check_passing_on_third_attempt_reproduced() {
         capsule_dir.path(),
         &CapsuleSpec {
             base: &c.base,
-            patches: &[("launch.patch", &c.launch), ("lane.patch", &c.lane)],
+            patches: &[("lane.patch", &c.lane)],
+            launch_removed: &[".env"],
             checks: &[("wobbly", "wobbly-cmd", 0)],
             flaky: &["wobbly"],
             unsandboxed: false,
@@ -619,7 +1027,8 @@ async fn test_non_flaky_check_failing_once_diverges() {
         capsule_dir.path(),
         &CapsuleSpec {
             base: &c.base,
-            patches: &[("launch.patch", &c.launch), ("lane.patch", &c.lane)],
+            patches: &[("lane.patch", &c.lane)],
+            launch_removed: &[".env"],
             checks: &[("steady", "steady-cmd", 0)],
             flaky: &[],
             unsandboxed: false,
@@ -653,7 +1062,8 @@ async fn test_runner_infra_error_is_infrastructure_not_divergence() {
         capsule_dir.path(),
         &CapsuleSpec {
             base: &c.base,
-            patches: &[("launch.patch", &c.launch), ("lane.patch", &c.lane)],
+            patches: &[("lane.patch", &c.lane)],
+            launch_removed: &[".env"],
             checks: &[("any", "any-cmd", 0)],
             flaky: &[],
             unsandboxed: false,
@@ -686,7 +1096,8 @@ async fn test_unsandboxed_capsule_never_proved() {
         capsule_dir.path(),
         &CapsuleSpec {
             base: &c.base,
-            patches: &[("launch.patch", &c.launch), ("lane.patch", &c.lane)],
+            patches: &[("lane.patch", &c.lane)],
+            launch_removed: &[".env"],
             checks: &[("any", "true", 0)],
             flaky: &[],
             unsandboxed: true,
@@ -721,7 +1132,8 @@ async fn test_tampered_lane_patch_rejected_before_anything_runs() {
         capsule_dir.path(),
         &CapsuleSpec {
             base: &c.base,
-            patches: &[("launch.patch", &c.launch), ("lane.patch", &c.lane)],
+            patches: &[("lane.patch", &c.lane)],
+            launch_removed: &[".env"],
             checks: &[("any", "true", 0)],
             flaky: &[],
             unsandboxed: false,
@@ -766,7 +1178,8 @@ async fn test_base_tree_hash_mismatch_is_infrastructure() {
         capsule_dir.path(),
         &CapsuleSpec {
             base: &wrong_base,
-            patches: &[("launch.patch", &c.launch), ("lane.patch", &c.lane)],
+            patches: &[("lane.patch", &c.lane)],
+            launch_removed: &[".env"],
             checks: &[("any", "true", 0)],
             flaky: &[],
             unsandboxed: false,
@@ -799,7 +1212,8 @@ async fn test_existing_tree_is_refused_not_reused() {
         capsule_dir.path(),
         &CapsuleSpec {
             base: &c.base,
-            patches: &[("launch.patch", &c.launch), ("lane.patch", &c.lane)],
+            patches: &[("lane.patch", &c.lane)],
+            launch_removed: &[".env"],
             checks: &[("any", "true", 0)],
             flaky: &[],
             unsandboxed: false,
@@ -829,7 +1243,7 @@ async fn test_existing_tree_is_refused_not_reused() {
 // sandbox. The tree verify() rebuilds is the sandbox's writable clone.
 // ============================================================================
 
-/// A base with `README`, an EMPTY launch.patch, and a lane.patch (made by `git diff`)
+/// A base with `README`, an EMPTY launch baseline, and a lane.patch (made by `git diff`)
 /// that adds `file_name`.
 fn adding_lane(file_name: &str) -> (Repo, (String, String), String) {
     let repo = Repo::new();
@@ -839,7 +1253,7 @@ fn adding_lane(file_name: &str) -> (Repo, (String, String), String) {
 }
 
 /// 1. The recorded check `test -f newfile` passed, and replaying base + empty
-/// launch.patch + lane.patch under the sandbox passes it again: Reproduced. A second
+/// the launch baseline + lane.patch under the sandbox passes it again: Reproduced. A second
 /// recorded check proves the verifier really is sandboxed: reading the real home must
 /// fail, which `! cat` records as a pass, so an unsandboxed runner would diverge.
 #[tokio::test]
@@ -857,7 +1271,8 @@ async fn test_sandboxed_verify_reproduces_a_recorded_pass() {
         capsule_dir.path(),
         &CapsuleSpec {
             base: &base,
-            patches: &[("launch.patch", ""), ("lane.patch", &lane)],
+            patches: &[("lane.patch", &lane)],
+            launch_removed: &[],
             checks: &[
                 ("adds-newfile", "test -f newfile", 0),
                 ("home-hidden", &hidden, 0),
@@ -902,7 +1317,8 @@ async fn test_sandboxed_verify_diverges_when_the_replayed_tree_lacks_the_file() 
         capsule_dir.path(),
         &CapsuleSpec {
             base: &base,
-            patches: &[("launch.patch", ""), ("lane.patch", &lane)],
+            patches: &[("lane.patch", &lane)],
+            launch_removed: &[],
             checks: &[("adds-newfile", "test -f newfile", 0)],
             flaky: &[],
             unsandboxed: false,
@@ -970,7 +1386,8 @@ fn passing_capsule(c: &Chain) -> TempDir {
         capsule_dir.path(),
         &CapsuleSpec {
             base: &c.base,
-            patches: &[("launch.patch", &c.launch), ("lane.patch", &c.lane)],
+            patches: &[("lane.patch", &c.lane)],
+            launch_removed: &[".env"],
             checks: &[("slow", "true", 0)],
             flaky: &[],
             unsandboxed: false,
@@ -1055,7 +1472,8 @@ async fn test_check_timeout_is_infrastructure_naming_the_check_and_frees_the_slo
         capsule_dir.path(),
         &CapsuleSpec {
             base: &c.base,
-            patches: &[("launch.patch", &c.launch), ("lane.patch", &c.lane)],
+            patches: &[("lane.patch", &c.lane)],
+            launch_removed: &[".env"],
             checks: &[("hangs", "sleep 30 & echo $! > ../bg.pid; wait", 0)],
             flaky: &[],
             unsandboxed: false,
@@ -1111,7 +1529,8 @@ async fn test_slot_is_released_when_verification_errors() {
         capsule_dir.path(),
         &CapsuleSpec {
             base: &c.base,
-            patches: &[("launch.patch", &c.launch), ("lane.patch", &c.lane)],
+            patches: &[("lane.patch", &c.lane)],
+            launch_removed: &[".env"],
             checks: &[("order", "true", 0)],
             flaky: &[],
             unsandboxed: false,

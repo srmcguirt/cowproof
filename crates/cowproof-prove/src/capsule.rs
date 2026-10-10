@@ -6,10 +6,15 @@ use std::fs;
 use std::path::Path;
 use thiserror::Error;
 
+/// The launch baseline: a JSON array of the relative paths the runner removed from
+/// the clone before the builder started. Paths only, never content (R15). It lives in
+/// its own hashed file, not in `capsule.json`, which is itself never hashed.
+const LAUNCH_REMOVED_FILE: &str = "launch_removed.json";
+
 /// Files at the capsule root whose hashes `write` records.
 const CAPSULE_TOP_FILES: &[&str] = &[
     "base.patch",
-    "launch.patch",
+    LAUNCH_REMOVED_FILE,
     "lane.patch",
     "gates.json",
     "escalations.jsonl",
@@ -82,6 +87,12 @@ pub struct Capsule {
     pub file_hashes: HashMap<String, String>,
     #[serde(default)]
     pub flaky_checks: HashSet<String>,
+    /// Paths removed during the launch baseline, relative and sorted. Verify replays
+    /// them by deleting these exact paths from the rebuilt tree. Stored in the hashed
+    /// `launch_removed.json`, not in `capsule.json`, so editing it after `write`
+    /// makes `read` fail.
+    #[serde(skip)]
+    pub launch_removed: Vec<String>,
 }
 
 impl Capsule {
@@ -109,15 +120,20 @@ impl Capsule {
             unsandboxed: false,
             file_hashes: HashMap::new(),
             flaky_checks: HashSet::new(),
+            launch_removed: Vec::new(),
         }
     }
 
-    /// Write the capsule to a directory. Records the SHA256 of every capsule file
-    /// present in `dir` (patches, packets, checks, gates, escalations, applied
-    /// records) in `file_hashes` before writing `capsule.json`, which is itself never
-    /// hashed. Hashes already present are kept.
+    /// Write the capsule to a directory. Writes `launch_removed.json`, then records
+    /// the SHA256 of every capsule file present in `dir` (patches, the launch
+    /// baseline, packets, checks, gates, escalations, applied records) in
+    /// `file_hashes` before writing `capsule.json`, which is itself never hashed.
     pub fn write(&mut self, dir: &Path) -> Result<()> {
         fs::create_dir_all(dir)?;
+        fs::write(
+            dir.join(LAUNCH_REMOVED_FILE),
+            serde_json::to_vec_pretty(&self.launch_removed)?,
+        )?;
         for sub in CAPSULE_SUBDIRS {
             fs::create_dir_all(dir.join(sub))?;
         }
@@ -159,7 +175,7 @@ impl Capsule {
 
         let capsule_content = fs::read_to_string(&capsule_path).map_err(CapsuleError::IoError)?;
 
-        let capsule: Capsule =
+        let mut capsule: Capsule =
             serde_json::from_str(&capsule_content).map_err(CapsuleError::JsonError)?;
 
         for (file_path, expected_hash) in &capsule.file_hashes {
@@ -180,6 +196,17 @@ impl Capsule {
                 ));
             }
         }
+
+        // The launch baseline must be present and hashed: a capsule without it would
+        // replay as "nothing was removed".
+        if !capsule.file_hashes.contains_key(LAUNCH_REMOVED_FILE) {
+            return Err(CapsuleError::InvalidFormat(format!(
+                "{LAUNCH_REMOVED_FILE} is not among the hashed files"
+            )));
+        }
+        let removed = fs::read(dir.join(LAUNCH_REMOVED_FILE)).map_err(CapsuleError::IoError)?;
+        capsule.launch_removed = serde_json::from_slice(&removed)
+            .map_err(|e| CapsuleError::InvalidFormat(format!("{LAUNCH_REMOVED_FILE}: {e}")))?;
 
         Ok(capsule)
     }

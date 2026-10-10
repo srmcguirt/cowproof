@@ -1041,14 +1041,11 @@ async fn replay_and_gate(
         .filter(|c| c.flaky)
         .map(|c| c.id.clone())
         .collect();
+    capsule.launch_removed = input.prepared.launch_removed.clone();
 
     if let Some(base_patch) = &input.prepared.base_patch {
         fs::write(capsule_dir.join("base.patch"), base_patch)?;
     }
-    fs::write(
-        capsule_dir.join("launch.patch"),
-        &input.prepared.launch_patch,
-    )?;
     fs::write(capsule_dir.join("lane.patch"), &lane_patch)?;
     let escalations = layout.control.join("escalations.jsonl");
     if escalations.is_file() {

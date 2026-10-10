@@ -329,7 +329,7 @@ Amended by the engineering review (2026-10-09); each change cites its decision i
 2. **Bring in the portkit the slice needs** (D15): subtree import, drop `demo/` and `schema/`, make `Command::execute` public (G1), with `portkit-core` and `portkit-mcp` green and used by the slice's escalation tools.
 3. **Slice: run** (API-key builders only, D2). Uses the isolation recipe from the `--bare` probe (D7, ruled in R15). `cowproof run packet.md` with committed-base dispatch, held-out checks stored outside the repository (D5), COW clone, `SandboxPolicy` ported from sandbox-runtime's design with the D10 regression contract and control-directory denial (D4, D8, A-3), the egress proxy holding the key, the control directory, a Haiku builder through headless Claude Code with the 1-hour cache (D19) and the shared, versioned builder prefix carrying the tools and the communications protocol (D20), one runner (Q-2).
 4. **Slice: escalate.** Runner-owned queue in `cowproof-run` (D3), `ask` / `check_ruling` / `run_check` tools served through portkit's MCP server, sandboxed `run_check`, end-and-resume delivery, escalate-early triggers, duplicate and late rulings rejected and resume fallback (D9), `cowproof rule` with all four verdicts plus `note` (D22), `cowproof watch --events` (D3) with parked age against cache lifetime (D21), and the director Monitor kept armed on it for the whole wave (D22).
-5. **Slice: prove.** Verifier in a fresh no-network sandbox holding its lane's class slot (D12), dependencies pre-fetched outside any builder and keyed by lockfile, registry configuration and target (D6, D11, D14), its own compile cache, held-out checks from the director store, gates loading packs from the base, `launch.patch` recorded and replayed (D13), capsule bundle, `cowproof verify` on pass or fail per check, infrastructure failures never `refuted` (F-1).
+5. **Slice: prove.** Verifier in a fresh no-network sandbox holding its lane's class slot (D12), dependencies pre-fetched outside any builder and keyed by lockfile, registry configuration and target (D6, D11, D14), its own compile cache, held-out checks from the director store, gates loading packs from the base, launch baseline recorded as removed paths and replayed (D13), capsule bundle, `cowproof verify` on pass or fail per check, infrastructure failures never `refuted` (F-1).
 6. **Prove the slice** against the first two success criteria (synthetic packet; adversarial packet).
 7. **Reference runner and fixtures** (moved after the slice by D15): the Node runner and its adapter under `reference/node-runner/`, the fake-worker harness, and fixtures for port steps 1 to 10, with portkit's G2 and G4 first.
 8. **Fold the runner in:** subscription mode (D2, with `--setting-sources` and `--strict-mcp-config`, SC-4), portkit hooks, trace fixes G5 and G6 and the usage monitor (D15), per-turn token and cache metrics and `cowproof report --port-candidates` (D23), classes and slots, diagnostics and host breaker, Codex and OpenRouter builders, `watch` TUI, preflight.
@@ -1031,7 +1031,7 @@ Runtime evidence: none (proposed); `.env*` removal happens in both auth modes, s
 Comparison grid:
 | Choice | Current | A | B | C | D |
 |---|---|---|---|---|---|
-| R10 replay input | base (+ base.patch) + lane.patch | the runner records its pre-launch changes as `launch.patch` in the capsule; the verifier and `cowproof verify` build base (+ base.patch) + launch.patch + lane.patch, the same tree the builder started from | as approved | investigate which pre-launch changes exist in the slice, then decide; no change approved | defer this change only |
+| R10 replay input | base (+ base.patch) + lane.patch | the runner records its pre-launch removals as the sorted list of removed paths (`launch_removed`) in the capsule, never their content; the verifier and `cowproof verify` build base (+ base.patch), delete exactly those paths and commit, then apply lane.patch: the same tree the builder started from (amended 2026-10-10: the original `launch.patch` carried removed `.env` content) | as approved | investigate which pre-launch changes exist in the slice, then decide; no change approved | defer this change only |
 | Subscription mode in slice | deferred (D2) | unchanged | unchanged | unchanged | unchanged |
 Question D13:
 D13 — Record the runner's pre-launch changes so a replay rebuilds the tree the builder actually started from?
@@ -1053,7 +1053,7 @@ Leave this row unresolved for a later decision; scope and other choices unchange
 
 State: approved
 Actual answer: A) Apply this change (D13, 2026-10-09)
-Accepted scope: the runner records its pre-launch changes as `launch.patch` in the capsule; the verifier and `cowproof verify` build base (+ base.patch) + launch.patch + lane.patch, the tree the builder started from. Test: a base containing a `.env` file replays to the same tree the builder saw. Subscription mode stays out of the slice (D2).
+Accepted scope: the runner records its pre-launch changes in the capsule; the verifier and `cowproof verify` rebuild the tree the builder started from. Amended 2026-10-10 (director ruling): the record is the sorted list of removed paths (`launch_removed`, never their content, which a `launch.patch` carried for `.env*` files), and verify replays it by deleting exactly those paths between base.patch and lane.patch. Test: a base containing a `.env` file replays to the same tree the builder saw. Subscription mode stays out of the slice (D2).
 History: pending until D13
 
 ### R11: dependency cache key covers registry configuration and target (O-2, refines D11)
@@ -1200,7 +1200,7 @@ queued ─► running ──ask(blocking)──► parked ──rule answer─�
 escalation-limit and stopped are reachable from running or parked.
 
 replay
-base commit (+ base.patch) ─► + launch.patch (D13) ─► + lane.patch ─► checks in no-net sandbox ─► pass/fail per check id
+base commit (+ base.patch) ─► delete launch_removed paths (D13) ─► + lane.patch ─► checks in no-net sandbox ─► pass/fail per check id
 ```
 Inline diagram to keep with code: `cowproof-run`'s lane state machine (the first block) above the state enum.
 
@@ -1253,7 +1253,7 @@ Synthesized from this review's findings. Each task derives from a specific findi
   - Surfaced by: Code quality Q-3 (D9); Scope D3; approved escalation protocol
   - Files: crates/cowproof-run/src/escalate/, crates/cowproof-cli/src/main.rs
   - Verify: duplicate and late rulings rejected; expired session falls back; same-check-twice forces escalation; `run_check` sandboxed
-- [ ] **T6 (P1, human: ~3 days / CC: ~1 hr)** — cowproof-prove — Verifier with trusted dependencies, launch patch and slot
+- [ ] **T6 (P1, human: ~3 days / CC: ~1 hr)** — cowproof-prove — Verifier with trusted dependencies, launch baseline and slot
   - Surfaced by: Architecture A-4 (D6), Performance P-1 (D11), P-2 (D12), Outside voice O-1 (D13), O-2 (D14), F-1
   - Files: crates/cowproof-prove/
   - Verify: offline verify on cargo and npm fixtures; builder cache never read; cache key misses on registry or target change; `.env` base replays exactly; slot limit held; infra failure not `refuted`

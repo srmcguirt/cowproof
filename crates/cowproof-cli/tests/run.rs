@@ -27,6 +27,9 @@ const REAL_KEY: &str = "sk-test-real-xyz";
 /// either way, so the key alone cannot show whether the environment was
 /// inherited.
 const DIRECTOR_CANARY: &str = "canary-director-env-77";
+/// The content of the `.env` files the runner removes at launch (R15). It must reach no
+/// file under the lane's `control/` directory, the capsule included.
+const CANARY_ENV: &str = "CANARY-ENV-7f3a";
 const SESSION: &str = "0a1b2c3d-1111-2222-3333-444455556666";
 
 /// What the fake prints on stdout: valid events, a blank line, a line that is
@@ -154,8 +157,18 @@ impl Harness {
         git(&repo, &["config", "user.name", "T"]);
         fs::write(repo.join("README.md"), "base\n").unwrap();
         // Removed from the clone at launch (R15): it must never show up in
-        // the lane patch, as a deletion or otherwise.
-        fs::write(repo.join(".env"), "SECRET=launch-baseline-only\n").unwrap();
+        // the lane patch, as a deletion or otherwise, nor anywhere in `control/`.
+        // Nested ones and `CLAUDE.md` files go too.
+        fs::create_dir_all(repo.join("sub")).unwrap();
+        fs::create_dir_all(repo.join("docs")).unwrap();
+        fs::write(repo.join(".env"), format!("SECRET={CANARY_ENV}\n")).unwrap();
+        fs::write(
+            repo.join("sub/.env.local"),
+            format!("SECRET={CANARY_ENV}\n"),
+        )
+        .unwrap();
+        fs::write(repo.join("CLAUDE.md"), "root instructions\n").unwrap();
+        fs::write(repo.join("docs/CLAUDE.md"), "docs instructions\n").unwrap();
         git(&repo, &["add", "."]);
         git(&repo, &["commit", "-q", "-m", "base"]);
 
@@ -383,7 +396,7 @@ fn lane_patch_holds_the_edit_and_the_new_file_and_nothing_from_the_launch_baseli
     // The runner removed `.env` from the clone at launch; that deletion is the
     // launch patch, not the builder's.
     assert!(!patch.contains(".env"), "{patch}");
-    assert!(!patch.contains("launch-baseline-only"), "{patch}");
+    assert!(!patch.contains(CANARY_ENV), "{patch}");
     assert_eq!(
         h.run_json()["patchBytes"].as_u64().unwrap() as usize,
         patch.len()
@@ -734,7 +747,7 @@ fn every_check_run_and_reproduced_with_owned_edits_is_proved_and_sealed_in_a_cap
     assert_eq!(capsule.environment.os, std::env::consts::OS);
     for file in [
         "lane.patch",
-        "launch.patch",
+        "launch_removed.json",
         "gates.json",
         "checks/edit.json",
         "checks/made.json",
@@ -748,8 +761,12 @@ fn every_check_run_and_reproduced_with_owned_edits_is_proved_and_sealed_in_a_cap
     let edit: Value = serde_json::from_str(&h.read("control/capsule/checks/edit.json")).unwrap();
     assert_eq!(edit["command"], "grep -q edited README.md");
     assert_eq!(edit["exit_status"], 0);
-    // The launch patch holds the runner's own removal of `.env`.
-    assert!(h.read("control/capsule/launch.patch").contains(".env"));
+    // The launch baseline is the sorted list of removed paths, nothing else.
+    assert_eq!(
+        capsule.launch_removed,
+        [".env", "CLAUDE.md", "docs/CLAUDE.md", "sub/.env.local"]
+    );
+    assert!(!dir.join("launch.patch").exists());
 
     // Verify really rebuilt the tree: the patch is applied (created.txt) and so
     // is the launch baseline (`.env` is gone, though the base commit has it).
@@ -758,11 +775,75 @@ fn every_check_run_and_reproduced_with_owned_edits_is_proved_and_sealed_in_a_cap
         fs::read_to_string(tree.join("created.txt")).unwrap(),
         "created\n"
     );
-    assert!(!tree.join(".env").exists());
+    for gone in [".env", "CLAUDE.md", "docs/CLAUDE.md", "sub/.env.local"] {
+        assert!(!tree.join(gone).exists(), "{gone} must be removed");
+    }
+    // The rebuilt tree's baseline commit is the tree the lane launched from.
+    let launch_commit = h.run_json()["launchCommit"].as_str().unwrap().to_string();
+    let lane_launch_tree = git_out(
+        &h.lane().join("clone"),
+        &["rev-parse", &format!("{launch_commit}^{{tree}}")],
+    );
+    assert_eq!(
+        git_out(&tree, &["rev-parse", "HEAD^{tree}"]),
+        lane_launch_tree
+    );
+    assert_ne!(
+        lane_launch_tree,
+        git_out(&h.repo, &["rev-parse", "HEAD^{tree}"]),
+        "the baseline removed something"
+    );
 
     // The capsule is tamper evident.
     fs::write(dir.join("lane.patch"), "tampered").unwrap();
     assert!(Capsule::read(&dir).is_err());
+}
+
+/// Every file under `dir` (not following symlinks) whose bytes contain `needle`.
+fn files_containing(dir: &Path, needle: &str) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    for entry in fs::read_dir(dir).unwrap() {
+        let entry = entry.unwrap();
+        let path = entry.path();
+        let kind = entry.file_type().unwrap();
+        if kind.is_dir() {
+            found.extend(files_containing(&path, needle));
+        } else if kind.is_file() {
+            let bytes = fs::read(&path).unwrap();
+            if bytes.windows(needle.len()).any(|w| w == needle.as_bytes()) {
+                found.push(path);
+            }
+        }
+    }
+    found
+}
+
+#[test]
+fn the_content_of_a_removed_env_file_reaches_no_file_under_control() {
+    if !sandbox_available() {
+        return;
+    }
+    let h = owned_packet(&run_checks(&["edit", "made"]));
+    h.run_expecting(0);
+    assert_eq!(h.verdict()["verdict"], "proved");
+
+    let control = h.lane().join("control");
+    // The search can find something: the builder's edit is in lane.patch, twice over.
+    assert!(
+        !files_containing(&control, "+edited").is_empty(),
+        "the search found nothing it should find"
+    );
+    assert_eq!(
+        files_containing(&control, CANARY_ENV),
+        Vec::<PathBuf>::new(),
+        "the removed .env content must appear in no file under control/ (capsule included)"
+    );
+    // The paths are recorded; the content is not.
+    let removed = h.read("control/capsule/launch_removed.json");
+    assert!(
+        removed.contains("\".env\"") && removed.contains("sub/.env.local"),
+        "{removed}"
+    );
 }
 
 #[test]

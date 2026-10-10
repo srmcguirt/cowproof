@@ -1,6 +1,6 @@
 use crate::capsule::{Capsule, CapsuleError, CheckResult};
 use crate::runner::{CheckRunner, acquire_slot};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use thiserror::Error;
@@ -79,13 +79,13 @@ const FLAKY_ATTEMPTS: u32 = 3;
 /// 1. Clone `source_repo` and check out the capsule's base commit (its tree hash must
 ///    match the capsule's `base_tree_hash`).
 /// 2. Apply `base.patch` (when present and non-empty).
-/// 3. Apply `launch.patch` (D13/R10: the pre-launch baseline the builder started from).
+/// 3. Replay the launch baseline by deleting the paths in `capsule.launch_removed` (D13/R10).
 /// 4. Apply `lane.patch`.
 /// 5. Run each recorded check's command through the `CheckRunner`.
 /// 6. Compare pass or fail per check id; durations and output hashes are never compared.
 ///
 /// Checks marked flaky in the capsule are retried up to three times. Any failure to
-/// rebuild the tree, apply a patch or run a check is `VerifyError::Infrastructure`,
+/// rebuild the tree, apply a patch, replay the baseline or run a check is `VerifyError::Infrastructure`,
 /// never a divergence (F-1).
 pub async fn verify(
     capsule_dir: &Path,
@@ -125,9 +125,11 @@ pub async fn verify(
         )));
     }
 
-    for name in ["base.patch", "launch.patch", "lane.patch"] {
-        apply_patch_file(&tree, &capsule_dir.join(name), name).await?;
-    }
+    // The builder's lane started from base.patch, then the launch baseline; lane.patch
+    // is computed against that, so this is the only order it applies in.
+    apply_patch_file(&tree, &capsule_dir.join("base.patch"), "base.patch").await?;
+    replay_launch_baseline(&tree, &capsule.launch_removed).await?;
+    apply_patch_file(&tree, &capsule_dir.join("lane.patch"), "lane.patch").await?;
 
     let mut check_matches = Vec::new();
     let mut diverged_ids = Vec::new();
@@ -280,4 +282,109 @@ async fn apply_patch_file(tree: &Path, patch: &Path, name: &str) -> Result<(), V
         )));
     }
     Ok(())
+}
+
+/// Replay the launch baseline (D13/R10): delete exactly the capsule's `launch_removed`
+/// paths from the rebuilt tree, then commit, so `lane.patch` applies on the same
+/// tree the builder started from.
+///
+/// The list comes from the capsule, which is untrusted input, and this deletes files, so
+/// every path is validated against the tree before any is deleted; one bad path means
+/// nothing is deleted. A path is accepted only when it is relative, has no empty, `.`,
+/// `..` or `.git` component, passes through no symlink, and ends in an existing file or
+/// symlink. Deletion unlinks; it never follows a symlink.
+async fn replay_launch_baseline(tree: &Path, removed_paths: &[String]) -> Result<(), VerifyError> {
+    remove_launch_paths(tree, removed_paths)?;
+    git(tree, &["add", "-A"])
+        .await
+        .map_err(|e| infra(format!("launch baseline: {e}")))?;
+    git(
+        tree,
+        &[
+            "-c",
+            "user.name=cowproof",
+            "-c",
+            "user.email=cowproof@localhost",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "--no-verify",
+            "-m",
+            "cowproof: replay launch baseline",
+        ],
+    )
+    .await
+    .map_err(|e| infra(format!("launch baseline: {e}")))?;
+    Ok(())
+}
+
+/// Validate every path, then delete them all. Never deletes anything unless all pass.
+fn remove_launch_paths(tree: &Path, removed_paths: &[String]) -> Result<(), VerifyError> {
+    let mut seen = HashSet::new();
+    let mut targets = Vec::new();
+    for rel in removed_paths {
+        if !seen.insert(rel.as_str()) {
+            return Err(infra(format!("launch baseline: duplicate path: {rel}")));
+        }
+        targets.push(validate_launch_path(tree, rel)?);
+    }
+    for (rel, path) in removed_paths.iter().zip(&targets) {
+        // `remove_file` unlinks a symlink itself and never follows it.
+        std::fs::remove_file(path)
+            .map_err(|e| infra(format!("launch baseline: cannot remove {rel}: {e}")))?;
+        // Leave no empty directory behind, as the lane did (git does not track them).
+        let mut parent = path.parent();
+        while let Some(dir) = parent {
+            if dir == tree || std::fs::remove_dir(dir).is_err() {
+                break;
+            }
+            parent = dir.parent();
+        }
+    }
+    Ok(())
+}
+
+/// The full path of `rel` inside `tree`, or an infrastructure error naming `rel`.
+fn validate_launch_path(tree: &Path, rel: &str) -> Result<PathBuf, VerifyError> {
+    let refuse = |why: &str| infra(format!("launch baseline: {why}: {rel}"));
+    let components: Vec<&str> = rel.split('/').collect();
+    if components[0].is_empty() && components.len() > 1 {
+        return Err(refuse("absolute path not allowed"));
+    }
+    for c in &components {
+        match *c {
+            "" => return Err(refuse("empty path component")),
+            "." | ".." => return Err(refuse("`.` or `..` component not allowed")),
+            _ if c.eq_ignore_ascii_case(".git") => {
+                return Err(refuse("`.git` component not allowed"));
+            }
+            _ if c.contains('\0') => return Err(refuse("NUL in path")),
+            _ => {}
+        }
+    }
+    let mut current = tree.to_path_buf();
+    for (i, c) in components.iter().enumerate() {
+        current.push(c);
+        let md = match std::fs::symlink_metadata(&current) {
+            Ok(md) => md,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(refuse("path does not exist"));
+            }
+            Err(e) => return Err(refuse(&format!("cannot inspect ({e})"))),
+        };
+        let last = i + 1 == components.len();
+        if last {
+            // A file or a symlink (the lane removes both); never a directory.
+            if md.is_dir() {
+                return Err(refuse("a directory is not a recorded removal"));
+            }
+        } else if md.file_type().is_symlink() {
+            return Err(refuse("path passes through a symlink"));
+        } else if !md.is_dir() {
+            return Err(refuse("path passes through a non-directory"));
+        }
+    }
+    Ok(current)
 }
