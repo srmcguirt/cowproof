@@ -58,12 +58,53 @@ enum Action {
     Plan(PlanArgs),
     /// Observe lanes and their escalation events.
     Watch(watch::WatchArgs),
+    /// Rule on an open escalation: `cowproof rule <lane-id> <escalation-id> (--answer <text> | --redirect <packet> | --reassign [--model <m>] | --stop) [--lanes-root <dir>]`
+    Rule(RuleArgs),
+    /// Send a note to a running lane: `cowproof note <lane-id> <text> [--lanes-root <dir>]`
+    Note(NoteArgs),
     /// The builder's tools (`ask`, `check_ruling`, `run_check`) as an MCP
     /// stdio server. It runs inside the sandbox and is only a client of the
     /// runner socket; the builder runtime launches it, people do not.
     #[command(hide = true)]
     LaneTools(LaneToolsArgs),
 }
+#[derive(Parser)]
+struct RuleArgs {
+    /// The lane ID.
+    lane_id: String,
+    /// The escalation ID (e.g., "lane-id:E1").
+    escalation_id: String,
+    /// Answer the question with text.
+    #[arg(long, group = "verdict")]
+    answer: Option<String>,
+    /// Redirect to a new packet.
+    #[arg(long, group = "verdict")]
+    redirect: Option<PathBuf>,
+    /// Reassign to the next model on the ladder.
+    #[arg(long, group = "verdict")]
+    reassign: bool,
+    /// Specific model to reassign to (optional, only with --reassign).
+    #[arg(long, requires = "reassign")]
+    model: Option<String>,
+    /// Stop the lane.
+    #[arg(long, group = "verdict")]
+    stop: bool,
+    /// Lanes root directory (auto-detected if not specified).
+    #[arg(long)]
+    lanes_root: Option<PathBuf>,
+}
+
+#[derive(Parser)]
+struct NoteArgs {
+    /// The lane ID.
+    lane_id: String,
+    /// The note text.
+    text: String,
+    /// Lanes root directory (auto-detected if not specified).
+    #[arg(long)]
+    lanes_root: Option<PathBuf>,
+}
+
 #[derive(Parser)]
 struct LaneToolsArgs {
     /// The lane's runner socket, `<lane>/sock/runner.sock`.
@@ -197,6 +238,8 @@ async fn main() -> Result<()> {
             PlanAction::Collect { repo } => plan_collect(&repo),
         },
         Action::Watch(args) => watch::watch(args).await,
+        Action::Rule(args) => rule_command(args).await,
+        Action::Note(args) => note_command(args).await,
         Action::LaneTools(args) => lane_tools::run(args.socket).await,
     }
 }
@@ -2584,6 +2627,144 @@ fn consume_event(e: &Value, line: &str, r: &mut WorkerResult, runner: &str) {
             .any(|p| lower.contains(p))
     {
         r.refusal = Some(message.chars().take(500).collect());
+    }
+}
+
+async fn rule_command(args: RuleArgs) -> Result<()> {
+    use serde_json::json;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::UnixStream;
+
+    let lanes_root = args
+        .lanes_root
+        .unwrap_or_else(|| std::env::temp_dir().join("cowproof"));
+    let director_sock = lanes_root
+        .join(&args.lane_id)
+        .join("control")
+        .join("director.sock");
+
+    if !director_sock.exists() {
+        eprintln!("lane {} is not running", args.lane_id);
+        std::process::exit(2);
+    }
+
+    // Parse the verdict
+    let verdict = if let Some(answer) = args.answer {
+        json!({"answer": answer})
+    } else if let Some(redirect) = args.redirect {
+        json!({"redirect": redirect.to_string_lossy().into_owned()})
+    } else if args.reassign {
+        json!({"reassign": {"model": args.model}})
+    } else if args.stop {
+        json!("stop")
+    } else {
+        return Err(anyhow::anyhow!(
+            "must specify one verdict: --answer, --redirect, --reassign, or --stop"
+        ));
+    };
+
+    // Build the request
+    let request = json!({
+        "op": "rule",
+        "id": args.escalation_id,
+        "verdict": verdict
+    });
+
+    // Connect and send
+    let mut stream = UnixStream::connect(&director_sock)
+        .await
+        .map_err(|e| anyhow::anyhow!("cannot connect to director socket: {e}"))?;
+
+    let mut req_bytes = serde_json::to_vec(&request)?;
+    req_bytes.push(b'\n');
+    stream
+        .write_all(&req_bytes)
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to write request: {e}"))?;
+
+    // Read response
+    let mut buf = vec![0u8; 8192];
+    let n = stream
+        .read(&mut buf)
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to read response: {e}"))?;
+
+    if n == 0 {
+        return Err(anyhow::anyhow!("director socket closed unexpectedly"));
+    }
+
+    let response: serde_json::Value = serde_json::from_slice(&buf[..n])?;
+
+    if response["ok"].as_bool().unwrap_or(false) {
+        println!("{}", serde_json::to_string_pretty(&response["outcome"])?);
+        Ok(())
+    } else {
+        eprintln!(
+            "error: {}",
+            response["error"].as_str().unwrap_or("unknown error")
+        );
+        std::process::exit(1);
+    }
+}
+
+async fn note_command(args: NoteArgs) -> Result<()> {
+    use serde_json::json;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::UnixStream;
+
+    let lanes_root = args
+        .lanes_root
+        .unwrap_or_else(|| std::env::temp_dir().join("cowproof"));
+    let director_sock = lanes_root
+        .join(&args.lane_id)
+        .join("control")
+        .join("director.sock");
+
+    if !director_sock.exists() {
+        eprintln!("lane {} is not running", args.lane_id);
+        std::process::exit(2);
+    }
+
+    // Build the request
+    let request = json!({
+        "op": "note",
+        "text": args.text
+    });
+
+    // Connect and send
+    let mut stream = UnixStream::connect(&director_sock)
+        .await
+        .map_err(|e| anyhow::anyhow!("cannot connect to director socket: {e}"))?;
+
+    let mut req_bytes = serde_json::to_vec(&request)?;
+    req_bytes.push(b'\n');
+    stream
+        .write_all(&req_bytes)
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to write request: {e}"))?;
+
+    // Read response
+    let mut buf = vec![0u8; 8192];
+    let n = stream
+        .read(&mut buf)
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to read response: {e}"))?;
+
+    if n == 0 {
+        return Err(anyhow::anyhow!("director socket closed unexpectedly"));
+    }
+
+    let response: serde_json::Value = serde_json::from_slice(&buf[..n])?;
+
+    if response["ok"].as_bool().unwrap_or(false) {
+        println!("{}", serde_json::to_string_pretty(&response["outcome"])?);
+        Ok(())
+    } else {
+        eprintln!(
+            "error: {}",
+            response["error"].as_str().unwrap_or("unknown error")
+        );
+        std::process::exit(1);
     }
 }
 

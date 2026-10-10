@@ -37,6 +37,7 @@
 //!   notes and marks them delivered in the same call.
 
 use crate::escalate::{Ask, EscalationId, NoteId, Origin, Queue};
+use crate::wire::{self, Read};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
@@ -46,20 +47,13 @@ use std::os::unix::fs::FileTypeExt;
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
-use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
-
-/// The longest request line accepted, in bytes, not counting the newline.
-pub const MAX_LINE: usize = 64 * 1024;
 
 /// The most check output returned to the builder, in bytes.
 const MAX_OUTPUT: usize = 32 * 1024;
 
-/// After an over-long line the rest of the input is discarded for at most this
-/// long and this much, so the error response is delivered before the close.
-const DRAIN_LIMIT: usize = 4 * 1024 * 1024;
-const DRAIN_TIME: Duration = Duration::from_millis(500);
+pub use wire::MAX_LINE;
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
@@ -140,58 +134,17 @@ pub async fn serve(
     }
 }
 
-enum Read {
-    Eof,
-    Line(Vec<u8>),
-    TooLong,
-}
-
-/// Read one line of at most `cap` bytes (not counting the newline).
-async fn read_line_capped<R: AsyncBufRead + Unpin>(r: &mut R, cap: usize) -> io::Result<Read> {
-    let mut buf: Vec<u8> = Vec::new();
-    loop {
-        let chunk = r.fill_buf().await?;
-        if chunk.is_empty() {
-            // EOF: an unterminated final line still counts as a line.
-            return Ok(if buf.is_empty() {
-                Read::Eof
-            } else {
-                Read::Line(buf)
-            });
-        }
-        match chunk.iter().position(|b| *b == b'\n') {
-            Some(i) => {
-                if buf.len() + i > cap {
-                    r.consume(i + 1);
-                    return Ok(Read::TooLong);
-                }
-                buf.extend_from_slice(&chunk[..i]);
-                r.consume(i + 1);
-                return Ok(Read::Line(buf));
-            }
-            None => {
-                let n = chunk.len();
-                if buf.len() + n > cap {
-                    r.consume(n);
-                    return Ok(Read::TooLong);
-                }
-                buf.extend_from_slice(chunk);
-                r.consume(n);
-            }
-        }
-    }
-}
-
 async fn handle_connection(stream: UnixStream, ctx: &Context) -> io::Result<()> {
     let (read, mut write) = stream.into_split();
     let mut read = BufReader::new(read);
     loop {
-        let response = match read_line_capped(&mut read, MAX_LINE).await? {
+        let response = match wire::read_line_capped(&mut read, wire::MAX_LINE).await? {
             Read::Eof => return Ok(()),
             Read::TooLong => {
-                send(
+                let max_line = wire::MAX_LINE;
+                wire::send(
                     &mut write,
-                    &failure(&format!("request line exceeds {MAX_LINE} bytes")),
+                    &wire::failure(&format!("request line exceeds {max_line} bytes")),
                 )
                 .await?;
                 // Close, but only after the client has had the chance to read
@@ -199,10 +152,10 @@ async fn handle_connection(stream: UnixStream, ctx: &Context) -> io::Result<()> 
                 write.shutdown().await?;
                 let mut sink = vec![0u8; 8192];
                 let mut drained = 0usize;
-                let _ = tokio::time::timeout(DRAIN_TIME, async {
+                let _ = tokio::time::timeout(wire::DRAIN_TIME, async {
                     while let Ok(n) = read.read(&mut sink).await {
                         drained += n;
-                        if n == 0 || drained > DRAIN_LIMIT {
+                        if n == 0 || drained > wire::DRAIN_LIMIT {
                             break;
                         }
                     }
@@ -212,19 +165,8 @@ async fn handle_connection(stream: UnixStream, ctx: &Context) -> io::Result<()> 
             }
             Read::Line(bytes) => dispatch(&bytes, ctx).await,
         };
-        send(&mut write, &response).await?;
+        wire::send(&mut write, &response).await?;
     }
-}
-
-async fn send<W: AsyncWriteExt + Unpin>(w: &mut W, response: &Value) -> io::Result<()> {
-    let mut line = serde_json::to_vec(response).map_err(io::Error::other)?;
-    line.push(b'\n');
-    w.write_all(&line).await?;
-    w.flush().await
-}
-
-fn failure(message: &str) -> Value {
-    json!({ "ok": false, "error": message })
 }
 
 /// Only the fields this module reads. Everything else, including any `lane`,
@@ -241,7 +183,7 @@ struct Request {
 async fn dispatch(line: &[u8], ctx: &Context) -> Value {
     let request: Request = match serde_json::from_slice(line) {
         Ok(r) => r,
-        Err(e) => return failure(&format!("malformed request: {e}")),
+        Err(e) => return wire::failure(&format!("malformed request: {e}")),
     };
     let result = match request.op.as_str() {
         "ask" => ask(ctx, request.ask),
@@ -251,7 +193,7 @@ async fn dispatch(line: &[u8], ctx: &Context) -> Value {
     };
     match result {
         Ok(v) => v,
-        Err(e) => failure(&e),
+        Err(e) => wire::failure(&e),
     }
 }
 

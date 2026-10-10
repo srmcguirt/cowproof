@@ -34,6 +34,7 @@ use cowproof_prove::{
 use cowproof_run::{
     LaneLayout, NetworkMode, SandboxPolicy,
     claude::{ClaudeSpec, claude_command},
+    director,
     escalate::{Queue, SystemClock},
     lane::{PrepareOptions, prepare_lane},
     prefix::assemble_prompt,
@@ -528,6 +529,13 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
         .sock
         .canonicalize()
         .context("resolving the tools socket")?;
+    let director_sock_path = layout.control.join("director.sock");
+    let director_listener =
+        director::bind(&director_sock_path).context("binding the director control socket")?;
+    // Set mode to 0600 (read-write for owner only)
+    let permissions = std::fs::Permissions::from_mode(0o600);
+    std::fs::set_permissions(&director_sock_path, permissions)
+        .context("setting director socket permissions")?;
     let tools_queue = queue.clone();
     let table: CheckTable = checks.iter().map(|c| c.id.clone()).collect();
     let context = Arc::new(CheckContext {
@@ -548,6 +556,16 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
                 tools::serve(tools_listener, lane_id, tools_queue, table, run_check).await
             {
                 eprintln!("builder tools stopped: {e}");
+            }
+        }
+    }));
+
+    let _director = AbortOnDrop(tokio::spawn({
+        let lane_id = header.id.clone();
+        let director_queue = queue.clone();
+        async move {
+            if let Err(e) = director::serve(director_listener, lane_id, director_queue).await {
+                eprintln!("director control socket stopped: {e}");
             }
         }
     }));
