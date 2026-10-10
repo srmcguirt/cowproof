@@ -121,6 +121,9 @@ pub fn prepare_lane(
         bail!("the working tree is dirty; commit the changes or pass allow_dirty to record them");
     }
     refuse_heldout(repo, dirty)?;
+    if opts.allow_dirty && dirty {
+        refuse_dirty_removed_paths(repo)?;
+    }
     let base_commit = git_text(&git_source(
         repo,
         &["rev-parse", "--verify", "HEAD^{commit}"],
@@ -226,6 +229,37 @@ fn validate_lane_id(lane_id: &str) -> Result<()> {
         .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
     {
         bail!("lane id '{lane_id}' may only contain [A-Za-z0-9._-]");
+    }
+    Ok(())
+}
+
+/// When `allow_dirty` is set, refuse if any dirty path (tracked or untracked)
+/// matches the launch-removal set. These paths would carry their content into
+/// `base.patch` and the capsule. The user must commit, ignore, or remove them.
+fn refuse_dirty_removed_paths(repo: &Path) -> Result<()> {
+    // Get all dirty files: modified tracked files and untracked files.
+    let status =
+        git_source(repo, &["status", "--porcelain"]).context("checking the working tree")?;
+    let status_str = String::from_utf8_lossy(&status.stdout);
+
+    let mut dirty_matching: Vec<String> = Vec::new();
+
+    for line in status_str.lines() {
+        if line.len() < 3 {
+            continue;
+        }
+        let path = &line[3..]; // Skip the first 3 chars (status codes + space)
+        if is_removed(path) {
+            dirty_matching.push(path.to_string());
+        }
+    }
+
+    if !dirty_matching.is_empty() {
+        dirty_matching.sort();
+        bail!(
+            "with allow_dirty, these paths would travel in base.patch (commit, ignore or remove them): {}",
+            dirty_matching.join(", ")
+        );
     }
     Ok(())
 }
@@ -958,34 +992,29 @@ mod tests {
     fn replay_of_base_and_launch_baseline_rebuilds_the_launch_tree_with_a_base_patch() {
         let tmp = TempDir::new().unwrap();
         let repo = repo_with(&tmp, PACKET_TREE);
-        // Dirty: a modified tracked file, a new file, and a change to a file the
-        // launch baseline will then remove.
+        // Dirty: a modified tracked file and a new file (not removable paths).
+        // With allow_dirty, dirty removable paths like .env are refused, so we
+        // only test the ordinary files here.
         write(&repo, "src/main.rs", "fn main() { println!(); }");
         write(&repo, "src/new.rs", "pub fn n() {}");
-        write(&repo, ".env", "SECRET=changed");
-        write(&repo, "added/.env.test", "SECRET=new");
 
         let lane = prepare_lane(&repo, &tmp.path().join("lanes"), "l1", dirty_opts()).unwrap();
 
         let base_patch = lane.base_patch.as_ref().expect("a base patch");
         assert_eq!(
             patch_paths(base_patch),
-            BTreeSet::from([
-                ".env".to_string(),
-                "added/.env.test".to_string(),
-                "src/main.rs".to_string(),
-                "src/new.rs".to_string()
-            ])
+            BTreeSet::from(["src/main.rs".to_string(), "src/new.rs".to_string()])
         );
-        // The launch baseline removes both added/.env.test and the modified .env.
-        assert!(lane.launch_removed.contains(&"added/.env.test".to_string()));
+        // The launch baseline removes the files matched by is_removed, which
+        // includes all the .env* files (except .env.example) from PACKET_TREE.
+        assert!(lane.launch_removed.contains(&".env".to_string()));
+        assert!(lane.launch_removed.contains(&"sub/.env.local".to_string()));
         let launch_tree = git(&lane.layout.clone, &["rev-parse", "HEAD^{tree}"]);
         assert_eq!(replay_tree(&tmp, &repo, &lane), launch_tree.trim());
         assert_eq!(
             fs::read_to_string(lane.layout.clone.join("src/main.rs")).unwrap(),
             "fn main() { println!(); }"
         );
-        assert!(!lane.layout.clone.join("added/.env.test").exists());
         // Tree equality is not vacuous: compare the files themselves too.
         assert_eq!(
             tree_of(&lane.layout.clone)
@@ -1239,5 +1268,158 @@ mod tests {
                 .contains(&"config/.env.local".to_string())
         );
         assert!(lane.launch_removed.contains(&"CLAUDE.md".to_string()));
+    }
+
+    #[test]
+    fn untracked_env_file_with_allow_dirty_is_refused_before_anything_is_created() {
+        let tmp = TempDir::new().unwrap();
+        let repo = repo_with(&tmp, &[("README.md", "safe")]);
+        write(&repo, ".env", "CANARY-DIRTY-3c1e");
+        let lanes_root = tmp.path().join("lanes");
+
+        let err = prepare_lane(&repo, &lanes_root, "l1", dirty_opts()).unwrap_err();
+
+        assert!(
+            err.to_string().contains(".env"),
+            "error must name .env: {err}"
+        );
+        assert!(
+            err.to_string().contains("allow_dirty"),
+            "error must mention allow_dirty: {err}"
+        );
+        assert!(!lanes_root.exists(), "nothing created before refusal");
+
+        // Verify the canary is not in any file under lanes_root if it somehow exists.
+        if lanes_root.exists()
+            && let Some(found) = find_bytes_in_tree(&lanes_root, b"CANARY-DIRTY-3c1e")
+        {
+            panic!("canary found in: {}", found.display());
+        }
+    }
+
+    #[test]
+    fn modified_tracked_env_file_with_allow_dirty_is_refused() {
+        let tmp = TempDir::new().unwrap();
+        let repo = repo_with(&tmp, &[("README.md", "safe"), ("sub/.env.local", "OLD")]);
+        write(&repo, "sub/.env.local", "MODIFIED-CANARY");
+        let lanes_root = tmp.path().join("lanes");
+
+        let err = prepare_lane(&repo, &lanes_root, "l1", dirty_opts()).unwrap_err();
+
+        assert!(
+            err.to_string().contains("sub/.env.local"),
+            "error must name sub/.env.local: {err}"
+        );
+        assert!(!lanes_root.exists());
+    }
+
+    #[test]
+    fn dirty_claude_md_at_any_depth_is_refused_with_allow_dirty() {
+        let tmp = TempDir::new().unwrap();
+        let repo = repo_with(
+            &tmp,
+            &[("README.md", "safe"), ("docs/CLAUDE.md", "# original")],
+        );
+        write(&repo, "docs/CLAUDE.md", "# modified");
+        let lanes_root = tmp.path().join("lanes");
+
+        let err = prepare_lane(&repo, &lanes_root, "l1", dirty_opts()).unwrap_err();
+
+        assert!(
+            err.to_string().contains("docs/CLAUDE.md"),
+            "error must name docs/CLAUDE.md: {err}"
+        );
+        assert!(!lanes_root.exists());
+    }
+
+    #[test]
+    fn dirty_env_example_is_accepted_with_allow_dirty() {
+        let tmp = TempDir::new().unwrap();
+        let repo = repo_with(
+            &tmp,
+            &[("README.md", "safe"), (".env.example", "PLACEHOLDER=1")],
+        );
+        write(&repo, ".env.example", "PLACEHOLDER=changed");
+        let lanes_root = tmp.path().join("lanes");
+
+        let lane = prepare_lane(&repo, &lanes_root, "l1", dirty_opts()).unwrap();
+
+        // .env.example survives in the clone and in the base patch.
+        assert!(lane.layout.clone.join(".env.example").exists());
+        let patch = lane.base_patch.expect("base patch exists");
+        assert!(
+            String::from_utf8_lossy(&patch).contains(".env.example"),
+            "base patch should contain .env.example"
+        );
+    }
+
+    #[test]
+    fn dirty_ordinary_file_is_accepted_with_allow_dirty() {
+        let tmp = TempDir::new().unwrap();
+        let repo = repo_with(&tmp, &[("README.md", "safe"), ("src/x.rs", "fn f() {}")]);
+        write(&repo, "src/x.rs", "fn f() { println!(); }");
+        let lanes_root = tmp.path().join("lanes");
+
+        let lane = prepare_lane(&repo, &lanes_root, "l1", dirty_opts()).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(lane.layout.clone.join("src/x.rs")).unwrap(),
+            "fn f() { println!(); }"
+        );
+    }
+
+    #[test]
+    fn ignored_env_file_is_accepted_with_allow_dirty() {
+        let tmp = TempDir::new().unwrap();
+        let repo = repo_with(&tmp, &[("README.md", "safe"), (".gitignore", ".env\n")]);
+        write(&repo, ".env", "CANARY-IGNORED");
+        // Verify git ignores it
+        assert_eq!(git(&repo, &["status", "--porcelain"]), "");
+        let lanes_root = tmp.path().join("lanes");
+
+        let lane = prepare_lane(&repo, &lanes_root, "l1", dirty_opts()).unwrap();
+
+        // The ignored .env is not in the base patch.
+        if let Some(patch) = &lane.base_patch {
+            assert!(
+                !String::from_utf8_lossy(patch).contains(".env"),
+                "ignored .env should not be in base patch"
+            );
+        }
+        // And the canary should not appear in any lane file.
+        if let Some(found) =
+            find_bytes_in_tree(lane.layout.control.parent().unwrap(), b"CANARY-IGNORED")
+        {
+            panic!("canary from ignored .env found in: {}", found.display());
+        }
+    }
+
+    #[test]
+    fn multiple_dirty_removed_paths_are_all_named_in_the_error() {
+        let tmp = TempDir::new().unwrap();
+        let repo = repo_with(
+            &tmp,
+            &[
+                ("README.md", "safe"),
+                (".env", "SECRET1"),
+                ("config/.env.local", "SECRET2"),
+                ("CLAUDE.md", "# docs"),
+            ],
+        );
+        write(&repo, ".env", "CHANGED");
+        write(&repo, "config/.env.local", "CHANGED");
+        write(&repo, "CLAUDE.md", "# changed");
+        let lanes_root = tmp.path().join("lanes");
+
+        let err = prepare_lane(&repo, &lanes_root, "l1", dirty_opts()).unwrap_err();
+
+        let msg = err.to_string();
+        assert!(msg.contains(".env"), "must list .env: {msg}");
+        assert!(
+            msg.contains("config/.env.local"),
+            "must list config/.env.local: {msg}"
+        );
+        assert!(msg.contains("CLAUDE.md"), "must list CLAUDE.md: {msg}");
+        assert!(!lanes_root.exists());
     }
 }
