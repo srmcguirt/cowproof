@@ -29,6 +29,13 @@
     }
   ],
   "packet_commands_unreported": [],
+  "unparsed": [
+    {
+      "line": 25,
+      "text": "cargo build",
+      "reason": "fenced command outside checks section"
+    }
+  ],
   "flaws": [],
   "removed_assertions": [],
   "limits": [],

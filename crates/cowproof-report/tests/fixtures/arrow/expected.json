@@ -15,7 +15,7 @@
     {
       "command": "npm run test",
       "result": "Errors detected in test suite",
-      "classification": "unclear"
+      "classification": "fail"
     },
     {
       "command": "git diff --check",
@@ -24,14 +24,15 @@
     }
   ],
   "packet_commands_unreported": [],
+  "unparsed": [],
   "flaws": [],
   "removed_assertions": [],
   "limits": [],
   "unverified": [],
   "questions": [],
-  "verdict_hint": "escalate",
+  "verdict_hint": "fix-then-apply",
   "verdict_reasons": [
-    "one or more reported checks are not run or unclear"
+    "a reported check failed"
   ],
   "sample_handoff": "# Verification Status\n\ncargo fmt --all -- --check  ->  All files properly formatted (exit 0)\nnpm run test  ->  Errors detected in test suite\ngit diff --check  ->  Check in progress\n\n# Summary\n\nThis fixture demonstrates the arrow format for check reporting.\nEach command is reported with a compact inline result.\n"
 }

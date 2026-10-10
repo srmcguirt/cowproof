@@ -24,6 +24,12 @@ struct Check {
     classification: String,
 }
 #[derive(Debug, Serialize)]
+struct UnparsedLine {
+    line: usize,
+    text: String,
+    reason: String,
+}
+#[derive(Debug, Serialize)]
 struct AssertionChange {
     file: String,
     removed: usize,
@@ -41,6 +47,7 @@ struct Report {
     outside_ownership_count: usize,
     checks: Vec<Check>,
     packet_commands_unreported: Vec<String>,
+    unparsed: Vec<UnparsedLine>,
     flaws: Vec<Finding>,
     removed_assertions: Vec<AssertionChange>,
     limits: Vec<String>,
@@ -57,10 +64,13 @@ fn value_str(v: &Value, keys: &[&str]) -> Option<String> {
 fn value_num(v: &Value, keys: &[&str]) -> Option<u64> {
     keys.iter().find_map(|k| v.get(*k).and_then(Value::as_u64))
 }
-fn parse_checks(text: &str) -> Vec<Check> {
+fn parse_checks(text: &str) -> (Vec<Check>, Vec<UnparsedLine>) {
     let mut checks = Vec::new();
+    let mut unparsed = Vec::new();
     let mut table_header: Option<(usize, usize)> = None;
-    for line in text.lines() {
+    for (line_num, line) in text.lines().enumerate() {
+        let line_1indexed = line_num + 1;
+
         if let Some((command, result)) = arrow_check(line)
             && is_command(&command)
         {
@@ -71,6 +81,25 @@ fn parse_checks(text: &str) -> Vec<Check> {
             });
             continue;
         }
+        // Detect malformed arrow lines (too few spaces before ->)
+        if line.contains(" -> ") && !line.contains("  ->") {
+            // This is likely a malformed arrow check (one space instead of two)
+            let trimmed = line.trim();
+            if (trimmed.contains("cargo ")
+                || trimmed.contains("git ")
+                || trimmed.contains("npm ")
+                || trimmed.contains("node "))
+                && trimmed.contains("->")
+            {
+                unparsed.push(UnparsedLine {
+                    line: line_1indexed,
+                    text: trimmed.chars().take(200).collect(),
+                    reason: "arrow line needs two spaces before ->".to_string(),
+                });
+                continue;
+            }
+        }
+
         let cells: Vec<_> = line
             .trim()
             .trim_matches('|')
@@ -92,34 +121,63 @@ fn parse_checks(text: &str) -> Vec<Check> {
                     .iter()
                     .all(|c| c.chars().all(|x| x == '-' || x == ':' || x == ' '))
             {
-                if let (Some(c), Some(r)) = (cells.get(ci), cells.get(ri))
-                    && !c.is_empty()
-                    && !r.is_empty()
-                    && is_command(&strip_code(c))
-                {
-                    checks.push(Check {
-                        command: strip_code(c),
-                        result: r.to_string(),
-                        classification: classify(r),
-                    });
+                if let (Some(c), Some(r)) = (cells.get(ci), cells.get(ri)) {
+                    // Check for empty cells
+                    if c.is_empty() || r.is_empty() {
+                        unparsed.push(UnparsedLine {
+                            line: line_1indexed,
+                            text: line.trim().chars().take(200).collect(),
+                            reason: "table row has empty cells".to_string(),
+                        });
+                    } else if !is_command(&strip_code(c)) {
+                        unparsed.push(UnparsedLine {
+                            line: line_1indexed,
+                            text: line.trim().chars().take(200).collect(),
+                            reason: "table cell is not a recognized command".to_string(),
+                        });
+                    } else {
+                        checks.push(Check {
+                            command: strip_code(c),
+                            result: r.to_string(),
+                            classification: classify(r),
+                        });
+                    }
                 }
             } else if !line.trim_start().starts_with('|') {
                 table_header = None;
             }
         }
-        if (line.trim_start().starts_with('-') || line.trim_start().starts_with('*'))
-            && let Some((cmd, res)) = bullet_pair(line)
-            && is_command(&cmd)
-        {
-            checks.push(Check {
-                command: cmd,
-                classification: classify(&res),
-                result: res,
-            });
+        if line.trim_start().starts_with('-') || line.trim_start().starts_with('*') {
+            if let Some((cmd, res)) = bullet_pair(line) {
+                if is_command(&cmd) {
+                    checks.push(Check {
+                        command: cmd,
+                        classification: classify(&res),
+                        result: res,
+                    });
+                }
+            } else {
+                // Detect bullet without proper separator
+                let trimmed = line.trim();
+                if (trimmed.starts_with("- ") || trimmed.starts_with("* "))
+                    && trimmed.contains("cargo ")
+                    || trimmed.contains("git ")
+                    || trimmed.contains("npm ")
+                    || trimmed.contains("node ")
+                {
+                    unparsed.push(UnparsedLine {
+                        line: line_1indexed,
+                        text: trimmed.chars().take(200).collect(),
+                        reason: "bullet without separator (— or -)".to_string(),
+                    });
+                }
+            }
         }
     }
-    checks.extend(parse_fenced_checks(text));
-    checks
+    let (fenced_checks, fenced_unparsed) = parse_fenced_checks(text);
+    checks.extend(fenced_checks);
+    unparsed.extend(fenced_unparsed);
+    (checks, unparsed)
 }
 fn arrow_check(line: &str) -> Option<(String, String)> {
     let re = Regex::new(r"^\s*(.+?)\s{2,}->\s*(.+?)\s*$").ok()?;
@@ -129,10 +187,11 @@ fn arrow_check(line: &str) -> Option<(String, String)> {
         captures[2].trim().to_string(),
     ))
 }
-fn parse_fenced_checks(text: &str) -> Vec<Check> {
+fn parse_fenced_checks(text: &str) -> (Vec<Check>, Vec<UnparsedLine>) {
     let lines: Vec<_> = text.lines().collect();
     let mut section = false;
     let mut checks = Vec::new();
+    let mut unparsed = Vec::new();
     let mut i = 0;
     while i < lines.len() {
         let line = lines[i].trim();
@@ -144,7 +203,7 @@ fn parse_fenced_checks(text: &str) -> Vec<Check> {
             i += 1;
             continue;
         }
-        if !section || !line.starts_with("```") {
+        if !line.starts_with("```") {
             i += 1;
             continue;
         }
@@ -172,7 +231,16 @@ fn parse_fenced_checks(text: &str) -> Vec<Check> {
                 break;
             }
         }
-        if let Some(result) = result {
+        if !section && !commands.is_empty() {
+            // Commands found in a fenced block but not in a checks section
+            for command in &commands {
+                unparsed.push(UnparsedLine {
+                    line: i.saturating_sub(commands.len()),
+                    text: command.chars().take(200).collect(),
+                    reason: "fenced command outside checks section".to_string(),
+                });
+            }
+        } else if let Some(result) = result {
             for command in commands {
                 checks.push(Check {
                     command,
@@ -182,7 +250,7 @@ fn parse_fenced_checks(text: &str) -> Vec<Check> {
             }
         }
     }
-    checks
+    (checks, unparsed)
 }
 fn is_command(s: &str) -> bool {
     let s = s.trim_start();
@@ -209,7 +277,13 @@ fn bullet_pair(line: &str) -> Option<(String, String)> {
 }
 fn classify(s: &str) -> String {
     let l = s.to_ascii_lowercase();
-    let failure = Regex::new(r"\b(?:fail(?:ed|ure)?|error)\b")
+    // Match failure words: error(s), errored, failed, failing, failure(s), panic(ked)
+    // Also match exit code patterns: exit 1, exited with 2, status 101, etc.
+    // Also match "N failed" where N > 0
+    // But NOT "0 failed", "no errors", "0 errors", "no failures"
+    let failure = Regex::new(
+        r"\b(?:fail(?:ed|ure|ing)?|errors?|errored?|panic(?:ked)?|FAILED)\b|exit(?:\s+code)?\s+[^0]|exited\s+with\s+[^0]|status\s+[^0]|\b([1-9]\d*)\s+failed"
+    )
         .unwrap()
         .find_iter(&l)
         .map(|m| m.start())
@@ -229,7 +303,7 @@ fn classify(s: &str) -> String {
     let final_rerun_passed =
         Regex::new(r"\b(?:final\s+)?(?:re)?run\s+passed\b").is_ok_and(|re| re.is_match(&l));
     let no_failures =
-        Regex::new(r"\b(?:0\s+fail(?:ed|ures?)?|no\s+failures?|exit(?:\s+code)?\s*[:=]?\s*0)\b")
+        Regex::new(r"\b(?:0\s+fail(?:ed|ures?)?|no\s+failures?|no\s+errors?|0\s+errors?|exit(?:\s+code)?\s*[:=]?\s*0)\b")
             .is_ok_and(|re| re.is_match(&l));
     if success.is_none() && (not_run.is_some() || skipped) {
         "not run"
@@ -413,7 +487,7 @@ fn main_report(args: &[String]) -> Result<Report> {
         handoff = fs::read_to_string(lane.join("handoff.md")).ok();
     }
     let handoff = handoff.unwrap_or_default();
-    let checks = parse_checks(&handoff);
+    let (checks, unparsed) = parse_checks(&handoff);
     let packet = packet_arg
         .and_then(|p| fs::read_to_string(p).ok())
         .or_else(|| {
@@ -518,6 +592,7 @@ fn main_report(args: &[String]) -> Result<Report> {
             as usize,
         checks,
         packet_commands_unreported: missing,
+        unparsed,
         flaws,
         removed_assertions,
         limits: extract_sections(&handoff, "limits"),
@@ -564,6 +639,12 @@ fn print_report(r: &Report) {
         "Packet commands unreported: {}",
         r.packet_commands_unreported.len()
     );
+    if !r.unparsed.is_empty() {
+        println!("Unparsed lines: {}", r.unparsed.len());
+        for u in &r.unparsed {
+            println!("- line {}: {} ({})", u.line, u.text, u.reason);
+        }
+    }
     println!("Flaws: {}", r.flaws.len());
     for f in &r.flaws {
         println!(
@@ -681,11 +762,12 @@ mod tests {
     }
     #[test]
     fn bullet_checks_and_packet_commands_parse() {
-        assert_eq!(
-            parse_checks("- `cargo test` — PASS\n- `cargo build` — not run")[1].classification,
-            "not run"
-        );
-        assert!(parse_checks("## Changed\n- `api/src/main.rs` — wired module").is_empty());
+        let (checks, _) = parse_checks("- `cargo test` — PASS\n- `cargo build` — not run");
+        assert_eq!(checks[1].classification, "not run");
+
+        let (checks, _) = parse_checks("## Changed\n- `api/src/main.rs` — wired module");
+        assert!(checks.is_empty());
+
         assert_eq!(classify("passed, 18 tests, 0 failed"), "pass");
         assert_eq!(classify("0 failed"), "pass");
         assert_eq!(classify("no failures"), "pass");
@@ -700,16 +782,17 @@ mod tests {
             classify("passed: 6 passed, 0 failed; browser test skipped and not executed"),
             "pass"
         );
-        assert_eq!(
-            parse_checks("| Check | Result | Wall time |\n| --- | --- | --- |\n| `node --check` | exit 0 | 0.1s |")[0]
-                .classification,
-            "pass"
+
+        let (checks, _) = parse_checks(
+            "| Check | Result | Wall time |\n| --- | --- | --- |\n| `node --check` | exit 0 | 0.1s |",
         );
-        let plain_arrow =
+        assert_eq!(checks[0].classification, "pass");
+
+        let (checks, _) =
             parse_checks("node scripts/check.mjs --flags  -> 4/4 scenarios passed (exit 0)");
-        assert_eq!(plain_arrow.len(), 1);
-        assert_eq!(plain_arrow[0].command, "node scripts/check.mjs --flags");
-        assert_eq!(plain_arrow[0].classification, "pass");
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].command, "node scripts/check.mjs --flags");
+        assert_eq!(checks[0].classification, "pass");
         let sections = "## Limits and director question\nKeep migration.\n## Deferred\nLater.\n## Unverified\nBrowser.\n## Questions\nReview?";
         assert!(extract_sections(sections, "limits").contains(&"Later.".to_string()));
         assert_eq!(extract_sections(sections, "unverified"), vec!["Browser."]);
@@ -857,36 +940,71 @@ mod tests {
         assert_eq!(r.lane_id, "fixture-baseline");
     }
     #[test]
-    fn malformed_table_row_ignored() {
-        let checks = parse_checks("| Command | Result |\n| --- | --- |\n| | missing result |");
+    fn malformed_table_row_reported_as_unparsed() {
+        let (checks, unparsed) =
+            parse_checks("| Command | Result |\n| --- | --- |\n| | missing result |");
         assert!(
             checks.is_empty(),
-            "empty table cells should be silently dropped"
+            "empty table cells should not produce checks"
         );
+        assert_eq!(unparsed.len(), 1, "empty table row should be in unparsed");
+        assert!(unparsed[0].reason.contains("empty cells"));
     }
     #[test]
-    fn malformed_bullet_without_separator_ignored() {
-        let checks = parse_checks("- `cargo test` with no separator");
+    fn malformed_bullet_without_separator_reported_as_unparsed() {
+        let (checks, unparsed) = parse_checks("- `cargo test` with no separator");
         assert!(
             checks.is_empty(),
-            "bullet without separator should be silently dropped"
+            "bullet without separator should not produce checks"
         );
+        assert_eq!(unparsed.len(), 1, "malformed bullet should be in unparsed");
+        assert!(unparsed[0].reason.contains("separator"));
     }
     #[test]
-    fn malformed_arrow_too_few_spaces_ignored() {
-        let checks = parse_checks("cargo test - result");
+    fn malformed_arrow_too_few_spaces_reported_as_unparsed() {
+        let (checks, unparsed) = parse_checks("cargo test -> result");
         assert!(
             checks.is_empty(),
-            "arrow with one space should be silently dropped"
+            "arrow with one space should not produce checks"
         );
+        assert_eq!(unparsed.len(), 1, "malformed arrow should be in unparsed");
+        assert!(unparsed[0].reason.contains("two spaces"));
     }
     #[test]
-    fn malformed_fenced_outside_checks_section_ignored() {
+    fn malformed_fenced_outside_checks_section_reported_as_unparsed() {
         let text = "# Other section\n```\ncargo test\n```\nPassed.";
-        let checks = parse_checks(text);
+        let (checks, unparsed) = parse_checks(text);
         assert!(
             checks.is_empty(),
-            "commands outside a checks section should be silently dropped"
+            "commands outside a checks section should not produce checks"
         );
+        assert_eq!(
+            unparsed.len(),
+            1,
+            "fenced command outside section should be in unparsed"
+        );
+        assert!(unparsed[0].reason.contains("outside checks section"));
+    }
+    #[test]
+    fn extended_failure_vocabulary() {
+        // Error phrases should classify as fail
+        assert_eq!(classify("Errors detected in test suite"), "fail");
+        assert_eq!(classify("3 failed tests"), "fail");
+        assert_eq!(classify("exit 1"), "fail");
+        assert_eq!(classify("exited with 2"), "fail");
+        assert_eq!(classify("status 101"), "fail");
+        assert_eq!(classify("panicked at line 42"), "fail");
+        assert_eq!(classify("FAILED: compilation"), "fail");
+        assert_eq!(classify("error occurred"), "fail");
+        assert_eq!(classify("errored during compilation"), "fail");
+        assert_eq!(classify("failing test"), "fail");
+        assert_eq!(classify("failure in setup"), "fail");
+
+        // Zero failures and "no errors" should still be pass
+        assert_eq!(classify("0 failed"), "pass");
+        assert_eq!(classify("no errors"), "pass");
+        assert_eq!(classify("0 errors"), "pass");
+        assert_eq!(classify("no failures"), "pass");
+        assert_eq!(classify("exit 0"), "pass");
     }
 }

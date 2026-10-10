@@ -14,6 +14,7 @@
     }
   ],
   "packet_commands_unreported": [],
+  "unparsed": [],
   "flaws": [],
   "removed_assertions": [],
   "limits": [
