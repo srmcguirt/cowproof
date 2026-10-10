@@ -409,7 +409,7 @@ async fn cli_rule_duplicate_rejected() {
         .arg("--answer")
         .arg("first answer")
         .arg("--lanes-root")
-        .arg(&lanes_root);
+        .arg(lanes_root);
 
     let output1 = tokio::time::timeout(Duration::from_secs(20), cmd1.output())
         .await
@@ -426,7 +426,7 @@ async fn cli_rule_duplicate_rejected() {
         .arg("--answer")
         .arg("second answer")
         .arg("--lanes-root")
-        .arg(&lanes_root);
+        .arg(lanes_root);
 
     let output2 = tokio::time::timeout(Duration::from_secs(20), cmd2.output())
         .await

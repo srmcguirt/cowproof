@@ -47,7 +47,7 @@ use std::os::unix::fs::FileTypeExt;
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 
 /// The most check output returned to the builder, in bytes.
@@ -313,6 +313,7 @@ mod tests {
     use crate::escalate::{AskKind, Opt, SystemClock, Verdict};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::TempDir;
+    use tokio::io::AsyncBufReadExt;
     use tokio::task::JoinHandle;
 
     const LANE: &str = "l1";
