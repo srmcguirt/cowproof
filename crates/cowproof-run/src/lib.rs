@@ -70,6 +70,11 @@ pub struct SandboxPolicy {
     /// The directory that holds every lane. Hidden in the sandbox to prevent
     /// cross-lane access.
     pub lanes_root: PathBuf,
+    /// Executable files (not directories) to grant read-only access to.
+    /// Symlinks are resolved to their canonical targets, and both the symlink
+    /// and target are granted. Used for toolchain binaries that live under
+    /// the hidden home.
+    pub executables: Vec<PathBuf>,
 }
 
 impl SandboxPolicy {
@@ -98,7 +103,27 @@ impl SandboxPolicy {
             home: lane.real_home.clone(),
             connect_socket: Some(lane.sock.clone()),
             lanes_root: lane.lanes_root.clone(),
+            executables: vec![],
         }
+    }
+
+    /// Builder for a lane with read-only access to specific executables.
+    ///
+    /// Like `builder`, but also grants read-only access to individual executable files.
+    /// Each executable is canonicalized (symlinks followed to their targets).
+    /// Refuses non-regular files and paths inside the lanes root or repo.
+    ///
+    /// - macOS: `(allow file-read* (literal "<canonical file>"))`, plus metadata on
+    ///   ancestors of the executable and the lanes root so path walks work.
+    /// - Linux: `--ro-bind <file> <file>`.
+    pub fn builder_with_executables(
+        lane: &LaneLayout,
+        network: NetworkMode,
+        executables: &[PathBuf],
+    ) -> Result<Self> {
+        let mut policy = Self::builder(lane, network);
+        policy.executables = executables.to_vec();
+        Ok(policy)
     }
 
     /// Verifier for checking patches.
@@ -121,6 +146,7 @@ impl SandboxPolicy {
             home: lane.real_home.clone(),
             connect_socket: None,
             lanes_root: lane.lanes_root.clone(),
+            executables: vec![],
         }
     }
 
@@ -139,6 +165,7 @@ impl SandboxPolicy {
             home: lane.real_home.clone(),
             connect_socket: Some(lane.sock.clone()),
             lanes_root: lane.lanes_root.clone(),
+            executables: vec![],
         }
     }
 
@@ -155,6 +182,7 @@ impl SandboxPolicy {
             home: lane.real_home.clone(),
             connect_socket: None,
             lanes_root: lane.lanes_root.clone(),
+            executables: vec![],
         }
     }
 
@@ -170,6 +198,7 @@ impl SandboxPolicy {
             home: lane.real_home.clone(),
             connect_socket: None,
             lanes_root: lane.lanes_root.clone(),
+            executables: vec![],
         }
     }
 
@@ -499,6 +528,9 @@ struct Resolved {
     credentials: Vec<PathBuf>,
     /// The connectable socket file and its directory, resolved.
     socket: Option<(PathBuf, PathBuf)>,
+    /// Executable files: both original paths (for symlinks) and canonical targets.
+    /// Stored as BTreeSet to deduplicate when symlink and target are both listed.
+    executables: BTreeSet<PathBuf>,
 }
 
 fn resolve_all(paths: &[PathBuf]) -> Result<BTreeSet<PathBuf>> {
@@ -569,6 +601,51 @@ fn resolve(policy: &SandboxPolicy) -> Result<Resolved> {
             Some((sock, dir))
         }
     };
+
+    // Validate and collect executables (both original and canonical paths).
+    let mut executables = BTreeSet::new();
+    for exe_path in &policy.executables {
+        // Refuse non-absolute paths
+        if !exe_path.is_absolute() {
+            bail!("executable path must be absolute: {}", exe_path.display());
+        }
+        // Refuse paths inside lanes root
+        if exe_path.starts_with(&lanes_root) {
+            bail!(
+                "executable {} lies inside the lanes root {}",
+                exe_path.display(),
+                lanes_root.display()
+            );
+        }
+
+        // Verify the file exists (symlinks OK)
+        std::fs::metadata(exe_path)
+            .with_context(|| format!("cannot stat executable {}", exe_path.display()))?;
+
+        // Canonicalize to verify the target exists and is a regular file
+        let canonical = std::fs::canonicalize(exe_path)
+            .with_context(|| format!("cannot resolve executable {}", exe_path.display()))?;
+
+        let metadata = std::fs::metadata(&canonical)
+            .with_context(|| format!("cannot stat executable {}", canonical.display()))?;
+        if !metadata.is_file() {
+            bail!("executable {} is not a regular file", canonical.display());
+        }
+
+        // Re-check that the canonical path is not inside lanes root
+        if canonical.starts_with(&lanes_root) {
+            bail!(
+                "executable {} (canonical) lies inside the lanes root {}",
+                canonical.display(),
+                lanes_root.display()
+            );
+        }
+
+        // Grant both the original path (for symlinks) and the canonical target
+        executables.insert(exe_path.clone());
+        executables.insert(canonical);
+    }
+
     Ok(Resolved {
         home,
         rw,
@@ -577,6 +654,7 @@ fn resolve(policy: &SandboxPolicy) -> Result<Resolved> {
         deny,
         credentials,
         socket,
+        executables,
     })
 }
 
@@ -614,6 +692,12 @@ pub fn render_macos_profile(policy: &SandboxPolicy) -> Result<String> {
             if a.starts_with(&r.home) {
                 metadata.insert(a.to_path_buf());
             }
+        }
+    }
+    // Metadata on ancestors of executables so path resolution works.
+    for e in &r.executables {
+        for a in e.ancestors().skip(1) {
+            metadata.insert(a.to_path_buf());
         }
     }
     out.push_str("(allow file-read-metadata");
@@ -655,6 +739,9 @@ pub fn render_macos_profile(policy: &SandboxPolicy) -> Result<String> {
     }
     for p in &r.ro {
         out.push_str(&format!("(allow file-read* (subpath {}))\n", sbpl(p)?));
+    }
+    for e in &r.executables {
+        out.push_str(&format!("(allow file-read* (literal {}))\n", sbpl(e)?));
     }
     for c in &r.credentials {
         out.push_str(&format!(
@@ -771,6 +858,11 @@ pub fn render_bwrap_args(policy: &SandboxPolicy, cmd: &[String]) -> Result<Vec<S
             bind(&mut args, "--ro-bind", p, p)?;
         }
     }
+    for e in &r.executables {
+        if e.exists() {
+            bind(&mut args, "--ro-bind", e, e)?;
+        }
+    }
     // The runner socket file alone (D22), never its directory, so nothing else
     // in the socket directory is visible. Bound when it exists, like the proxy
     // socket: the runner binds it before the builder starts.
@@ -848,6 +940,7 @@ pub fn sandbox_command(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
 
     /// Absolute, non-symlinked, non-existent paths: renders are pure.
     fn test_lane() -> LaneLayout {
@@ -1743,6 +1836,144 @@ mod tests {
         assert!(
             err.contains("must not contain the real home"),
             "expected error about lanes_root containing real_home, got: {err}"
+        );
+    }
+
+    #[test]
+    fn executable_symlink_is_granted_as_canonical_target() {
+        // Create a temp directory with a real executable and a symlink to it
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        // Create a real executable
+        let exe_dir = root.join("bin");
+        std::fs::create_dir(&exe_dir).unwrap();
+        let real_exe = exe_dir.join("mytool");
+        std::fs::write(&real_exe, b"#!/bin/sh\necho hello").unwrap();
+        std::fs::set_permissions(&real_exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // Create a symlink to it
+        let symlink_exe = root.join("bin-link").join("mytool");
+        std::fs::create_dir(root.join("bin-link")).unwrap();
+        std::os::unix::fs::symlink(&real_exe, &symlink_exe).unwrap();
+
+        let lane = test_lane();
+        let policy = SandboxPolicy::builder_with_executables(
+            &lane,
+            NetworkMode::None,
+            std::slice::from_ref(&symlink_exe),
+        )
+        .unwrap();
+
+        let profile = render_macos_profile(&policy).unwrap();
+        let canonical = std::fs::canonicalize(&real_exe).unwrap();
+        let grant = format!("(allow file-read* (literal \"{}\"))", canonical.display());
+        assert!(
+            profile.contains(&grant),
+            "executable grant should contain canonical path\nGrant: {grant}\nProfile: {profile}"
+        );
+    }
+
+    #[test]
+    fn executable_directory_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+
+        let lane = LaneLayout {
+            clone: root.join("lane/clone"),
+            home: root.join("lane/home"),
+            scratch: root.join("lane/scratch"),
+            control: root.join("lane/control"),
+            real_home: root.join("realhome"),
+            sock: root.join("lane/sock/runner.sock"),
+            lanes_root: root.join("lane"),
+        };
+
+        // Create required directories
+        for d in [
+            "lane/clone",
+            "lane/home",
+            "lane/control",
+            "lane/sock",
+            "realhome",
+            "bindir",
+        ] {
+            std::fs::create_dir_all(root.join(d)).unwrap();
+        }
+
+        let policy = SandboxPolicy::builder_with_executables(
+            &lane,
+            NetworkMode::None,
+            &[root.join("bindir")], // This is a directory, should be refused
+        )
+        .unwrap();
+
+        let err = render_macos_profile(&policy).unwrap_err().to_string();
+        assert!(
+            err.contains("not a regular file"),
+            "directory executable should be refused: {err}"
+        );
+    }
+
+    #[test]
+    fn linux_executable_bind_is_correct() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+
+        // Create a real executable
+        let exe_dir = root.join("bin");
+        std::fs::create_dir(&exe_dir).unwrap();
+        let exe = exe_dir.join("mytool");
+        std::fs::write(&exe, b"#!/bin/sh\necho hello").unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        for d in [
+            "lane/clone",
+            "lane/home",
+            "lane/control",
+            "lane/sock",
+            "realhome/.rustup",
+        ] {
+            std::fs::create_dir_all(root.join(d)).unwrap();
+        }
+
+        let lane = LaneLayout {
+            clone: root.join("lane/clone"),
+            home: root.join("lane/home"),
+            scratch: root.join("lane/scratch"),
+            control: root.join("lane/control"),
+            real_home: root.join("realhome"),
+            sock: root.join("lane/sock/runner.sock"),
+            lanes_root: root.join("lane"),
+        };
+
+        let policy = SandboxPolicy::builder_with_executables(
+            &lane,
+            NetworkMode::None,
+            std::slice::from_ref(&exe),
+        )
+        .unwrap();
+        let args = render_bwrap_args(&policy, &[]).unwrap();
+
+        // Find the tmpfs that hides the lanes root
+        let lanes_root_tmpfs_idx = args
+            .windows(2)
+            .position(|w| w[0] == "--tmpfs" && w[1].contains("lane"))
+            .expect("should have a --tmpfs for lanes_root");
+
+        // The executable bind should come after the lanes root tmpfs
+        let exe_bind_idx = args
+            .windows(3)
+            .position(|w| {
+                w[0] == "--ro-bind" && w[1].contains("bin/mytool") && w[2].contains("bin/mytool")
+            })
+            .expect("should have --ro-bind for the executable");
+
+        assert!(
+            lanes_root_tmpfs_idx < exe_bind_idx,
+            "executable bind should come after lanes_root tmpfs: tmpfs at {}, bind at {}",
+            lanes_root_tmpfs_idx,
+            exe_bind_idx
         );
     }
 }

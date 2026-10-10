@@ -213,19 +213,6 @@ fn builder_path(director_path: &str, real_home: &Path) -> String {
     }
 }
 
-/// Warn when the sandbox cannot see a program the builder has to run: the
-/// builder policy hides the real home. The policy is not widened here.
-fn warn_if_hidden(label: &str, path: &Path, real_home: &Path) {
-    if let (Ok(p), Ok(h)) = (path.canonicalize(), real_home.canonicalize())
-        && p.starts_with(&h)
-    {
-        eprintln!(
-            "warning: {label} {} is under the real home, which the builder sandbox hides, so the builder may fail to run it; install it outside the home or ask the director to rule on a read grant",
-            path.display()
-        );
-    }
-}
-
 fn platform() -> &'static str {
     if cfg!(target_os = "macos") {
         "darwin"
@@ -489,11 +476,12 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<()> {
         None => real_home.join(".cache/cowproof/lanes"),
     };
     let path = builder_path(&director_path, &real_home);
+    let claude_bin = claude_bin
+        .canonicalize()
+        .context("resolving the claude executable")?;
     let cowproof_exe = std::env::current_exe()
         .and_then(|p| p.canonicalize())
         .context("locating the cowproof executable")?;
-    warn_if_hidden("the claude executable", &claude_bin, &real_home);
-    warn_if_hidden("the cowproof executable", &cowproof_exe, &real_home);
 
     // 3. The lane.
     fs::create_dir_all(&lanes_root)
@@ -590,7 +578,11 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<()> {
     let argv: Vec<String> = std::iter::once(invocation.program.clone())
         .chain(invocation.args.iter().cloned())
         .collect();
-    let policy = SandboxPolicy::builder(&layout, endpoint.network);
+    let policy = SandboxPolicy::builder_with_executables(
+        &layout,
+        endpoint.network,
+        &[claude_bin.clone(), cowproof_exe.clone()],
+    )?;
     let stderr_file = fs::File::create(layout.control.join("builder.stderr"))?;
     let mut child = sandboxed_command(
         &policy,
