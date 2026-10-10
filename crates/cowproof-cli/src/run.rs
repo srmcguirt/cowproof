@@ -431,6 +431,16 @@ async fn capture_patch(layout: &LaneLayout, launch_commit: &str, path: &str) -> 
     unreachable!("the diff step returns")
 }
 
+/// The lanes root: `--lanes-root` relative to the working directory, or
+/// `~/.cache/cowproof/lanes` (never under `/tmp`, which macOS cleans by access
+/// time). `cowproof run` and `cowproof watch` both use this one default.
+pub(crate) fn lanes_root(arg: Option<&Path>, cwd: &Path, home: &Path) -> PathBuf {
+    match arg {
+        Some(p) => cwd.join(p),
+        None => home.join(".cache/cowproof/lanes"),
+    }
+}
+
 pub async fn run_one(args: super::RunOneArgs) -> Result<()> {
     let started = Instant::now();
     let cwd = std::env::current_dir().context("reading the current directory")?;
@@ -471,10 +481,7 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<()> {
     let claude_bin = resolve_executable(&args.claude_bin, &director_path, &cwd)?;
     let real_home =
         PathBuf::from(std::env::var_os("HOME").ok_or_else(|| anyhow!("HOME is not set"))?);
-    let lanes_root = match args.lanes_root {
-        Some(p) => cwd.join(p),
-        None => real_home.join(".cache/cowproof/lanes"),
-    };
+    let lanes_root = lanes_root(args.lanes_root.as_deref(), &cwd, &real_home);
     let path = builder_path(&director_path, &real_home);
     let claude_bin = claude_bin
         .canonicalize()

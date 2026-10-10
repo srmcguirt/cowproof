@@ -122,15 +122,9 @@ fn truncate_line(s: &str, max_chars: usize) -> String {
 }
 
 fn expand_lanes_root(root: &Option<PathBuf>) -> Result<PathBuf> {
-    let real_home =
-        PathBuf::from(std::env::var_os("HOME").ok_or_else(|| anyhow!("HOME is not set"))?);
-    Ok(match root {
-        Some(p) => {
-            let cwd = std::env::current_dir()?;
-            cwd.join(p)
-        }
-        None => real_home.join(".cache/cowproof/lanes"),
-    })
+    let home = PathBuf::from(std::env::var_os("HOME").ok_or_else(|| anyhow!("HOME is not set"))?);
+    let cwd = std::env::current_dir()?;
+    Ok(crate::run::lanes_root(root.as_deref(), &cwd, &home))
 }
 
 pub async fn watch(args: WatchArgs) -> Result<()> {
