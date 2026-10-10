@@ -770,6 +770,8 @@ struct Evidence {
     failed_gates: Vec<GateFailure>,
     /// Anything that stopped the proof from running (F-1: never a refutation).
     infrastructure: Vec<String>,
+    /// The packet declared no checks, so nothing was verified.
+    no_checks_declared: bool,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -816,9 +818,12 @@ fn judge(e: &Evidence) -> Verdict {
     for id in &e.unrun {
         reasons.push(format!("check {id:?} was never run"));
     }
+    if e.no_checks_declared {
+        reasons.push("the packet declares no checks, so nothing was verified".to_string());
+    }
     let outcome = if refuted {
         Outcome::Refuted
-    } else if !e.unrun.is_empty() {
+    } else if !e.unrun.is_empty() || e.no_checks_declared {
         Outcome::Incomplete
     } else {
         Outcome::Proved
@@ -862,7 +867,10 @@ async fn prove_lane(
     results: std::result::Result<BTreeMap<String, bool>, String>,
 ) -> Result<Verdict> {
     let header = input.header;
-    let mut evidence = Evidence::default();
+    let mut evidence = Evidence {
+        no_checks_declared: header.checks.is_empty(),
+        ..Evidence::default()
+    };
     let results = results.unwrap_or_else(|e| {
         evidence.infrastructure.push(e);
         BTreeMap::new()
@@ -1326,6 +1334,20 @@ body"#;
     }
 
     #[test]
+    fn judge_a_packet_with_no_checks_is_incomplete_never_proved() {
+        let e = Evidence {
+            no_checks_declared: true,
+            ..Evidence::default()
+        };
+        let (outcome, reasons) = reasons_of(&e);
+        assert_eq!(outcome, Outcome::Incomplete);
+        assert_eq!(
+            reasons,
+            vec!["the packet declares no checks, so nothing was verified".to_string()]
+        );
+    }
+
+    #[test]
     fn judge_an_unrun_check_is_incomplete_and_named() {
         let e = Evidence {
             unrun: vec!["lint".into(), "unit".into()],
@@ -1353,6 +1375,7 @@ body"#;
                 evidence: vec!["Files outside owns globs: x.txt".into()],
             }],
             infrastructure: vec![],
+            no_checks_declared: false,
         };
         let (outcome, reasons) = reasons_of(&e);
         assert_eq!(outcome, Outcome::Refuted);
