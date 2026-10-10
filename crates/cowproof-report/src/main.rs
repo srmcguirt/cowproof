@@ -282,7 +282,7 @@ fn classify(s: &str) -> String {
     // Also match "N failed" where N > 0
     // But NOT "0 failed", "no errors", "0 errors", "no failures"
     let failure = Regex::new(
-        r"\b(?:fail(?:ed|ure|ing)?|errors?|errored?|panic(?:ked)?|FAILED)\b|exit(?:\s+code)?\s+[^0]|exited\s+with\s+[^0]|status\s+[^0]|\b([1-9]\d*)\s+failed"
+        r"\b(?:fail(?:ed|ure|ing)?|errors?|errored?|panic(?:ked)?|FAILED)\b|exit(?:\s+code)?\s+[1-9]|exited\s+with\s+[1-9]|status\s+[1-9]|\b([1-9]\d*)\s+failed"
     )
         .unwrap()
         .find_iter(&l)
@@ -305,8 +305,17 @@ fn classify(s: &str) -> String {
     let no_failures =
         Regex::new(r"\b(?:0\s+fail(?:ed|ures?)?|no\s+failures?|no\s+errors?|0\s+errors?|exit(?:\s+code)?\s*[:=]?\s*0)\b")
             .is_ok_and(|re| re.is_match(&l));
+    // An explicit nonzero failure count, nonzero exit or panic is a failure no
+    // matter what else the line says: "suite a: 0 failed; suite b: 2 failed" and
+    // "no errors, 1 failed" must never read as a pass.
+    let hard_failure = Regex::new(
+        r"\b[1-9]\d*\s+(?:failed|failures?|errors?)\b|\bexit(?:\s+code)?\s*[:=]?\s*[1-9]|\bexited\s+with\s+[1-9]|\bstatus\s+[1-9]|\bpanicked\b",
+    )
+    .is_ok_and(|re| re.is_match(&l));
     if success.is_none() && (not_run.is_some() || skipped) {
         "not run"
+    } else if hard_failure && !final_rerun_passed {
+        "fail"
     } else if final_rerun_passed
         || no_failures
         || success.is_some_and(|pass_at| failure.is_none_or(|fail_at| pass_at > fail_at))
@@ -1002,6 +1011,16 @@ mod tests {
 
         // Zero failures and "no errors" should still be pass
         assert_eq!(classify("0 failed"), "pass");
+        // A nonzero count anywhere wins over a zero count elsewhere.
+        assert_eq!(classify("suite a: 0 failed; suite b: 2 failed"), "fail");
+        assert_eq!(classify("no errors, 1 failed"), "fail");
+        assert_eq!(classify("exit 0 from setup, then 3 errors"), "fail");
+        assert_eq!(classify("test result: ok. 12 passed; 0 failed"), "pass");
+        assert_eq!(classify("status ok"), "pass");
+        assert_eq!(
+            classify("final rerun passed after 1 failed attempt"),
+            "pass"
+        );
         assert_eq!(classify("no errors"), "pass");
         assert_eq!(classify("0 errors"), "pass");
         assert_eq!(classify("no failures"), "pass");
