@@ -40,7 +40,15 @@ struct Args {
 }
 #[derive(clap::Subcommand)]
 enum Action {
-    /// Run one packet: lint, prepare the lane, start the proxy and tools, launch the sandboxed builder.
+    /// Run one packet: lint, prepare the lane, launch the sandboxed builder, then prove the lane.
+    ///
+    /// After the builder exits, the last result it recorded through `run_check` for each declared
+    /// check is replayed by the verifier in a fresh sandbox, the gates run, and the verdict is
+    /// written to `control/verdict.json` and printed on one line.
+    ///
+    /// Exit codes: 0 proved; 2 refuted (a recorded check failed, verify diverged, or a gate
+    /// failed); 3 incomplete (a declared check was never run); 4 infrastructure (the proof could
+    /// not run, never a refutation); 1 the run itself failed before a verdict.
     Run(RunOneArgs),
     /// the multi-packet host runner ported from the source project; superseded by `cowproof run`
     LegacyRun(RunArgs),
@@ -167,7 +175,13 @@ enum HostAction {
 #[tokio::main]
 async fn main() -> Result<()> {
     match Args::parse().command {
-        Action::Run(args) => run::run_one(args).await,
+        Action::Run(args) => {
+            let code = run::run_one(args).await?;
+            if code != 0 {
+                std::process::exit(code);
+            }
+            Ok(())
+        }
         Action::LegacyRun(args) => {
             lint_run_packets(&args)?;
             if let Some(host) = args.host.clone() {

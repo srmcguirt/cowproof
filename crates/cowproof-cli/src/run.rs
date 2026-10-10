@@ -13,7 +13,11 @@
 //! 5. launch the builder inside `SandboxPolicy::builder`, feeding its stdout
 //!    to the stream meter and to `control/stream.jsonl`;
 //! 6. stop the tools server and the proxy, capture `control/lane.patch` and
-//!    write `control/run.json`.
+//!    write `control/run.json`;
+//! 7. prove the lane: seal a capsule from the builder's last recorded
+//!    `run_check` results, replay it in the verifier, run the gates and write
+//!    `control/verdict.json`. The exit code is the verdict (0 proved, 2
+//!    refuted, 3 incomplete, 4 infrastructure).
 //!
 //! Every child process started here gets an explicit environment
 //! (`env_clear`), so the director's `ANTHROPIC_API_KEY` is never inherited:
@@ -21,6 +25,12 @@
 
 use anyhow::{Context, Result, anyhow, bail};
 use cowproof_core::parse_header;
+use cowproof_prove::{
+    capsule::{Capsule, CheckResult, EnvironmentFingerprint},
+    gates::{GatePacket, run_gates},
+    runner::SandboxedRunner,
+    verify::{VerifyOptions, verify},
+};
 use cowproof_run::{
     LaneLayout, NetworkMode, SandboxPolicy,
     claude::{ClaudeSpec, claude_command},
@@ -33,7 +43,7 @@ use cowproof_run::{
     tools::{self, CheckOutcome, CheckTable, RunCheck},
 };
 use serde_json::json;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io;
 use std::os::unix::fs::PermissionsExt;
@@ -441,7 +451,7 @@ pub(crate) fn lanes_root(arg: Option<&Path>, cwd: &Path, home: &Path) -> PathBuf
     }
 }
 
-pub async fn run_one(args: super::RunOneArgs) -> Result<()> {
+pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
     let started = Instant::now();
     let cwd = std::env::current_dir().context("reading the current directory")?;
 
@@ -518,6 +528,7 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<()> {
         .sock
         .canonicalize()
         .context("resolving the tools socket")?;
+    let tools_queue = queue.clone();
     let table: CheckTable = checks.iter().map(|c| c.id.clone()).collect();
     let context = Arc::new(CheckContext {
         layout: layout.clone(),
@@ -533,7 +544,9 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<()> {
     let _tools = AbortOnDrop(tokio::spawn({
         let lane_id = header.id.clone();
         async move {
-            if let Err(e) = tools::serve(tools_listener, lane_id, queue, table, run_check).await {
+            if let Err(e) =
+                tools::serve(tools_listener, lane_id, tools_queue, table, run_check).await
+            {
                 eprintln!("builder tools stopped: {e}");
             }
         }
@@ -672,7 +685,463 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<()> {
     if !status.success() {
         bail!("the builder exited with {status}");
     }
+
+    // 7. Prove the lane: replay the recorded results, run the gates, judge.
+    // The results come from the very `Queue` the tools server recorded into;
+    // a second `Queue` on the same directory would know none of them.
+    let results = queue
+        .lock()
+        .map(|q| q.check_results(&header.id))
+        .map_err(|_| {
+            "the escalation queue is unavailable, so the recorded check results are lost"
+                .to_string()
+        });
+    let total_tokens = summary.total_input_tokens
+        + summary.total_output_tokens
+        + summary.total_cache_read_tokens
+        + summary.total_cache_creation_tokens;
+    let verdict = prove_lane(
+        &ProofInput {
+            layout: &layout,
+            repo: &repo,
+            prepared: &prepared,
+            header: &header,
+            model: &args.model,
+            cost_usd: summary.total_cost_usd.unwrap_or(0.0),
+            tokens: total_tokens,
+        },
+        results,
+    )
+    .await?;
+    Ok(verdict.outcome.exit_code())
+}
+
+/// How a lane ends. The exit code of `cowproof run` is the outcome's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Outcome {
+    Proved,
+    Refuted,
+    Incomplete,
+    Infrastructure,
+}
+
+impl Outcome {
+    fn name(self) -> &'static str {
+        match self {
+            Outcome::Proved => "proved",
+            Outcome::Refuted => "refuted",
+            Outcome::Incomplete => "incomplete",
+            Outcome::Infrastructure => "infrastructure",
+        }
+    }
+
+    fn exit_code(self) -> i32 {
+        match self {
+            Outcome::Proved => 0,
+            Outcome::Refuted => 2,
+            Outcome::Incomplete => 3,
+            Outcome::Infrastructure => 4,
+        }
+    }
+}
+
+/// A check whose result in the verifier differs from the one the builder recorded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Divergence {
+    id: String,
+    recorded_passed: bool,
+    verify_exit: i32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GateFailure {
+    name: String,
+    evidence: Vec<String>,
+}
+
+/// Everything the proof found, before it is judged.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Evidence {
+    /// Declared checks the builder never ran through `run_check`.
+    unrun: Vec<String>,
+    /// Checks whose last recorded result failed.
+    failed_checks: Vec<String>,
+    diverged: Vec<Divergence>,
+    failed_gates: Vec<GateFailure>,
+    /// Anything that stopped the proof from running (F-1: never a refutation).
+    infrastructure: Vec<String>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct Verdict {
+    outcome: Outcome,
+    reasons: Vec<String>,
+}
+
+/// Judge the evidence. Infrastructure wins over everything (a proof that could
+/// not run proves and refutes nothing, F-1). A definite failure beats a
+/// missing result, and unrun checks are still listed beside it. `Proved`
+/// needs every declared check run, reproduced and passing, and no failed gate.
+fn judge(e: &Evidence) -> Verdict {
+    if !e.infrastructure.is_empty() {
+        return Verdict {
+            outcome: Outcome::Infrastructure,
+            reasons: e.infrastructure.clone(),
+        };
+    }
+    let mut reasons = Vec::new();
+    for id in &e.failed_checks {
+        reasons.push(format!("check {id:?} failed when the builder ran it"));
+    }
+    for d in &e.diverged {
+        reasons.push(format!(
+            "check {:?} diverged: the builder recorded {}, but verify got exit {}",
+            d.id,
+            if d.recorded_passed {
+                "a pass"
+            } else {
+                "a failure"
+            },
+            d.verify_exit
+        ));
+    }
+    for g in &e.failed_gates {
+        if g.evidence.is_empty() {
+            reasons.push(format!("gate {} failed", g.name));
+        } else {
+            reasons.push(format!("gate {} failed: {}", g.name, g.evidence.join("; ")));
+        }
+    }
+    let refuted = !reasons.is_empty();
+    for id in &e.unrun {
+        reasons.push(format!("check {id:?} was never run"));
+    }
+    let outcome = if refuted {
+        Outcome::Refuted
+    } else if !e.unrun.is_empty() {
+        Outcome::Incomplete
+    } else {
+        Outcome::Proved
+    };
+    Verdict { outcome, reasons }
+}
+
+/// Builder-controlled text (file names in gate evidence) reaches the
+/// director's terminal: control characters are shown as escapes, and the
+/// result is one line.
+fn one_line(text: &str) -> String {
+    text.chars()
+        .map(|c| {
+            if c.is_control() {
+                c.escape_default().to_string()
+            } else {
+                c.to_string()
+            }
+        })
+        .collect()
+}
+
+/// What the proof needs from the run.
+struct ProofInput<'a> {
+    layout: &'a LaneLayout,
+    repo: &'a Path,
+    prepared: &'a cowproof_run::lane::PreparedLane,
+    header: &'a cowproof_core::Header,
+    model: &'a str,
+    cost_usd: f64,
+    tokens: u64,
+}
+
+/// Prove the lane after the builder exits: capsule, gates, verify, verdict.
+///
+/// `results` is the builder's last `run_check` result per check id, from the
+/// queue. Only a failure to write `verdict.json` is an error; every other
+/// failure to prove is an `Infrastructure` verdict.
+async fn prove_lane(
+    input: &ProofInput<'_>,
+    results: std::result::Result<BTreeMap<String, bool>, String>,
+) -> Result<Verdict> {
+    let header = input.header;
+    let mut evidence = Evidence::default();
+    let results = results.unwrap_or_else(|e| {
+        evidence.infrastructure.push(e);
+        BTreeMap::new()
+    });
+    let mut ran: Vec<(&cowproof_core::Check, bool)> = Vec::new();
+    for check in &header.checks {
+        match results.get(&check.id) {
+            Some(&passed) => {
+                ran.push((check, passed));
+                if !passed {
+                    evidence.failed_checks.push(check.id.clone());
+                }
+            }
+            None => evidence.unrun.push(check.id.clone()),
+        }
+    }
+
+    if let Err(e) = replay_and_gate(input, &ran, &mut evidence).await {
+        evidence.infrastructure.push(format!("{e:#}"));
+    }
+    let verdict = judge(&evidence);
+
+    let control = &input.layout.control;
+    let details = json!({
+        "id": header.id,
+        "verdict": verdict.outcome.name(),
+        "exitCode": verdict.outcome.exit_code(),
+        "reasons": verdict.reasons,
+        "unrun": evidence.unrun,
+        "failedChecks": evidence.failed_checks,
+        "diverged": evidence.diverged.iter().map(|d| d.id.clone()).collect::<Vec<_>>(),
+        "failedGates": evidence.failed_gates.iter().map(|g| g.name.clone()).collect::<Vec<_>>(),
+    });
+    fs::write(
+        control.join("verdict.json"),
+        serde_json::to_vec_pretty(&details)?,
+    )
+    .context("writing verdict.json")?;
+
+    // The capsule was sealed as `finished` before verify read it; record how
+    // the lane ended (a lane that could not be proved stays `finished`).
+    if verdict.outcome != Outcome::Infrastructure {
+        let dir = control.join("capsule");
+        let sealed = Capsule::read(&dir).and_then(|mut c| {
+            c.lane_state = verdict.outcome.name().to_string();
+            c.write(&dir).map_err(|e| {
+                cowproof_prove::CapsuleError::InvalidFormat(format!("rewriting capsule.json: {e}"))
+            })
+        });
+        if let Err(e) = sealed {
+            eprintln!("warning: could not record the verdict in the capsule: {e}");
+        }
+    }
+
+    let line = if verdict.reasons.is_empty() {
+        format!("{}: {}", header.id, verdict.outcome.name())
+    } else {
+        format!(
+            "{}: {}: {}",
+            header.id,
+            verdict.outcome.name(),
+            one_line(&verdict.reasons.join("; "))
+        )
+    };
+    println!("{line}");
+    Ok(verdict)
+}
+
+/// Remove `path` whatever it is, without following a symlink.
+fn remove_path(path: &Path) -> io::Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(m) if m.is_dir() => fs::remove_dir_all(path),
+        Ok(_) => fs::remove_file(path),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+/// Gates, capsule, verify. Gate and verify findings go into `evidence`;
+/// an `Err` means the proof itself could not be built.
+async fn replay_and_gate(
+    input: &ProofInput<'_>,
+    ran: &[(&cowproof_core::Check, bool)],
+    evidence: &mut Evidence,
+) -> Result<()> {
+    let (layout, header) = (input.layout, input.header);
+    let capsule_dir = layout.control.join("capsule");
+    fs::create_dir_all(&capsule_dir).context("creating the capsule directory")?;
+    let lane_patch = fs::read(layout.control.join("lane.patch")).context("reading lane.patch")?;
+
+    // Gates load their configuration from the base revision, not the patch.
+    let packet = GatePacket {
+        owns: header.owns.clone(),
+        append_only: header.append_only.clone(),
+        protected: vec![],
+        require_heldout: false,
+        heldout_path: None,
+    };
+    match run_gates(
+        input.repo,
+        &input.prepared.base_commit,
+        &String::from_utf8_lossy(&lane_patch),
+        &packet,
+    ) {
+        Ok(report) => {
+            fs::write(
+                capsule_dir.join("gates.json"),
+                serde_json::to_vec_pretty(&report)?,
+            )
+            .context("writing gates.json")?;
+            evidence
+                .failed_gates
+                .extend(
+                    report
+                        .gates
+                        .iter()
+                        .filter(|g| !g.passed)
+                        .map(|g| GateFailure {
+                            name: g.name.clone(),
+                            evidence: g.evidence.clone(),
+                        }),
+                );
+        }
+        Err(e) => evidence
+            .infrastructure
+            .push(format!("the gates could not run: {e:#}")),
+    }
+
+    // The capsule: only results the builder actually recorded. A check never
+    // run has no file, so the verifier never compares an invented result.
+    // The queue keeps pass or fail only, so the stored exit status is 0 or 1
+    // and replay compares pass or fail, as the design says.
+    let base = &input.prepared.base_commit;
+    let base_tree_hash = git_stdout(input.repo, &["rev-parse", &format!("{base}^{{tree}}")])
+        .await
+        .context("reading the base tree hash")?;
+    let remote_reachable = !git_stdout(
+        input.repo,
+        &["for-each-ref", "--contains", base, "refs/remotes"],
+    )
+    .await
+    .context("checking whether the base commit is on a remote")?
+    .is_empty();
+    let mut tools = HashMap::new();
+    for tool in ["git", "cargo", "rustc"] {
+        if let Some(version) = tool_version(tool).await {
+            tools.insert(tool.to_string(), version);
+        }
+    }
+    let mut capsule = Capsule::new(
+        base.clone(),
+        base_tree_hash,
+        EnvironmentFingerprint {
+            os: std::env::consts::OS.to_string(),
+            arch: std::env::consts::ARCH.to_string(),
+            tools,
+        },
+        input.model.to_string(),
+        "api-key".to_string(),
+    );
+    capsule.estimated_cost_usd = input.cost_usd;
+    capsule.estimated_tokens = input.tokens;
+    capsule.unsandboxed = false;
+    capsule.local_replay_only = !remote_reachable;
+    capsule.flaky_checks = header
+        .checks
+        .iter()
+        .filter(|c| c.flaky)
+        .map(|c| c.id.clone())
+        .collect();
+
+    if let Some(base_patch) = &input.prepared.base_patch {
+        fs::write(capsule_dir.join("base.patch"), base_patch)?;
+    }
+    fs::write(
+        capsule_dir.join("launch.patch"),
+        &input.prepared.launch_patch,
+    )?;
+    fs::write(capsule_dir.join("lane.patch"), &lane_patch)?;
+    let escalations = layout.control.join("escalations.jsonl");
+    if escalations.is_file() {
+        fs::copy(&escalations, capsule_dir.join("escalations.jsonl"))
+            .context("copying escalations.jsonl")?;
+    }
+    let checks_dir = capsule_dir.join("checks");
+    fs::create_dir_all(&checks_dir)?;
+    for (check, passed) in ran {
+        let recorded = CheckResult {
+            command: check.command.clone(),
+            exit_status: if *passed { 0 } else { 1 },
+            // The queue keeps no run count, duration or output (backlog).
+            attempts: 1,
+            duration_ms: 0,
+            output_sha256: String::new(),
+        };
+        fs::write(
+            checks_dir.join(format!("{}.json", check.id)),
+            serde_json::to_vec_pretty(&recorded)?,
+        )?;
+    }
+    capsule.write(&capsule_dir).context("writing the capsule")?;
+
+    // Verify in a fresh directory of its own. The verifier policy grants the
+    // layout's scratch read and write, so the layout it gets names only this
+    // directory: whatever the builder left in the lane's scratch is hidden.
+    // The builder has exited, but it owned `scratch/`, so anything it left at
+    // `scratch/verify` is removed first.
+    let verify_dir = layout.scratch.join("verify");
+    remove_path(&verify_dir).context("clearing the verify directory")?;
+    let cache = verify_dir.join("cache");
+    fs::create_dir_all(cache.join(".cargo")).context("creating the verify directory")?;
+    let mut verify_layout = layout.clone();
+    verify_layout.scratch = verify_dir.clone();
+    let runner = SandboxedRunner::new(verify_layout, cache, platform().to_string());
+    // The builder's class slot (D12) is not held in this flow, so the
+    // verifier takes the lane's class slot without waiting on itself.
+    let options = VerifyOptions {
+        slot_class: header.class_name.clone(),
+        ..VerifyOptions::default()
+    };
+    match verify(&capsule_dir, input.repo, &verify_dir, &runner, options).await {
+        Ok(report) => {
+            for (check, passed) in ran {
+                match report.checks.iter().find(|m| m.check_id == check.id) {
+                    None => evidence
+                        .infrastructure
+                        .push(format!("verify did not run check {:?}", check.id)),
+                    Some(m) if !m.matched_capsule => evidence.diverged.push(Divergence {
+                        id: check.id.clone(),
+                        recorded_passed: *passed,
+                        verify_exit: m.actual_exit_status,
+                    }),
+                    Some(_) => {}
+                }
+            }
+        }
+        Err(e) => evidence
+            .infrastructure
+            .push(format!("verify could not run: {e}")),
+    }
     Ok(())
+}
+
+/// Trimmed stdout of a git command in the director's own repository.
+async fn git_stdout(repo: &Path, args: &[&str]) -> Result<String> {
+    let output = Command::new("git")
+        .args(["-c", "core.hooksPath=/dev/null", "-C"])
+        .arg(repo)
+        .args(args)
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .context("running git")?;
+    if !output.status.success() {
+        bail!(
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// First line of `<tool> --version`, when the tool runs.
+async fn tool_version(tool: &str) -> Option<String> {
+    let out = Command::new(tool)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .next()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
 }
 
 #[cfg(test)]
@@ -843,5 +1312,79 @@ body"#;
             .await
             .expect("the proxy accepts connections on its socket");
         unix.task.abort();
+    }
+
+    fn reasons_of(e: &Evidence) -> (Outcome, Vec<String>) {
+        let v = judge(e);
+        (v.outcome, v.reasons)
+    }
+
+    #[test]
+    fn judge_proves_only_when_nothing_is_wrong() {
+        assert_eq!(reasons_of(&Evidence::default()), (Outcome::Proved, vec![]));
+        assert_eq!(Outcome::Proved.exit_code(), 0);
+    }
+
+    #[test]
+    fn judge_an_unrun_check_is_incomplete_and_named() {
+        let e = Evidence {
+            unrun: vec!["lint".into(), "unit".into()],
+            ..Evidence::default()
+        };
+        let (outcome, reasons) = reasons_of(&e);
+        assert_eq!(outcome, Outcome::Incomplete);
+        assert_eq!(outcome.exit_code(), 3);
+        assert_eq!(reasons.len(), 2, "{reasons:?}");
+        assert!(reasons[0].contains("\"lint\"") && reasons[1].contains("\"unit\""));
+    }
+
+    #[test]
+    fn judge_every_refuting_reason_is_named_and_unrun_checks_stay_listed() {
+        let e = Evidence {
+            unrun: vec!["late".into()],
+            failed_checks: vec!["unit".into()],
+            diverged: vec![Divergence {
+                id: "marker".into(),
+                recorded_passed: true,
+                verify_exit: 1,
+            }],
+            failed_gates: vec![GateFailure {
+                name: "ownership".into(),
+                evidence: vec!["Files outside owns globs: x.txt".into()],
+            }],
+            infrastructure: vec![],
+        };
+        let (outcome, reasons) = reasons_of(&e);
+        assert_eq!(outcome, Outcome::Refuted);
+        assert_eq!(outcome.exit_code(), 2);
+        assert_eq!(reasons.len(), 4, "{reasons:?}");
+        assert!(reasons[0].contains("\"unit\" failed"));
+        assert!(reasons[1].contains("\"marker\" diverged") && reasons[1].contains("exit 1"));
+        assert!(reasons[2].contains("gate ownership failed") && reasons[2].contains("x.txt"));
+        assert!(reasons[3].contains("\"late\" was never run"));
+    }
+
+    #[test]
+    fn judge_infrastructure_is_never_a_refutation() {
+        let e = Evidence {
+            failed_checks: vec!["unit".into()],
+            failed_gates: vec![GateFailure {
+                name: "ownership".into(),
+                evidence: vec![],
+            }],
+            infrastructure: vec!["verify could not run: sandbox".into()],
+            ..Evidence::default()
+        };
+        let (outcome, reasons) = reasons_of(&e);
+        assert_eq!(outcome, Outcome::Infrastructure);
+        assert_eq!(outcome.exit_code(), 4);
+        assert_eq!(reasons, vec!["verify could not run: sandbox".to_string()]);
+    }
+
+    #[test]
+    fn one_line_escapes_control_characters_from_builder_text() {
+        let shown = one_line("a\nb\x1b[31mred\r");
+        assert_eq!(shown, "a\\nb\\u{1b}[31mred\\r");
+        assert!(!shown.chars().any(char::is_control));
     }
 }

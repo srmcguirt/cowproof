@@ -11,6 +11,7 @@
 //! `/var/tmp` (not `/tmp`, which bwrap hides, and not the home, which both
 //! sandboxes hide), and the lanes root sits beside, not around, the fake.
 
+use cowproof_prove::Capsule;
 use cowproof_run::prefix::PREAMBLE;
 use serde_json::{Value, json};
 use std::fs;
@@ -131,6 +132,19 @@ impl Harness {
     /// the cowproof binary outside the home, and a fake `claude` whose body is
     /// `fake_body` (after the common recording prologue).
     fn new(fake_body: &str) -> Self {
+        Self::with_packet(
+            fake_body,
+            json!(["README.md"]),
+            json!([
+                {"id": "ok", "command": "echo check-ran"},
+                {"id": "denied", "command": "cat ../control/builder.stderr"},
+                {"id": "slow", "command": "echo start >> ../scratch/trace; sleep 1; echo end >> ../scratch/trace"},
+            ]),
+        )
+    }
+
+    /// Like `new`, with the packet's `owns` and `checks` chosen by the test.
+    fn with_packet(fake_body: &str, owns: Value, checks: Value) -> Self {
         let work = var_tmp("cp-run-work-");
         let lanes = var_tmp("cp-run-lanes-");
         let repo = work.path().join("repo");
@@ -149,13 +163,9 @@ impl Harness {
             "# Task\n\n<!-- lane {} -->\n\nChange the README.\n",
             json!({
                 "id": "t-run",
-                "owns": ["README.md"],
+                "owns": owns,
                 "class": "light",
-                "checks": [
-                    {"id": "ok", "command": "echo check-ran"},
-                    {"id": "denied", "command": "cat ../control/builder.stderr"},
-                    {"id": "slow", "command": "echo start >> ../scratch/trace; sleep 1; echo end >> ../scratch/trace"},
-                ],
+                "checks": checks,
             })
         );
         let packet = work.path().join("packet.md");
@@ -221,19 +231,44 @@ exit 0
         c
     }
 
-    /// Run the whole flow with the real key set, expecting success.
-    fn run_ok(&self) -> Output {
-        let out = output(
+    /// Run the whole flow with the real key set and return what it did.
+    fn run(&self) -> Output {
+        output(
             self.command(self.lanes.path())
                 .env("ANTHROPIC_API_KEY", REAL_KEY)
                 .env("DIRECTOR_ONLY_SECRET", DIRECTOR_CANARY),
-        );
-        assert!(
-            out.status.success(),
-            "cowproof run failed:\n{}",
+        )
+    }
+
+    /// Run the whole flow and require this exit code (the verdict's).
+    fn run_expecting(&self, code: i32) -> Output {
+        let out = self.run();
+        assert_eq!(
+            out.status.code(),
+            Some(code),
+            "cowproof run:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&out.stdout),
             String::from_utf8_lossy(&out.stderr)
         );
         out
+    }
+
+    /// Run the flow to a verdict, whatever it is: for tests about the builder
+    /// side, which do not care how the lane was judged. Exit 1 (the run itself
+    /// failed) or 4 (infrastructure) is still a failure here.
+    fn run_ok(&self) -> Output {
+        let out = self.run();
+        assert!(
+            matches!(out.status.code(), Some(0 | 2 | 3)),
+            "cowproof run did not reach a verdict:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        out
+    }
+
+    fn verdict(&self) -> Value {
+        serde_json::from_str(&self.read("control/verdict.json")).unwrap()
     }
 
     fn lane(&self) -> PathBuf {
@@ -310,13 +345,24 @@ fn run_json_records_exit_status_turns_and_the_session_id() {
         run["lane"]["dir"].as_str().unwrap(),
         h.lane().to_str().unwrap()
     );
-    // One summary line on stdout, nothing else.
+    // The summary line, then the verdict line, nothing else. The default
+    // packet owns only README.md (the fake also creates created.txt) and the
+    // fake runs none of the three declared checks.
     let stdout = String::from_utf8(out.stdout).unwrap();
-    assert_eq!(stdout.lines().count(), 1, "{stdout:?}");
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines.len(), 2, "{stdout:?}");
     assert!(
-        stdout.starts_with("t-run: finished, exit 0, 2 turns"),
+        lines[0].starts_with("t-run: finished, exit 0, 2 turns"),
         "{stdout}"
     );
+    assert!(lines[1].starts_with("t-run: refuted: "), "{stdout}");
+    assert!(lines[1].contains("gate ownership failed"), "{stdout}");
+    for id in ["ok", "denied", "slow"] {
+        assert!(
+            lines[1].contains(&format!("check \"{id}\" was never run")),
+            "{stdout}"
+        );
+    }
 }
 
 #[test]
@@ -593,6 +639,296 @@ fn a_lint_error_stops_the_run_before_any_lane_exists() {
     assert!(!stderr.contains(REAL_KEY));
 }
 
+// ---- Proof: the verdict after the builder exits ----------------------------
+//
+// Each test runs the whole flow with the fake `claude`, which drives
+// `cowproof lane-tools` over the lane's socket (MCP `run_check`), and asserts
+// the verdict file, the named reason and the exit code. The fake always edits
+// README.md and creates created.txt before its own body.
+
+/// Shell for a fake that calls `run_check` once for each id, in order, saving
+/// the frames to `$rec/mcp.out` (frame ids start at 3).
+fn run_checks(ids: &[&str]) -> String {
+    let calls: Vec<(u64, &str, Value)> = ids
+        .iter()
+        .enumerate()
+        .map(|(i, id)| (3 + i as u64, "run_check", json!({ "id": id })))
+        .collect();
+    mcp_session("mcp.out", &calls)
+}
+
+fn passed(h: &Harness, id: u64) -> bool {
+    let out = frames(&h.read("home/fake/mcp.out"));
+    frame(&out, id)["result"]["structuredContent"]["passed"] == true
+}
+
+fn git_out(repo: &Path, args: &[&str]) -> String {
+    let out = output(
+        Command::new("git")
+            .args(["-C", repo.to_str().unwrap()])
+            .args(args),
+    );
+    assert!(out.status.success(), "git {args:?}");
+    String::from_utf8(out.stdout).unwrap().trim().to_string()
+}
+
+fn reasons(verdict: &Value) -> Vec<String> {
+    verdict["reasons"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r.as_str().unwrap().to_string())
+        .collect()
+}
+
+/// A packet that owns what the fake touches, with two checks that read it.
+fn owned_packet(fake_body: &str) -> Harness {
+    Harness::with_packet(
+        fake_body,
+        json!(["README.md", "created.txt"]),
+        json!([
+            {"id": "edit", "command": "grep -q edited README.md"},
+            {"id": "made", "command": "test -f created.txt"},
+        ]),
+    )
+}
+
+#[test]
+fn every_check_run_and_reproduced_with_owned_edits_is_proved_and_sealed_in_a_capsule() {
+    if !sandbox_available() {
+        return;
+    }
+    let h = owned_packet(&run_checks(&["edit", "made"]));
+    let out = h.run_expecting(0);
+    assert!(
+        passed(&h, 3) && passed(&h, 4),
+        "both checks pass in the lane"
+    );
+
+    let verdict = h.verdict();
+    assert_eq!(verdict["verdict"], "proved", "{verdict}");
+    assert_eq!(verdict["exitCode"], 0);
+    assert!(reasons(&verdict).is_empty(), "{verdict}");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert_eq!(stdout.lines().last().unwrap(), "t-run: proved", "{stdout}");
+
+    // The capsule reads back with every recorded hash verified, and holds what
+    // the lane was, not just that a file exists.
+    let dir = h.lane().join("control/capsule");
+    let capsule = Capsule::read(&dir).expect("the capsule reads back");
+    assert_eq!(
+        capsule.base_commit,
+        git_out(&h.repo, &["rev-parse", "HEAD"])
+    );
+    assert_eq!(
+        capsule.base_tree_hash,
+        git_out(&h.repo, &["rev-parse", "HEAD^{tree}"])
+    );
+    assert_eq!(capsule.builder_model, "haiku");
+    assert!(!capsule.unsandboxed);
+    assert!(
+        capsule.local_replay_only,
+        "the test repository has no remote"
+    );
+    assert_eq!(capsule.lane_state, "proved");
+    assert_eq!(capsule.environment.os, std::env::consts::OS);
+    for file in [
+        "lane.patch",
+        "launch.patch",
+        "gates.json",
+        "checks/edit.json",
+        "checks/made.json",
+    ] {
+        assert!(capsule.file_hashes.contains_key(file), "{file} not hashed");
+    }
+    assert_eq!(
+        fs::read(dir.join("lane.patch")).unwrap(),
+        fs::read(h.lane().join("control/lane.patch")).unwrap()
+    );
+    let edit: Value = serde_json::from_str(&h.read("control/capsule/checks/edit.json")).unwrap();
+    assert_eq!(edit["command"], "grep -q edited README.md");
+    assert_eq!(edit["exit_status"], 0);
+    // The launch patch holds the runner's own removal of `.env`.
+    assert!(h.read("control/capsule/launch.patch").contains(".env"));
+
+    // Verify really rebuilt the tree: the patch is applied (created.txt) and so
+    // is the launch baseline (`.env` is gone, though the base commit has it).
+    let tree = h.lane().join("scratch/verify/tree");
+    assert_eq!(
+        fs::read_to_string(tree.join("created.txt")).unwrap(),
+        "created\n"
+    );
+    assert!(!tree.join(".env").exists());
+
+    // The capsule is tamper evident.
+    fs::write(dir.join("lane.patch"), "tampered").unwrap();
+    assert!(Capsule::read(&dir).is_err());
+}
+
+#[test]
+fn a_declared_check_the_builder_never_ran_is_incomplete_and_named() {
+    if !sandbox_available() {
+        return;
+    }
+    let h = owned_packet(&run_checks(&["edit"]));
+    let out = h.run_expecting(3);
+
+    let verdict = h.verdict();
+    assert_eq!(verdict["verdict"], "incomplete", "{verdict}");
+    assert_eq!(verdict["exitCode"], 3);
+    assert_eq!(verdict["unrun"], json!(["made"]));
+    let reasons = reasons(&verdict);
+    assert_eq!(reasons.len(), 1, "{reasons:?}");
+    assert!(reasons[0].contains("\"made\" was never run"), "{reasons:?}");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        stdout
+            .lines()
+            .last()
+            .unwrap()
+            .starts_with("t-run: incomplete: ")
+            && stdout.contains("\"made\""),
+        "{stdout}"
+    );
+    // Only what the builder recorded is sealed: no invented result for `made`.
+    assert!(h.lane().join("control/capsule/checks/edit.json").exists());
+    assert!(!h.lane().join("control/capsule/checks/made.json").exists());
+}
+
+#[test]
+fn a_check_that_fails_when_the_builder_runs_it_is_refuted_and_named() {
+    if !sandbox_available() {
+        return;
+    }
+    // `breaks` looks for text the fake's edit never writes, so it fails in the
+    // lane and fails again in verify: a reproduced failure, one reason.
+    let h = Harness::with_packet(
+        &run_checks(&["edit", "breaks"]),
+        json!(["README.md", "created.txt"]),
+        json!([
+            {"id": "edit", "command": "grep -q edited README.md"},
+            {"id": "breaks", "command": "grep -q no-such-text README.md"},
+        ]),
+    );
+    let out = h.run_expecting(2);
+    assert!(passed(&h, 3) && !passed(&h, 4));
+
+    let verdict = h.verdict();
+    assert_eq!(verdict["verdict"], "refuted", "{verdict}");
+    assert_eq!(verdict["exitCode"], 2);
+    assert_eq!(verdict["failedChecks"], json!(["breaks"]));
+    assert_eq!(verdict["diverged"], json!([]));
+    let reasons = reasons(&verdict);
+    assert_eq!(reasons.len(), 1, "{reasons:?}");
+    assert!(
+        reasons[0].contains("\"breaks\" failed when the builder ran it"),
+        "{reasons:?}"
+    );
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        stdout
+            .lines()
+            .last()
+            .unwrap()
+            .starts_with("t-run: refuted: "),
+        "{stdout}"
+    );
+    // A failing recorded result is sealed as a failure.
+    let breaks: Value =
+        serde_json::from_str(&h.read("control/capsule/checks/breaks.json")).unwrap();
+    assert_eq!(breaks["exit_status"], 1);
+}
+
+#[test]
+fn an_edit_outside_owns_is_refuted_by_the_ownership_gate() {
+    if !sandbox_available() {
+        return;
+    }
+    // The fake also creates created.txt, which this packet does not own.
+    let h = Harness::with_packet(
+        &run_checks(&["edit"]),
+        json!(["README.md"]),
+        json!([{"id": "edit", "command": "grep -q edited README.md"}]),
+    );
+    let out = h.run_expecting(2);
+    assert!(passed(&h, 3), "the check itself passes");
+
+    let verdict = h.verdict();
+    assert_eq!(verdict["verdict"], "refuted", "{verdict}");
+    assert_eq!(verdict["exitCode"], 2);
+    assert_eq!(verdict["failedGates"], json!(["ownership"]));
+    assert_eq!(verdict["failedChecks"], json!([]));
+    let reasons = reasons(&verdict);
+    assert_eq!(reasons.len(), 1, "{reasons:?}");
+    assert!(
+        reasons[0].contains("gate ownership failed") && reasons[0].contains("created.txt"),
+        "{reasons:?}"
+    );
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(stdout.contains("gate ownership failed"), "{stdout}");
+    // The gate report is sealed too, and says the same.
+    let gates: Value = serde_json::from_str(&h.read("control/capsule/gates.json")).unwrap();
+    assert_eq!(gates["any_failed"], true);
+}
+
+#[test]
+fn a_check_that_passes_in_the_lane_but_not_in_the_rebuilt_tree_is_a_divergence() {
+    if !sandbox_available() {
+        return;
+    }
+    // The builder owns the clone's `.git`, so it can exclude a file from the
+    // patch. `marker` exists in the lane (the check passes there) and is not in
+    // lane.patch, so the verifier's rebuilt tree lacks it and the check fails.
+    let body = format!(
+        "mkdir -p .git/info\necho marker >> .git/info/exclude\necho state > marker\n{}",
+        run_checks(&["edit", "marker"])
+    );
+    let h = Harness::with_packet(
+        &body,
+        json!(["README.md", "created.txt"]),
+        json!([
+            {"id": "edit", "command": "grep -q edited README.md"},
+            {"id": "marker", "command": "test -f marker"},
+        ]),
+    );
+    let out = h.run_expecting(2);
+    assert!(passed(&h, 3) && passed(&h, 4), "both pass in the lane");
+    assert!(
+        !h.read("control/lane.patch").contains("marker"),
+        "the excluded file is not in the patch"
+    );
+
+    let verdict = h.verdict();
+    assert_eq!(verdict["verdict"], "refuted", "{verdict}");
+    assert_eq!(verdict["exitCode"], 2);
+    assert_eq!(verdict["diverged"], json!(["marker"]));
+    assert_eq!(verdict["failedChecks"], json!([]));
+    assert_eq!(verdict["failedGates"], json!([]));
+    let reasons = reasons(&verdict);
+    assert_eq!(reasons.len(), 1, "{reasons:?}");
+    assert!(
+        reasons[0].contains("\"marker\" diverged")
+            && reasons[0].contains("recorded a pass")
+            && reasons[0].contains("verify got exit 1"),
+        "{reasons:?}"
+    );
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(stdout.contains("diverged"), "{stdout}");
+}
+
+#[test]
+fn run_help_documents_every_exit_code() {
+    let out = output(Command::new(env!("CARGO_BIN_EXE_cowproof")).args(["run", "--help"]));
+    assert!(out.status.success());
+    let help = String::from_utf8(out.stdout)
+        .unwrap()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    for code in ["0 proved", "2 refuted", "3 incomplete", "4 infrastructure"] {
+        assert!(help.contains(code), "no {code:?} in: {help}");
+    }
+}
 #[test]
 fn a_missing_api_key_stops_the_run_before_any_lane_exists() {
     let h = Harness::new("");

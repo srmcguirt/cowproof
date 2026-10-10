@@ -442,6 +442,7 @@ dependencies = [
  "cowproof-host",
  "cowproof-lint",
  "cowproof-plan",
+ "cowproof-prove",
  "cowproof-run",
  "portkit-core",
  "portkit-mcp",

@@ -15,7 +15,7 @@
 //!   resume-fallback (counted against the escalation limit) and starts a fresh
 //!   session with a carry-over summary built from the queue.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -1123,6 +1123,23 @@ impl Queue {
     /// State of the lane as far as the queue knows (`None` = never set).
     pub fn lane_state(&self, lane: &str) -> StdOption<LaneState> {
         self.lane_state.get(lane).copied()
+    }
+
+    /// The builder's last recorded `run_check` result for each check id the lane has
+    /// run: `true` for a pass. A check id with no entry was never run. Earlier results
+    /// are superseded, so a fail followed by a pass reads as a pass and the reverse as
+    /// a fail. The state lives in memory only: read it from the `Queue` the tools
+    /// server recorded into, never from a second `Queue` opened on the same directory.
+    pub fn check_results(&self, lane: &str) -> BTreeMap<String, bool> {
+        self.check_state
+            .get(lane)
+            .map(|checks| {
+                checks
+                    .iter()
+                    .map(|(id, state)| (id.clone(), state.last_pass))
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// What a fresh session needs: the question, what was tried, the ruling.
@@ -3153,5 +3170,43 @@ mod tests {
         // Queue file should be unchanged
         let a_notes = queue.pending_notes("a");
         assert_eq!(a_notes.len(), 1, "note should still be pending");
+    }
+
+    #[test]
+    fn check_results_returns_last_result_per_check_id() {
+        let tmpdir = tempfile::TempDir::new().unwrap();
+        let mut queue = Queue::new(tmpdir.path(), Box::new(TestClock::new())).unwrap();
+
+        // `up`: fail then pass. `down`: pass then fail. `flip`: fail, pass, fail, pass.
+        // `solo`: a single fail. A first-result or any-pass rule gets one of these wrong.
+        queue.record_check("lane1", "up", false).unwrap();
+        queue.record_check("lane1", "up", true).unwrap();
+        queue.record_check("lane1", "down", true).unwrap();
+        queue.record_check("lane1", "down", false).unwrap();
+        for passed in [false, true, false, true] {
+            queue.record_check("lane1", "flip", passed).unwrap();
+        }
+        queue.record_check("lane1", "solo", false).unwrap();
+        // Another lane's results never leak in.
+        queue.record_check("lane2", "other", true).unwrap();
+
+        let results = queue.check_results("lane1");
+        let expected: BTreeMap<String, bool> = [
+            ("up", true),
+            ("down", false),
+            ("flip", true),
+            ("solo", false),
+        ]
+        .into_iter()
+        .map(|(id, passed)| (id.to_string(), passed))
+        .collect();
+        assert_eq!(results, expected);
+        assert_eq!(
+            queue.check_results("lane2"),
+            BTreeMap::from([("other".to_string(), true)])
+        );
+        // A check never run has no entry, and neither has an unknown lane.
+        assert!(!results.contains_key("never-run"));
+        assert!(queue.check_results("unknown").is_empty());
     }
 }

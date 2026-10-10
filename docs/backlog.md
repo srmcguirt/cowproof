@@ -2,8 +2,14 @@
 
 Work the crate port (2026-10-09) deferred or exposed. Newest first.
 
-- **`cowproof run`: out of scope of the first slice (each needs its own lane).**
-  - Verify, gates and capsule after the builder exits: `run` stops at `lane.patch` and `run.json`; nothing calls `cowproof-prove` yet.
+- **`cowproof run`: slice done (D2, D19, D20, D22, D24).**
+  - Prove after the builder exits: done. The builder's last recorded `run_check` result per check seals a capsule, the verifier replays it, the gates run, and `control/verdict.json` plus the exit code (0 proved, 2 refuted, 3 incomplete, 4 infrastructure) say how the lane ended. Open in that step:
+    - The queue records pass or fail only, so the capsule's `checks/<id>.json` carries exit status 0 or 1, `attempts` 1, `duration_ms` 0 and an empty output hash; the design lists the real values. `packets/` (packet versions) and `base_remote` are not written, and `local_replay_only` is computed from remote-tracking refs only.
+    - Held-out checks are not wired: `cowproof run` passes no `heldout_path`, so the held-out gate always warns, and `require_heldout` is never set.
+    - A packet with no declared checks is `proved` by the gates alone (it warns at start); decide whether that should be `incomplete`.
+    - The verifier has no dependency cache yet (D6, D11, D14): its cargo home is an empty directory, so a check that needs crates fails offline.
+    - `launch.patch` carries the content of the `.env*` files the runner removed (D13 replays them exactly), so a shared capsule would carry those secrets. Needs a ruling before capsules leave the machine.
+    - A `run_check` still running in a detached tool task when the builder dies records its result after the proof has read the queue; the check then counts as not run (incomplete), never as a pass.
   - The escalation resume loop (end-and-resume, resume-fallback, D9): a blocking `ask` is queued, but the session is not ended and resumed. The resume must rewrite `settings.json`, `mcp.json` and `system-prompt.md` before every launch, because the lane home is writable by the builder.
   - `Stop` and `Reassign` verdicts (existing entry below): `cowproof run` never reads a verdict.
   - Subscription auth: API-key builders only.
