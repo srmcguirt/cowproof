@@ -883,7 +883,7 @@ fn live_executable_grant_runs_symlink_denies_sibling() {
 echo "SECRET:$(cat '{secret}' 2>&1)"
 
 # Try to list the directory (should fail)
-for e in $(ls '{share_dir}' 2>&1); do echo "LISTED:$e"; done
+ls '{share_dir}' 2>/dev/null | while read -r e; do echo "LISTED:$e"; done
 
 echo END
 "#,
@@ -926,10 +926,21 @@ echo END
         !out.contains("LISTED:secret"),
         "sibling file was listed\n{why}"
     );
-    assert!(
-        !out.contains("LISTED:tool"),
-        "directory contents were listed\n{why}"
-    );
+    // macOS denies the listing outright. bwrap instead builds the granted file's
+    // parent directories inside the hidden home's tmpfs, so a listing there can
+    // show the granted file itself, and must show nothing else.
+    let listed: Vec<&str> = out
+        .lines()
+        .filter_map(|l| l.strip_prefix("LISTED:"))
+        .collect();
+    if cfg!(target_os = "macos") {
+        assert!(listed.is_empty(), "directory contents were listed\n{why}");
+    } else {
+        assert!(
+            listed.iter().all(|e| *e == "tool"),
+            "the listing showed more than the granted file\n{why}"
+        );
+    }
 }
 
 #[test]
