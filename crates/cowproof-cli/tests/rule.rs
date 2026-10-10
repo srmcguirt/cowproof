@@ -64,7 +64,7 @@ async fn test_ask_then_rule() {
     let queue_clone = queue.clone();
 
     let _server = tokio::spawn(async move {
-        let _ = director::serve(listener, "test-lane".to_string(), queue_clone).await;
+        let _ = director::serve(listener, "test-lane".to_string(), queue_clone, None).await;
     });
 
     // Give the server a moment to start
@@ -122,7 +122,7 @@ async fn director_rejects_unknown_escalation() {
     let queue_clone = queue.clone();
 
     let _server = tokio::spawn(async move {
-        let _ = director::serve(listener, "test-lane".to_string(), queue_clone).await;
+        let _ = director::serve(listener, "test-lane".to_string(), queue_clone, None).await;
     });
 
     // Give the server a moment to start
@@ -166,7 +166,7 @@ async fn director_sends_notes() {
     let queue_clone = queue.clone();
 
     let _server = tokio::spawn(async move {
-        let _ = director::serve(listener, "test-lane".to_string(), queue_clone).await;
+        let _ = director::serve(listener, "test-lane".to_string(), queue_clone, None).await;
     });
 
     // Give the server a moment to start
@@ -226,7 +226,7 @@ async fn director_rejects_malformed_json() {
     let queue_clone = queue.clone();
 
     let _server = tokio::spawn(async move {
-        let _ = director::serve(listener, "test-lane".to_string(), queue_clone).await;
+        let _ = director::serve(listener, "test-lane".to_string(), queue_clone, None).await;
     });
 
     // Give the server a moment to start
@@ -266,7 +266,7 @@ async fn director_line_cap() {
     let queue_clone = queue.clone();
 
     let _server = tokio::spawn(async move {
-        let _ = director::serve(listener, "test-lane".to_string(), queue_clone).await;
+        let _ = director::serve(listener, "test-lane".to_string(), queue_clone, None).await;
     });
 
     // Give the server a moment to start
@@ -327,7 +327,7 @@ async fn cli_rule_with_answer() {
     let queue_clone = queue.clone();
 
     let _server = tokio::spawn(async move {
-        let _ = director::serve(listener, lane_id.to_string(), queue_clone).await;
+        let _ = director::serve(listener, lane_id.to_string(), queue_clone, None).await;
     });
 
     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -396,7 +396,7 @@ async fn cli_rule_duplicate_rejected() {
     let queue_clone = queue.clone();
 
     let _server = tokio::spawn(async move {
-        let _ = director::serve(listener, lane_id.to_string(), queue_clone).await;
+        let _ = director::serve(listener, lane_id.to_string(), queue_clone, None).await;
     });
 
     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -453,7 +453,7 @@ async fn cli_note_works() {
     let queue_clone = queue.clone();
 
     let _server = tokio::spawn(async move {
-        let _ = director::serve(listener, lane_id.to_string(), queue_clone).await;
+        let _ = director::serve(listener, lane_id.to_string(), queue_clone, None).await;
     });
 
     tokio::time::sleep(Duration::from_millis(50)).await;

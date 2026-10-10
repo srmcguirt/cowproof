@@ -11,13 +11,19 @@
 //!    builder starts (the Linux policy binds a socket only when the file
 //!    exists, so a late bind would leave the builder without it, silently);
 //! 5. launch the builder inside `SandboxPolicy::builder`, feeding its stdout
-//!    to the stream meter and to `control/stream.jsonl`;
+//!    to the stream meter and to `control/stream.jsonl`. A builder that exits
+//!    with a parked BLOCKING escalation is waited for and relaunched when the
+//!    director rules (the resume loop, [`Drive`], D9): `answer` resumes the
+//!    session, `redirect` and `reassign` start a fresh one, `stop` ends the
+//!    lane. Each launch is one segment in `run.json`;
 //! 6. stop the tools server and the proxy, capture `control/lane.patch` and
 //!    write `control/run.json`;
 //! 7. prove the lane: seal a capsule from the builder's last recorded
 //!    `run_check` results, replay it in the verifier, run the gates and write
 //!    `control/verdict.json`. The exit code is the verdict (0 proved, 2
-//!    refuted, 3 incomplete, 4 infrastructure).
+//!    refuted, 3 incomplete, 4 infrastructure). A lane the director stopped,
+//!    or one that hit the escalation limit, keeps its work and is not proved:
+//!    `run.json` says how it ended and the exit code is 1.
 //!
 //! Every child process started here gets an explicit environment
 //! (`env_clear`), so the director's `ANTHROPIC_API_KEY` is never inherited:
@@ -34,13 +40,16 @@ use cowproof_prove::{
 use cowproof_run::{
     LaneLayout, NetworkMode, SandboxPolicy,
     claude::{ClaudeSpec, claude_command},
-    director,
-    escalate::{Queue, SystemClock},
+    director::{self, VerdictEvent},
+    escalate::{
+        Ask, Delivery, DeliveryError, DeliveryOutcome, DeliveryResult, EscalationId, LaneState,
+        Queue, SystemClock, Verdict as EscalationVerdict,
+    },
     lane::{PrepareOptions, prepare_lane},
     prefix::assemble_prompt,
     proxy::{ProxyConfig, ProxyServer},
     render_macos_profile, sandbox_command,
-    stream::StreamMeter,
+    stream::{MeterSummary, StreamMeter},
     tools::{self, CheckOutcome, CheckTable, RunCheck},
 };
 use serde_json::json;
@@ -50,13 +59,13 @@ use std::io;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
+use std::process::{ExitStatus, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 use tokio::process::Command;
-use tokio::sync::Semaphore;
+use tokio::sync::{Semaphore, mpsc::UnboundedReceiver};
 use tokio::task::JoinHandle;
 
 /// The provider the proxy forwards to.
@@ -172,6 +181,694 @@ impl Drop for AbortOnDrop {
     fn drop(&mut self) {
         self.0.abort();
     }
+}
+
+/// The model ladder a `reassign` without a named model climbs (design: next
+/// model on the ladder).
+const MODEL_LADDER: [&str; 3] = ["haiku", "sonnet", "opus"];
+
+/// The rung above `current`, matched by name so full ids (`claude-haiku-5-5`)
+/// work. `None` for the top rung and for a model that is not on the ladder.
+fn next_model(current: &str) -> Option<&'static str> {
+    let lower = current.to_ascii_lowercase();
+    let rung = MODEL_LADDER.iter().position(|m| lower.contains(m))?;
+    MODEL_LADDER.get(rung + 1).copied()
+}
+
+/// A model name the director named in a ruling goes into the builder's argv,
+/// so it is held to a conservative alphabet (and never starts like a flag).
+fn valid_model(model: &str) -> bool {
+    !model.is_empty()
+        && model.len() <= 64
+        && !model.starts_with('-')
+        && model
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | ':' | '[' | ']'))
+}
+
+/// The shape `claude --resume` accepts, the same rule `claude_command`
+/// enforces. A session id outside it is treated as "no session to resume".
+fn resumable(session_id: &str) -> bool {
+    (8..=64).contains(&session_id.len())
+        && session_id
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() || c == '-')
+}
+
+/// Text inside a fence longer than any run of backticks it contains, so it
+/// cannot close the fence.
+fn fenced(text: &str) -> String {
+    let longest = text
+        .split(|c| c != '`')
+        .map(str::len)
+        .max()
+        .unwrap_or_default();
+    let fence = "`".repeat((longest + 1).max(3));
+    format!("{fence}\n{text}\n{fence}")
+}
+
+/// A resumed session that fails faster than this, with nothing on stdout, is
+/// treated as a session that no longer exists.
+const RESUME_FAILS_WITHIN: Duration = Duration::from_secs(60);
+
+/// Did `claude --resume` fail because the session is gone (D9)?
+///
+/// `claude` has no stable, documented signal for this, so the test is
+/// deliberately narrow: ALL of these must hold, and any work or any doubt
+/// means "not gone":
+///
+/// - it exited with a non-zero exit CODE (a signal is a kill, not a refusal);
+/// - it wrote no stdout line at all (a resumed session that started emits at
+///   least its init event, so silence means it never got that far);
+/// - the meter saw no turn;
+/// - it all happened within [`RESUME_FAILS_WITHIN`] (a missing session fails
+///   at once; an API outage retries for longer).
+///
+/// A false positive costs one fresh session and one escalation of the lane's
+/// budget (a fallback is counted). A false negative leaves the lane `failed`
+/// for the director to look at, with the resume's stderr kept in
+/// `control/builder.stderr`.
+fn resume_session_gone(seg: &SegmentRun) -> bool {
+    seg.status.code().is_some_and(|c| c != 0)
+        && seg.stats == PumpStats::default()
+        && seg.summary.turns.is_empty()
+        && seg.elapsed < RESUME_FAILS_WITHIN
+}
+
+/// What the runner already did about a ruling, handed to the queue's own
+/// delivery path (`Queue::redeliver`) so the queue records `delivered`, or the
+/// D9 `resume-fallback` and its carry-over summary.
+///
+/// The runner cannot launch the session INSIDE `Delivery::deliver`: that is a
+/// synchronous call made with the queue locked, and the lane's own tool server
+/// needs the same lock to answer the builder it is about to start. So the
+/// runner launches (or decides not to) first, and reports the result here.
+struct Observed {
+    result: DeliveryResult,
+    /// The queue's carry-over summary, set when the queue fell back to a fresh
+    /// session. The runner launches that session.
+    summary: Option<String>,
+}
+
+impl Observed {
+    fn delivered() -> Self {
+        Observed {
+            result: DeliveryResult::Delivered,
+            summary: None,
+        }
+    }
+
+    fn session_gone() -> Self {
+        Observed {
+            result: DeliveryResult::SessionGone,
+            summary: None,
+        }
+    }
+}
+
+impl Delivery for Observed {
+    fn deliver(
+        &mut self,
+        _lane: &str,
+        _id: &EscalationId,
+        _verdict: &EscalationVerdict,
+    ) -> Result<DeliveryResult, DeliveryError> {
+        Ok(self.result)
+    }
+
+    fn deliver_fresh(
+        &mut self,
+        _lane: &str,
+        _id: &EscalationId,
+        _verdict: &EscalationVerdict,
+        summary: &str,
+    ) -> Result<(), DeliveryError> {
+        self.summary = Some(summary.to_string());
+        Ok(())
+    }
+}
+
+/// How one builder launch began.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StartKind {
+    /// A new session on the packet (the first launch, a redirect, a reassign).
+    Fresh,
+    /// `claude --resume` of the parked session with the ruling.
+    Resumed,
+    /// A new session because the parked one could not be resumed (D9).
+    Fallback,
+}
+
+impl StartKind {
+    fn name(self) -> &'static str {
+        match self {
+            StartKind::Fresh => "fresh",
+            StartKind::Resumed => "resumed",
+            StartKind::Fallback => "fallback",
+        }
+    }
+}
+
+/// One builder launch.
+struct Launch {
+    model: String,
+    /// The packet this session works from (the system prompt is assembled
+    /// from it).
+    packet: String,
+    prompt: String,
+    resume: Option<String>,
+    kind: StartKind,
+    /// The escalation whose ruling started this launch.
+    started_by: Option<EscalationId>,
+}
+
+/// What one builder launch did.
+struct SegmentRun {
+    status: ExitStatus,
+    stats: PumpStats,
+    summary: MeterSummary,
+    elapsed: Duration,
+}
+
+/// Everything a launch needs that does not change between launches.
+struct Launcher {
+    layout: LaneLayout,
+    claude_bin: PathBuf,
+    cowproof_exe: PathBuf,
+    path: String,
+    base_url: String,
+    placeholder_key: String,
+    network: NetworkMode,
+    max_turns: u32,
+    /// The builder tools socket, canonical.
+    socket: PathBuf,
+    /// Where `CLAUDE.md` is read from.
+    repo: PathBuf,
+}
+
+impl Launcher {
+    /// Launch the builder once and wait for it to exit.
+    ///
+    /// The lane home is writable by the builder, so `settings.json`,
+    /// `mcp.json` and `system-prompt.md` are rewritten before EVERY launch
+    /// (a resume must never trust what the previous session left there).
+    async fn launch(&self, index: usize, launch: &Launch) -> Result<SegmentRun> {
+        let started = Instant::now();
+        let layout = &self.layout;
+        let settings_file = layout.home.join("settings.json");
+        fs::write(
+            &settings_file,
+            serde_json::to_vec_pretty(&json!({
+                "permissions": {"allow": BUILDER_ALLOW, "deny": BUILDER_DENY}
+            }))?,
+        )?;
+        let mcp_config = layout.home.join("mcp.json");
+        fs::write(
+            &mcp_config,
+            serde_json::to_vec_pretty(&json!({
+                "mcpServers": {
+                    "cowproof-tools": {
+                        "type": "stdio",
+                        "command": self.cowproof_exe,
+                        "args": ["lane-tools", "--socket", self.socket],
+                    }
+                }
+            }))?,
+        )?;
+        let project_instructions = fs::read_to_string(self.repo.join("CLAUDE.md")).ok();
+        let assembled = assemble_prompt(project_instructions.as_deref(), &launch.packet);
+        let system_prompt = layout.home.join("system-prompt.md");
+        fs::write(&system_prompt, &assembled.system_append)?;
+
+        let mut invocation = claude_command(&ClaudeSpec {
+            lane: layout.clone(),
+            model: launch.model.clone(),
+            proxy_base_url: self.base_url.clone(),
+            placeholder_key: self.placeholder_key.clone(),
+            settings_file,
+            mcp_config,
+            append_system_prompt_file: system_prompt,
+            prompt: launch.prompt.clone(),
+            max_turns: self.max_turns,
+            resume_session_id: launch.resume.clone(),
+            cache_ttl: "1h".to_string(),
+            path: self.path.clone(),
+        })?;
+        invocation.program = self.claude_bin.to_string_lossy().into_owned();
+        let argv: Vec<String> = std::iter::once(invocation.program.clone())
+            .chain(invocation.args.iter().cloned())
+            .collect();
+        let policy = SandboxPolicy::builder_with_executables(
+            layout,
+            self.network.clone(),
+            &[self.claude_bin.clone(), self.cowproof_exe.clone()],
+        )?;
+        // The first launch starts the lane's stream and stderr files; every
+        // later one appends, so they hold the whole lane in order.
+        let first = index == 0;
+        let stderr_file = fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .append(!first)
+            .truncate(first)
+            .open(layout.control.join("builder.stderr"))?;
+        let mut child = sandboxed_command(
+            &policy,
+            &layout.control.join("builder.sb"),
+            &argv,
+            invocation.env,
+            &invocation.cwd,
+        )?
+        .stdout(Stdio::piped())
+        .stderr(Stdio::from(stderr_file))
+        .spawn()
+        .context("launching the builder in its sandbox")?;
+        let stdout = child.stdout.take().context("taking the builder's stdout")?;
+
+        let mut meter = StreamMeter::new(launch.resume.is_some());
+        let mut stream = tokio::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .append(!first)
+            .truncate(first)
+            .open(layout.control.join("stream.jsonl"))
+            .await?;
+        let pumped = pump_stream(stdout, &mut stream, &mut meter, MAX_STREAM_LINE).await;
+        let status = child.wait().await.context("waiting for the builder")?;
+        let stats = pumped.context("reading the builder's stream")?;
+        Ok(SegmentRun {
+            status,
+            stats,
+            summary: meter.summary(),
+            elapsed: started.elapsed(),
+        })
+    }
+}
+
+/// How the lane's builder launches ended.
+#[derive(Debug, PartialEq, Eq)]
+enum LaneEnd {
+    /// The builder exited with nothing parked: go on to the proof.
+    Builder,
+    /// The director ruled `stop`.
+    Stopped,
+    /// The park limit or the escalation limit ended the lane.
+    EscalationLimit,
+    /// A ruling could not be carried out; the work is kept.
+    Refused(String),
+}
+
+impl LaneEnd {
+    fn name(&self, builder_ok: bool) -> &'static str {
+        match self {
+            LaneEnd::Builder if builder_ok => "finished",
+            LaneEnd::Builder | LaneEnd::Refused(_) => "failed",
+            LaneEnd::Stopped => "stopped",
+            LaneEnd::EscalationLimit => "escalation-limit",
+        }
+    }
+}
+
+/// Everything the launches did.
+struct LaneRun {
+    /// One entry per launch, for `run.json`.
+    segments: Vec<serde_json::Value>,
+    summaries: Vec<MeterSummary>,
+    stats: PumpStats,
+    /// How the last launch exited.
+    status: ExitStatus,
+    /// The model of the last launch.
+    model: String,
+    /// The newest session id the stream reported.
+    session_id: Option<String>,
+    end: LaneEnd,
+}
+
+/// What waiting for the director found.
+enum Waited {
+    /// No blocking escalation is parked: the builder is simply done.
+    Nothing,
+    Ruling(EscalationId, EscalationVerdict),
+    /// A parked escalation passed the park limit; the queue ended the lane.
+    Expired,
+    /// No ruling can arrive any more.
+    Lost(String),
+}
+
+/// What the queue's D9 fallback decided.
+enum Fallback {
+    /// Start a fresh session with this carry-over summary.
+    Fresh(String),
+    /// The fallback would exceed the escalation limit; the lane ended.
+    Limit,
+}
+
+/// The resume loop (D9, D22, D25): runs the builder, and while it exits with
+/// a parked blocking escalation, waits for the director's ruling and carries
+/// it out.
+struct Drive<'a> {
+    launcher: &'a Launcher,
+    queue: &'a Arc<Mutex<Queue>>,
+    lane_id: &'a str,
+    cwd: &'a Path,
+    repo: &'a Path,
+    plans: &'a [cowproof_plan::Plan],
+}
+
+impl Drive<'_> {
+    fn lock(&self) -> Result<std::sync::MutexGuard<'_, Queue>> {
+        self.queue
+            .lock()
+            .map_err(|_| anyhow!("the escalation queue is unavailable"))
+    }
+
+    /// Tell the queue the ruling reached the builder (`delivered`, no fallback).
+    fn mark_delivered(&self, id: &EscalationId) -> Result<()> {
+        let outcome = self
+            .lock()?
+            .redeliver(self.lane_id, id, &mut Observed::delivered())
+            .map_err(|e| anyhow!("recording the delivery of {id}: {e}"))?;
+        if outcome != DeliveryOutcome::Delivered {
+            bail!("recording the delivery of {id} gave {outcome:?}");
+        }
+        Ok(())
+    }
+
+    /// The session cannot be resumed: let the queue run D9's fallback.
+    fn fall_back(&self, id: &EscalationId) -> Result<Fallback> {
+        let mut observed = Observed::session_gone();
+        let outcome = self
+            .lock()?
+            .redeliver(self.lane_id, id, &mut observed)
+            .map_err(|e| anyhow!("falling back for {id}: {e}"))?;
+        match (outcome, observed.summary) {
+            (DeliveryOutcome::FreshSession, Some(summary)) => Ok(Fallback::Fresh(summary)),
+            (DeliveryOutcome::EscalationLimit, _) => Ok(Fallback::Limit),
+            (outcome, _) => bail!("falling back for {id} gave {outcome:?} and no summary"),
+        }
+    }
+
+    /// Wait for a ruling on a parked blocking escalation. There is no timeout
+    /// but the queue's own park limit: when that passes, the queue ends the
+    /// lane as `escalation-limit` (a ruling would only be refused after it).
+    async fn wait_for_ruling(&self, rx: &mut UnboundedReceiver<VerdictEvent>) -> Result<Waited> {
+        loop {
+            let pending = self.lock()?.pending_blocking(self.lane_id);
+            let Some(oldest) = pending.first() else {
+                return Ok(Waited::Nothing);
+            };
+            if let Some((id, verdict)) = pending
+                .iter()
+                .find_map(|p| p.verdict.clone().map(|v| (p.id.clone(), v)))
+            {
+                return Ok(Waited::Ruling(id, verdict));
+            }
+            let left = pending
+                .iter()
+                .map(|p| p.time_left)
+                .min()
+                .unwrap_or_default();
+            eprintln!(
+                "[{}] parked on {}: waiting for the director (`cowproof rule`)",
+                self.lane_id, oldest.id
+            );
+            // The channel only wakes this loop; the queue is the truth.
+            match tokio::time::timeout(left + Duration::from_millis(10), rx.recv()).await {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    return Ok(Waited::Lost(format!(
+                        "the director control socket stopped, so no ruling can arrive for {}",
+                        oldest.id
+                    )));
+                }
+                Err(_) => {
+                    let expired = self
+                        .lock()?
+                        .expire_parked(self.lane_id)
+                        .map_err(|e| anyhow!("ending the parked lane: {e}"))?;
+                    if expired.is_some() {
+                        return Ok(Waited::Expired);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Read and lint a redirect packet. Anything wrong refuses the redirect.
+    fn load_redirect(&self, packet_path: &str) -> Result<String, String> {
+        const MAX_PACKET: u64 = 1024 * 1024;
+        let path = self.cwd.join(packet_path);
+        let meta = fs::metadata(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+        if !meta.is_file() || meta.len() > MAX_PACKET {
+            return Err(format!(
+                "{} is not a regular file under 1 MiB",
+                path.display()
+            ));
+        }
+        let text = fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let header = parse_header(&text).map_err(|e| format!("{}: {e:#}", path.display()))?;
+        if header.id != self.lane_id {
+            return Err(format!(
+                "the packet's id is {:?}, not this lane's {:?}",
+                header.id, self.lane_id
+            ));
+        }
+        let errors: Vec<String> = cowproof_lint::lint_packet(&text, self.repo, self.plans)
+            .iter()
+            .filter(|f| f.severity == cowproof_lint::Severity::Error)
+            .map(|f| one_line(&f.to_string()))
+            .collect();
+        if errors.is_empty() {
+            Ok(text)
+        } else {
+            Err(format!("lint errors: {}", errors.join("; ")))
+        }
+    }
+
+    fn segment_record(index: usize, launch: &Launch, seg: &SegmentRun) -> serde_json::Value {
+        json!({
+            "index": index,
+            "model": launch.model,
+            "start": launch.kind.name(),
+            "resumedSession": launch.resume,
+            "startedBy": launch.started_by.as_ref().map(|id| id.0.clone()),
+            "sessionId": seg.summary.session_id,
+            "status": if seg.status.success() { "finished" } else { "failed" },
+            "exitCode": seg.status.code(),
+            "signal": seg.status.signal(),
+            "turns": seg.summary.turns.len(),
+            "durationMs": seg.elapsed.as_millis() as u64,
+            "endedBy": serde_json::Value::Null,
+        })
+    }
+
+    /// Run the builder, and keep running it for as long as rulings say so.
+    async fn run(
+        &self,
+        rx: &mut UnboundedReceiver<VerdictEvent>,
+        first_model: &str,
+        first_packet: &str,
+    ) -> Result<LaneRun> {
+        let mut model = first_model.to_string();
+        let mut packet = first_packet.to_string();
+        let mut launch = Launch {
+            model: model.clone(),
+            packet: packet.clone(),
+            prompt: packet.clone(),
+            resume: None,
+            kind: StartKind::Fresh,
+            started_by: None,
+        };
+        // The ruling a resumed launch is delivering: told to the queue once
+        // we know whether the session was there.
+        let mut resuming: Option<EscalationId> = None;
+        let mut session_id: Option<String> = None;
+        let mut segments = Vec::new();
+        let mut summaries = Vec::new();
+        let mut stats = PumpStats::default();
+
+        let (end, status) = loop {
+            let seg = self.launcher.launch(segments.len(), &launch).await?;
+            stats.add(&seg.stats);
+            if let Some(id) = &seg.summary.session_id {
+                session_id = Some(id.clone());
+            }
+            let status = seg.status;
+            let mut record = Self::segment_record(segments.len(), &launch, &seg);
+
+            if let Some(id) = resuming.take() {
+                if resume_session_gone(&seg) {
+                    record["resumeFailed"] = json!("session-gone");
+                    segments.push(record);
+                    summaries.push(seg.summary);
+                    launch = match self.fall_back(&id)? {
+                        Fallback::Fresh(summary) => Launch {
+                            model: model.clone(),
+                            packet: packet.clone(),
+                            prompt: format!("{packet}\n\n{summary}"),
+                            resume: None,
+                            kind: StartKind::Fallback,
+                            started_by: Some(id),
+                        },
+                        Fallback::Limit => break (LaneEnd::EscalationLimit, status),
+                    };
+                    continue;
+                }
+                self.mark_delivered(&id)?;
+            }
+
+            let parked = self.lock()?.pending_blocking(self.lane_id);
+            if let Some(first) = parked.first() {
+                record["endedBy"] = json!(first.id.0);
+            }
+            segments.push(record);
+            summaries.push(seg.summary);
+
+            if self.lock()?.lane_state(self.lane_id) == Some(LaneState::EscalationLimit) {
+                break (LaneEnd::EscalationLimit, status);
+            }
+            let (id, verdict) = match self.wait_for_ruling(rx).await? {
+                Waited::Nothing => break (LaneEnd::Builder, status),
+                Waited::Expired => break (LaneEnd::EscalationLimit, status),
+                Waited::Lost(why) => break (LaneEnd::Refused(why), status),
+                Waited::Ruling(id, verdict) => (id, verdict),
+            };
+            eprintln!("[{}] ruling on {id}: {verdict:?}", self.lane_id);
+
+            match verdict {
+                EscalationVerdict::Stop => {
+                    self.lock()?
+                        .set_lane_state(self.lane_id, LaneState::Stopped);
+                    self.mark_delivered(&id)?;
+                    break (LaneEnd::Stopped, status);
+                }
+                EscalationVerdict::Answer { text } => {
+                    let prompt = format!("Director ruling on {id}:\n{}", fenced(&text));
+                    match session_id.clone().filter(|s| resumable(s)) {
+                        Some(session) => {
+                            launch = Launch {
+                                model: model.clone(),
+                                packet: packet.clone(),
+                                prompt,
+                                resume: Some(session),
+                                kind: StartKind::Resumed,
+                                started_by: Some(id.clone()),
+                            };
+                            resuming = Some(id);
+                        }
+                        // The stream never gave a session id we can resume.
+                        None => match self.fall_back(&id)? {
+                            Fallback::Fresh(summary) => {
+                                launch = Launch {
+                                    model: model.clone(),
+                                    packet: packet.clone(),
+                                    prompt: format!("{packet}\n\n{summary}"),
+                                    resume: None,
+                                    kind: StartKind::Fallback,
+                                    started_by: Some(id),
+                                };
+                            }
+                            Fallback::Limit => break (LaneEnd::EscalationLimit, status),
+                        },
+                    }
+                }
+                EscalationVerdict::Redirect { packet_path } => {
+                    match self.load_redirect(&packet_path) {
+                        Ok(text) => {
+                            self.mark_delivered(&id)?;
+                            packet = text;
+                            launch = Launch {
+                                model: model.clone(),
+                                packet: packet.clone(),
+                                prompt: packet.clone(),
+                                resume: None,
+                                kind: StartKind::Fresh,
+                                started_by: Some(id),
+                            };
+                        }
+                        Err(why) => {
+                            break (
+                                LaneEnd::Refused(format!(
+                                    "redirect for {id} refused ({why}); the ruling stays recorded and undelivered"
+                                )),
+                                status,
+                            );
+                        }
+                    }
+                }
+                EscalationVerdict::Reassign { model: named } => {
+                    let to = match named {
+                        Some(m) if valid_model(&m) => m,
+                        Some(m) => {
+                            break (
+                                LaneEnd::Refused(format!(
+                                    "reassign for {id} refused: {m:?} is not a model name"
+                                )),
+                                status,
+                            );
+                        }
+                        None => match next_model(&model) {
+                            Some(m) => m.to_string(),
+                            None => {
+                                break (
+                                    LaneEnd::Refused(format!(
+                                        "reassign for {id} refused: no model above {model:?} on the ladder; name one with --model"
+                                    )),
+                                    status,
+                                );
+                            }
+                        },
+                    };
+                    let summary = {
+                        let mut queue = self.lock()?;
+                        let summary = queue
+                            .get(&id)
+                            .map(|(ask, _, _)| reassign_summary(&id, ask, &model, &to))
+                            .ok_or_else(|| anyhow!("escalation {id} is unknown"))?;
+                        queue
+                            .reassign(self.lane_id)
+                            .map_err(|e| anyhow!("reassigning {id}: {e}"))?;
+                        summary
+                    };
+                    self.mark_delivered(&id)?;
+                    model = to;
+                    launch = Launch {
+                        model: model.clone(),
+                        packet: packet.clone(),
+                        prompt: format!("{packet}\n\n{summary}"),
+                        resume: None,
+                        kind: StartKind::Fresh,
+                        started_by: Some(id),
+                    };
+                }
+            }
+        };
+        Ok(LaneRun {
+            segments,
+            summaries,
+            stats,
+            status,
+            model: launch.model,
+            session_id,
+            end,
+        })
+    }
+}
+
+/// What a session that takes over after `reassign` is told: the question, what
+/// was tried and the ruling (the work itself is in the clone).
+fn reassign_summary(id: &EscalationId, ask: &Ask, from: &str, to: &str) -> String {
+    let mut out = format!(
+        "You are taking over this lane from a previous session on {from}; the clone already holds its work. Escalation {id} was ruled: reassign to {to}.\n\nQuestion: {}\n",
+        ask.question
+    );
+    if !ask.tried.is_empty() {
+        out.push_str("Tried:\n");
+        for tried in &ask.tried {
+            out.push_str(&format!("- {tried}\n"));
+        }
+    }
+    out
 }
 
 /// The lane directory: the parent of the clone.
@@ -325,6 +1022,14 @@ struct PumpStats {
     unparsed: u64,
     /// Lines longer than the limit, written but not metered.
     oversized: u64,
+}
+
+impl PumpStats {
+    fn add(&mut self, other: &PumpStats) {
+        self.metered += other.metered;
+        self.unparsed += other.unparsed;
+        self.oversized += other.oversized;
+    }
 }
 
 /// Copy `reader` to `sink` byte for byte and feed each complete line to the
@@ -560,86 +1265,51 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
         }
     }));
 
+    // The director's rulings wake the resume loop below (D9, D25). The queue,
+    // not the channel, is the truth: the loop re-reads it on every wake.
+    let (verdict_tx, mut verdict_rx) = tokio::sync::mpsc::unbounded_channel();
     let _director = AbortOnDrop(tokio::spawn({
         let lane_id = header.id.clone();
         let director_queue = queue.clone();
+        let verdict_tx = Some(verdict_tx);
         async move {
-            if let Err(e) = director::serve(director_listener, lane_id, director_queue).await {
+            if let Err(e) =
+                director::serve(director_listener, lane_id, director_queue, verdict_tx).await
+            {
                 eprintln!("director control socket stopped: {e}");
             }
         }
     }));
 
-    // The builder's configuration (rewritten at every launch: home is
-    // writable by the builder, so a resume must never trust these files).
-    let settings_file = layout.home.join("settings.json");
-    fs::write(
-        &settings_file,
-        serde_json::to_vec_pretty(&json!({
-            "permissions": {"allow": BUILDER_ALLOW, "deny": BUILDER_DENY}
-        }))?,
-    )?;
-    let mcp_config = layout.home.join("mcp.json");
-    fs::write(
-        &mcp_config,
-        serde_json::to_vec_pretty(&json!({
-            "mcpServers": {
-                "cowproof-tools": {
-                    "type": "stdio",
-                    "command": cowproof_exe,
-                    "args": ["lane-tools", "--socket", socket],
-                }
-            }
-        }))?,
-    )?;
-    let project_instructions = fs::read_to_string(repo.join("CLAUDE.md")).ok();
-    let assembled = assemble_prompt(project_instructions.as_deref(), &packet_text);
-    let system_prompt = layout.home.join("system-prompt.md");
-    fs::write(&system_prompt, &assembled.system_append)?;
-
-    // 5. Launch inside the builder sandbox.
-    let mut invocation = claude_command(&ClaudeSpec {
-        lane: layout.clone(),
-        model: args.model.clone(),
-        proxy_base_url: endpoint.base_url,
-        placeholder_key: endpoint.placeholder_key,
-        settings_file,
-        mcp_config,
-        append_system_prompt_file: system_prompt,
-        prompt: assembled.prompt,
-        max_turns: args.max_turns,
-        resume_session_id: None,
-        cache_ttl: "1h".to_string(),
+    // 5. Launch inside the builder sandbox, and relaunch on the director's
+    // rulings while a blocking escalation is parked.
+    let launcher = Launcher {
+        layout: layout.clone(),
+        claude_bin: claude_bin.clone(),
+        cowproof_exe: cowproof_exe.clone(),
         path: path.clone(),
-    })?;
-    invocation.program = claude_bin.to_string_lossy().into_owned();
-    let argv: Vec<String> = std::iter::once(invocation.program.clone())
-        .chain(invocation.args.iter().cloned())
-        .collect();
-    let policy = SandboxPolicy::builder_with_executables(
-        &layout,
-        endpoint.network,
-        &[claude_bin.clone(), cowproof_exe.clone()],
-    )?;
-    let stderr_file = fs::File::create(layout.control.join("builder.stderr"))?;
-    let mut child = sandboxed_command(
-        &policy,
-        &layout.control.join("builder.sb"),
-        &argv,
-        invocation.env,
-        &invocation.cwd,
-    )?
-    .stdout(Stdio::piped())
-    .stderr(Stdio::from(stderr_file))
-    .spawn()
-    .context("launching the builder in its sandbox")?;
-    let stdout = child.stdout.take().context("taking the builder's stdout")?;
-
-    let mut meter = StreamMeter::new(false);
-    let mut stream = tokio::fs::File::create(layout.control.join("stream.jsonl")).await?;
-    let pumped = pump_stream(stdout, &mut stream, &mut meter, MAX_STREAM_LINE).await;
-    let status = child.wait().await.context("waiting for the builder")?;
-    let stats = pumped.context("reading the builder's stream")?;
+        base_url: endpoint.base_url,
+        placeholder_key: endpoint.placeholder_key,
+        network: endpoint.network,
+        max_turns: args.max_turns,
+        socket,
+        repo: repo.clone(),
+    };
+    let drive = Drive {
+        launcher: &launcher,
+        queue: &queue,
+        lane_id: &header.id,
+        cwd: &cwd,
+        repo: &repo,
+        plans: &plans,
+    };
+    let lane_run = drive
+        .run(&mut verdict_rx, &args.model, &packet_text)
+        .await?;
+    let status = lane_run.status;
+    let stats = &lane_run.stats;
+    let end = &lane_run.end;
+    let status_name = end.name(status.success());
 
     // 6. The lane is over: stop serving, then capture.
     drop(_tools);
@@ -654,16 +1324,43 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
         Err(_) => None,
     };
 
-    let summary = meter.summary();
+    // The last launch's meter stands for the single-launch fields; totals add
+    // every launch up.
+    let summary = lane_run
+        .summaries
+        .last()
+        .context("the builder never ran")?
+        .clone();
+    let total_turns: usize = lane_run.summaries.iter().map(|s| s.turns.len()).sum();
+    let total_tokens: u64 = lane_run
+        .summaries
+        .iter()
+        .map(|s| {
+            s.total_input_tokens
+                + s.total_output_tokens
+                + s.total_cache_read_tokens
+                + s.total_cache_creation_tokens
+        })
+        .sum();
+    let total_cost_usd: f64 = lane_run
+        .summaries
+        .iter()
+        .filter_map(|s| s.total_cost_usd)
+        .sum();
     let run = json!({
         "id": header.id,
-        "status": if status.success() { "finished" } else { "failed" },
+        "status": status_name,
+        "error": match end {
+            LaneEnd::Refused(why) => json!(why),
+            _ => serde_json::Value::Null,
+        },
         "exitCode": status.code(),
         "signal": status.signal(),
-        "model": args.model,
-        "turns": summary.turns.len(),
-        "sessionId": summary.session_id,
+        "model": lane_run.model,
+        "turns": total_turns,
+        "sessionId": lane_run.session_id,
         "meter": summary,
+        "segments": lane_run.segments,
         "stream": {
             "metered": stats.metered,
             "unparsed": stats.unparsed,
@@ -691,15 +1388,24 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
     println!(
         "{}: {}, exit {}, {} turns, patch {} bytes, lane {}",
         header.id,
-        run["status"].as_str().unwrap_or("unknown"),
+        status_name,
         status
             .code()
             .map_or_else(|| "signal".to_string(), |c| c.to_string()),
-        run["turns"],
+        total_turns,
         patch_bytes.map_or_else(|| "none".to_string(), |n| n.to_string()),
         lane.display()
     );
     patch?;
+    match end {
+        LaneEnd::Builder => {}
+        LaneEnd::Stopped => bail!("the director stopped lane {}; its work is kept", header.id),
+        LaneEnd::EscalationLimit => bail!(
+            "lane {} ended as escalation-limit; its work is kept",
+            header.id
+        ),
+        LaneEnd::Refused(why) => bail!("{why}"),
+    }
     if !status.success() {
         bail!("the builder exited with {status}");
     }
@@ -714,18 +1420,14 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
             "the escalation queue is unavailable, so the recorded check results are lost"
                 .to_string()
         });
-    let total_tokens = summary.total_input_tokens
-        + summary.total_output_tokens
-        + summary.total_cache_read_tokens
-        + summary.total_cache_creation_tokens;
     let verdict = prove_lane(
         &ProofInput {
             layout: &layout,
             repo: &repo,
             prepared: &prepared,
             header: &header,
-            model: &args.model,
-            cost_usd: summary.total_cost_usd.unwrap_or(0.0),
+            model: &lane_run.model,
+            cost_usd: total_cost_usd,
             tokens: total_tokens,
         },
         results,
@@ -1424,5 +2126,84 @@ body"#;
         let shown = one_line("a\nb\x1b[31mred\r");
         assert_eq!(shown, "a\\nb\\u{1b}[31mred\\r");
         assert!(!shown.chars().any(char::is_control));
+    }
+
+    fn segment(status_raw: i32, lines: u64, turns: bool, elapsed_secs: u64) -> SegmentRun {
+        let mut meter = StreamMeter::new(true);
+        if turns {
+            meter
+                .feed(r#"{"type":"assistant","message":{"id":"m1","usage":{"input_tokens":1,"output_tokens":1}}}"#)
+                .unwrap();
+        }
+        SegmentRun {
+            status: ExitStatus::from_raw(status_raw),
+            stats: PumpStats {
+                metered: lines,
+                ..PumpStats::default()
+            },
+            summary: meter.summary(),
+            elapsed: Duration::from_secs(elapsed_secs),
+        }
+    }
+
+    #[test]
+    fn a_resume_is_gone_only_when_it_fails_fast_with_no_output_and_no_turn() {
+        // Exit code 1 (wait status 1 << 8), nothing printed, no turn, quick.
+        assert!(resume_session_gone(&segment(1 << 8, 0, false, 1)));
+        // Each condition alone breaks it.
+        assert!(!resume_session_gone(&segment(0, 0, false, 1)), "exit 0");
+        assert!(!resume_session_gone(&segment(9, 0, false, 1)), "SIGKILL");
+        assert!(
+            !resume_session_gone(&segment(1 << 8, 1, false, 1)),
+            "output"
+        );
+        assert!(!resume_session_gone(&segment(1 << 8, 0, true, 1)), "a turn");
+        assert!(
+            !resume_session_gone(&segment(1 << 8, 0, false, 61)),
+            "slow failures are outages, not missing sessions"
+        );
+        let unparsed = SegmentRun {
+            stats: PumpStats {
+                unparsed: 1,
+                ..PumpStats::default()
+            },
+            ..segment(1 << 8, 0, false, 1)
+        };
+        assert!(!resume_session_gone(&unparsed), "any stdout line is output");
+    }
+
+    #[test]
+    fn the_model_ladder_climbs_by_name_and_stops_at_the_top() {
+        assert_eq!(next_model("haiku"), Some("sonnet"));
+        assert_eq!(next_model("claude-haiku-5-5"), Some("sonnet"));
+        assert_eq!(next_model("sonnet"), Some("opus"));
+        assert_eq!(next_model("Opus"), None);
+        assert_eq!(next_model("gpt-6"), None, "not on the ladder");
+    }
+
+    #[test]
+    fn a_named_model_must_look_like_a_model_and_never_like_a_flag() {
+        for ok in ["opus", "claude-haiku-5-5", "opus[1m]", "a.b_c:d"] {
+            assert!(valid_model(ok), "{ok}");
+        }
+        for bad in ["", "-x", "--model", "a b", "a;b", "a\nb", &"x".repeat(65)] {
+            assert!(!valid_model(bad), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn only_session_ids_claude_accepts_are_resumable() {
+        assert!(resumable("0a1b2c3d-1111-2222-3333-444455556666"));
+        assert!(!resumable("short"));
+        assert!(!resumable("0a1b2c3d;rm -rf"));
+        assert!(!resumable(&"a".repeat(65)));
+    }
+
+    #[test]
+    fn a_fence_is_longer_than_any_run_of_backticks_in_the_text() {
+        assert_eq!(fenced("plain"), "```\nplain\n```");
+        let fenced_text = fenced("a ``` b ````` c");
+        assert!(fenced_text.starts_with("``````\n"), "{fenced_text}");
+        assert!(fenced_text.ends_with("\n``````"), "{fenced_text}");
     }
 }

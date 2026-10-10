@@ -17,8 +17,9 @@ use serde_json::{Value, json};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Child, Command, Output, Stdio};
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
 const REAL_KEY: &str = "sk-test-real-xyz";
@@ -197,11 +198,29 @@ impl Harness {
         let script = format!(
             r#"#!/bin/sh
 rec="$HOME/fake"
-mkdir "$rec"
+mkdir -p "$rec"
+n=1
+while [ -e "$rec/seg$n" ]; do n=$((n+1)); done
+seg="$rec/seg$n"
+mkdir "$seg"
 env | sort > "$rec/env.txt"
 i=0
-for a in "$@"; do printf '%s' "$a" > "$rec/arg.$i"; i=$((i+1)); done
+resume=""; model=""; prompt=""; prev=""
+for a in "$@"; do
+    printf '%s' "$a" > "$rec/arg.$i"
+    printf '%s' "$a" > "$seg/arg.$i"
+    [ "$prev" = "--resume" ] && resume="$a"
+    [ "$prev" = "--model" ] && model="$a"
+    prompt="$a"; prev="$a"; i=$((i+1))
+done
 echo "$i" > "$rec/argc"
+echo "$i" > "$seg/argc"
+printf '%s' "$resume" > "$seg/resume"
+printf '%s' "$model" > "$seg/model"
+printf '%s' "$prompt" > "$seg/prompt"
+cp "$HOME/settings.json" "$seg/settings.json"
+cp "$HOME/mcp.json" "$seg/mcp.json"
+cp "$HOME/system-prompt.md" "$seg/system-prompt.md"
 sock="$(dirname "$HOME")/sock/runner.sock"
 echo edited >> README.md
 echo created > created.txt
@@ -295,6 +314,19 @@ exit 0
 
     fn run_json(&self) -> Value {
         serde_json::from_str(&self.read("control/run.json")).unwrap()
+    }
+
+    /// What the fake recorded for its `n`th launch (1-based): `resume`,
+    /// `model`, `prompt`, `settings.json`, `mcp.json`, `system-prompt.md`.
+    fn seg(&self, n: usize, file: &str) -> String {
+        self.read(&format!("home/fake/seg{n}/{file}"))
+    }
+
+    /// How many times the fake was launched.
+    fn launches(&self) -> usize {
+        (1..)
+            .take_while(|n| self.lane().join(format!("home/fake/seg{n}")).exists())
+            .count()
     }
 
     /// The fake's recorded argv, one entry per argument.
@@ -1019,4 +1051,470 @@ fn a_missing_api_key_stops_the_run_before_any_lane_exists() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("ANTHROPIC_API_KEY is not set"), "{stderr}");
     assert!(!lanes_root.exists(), "no lanes root, so no lane dir");
+}
+
+// ---- The resume loop (D9, D22, D25) -------------------------------------
+//
+// The test plays the director: it starts `cowproof run`, waits until the
+// lane's escalation queue shows the builder's ask, then rules with the real
+// `cowproof rule`. The fake `claude` asks on its first launch only; on later
+// launches it records what it was started with and runs the checks.
+
+const PARKED_WAIT: Duration = Duration::from_secs(60);
+
+/// A `cowproof run` in flight.
+fn start(h: &Harness) -> Child {
+    let _g = fork_lock();
+    h.command(h.lanes.path())
+        .env("ANTHROPIC_API_KEY", REAL_KEY)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap()
+}
+
+/// Wait for the run to end. A run that outlives `PARKED_WAIT` is killed (by
+/// its pid, nothing else) and fails the test with what it printed.
+fn finish(mut child: Child) -> Output {
+    let deadline = Instant::now() + PARKED_WAIT;
+    loop {
+        if child.try_wait().unwrap().is_some() {
+            return child.wait_with_output().unwrap();
+        }
+        if Instant::now() > deadline {
+            child.kill().unwrap();
+            let out = child.wait_with_output().unwrap();
+            panic!(
+                "cowproof run was still going after {PARKED_WAIT:?}:\nstdout: {}\nstderr: {}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// The id of the `nth` (1-based) escalation the queue file shows as asked,
+/// waiting for it to appear.
+fn wait_for_ask(h: &Harness, child: &mut Child, nth: usize) -> String {
+    let path = h.lane().join("control/escalations.jsonl");
+    let deadline = Instant::now() + PARKED_WAIT;
+    loop {
+        let text = fs::read_to_string(&path).unwrap_or_default();
+        let asked: Vec<String> = text
+            .lines()
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .filter(|v| v["event"] == "asked")
+            .map(|v| v["id"].as_str().unwrap().to_string())
+            .collect();
+        if let Some(id) = asked.get(nth - 1) {
+            return id.clone();
+        }
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "the run ended before ask {nth}: {text}"
+        );
+        assert!(Instant::now() < deadline, "ask {nth} never appeared");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// `cowproof rule t-run <id> <verdict args>`, which must succeed.
+fn rule(h: &Harness, id: &str, verdict: &[&str]) {
+    let out = output(
+        Command::new(&h.cowproof)
+            .args(["rule", "t-run", id])
+            .args(verdict)
+            .arg("--lanes-root")
+            .arg(h.lanes.path()),
+    );
+    assert!(
+        out.status.success(),
+        "cowproof rule {verdict:?}:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// Events of one kind in the lane's queue file.
+fn queue_events(h: &Harness, event: &str) -> Vec<Value> {
+    h.read("control/escalations.jsonl")
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .filter(|v| v["event"] == event)
+        .collect()
+}
+
+fn blocking_ask(question: &str) -> Value {
+    json!({
+        "kind": "blocker",
+        "question": question,
+        "tried": ["read the packet"],
+        "options": [{"id": "a", "summary": "Option A", "cost": "low"}],
+        "recommend": "a",
+        "blocking": true,
+    })
+}
+
+/// A fake that, on its first launch only, scribbles over the files the runner
+/// wrote in its home (the home is writable) and asks a blocking `ask`; on
+/// every later launch it runs the checks, unless `later` says otherwise.
+fn asks_first(question: &str, blocking: bool, later: &str) -> String {
+    let mut ask = blocking_ask(question);
+    ask["blocking"] = json!(blocking);
+    format!(
+        "if [ \"$n\" = 1 ]; then\n\
+         echo '{{}}' > \"$HOME/settings.json\"\n\
+         echo '{{}}' > \"$HOME/mcp.json\"\n\
+         echo tampered > \"$HOME/system-prompt.md\"\n\
+         {}\
+         else\n\
+         {}\
+         fi\n",
+        mcp_session("ask.out", &[(3, "ask", ask)]),
+        later
+    )
+}
+
+/// What a fake does on a later launch: run both checks of `owned_packet`.
+fn then_checks() -> String {
+    run_checks(&["edit", "made"])
+}
+
+fn segments(h: &Harness) -> Vec<Value> {
+    h.run_json()["segments"].as_array().unwrap().clone()
+}
+
+fn stdout_of(out: &Output) -> String {
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+#[test]
+fn an_answer_resumes_the_parked_session_with_the_ruling_and_the_lane_is_proved() {
+    if !sandbox_available() {
+        return;
+    }
+    let h = owned_packet(&asks_first("Choose A or B?", true, &then_checks()));
+    let mut child = start(&h);
+    let id = wait_for_ask(&h, &mut child, 1);
+    rule(&h, &id, &["--answer", "use option B"]);
+    let out = finish(child);
+    assert_eq!(out.status.code(), Some(0), "{}", stdout_of(&out));
+    assert_eq!(stdout_of(&out).lines().last().unwrap(), "t-run: proved");
+
+    // Two launches; the second resumed the first one's session.
+    assert_eq!(h.launches(), 2);
+    let segs = segments(&h);
+    assert_eq!(segs.len(), 2, "{segs:?}");
+    assert_eq!(segs[0]["start"], "fresh");
+    assert_eq!(segs[0]["sessionId"], SESSION);
+    assert_eq!(segs[0]["endedBy"], id.as_str(), "{segs:?}");
+    assert_eq!(segs[1]["start"], "resumed");
+    assert_eq!(segs[1]["resumedSession"], SESSION);
+    assert_eq!(segs[1]["startedBy"], id.as_str());
+    assert_eq!(segs[1]["endedBy"], Value::Null);
+    assert_eq!(segs[1]["model"], "haiku");
+    assert_eq!(segs[1]["exitCode"], 0);
+    assert_eq!(h.seg(2, "resume"), SESSION, "claude --resume <session id>");
+    assert_eq!(h.seg(2, "model"), "haiku");
+    // The prompt is the runner's, not the packet: the ruling in a fence.
+    assert_eq!(
+        h.seg(2, "prompt"),
+        format!("Director ruling on {id}:\n```\nuse option B\n```")
+    );
+    // The first launch got the packet, fresh.
+    assert_eq!(h.seg(1, "resume"), "");
+    assert_eq!(h.seg(1, "prompt"), h.packet_text);
+
+    // The home was rewritten before the second launch, whatever the first
+    // session left in it.
+    let settings: Value = serde_json::from_str(&h.seg(2, "settings.json")).unwrap();
+    assert!(
+        settings["permissions"]["allow"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("mcp__cowproof-tools"))
+    );
+    let mcp: Value = serde_json::from_str(&h.seg(2, "mcp.json")).unwrap();
+    assert!(mcp["mcpServers"]["cowproof-tools"].is_object(), "{mcp}");
+    assert!(h.seg(2, "system-prompt.md").starts_with(PREAMBLE));
+
+    // The queue: ruled, delivered through the resume, no fallback.
+    let delivered = queue_events(&h, "delivered");
+    assert_eq!(delivered.len(), 1);
+    assert_eq!(delivered[0]["id"], id.as_str());
+    assert_eq!(delivered[0]["fresh"], false);
+    assert!(queue_events(&h, "resume-fallback").is_empty());
+    assert_eq!(h.run_json()["turns"], 4, "two launches of two turns");
+    assert_eq!(h.verdict()["verdict"], "proved");
+}
+
+#[test]
+fn a_stop_ruling_ends_the_lane_after_one_launch_and_keeps_the_work() {
+    if !sandbox_available() {
+        return;
+    }
+    let h = owned_packet(&asks_first("Quit?", true, &then_checks()));
+    let mut child = start(&h);
+    let id = wait_for_ask(&h, &mut child, 1);
+    rule(&h, &id, &["--stop"]);
+    let out = finish(child);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("stopped"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    assert_eq!(h.launches(), 1, "no second launch");
+    let run = h.run_json();
+    assert_eq!(run["status"], "stopped", "{run}");
+    assert_eq!(segments(&h).len(), 1);
+    assert_eq!(segments(&h)[0]["endedBy"], id.as_str());
+    // The work is kept; the lane is not proved.
+    assert!(h.read("control/lane.patch").contains("+edited"));
+    assert!(!h.lane().join("control/verdict.json").exists());
+    assert!(!h.lane().join("control/capsule").exists());
+    let ruled = queue_events(&h, "ruled");
+    assert_eq!(ruled[0]["verdict"]["verdict"], "stop");
+    assert_eq!(queue_events(&h, "delivered").len(), 1);
+}
+
+#[test]
+fn a_reassign_starts_a_fresh_session_on_the_next_model_with_a_carry_over() {
+    if !sandbox_available() {
+        return;
+    }
+    let h = owned_packet(&asks_first("Which design?", true, &then_checks()));
+    let mut child = start(&h);
+    let id = wait_for_ask(&h, &mut child, 1);
+    rule(&h, &id, &["--reassign"]);
+    let out = finish(child);
+    assert_eq!(out.status.code(), Some(0), "{}", stdout_of(&out));
+
+    let segs = segments(&h);
+    assert_eq!(segs.len(), 2, "{segs:?}");
+    assert_eq!(segs[1]["start"], "fresh");
+    assert_eq!(segs[1]["model"], "sonnet");
+    assert_eq!(segs[1]["resumedSession"], Value::Null);
+    assert_eq!(h.seg(2, "resume"), "", "a reassign never resumes");
+    assert_eq!(h.seg(2, "model"), "sonnet");
+    let prompt = h.seg(2, "prompt");
+    assert!(prompt.starts_with(&h.packet_text), "{prompt}");
+    assert!(prompt.contains("Which design?"), "the question: {prompt}");
+    assert!(
+        prompt.contains("read the packet"),
+        "what was tried: {prompt}"
+    );
+    assert!(prompt.contains("reassign to sonnet"), "{prompt}");
+    assert_eq!(h.run_json()["model"], "sonnet");
+    assert!(queue_events(&h, "resume-fallback").is_empty());
+    let delivered = queue_events(&h, "delivered");
+    assert_eq!(delivered.len(), 1);
+    assert_eq!(delivered[0]["fresh"], false);
+    // The checks ran on the second model, and the capsule names it.
+    assert_eq!(h.verdict()["verdict"], "proved");
+    let capsule = Capsule::read(&h.lane().join("control/capsule")).unwrap();
+    assert_eq!(capsule.builder_model, "sonnet");
+}
+
+#[test]
+fn a_reassign_names_its_model_and_a_bad_name_refuses_the_ruling() {
+    if !sandbox_available() {
+        return;
+    }
+    let h = owned_packet(&asks_first("Which design?", true, &then_checks()));
+    let mut child = start(&h);
+    let id = wait_for_ask(&h, &mut child, 1);
+    rule(&h, &id, &["--reassign", "--model", "opus"]);
+    let out = finish(child);
+    assert_eq!(out.status.code(), Some(0), "{}", stdout_of(&out));
+    assert_eq!(h.seg(2, "model"), "opus");
+
+    // A name that could be a flag is refused: nothing launches, the work is
+    // kept and the ruling is left recorded and undelivered.
+    let h = owned_packet(&asks_first("Which design?", true, &then_checks()));
+    let mut child = start(&h);
+    let id = wait_for_ask(&h, &mut child, 1);
+    rule(&h, &id, &["--reassign", "--model=--dangerous"]);
+    let out = finish(child);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("is not a model name"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(h.launches(), 1);
+    assert_eq!(h.run_json()["status"], "failed");
+    assert!(queue_events(&h, "delivered").is_empty());
+}
+
+#[test]
+fn a_redirect_starts_a_fresh_session_whose_prompt_is_the_new_packet() {
+    if !sandbox_available() {
+        return;
+    }
+    let h = owned_packet(&asks_first("Right task?", true, &then_checks()));
+    let redirected = h
+        .packet_text
+        .replace("Change the README.", "Change the README, then stop.");
+    assert_ne!(redirected, h.packet_text);
+    let packet = h.work.path().join("redirect.md");
+    fs::write(&packet, &redirected).unwrap();
+    let mut child = start(&h);
+    let id = wait_for_ask(&h, &mut child, 1);
+    rule(&h, &id, &["--redirect", packet.to_str().unwrap()]);
+    let out = finish(child);
+    assert_eq!(out.status.code(), Some(0), "{}", stdout_of(&out));
+
+    let segs = segments(&h);
+    assert_eq!(segs.len(), 2);
+    assert_eq!(segs[1]["start"], "fresh");
+    assert_eq!(h.seg(2, "resume"), "");
+    assert_eq!(h.seg(2, "model"), "haiku");
+    assert_eq!(h.seg(2, "prompt"), redirected, "the packet's body, exactly");
+    assert_eq!(queue_events(&h, "delivered").len(), 1);
+}
+
+#[test]
+fn a_redirect_with_another_lanes_id_is_refused_and_nothing_launches() {
+    if !sandbox_available() {
+        return;
+    }
+    let h = owned_packet(&asks_first("Right task?", true, &then_checks()));
+    let packet = h.work.path().join("redirect.md");
+    fs::write(&packet, h.packet_text.replace("t-run", "someone-else")).unwrap();
+    let mut child = start(&h);
+    let id = wait_for_ask(&h, &mut child, 1);
+    rule(&h, &id, &["--redirect", packet.to_str().unwrap()]);
+    let out = finish(child);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("not this lane's"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(h.launches(), 1);
+}
+
+/// A fake whose `--resume` fails at once with no output, like `claude` does
+/// for a session that no longer exists.
+fn session_gone_then_checks() -> String {
+    format!("if [ -n \"$resume\" ]; then exit 1; fi\n{}", then_checks())
+}
+
+#[test]
+fn a_session_that_is_gone_falls_back_to_a_fresh_launch_with_the_carry_over_summary() {
+    if !sandbox_available() {
+        return;
+    }
+    let h = owned_packet(&asks_first(
+        "Choose A or B?",
+        true,
+        &session_gone_then_checks(),
+    ));
+    let mut child = start(&h);
+    let id = wait_for_ask(&h, &mut child, 1);
+    rule(&h, &id, &["--answer", "use option B"]);
+    let out = finish(child);
+    assert_eq!(out.status.code(), Some(0), "{}", stdout_of(&out));
+
+    // fresh, the failed resume, the fallback.
+    assert_eq!(h.launches(), 3);
+    let segs = segments(&h);
+    assert_eq!(segs.len(), 3, "{segs:?}");
+    assert_eq!(segs[1]["start"], "resumed");
+    assert_eq!(segs[1]["resumedSession"], SESSION);
+    assert_eq!(segs[1]["exitCode"], 1);
+    assert_eq!(segs[1]["resumeFailed"], "session-gone");
+    assert_eq!(segs[2]["start"], "fallback");
+    assert_eq!(segs[2]["startedBy"], id.as_str());
+    assert_eq!(segs[2]["resumedSession"], Value::Null);
+    assert_eq!(h.seg(2, "resume"), SESSION);
+    assert_eq!(h.seg(3, "resume"), "", "the fallback is a fresh session");
+    assert_eq!(h.seg(3, "model"), "haiku");
+    let prompt = h.seg(3, "prompt");
+    assert!(prompt.starts_with(&h.packet_text), "the task: {prompt}");
+    assert!(
+        prompt.contains(&format!(
+            "Your previous session could not be resumed. Escalation {id} is answered below."
+        )),
+        "{prompt}"
+    );
+    assert!(prompt.contains("Question: Choose A or B?"), "{prompt}");
+    assert!(prompt.contains("Ruling: answer: use option B"), "{prompt}");
+
+    // The queue records the fallback, then the fresh delivery.
+    let fallbacks = queue_events(&h, "resume-fallback");
+    assert_eq!(fallbacks.len(), 1);
+    assert_eq!(fallbacks[0]["id"], id.as_str());
+    let delivered = queue_events(&h, "delivered");
+    assert_eq!(delivered.len(), 1);
+    assert_eq!(delivered[0]["fresh"], true);
+    assert_eq!(h.verdict()["verdict"], "proved");
+}
+
+#[test]
+fn a_resume_that_fails_after_doing_work_is_not_a_gone_session() {
+    if !sandbox_available() {
+        return;
+    }
+    // The resumed fake prints a stream line and then exits 1: that is a
+    // builder failure, not a missing session, so no fallback starts.
+    let later = format!(
+        "if [ -n \"$resume\" ]; then printf '%s\\n' '{{\"type\":\"system\",\"session_id\":\"{SESSION}\"}}'; exit 1; fi\n{}",
+        then_checks()
+    );
+    let h = owned_packet(&asks_first("Choose A or B?", true, &later));
+    let mut child = start(&h);
+    let id = wait_for_ask(&h, &mut child, 1);
+    rule(&h, &id, &["--answer", "use option B"]);
+    let out = finish(child);
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(h.launches(), 2, "no fallback launch");
+    assert!(queue_events(&h, "resume-fallback").is_empty());
+    assert_eq!(h.run_json()["status"], "failed");
+    assert_eq!(segments(&h)[1].get("resumeFailed"), None);
+}
+
+#[test]
+fn a_non_blocking_ask_does_not_wait_and_leaves_one_segment() {
+    if !sandbox_available() {
+        return;
+    }
+    // Nobody rules, and the run still ends: it must not wait for a ruling on
+    // an ask that did not park the builder.
+    let h = owned_packet(&asks_first("Design choice?", false, ":\n"));
+    let out = finish(start(&h));
+    // The fake ran no checks, so the lane is incomplete (3), not stuck.
+    assert_eq!(out.status.code(), Some(3), "{}", stdout_of(&out));
+    assert_eq!(queue_events(&h, "asked").len(), 1, "the ask did land");
+    assert_eq!(h.launches(), 1);
+    let segs = segments(&h);
+    assert_eq!(segs.len(), 1);
+    assert_eq!(segs[0]["endedBy"], Value::Null);
+    assert_eq!(h.run_json()["status"], "finished");
+}
+
+#[test]
+fn the_fourth_ask_ends_the_lane_as_escalation_limit_without_a_proof() {
+    if !sandbox_available() {
+        return;
+    }
+    // Every launch asks again. Three asks are allowed; each is answered and
+    // resumed; the fourth is refused by the queue, which ends the lane.
+    let ask = mcp_session("ask.out", &[(3, "ask", blocking_ask("Again?"))]);
+    let h = owned_packet(&ask);
+    let mut child = start(&h);
+    for nth in 1..=3 {
+        let id = wait_for_ask(&h, &mut child, nth);
+        rule(&h, &id, &["--answer", "keep going"]);
+    }
+    let out = finish(child);
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(h.launches(), 4);
+    assert_eq!(h.run_json()["status"], "escalation-limit");
+    assert_eq!(queue_events(&h, "lane-escalation-limit").len(), 1);
+    assert!(!h.lane().join("control/verdict.json").exists());
 }

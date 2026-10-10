@@ -354,6 +354,18 @@ pub enum Origin {
     Forced { reason: String },
 }
 
+/// A blocking escalation whose ruling has not reached the builder yet: either
+/// still parked (no ruling) or ruled but undelivered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingBlocking {
+    pub id: EscalationId,
+    /// The ruling, once the director has given one.
+    pub verdict: std::option::Option<Verdict>,
+    /// How long the escalation may stay parked before the lane ends as
+    /// `escalation-limit` (zero once past the limit).
+    pub time_left: Duration,
+}
+
 /// A director's verdict in response to an ask.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "verdict")]
@@ -1114,6 +1126,69 @@ impl Queue {
         self.escalations.get(id).is_some_and(|e| e.delivered)
     }
 
+    /// The lane's blocking escalations that have not reached the builder, oldest
+    /// first. The runner's resume loop reads this after each builder exit: an
+    /// empty list means nothing is parked. (Ids are `<lane>:E<n>`, so the order
+    /// is numeric, not the string order `E10 < E2`.)
+    pub fn pending_blocking(&self, lane: &str) -> Vec<PendingBlocking> {
+        let now = self.clock.now();
+        let mut pending: Vec<(usize, PendingBlocking)> = self
+            .escalations
+            .iter()
+            .filter(|(_, e)| e.lane == lane && e.ask.blocking && !e.delivered)
+            .map(|(id, e)| {
+                let number =
+                    id.0.rsplit_once(":E")
+                        .and_then(|(_, n)| n.parse().ok())
+                        .unwrap_or(usize::MAX);
+                let elapsed = self
+                    .park_times
+                    .get(id)
+                    .and_then(|parked_at| now.duration_since(*parked_at).ok())
+                    .unwrap_or_default();
+                (
+                    number,
+                    PendingBlocking {
+                        id: id.clone(),
+                        verdict: e.verdict.clone(),
+                        time_left: self.park_limit.saturating_sub(elapsed),
+                    },
+                )
+            })
+            .collect();
+        pending.sort_by(|a, b| (a.0, &a.1.id).cmp(&(b.0, &b.1.id)));
+        pending.into_iter().map(|(_, p)| p).collect()
+    }
+
+    /// End the lane as `escalation-limit` if a blocking escalation has waited
+    /// for a ruling past the park limit, and return its id. Nothing else ever
+    /// ends a lane whose director is silent: [`Queue::rule`] only checks the
+    /// limit when a ruling arrives. Same boundary as `rule`: exactly at the
+    /// limit is still fine.
+    pub fn expire_parked(
+        &mut self,
+        lane: &str,
+    ) -> Result<std::option::Option<EscalationId>, String> {
+        let now = self.clock.now();
+        let expired = self
+            .pending_blocking(lane)
+            .into_iter()
+            .filter(|p| p.verdict.is_none())
+            .find(|p| {
+                self.park_times
+                    .get(&p.id)
+                    .and_then(|parked_at| now.duration_since(*parked_at).ok())
+                    .is_some_and(|elapsed| elapsed > self.park_limit)
+            });
+        match expired {
+            Some(p) => {
+                self.end_lane_escalation_limit(lane, StdOption::Some(&p.id))?;
+                Ok(Some(p.id))
+            }
+            None => Ok(None),
+        }
+    }
+
     /// Number of escalations counted against the lane's limit (asks, forced
     /// escalations and resume-fallbacks).
     pub fn escalation_count(&self, lane: &str) -> usize {
@@ -1828,6 +1903,90 @@ mod tests {
         assert!(err.contains("escalation-limit"), "{err}");
         assert_eq!(queue.lane_state("lane1"), Some(LaneState::EscalationLimit));
         assert!(queue.get(&late).unwrap().2.is_none());
+    }
+
+    #[test]
+    fn pending_blocking_lists_only_undelivered_blocking_asks_in_numeric_order() {
+        let tmpdir = tempfile::TempDir::new().unwrap();
+        let mut queue = Queue::with_limits(
+            tmpdir.path(),
+            Box::new(SystemClock),
+            Duration::from_secs(30 * 60),
+            20,
+        )
+        .unwrap();
+        let blocking = new_ask("blocks?");
+        let mut non_blocking = new_ask("later?");
+        non_blocking.blocking = false;
+        let ids: Vec<EscalationId> = (0..10)
+            .map(|_| queue.ask("lane1", &blocking, Origin::Builder).unwrap())
+            .collect();
+        queue.ask("lane1", &non_blocking, Origin::Builder).unwrap();
+        queue.ask("other", &blocking, Origin::Builder).unwrap();
+
+        let pending = queue.pending_blocking("lane1");
+        assert_eq!(
+            pending.iter().map(|p| p.id.clone()).collect::<Vec<_>>(),
+            ids,
+            "E10 sorts after E9, the non-blocking ask and the other lane are absent"
+        );
+        assert!(pending.iter().all(|p| p.verdict.is_none()));
+
+        let verdict = Verdict::Stop;
+        queue.rule("lane1", &ids[0], &verdict).unwrap();
+        assert_eq!(
+            queue.pending_blocking("lane1")[0].verdict,
+            Some(verdict.clone()),
+            "ruled but undelivered is still pending"
+        );
+        queue
+            .redeliver("lane1", &ids[0], &mut RecordingDelivery::new())
+            .unwrap();
+        assert_eq!(queue.pending_blocking("lane1").len(), 9);
+        assert_eq!(queue.pending_blocking("lane1")[0].id, ids[1]);
+    }
+
+    #[test]
+    fn expire_parked_ends_the_lane_only_past_the_limit_and_only_for_unruled_asks() {
+        let tmpdir = tempfile::TempDir::new().unwrap();
+        let clock = Arc::new(TestClock::new());
+        let mut queue = Queue::with_limits(
+            tmpdir.path(),
+            Box::new(clock.clone()),
+            Duration::from_secs(30 * 60),
+            3,
+        )
+        .unwrap();
+        let ruled = queue
+            .ask("lane1", &new_ask("one?"), Origin::Builder)
+            .unwrap();
+        let parked = queue
+            .ask("lane1", &new_ask("two?"), Origin::Builder)
+            .unwrap();
+        queue.rule("lane1", &ruled, &Verdict::Stop).unwrap();
+
+        clock.advance(Duration::from_secs(10 * 60));
+        assert_eq!(
+            queue.pending_blocking("lane1")[1].time_left,
+            Duration::from_secs(20 * 60)
+        );
+
+        // Exactly at the limit: still parked.
+        clock.advance(Duration::from_secs(20 * 60));
+        assert_eq!(queue.expire_parked("lane1").unwrap(), None);
+        assert_eq!(queue.lane_state("lane1"), None);
+
+        clock.advance(Duration::from_secs(1));
+        assert_eq!(queue.expire_parked("lane1").unwrap(), Some(parked));
+        assert_eq!(queue.lane_state("lane1"), Some(LaneState::EscalationLimit));
+        assert_eq!(queue.expire_parked("other").unwrap(), None);
+        // It is persisted: a rebuilt queue still has the lane ended.
+        drop(queue);
+        let rebuilt = Queue::new(tmpdir.path(), Box::new(SystemClock)).unwrap();
+        assert_eq!(
+            rebuilt.lane_state("lane1"),
+            Some(LaneState::EscalationLimit)
+        );
     }
 
     #[test]

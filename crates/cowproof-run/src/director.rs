@@ -18,7 +18,7 @@
 //! Responses:
 //! - Success: `{"ok":true,"outcome":...}`
 //! - Failure: `{"ok":false,"error":"..."}`
-//! - Rule reply special field: `"delivery":"pending"` (TODO: D9 delivery is out of scope here)
+//! - Rule reply special field: `"delivery":"pending"` or `"delivery":"sent"` when sent through channel (D25)
 
 use crate::escalate::{EscalationId, Queue, Verdict};
 use crate::wire::{self, Read};
@@ -30,6 +30,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
+use tokio::sync::mpsc;
 
 pub use wire::MAX_LINE;
 
@@ -52,9 +53,17 @@ pub fn bind(path: &Path) -> io::Result<UnixListener> {
     UnixListener::bind(path)
 }
 
+/// Verdict event sent to the resume loop (D25).
+#[derive(Debug, Clone)]
+pub struct VerdictEvent {
+    pub id: EscalationId,
+    pub verdict: Verdict,
+}
+
 struct Context {
     lane: String,
     queue: Arc<Mutex<Queue>>,
+    verdict_tx: Option<mpsc::UnboundedSender<VerdictEvent>>,
 }
 
 /// Serve the director control socket for one lane until the listener fails.
@@ -62,8 +71,13 @@ pub async fn serve(
     listener: UnixListener,
     lane: String,
     queue: Arc<Mutex<Queue>>,
+    verdict_tx: Option<mpsc::UnboundedSender<VerdictEvent>>,
 ) -> io::Result<()> {
-    let ctx = Arc::new(Context { lane, queue });
+    let ctx = Arc::new(Context {
+        lane,
+        queue,
+        verdict_tx,
+    });
     loop {
         let stream = match listener.accept().await {
             Ok((stream, _)) => stream,
@@ -217,10 +231,24 @@ fn rule(ctx: &Context, id: Option<String>, verdict: Option<Value>) -> Result<Val
     // Apply the ruling.
     queue.rule(&ctx.lane, &escalation_id, &parsed_verdict)?;
 
-    // TODO (D9): deliver the verdict. For now, return pending.
+    // Send the verdict through the channel if one exists (D25).
+    let delivery_status = if let Some(ref tx) = ctx.verdict_tx {
+        let event = VerdictEvent {
+            id: escalation_id.clone(),
+            verdict: parsed_verdict.clone(),
+        };
+        if tx.send(event).is_ok() {
+            "sent"
+        } else {
+            "failed-channel-closed"
+        }
+    } else {
+        "pending"
+    };
+
     Ok(success(json!({
         "id": escalation_id.0,
-        "delivery": "pending"
+        "delivery": delivery_status
     })))
 }
 
@@ -279,7 +307,12 @@ mod tests {
         let queue = Arc::new(Mutex::new(
             Queue::new(tmp.path(), Box::new(SystemClock)).unwrap(),
         ));
-        let serve_task = tokio::spawn(serve(listener, "test-lane".to_string(), queue.clone()));
+        let serve_task = tokio::spawn(serve(
+            listener,
+            "test-lane".to_string(),
+            queue.clone(),
+            None,
+        ));
 
         // Give the server a moment to start
         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
