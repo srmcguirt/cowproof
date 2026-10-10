@@ -2635,9 +2635,12 @@ async fn rule_command(args: RuleArgs) -> Result<()> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::UnixStream;
 
-    let lanes_root = args
-        .lanes_root
-        .unwrap_or_else(|| std::env::temp_dir().join("cowproof"));
+    // The same default as `cowproof run` and `cowproof watch`, or the
+    // director could not reach a lane started without `--lanes-root`.
+    let home = std::path::PathBuf::from(
+        std::env::var_os("HOME").ok_or_else(|| anyhow::anyhow!("HOME is not set"))?,
+    );
+    let lanes_root = run::lanes_root(args.lanes_root.as_deref(), &std::env::current_dir()?, &home);
     let director_sock = lanes_root
         .join(&args.lane_id)
         .join("control")
@@ -2712,9 +2715,12 @@ async fn note_command(args: NoteArgs) -> Result<()> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::UnixStream;
 
-    let lanes_root = args
-        .lanes_root
-        .unwrap_or_else(|| std::env::temp_dir().join("cowproof"));
+    // The same default as `cowproof run` and `cowproof watch`, or the
+    // director could not reach a lane started without `--lanes-root`.
+    let home = std::path::PathBuf::from(
+        std::env::var_os("HOME").ok_or_else(|| anyhow::anyhow!("HOME is not set"))?,
+    );
+    let lanes_root = run::lanes_root(args.lanes_root.as_deref(), &std::env::current_dir()?, &home);
     let director_sock = lanes_root
         .join(&args.lane_id)
         .join("control")
