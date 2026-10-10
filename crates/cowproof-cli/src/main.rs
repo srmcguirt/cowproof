@@ -30,6 +30,7 @@ use tokio::process::Command;
 
 mod lane_tools;
 mod run;
+mod watch;
 
 #[derive(Parser)]
 #[command(name = "lanes", about = "Run isolated engineering lanes")]
@@ -47,6 +48,8 @@ enum Action {
     Host(HostArgs),
     Hosts,
     Plan(PlanArgs),
+    /// Observe lanes and their escalation events.
+    Watch(watch::WatchArgs),
     /// The builder's tools (`ask`, `check_ruling`, `run_check`) as an MCP
     /// stdio server. It runs inside the sandbox and is only a client of the
     /// runner socket; the builder runtime launches it, people do not.
@@ -179,6 +182,7 @@ async fn main() -> Result<()> {
             PlanAction::Run { repo, max, dry_run } => plan_run(&repo, max, dry_run),
             PlanAction::Collect { repo } => plan_collect(&repo),
         },
+        Action::Watch(args) => watch::watch(args).await,
         Action::LaneTools(args) => lane_tools::run(args.socket).await,
     }
 }
