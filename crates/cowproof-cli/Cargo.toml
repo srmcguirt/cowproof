@@ -5,9 +5,21 @@ rust-version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[lib]
+name = "cowproof_cli"
+path = "src/lib.rs"
+
 [[bin]]
 name = "cowproof"
 path = "src/main.rs"
+
+[[bin]]
+name = "pk"
+path = "src/bin/pk.rs"
+
+[[bin]]
+name = "pk-read"
+path = "src/bin/pk-read.rs"
 
 [dependencies]
 anyhow.workspace = true
@@ -22,7 +34,10 @@ cowproof-lint = { path = "../cowproof-lint" }
 cowproof-run = { path = "../cowproof-run" }
 cowproof-prove = { path = "../cowproof-prove" }
 portkit-core.workspace = true
+portkit-cli.workspace = true
 portkit-mcp.workspace = true
+portkit-plugin.workspace = true
+portkit-read.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

@@ -91,6 +91,20 @@ enum Action {
     /// people do not.
     #[command(hide = true)]
     NetBridge(NetBridgeArgs),
+    /// Run portkit commands.
+    #[command(disable_help_flag = true, disable_version_flag = true)]
+    Pk {
+        /// Arguments passed to pk.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Read file contents, tracking what the caller already has.
+    #[command(disable_help_flag = true, disable_version_flag = true)]
+    Read {
+        /// Arguments passed to pk-read.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
 }
 #[derive(Parser)]
 struct RuleArgs {
@@ -313,8 +327,23 @@ enum HostAction {
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() -> std::process::ExitCode {
     match Args::parse().command {
+        // The portkit commands own their exit codes, so they bypass `dispatch`.
+        Action::Pk { args } => cowproof_cli::pk::run(args).await,
+        Action::Read { args } => portkit_read::run(args),
+        command => match dispatch(command).await {
+            Ok(()) => std::process::ExitCode::SUCCESS,
+            Err(err) => {
+                eprintln!("Error: {err:?}");
+                std::process::ExitCode::FAILURE
+            }
+        },
+    }
+}
+
+async fn dispatch(command: Action) -> Result<()> {
+    match command {
         Action::Run(args) => {
             let code = run::run_one(args).await?;
             if code != 0 {
@@ -351,6 +380,9 @@ async fn main() -> Result<()> {
         Action::Check(args) => check_command(args).await,
         Action::LaneTools(args) => lane_tools::run(args.socket).await,
         Action::NetBridge(args) => net_bridge_command(args).await,
+        Action::Pk { .. } | Action::Read { .. } => {
+            unreachable!("pk and read return their own exit code from main")
+        }
     }
 }
 

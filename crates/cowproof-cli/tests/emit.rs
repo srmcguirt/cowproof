@@ -26,14 +26,18 @@ impl Session {
     }
 
     fn run(&self, args: &[&str]) -> String {
-        let out = Command::new(bin())
+        let bin_path = bin();
+        let out = Command::new(bin_path)
             .args(args)
             .current_dir(self.dir.path())
             .env("PORTKIT_SESSION", "test")
             .env("PORTKIT_STATE_DIR", self.dir.path().join("state"))
-            .output()
-            .expect("pk-read must run");
-        String::from_utf8_lossy(&out.stdout).to_string()
+            .output();
+
+        match out {
+            Ok(output) => String::from_utf8_lossy(&output.stdout).to_string(),
+            Err(_) => panic!("pk-read must be available; it moved to cowproof-cli as of D2"),
+        }
     }
 
     fn path(&self) -> &Path {

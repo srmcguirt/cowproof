@@ -88,6 +88,49 @@ async fn a_hanging_plugin_is_abandoned_rather_than_hanging_the_agent() {
     );
 }
 
+/// Whether `pid` is a live process. A zombie awaiting reaping counts as gone:
+/// it is dead, and only its exit status is still held.
+fn process_is_alive(pid: u32) -> bool {
+    let out = std::process::Command::new("ps")
+        .args(["-o", "stat=", "-p", &pid.to_string()])
+        .output()
+        .expect("ps");
+    let stat = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    !stat.is_empty() && !stat.starts_with('Z')
+}
+
+#[tokio::test]
+async fn a_timed_out_plugin_process_is_killed_not_left_running() {
+    let dir = tempfile::tempdir().unwrap();
+    let pid_file = dir.path().join("hangs.pid");
+
+    let mut e = entry("hangs.py");
+    e.args.push(pid_file.to_string_lossy().to_string());
+    e.timeout_secs = 1;
+    let tool = PluginTool::discover(e).await.unwrap();
+    let mut r = Registry::new();
+    r.register(tool);
+
+    let err = r.call("hangs", json!({})).await.unwrap_err().to_string();
+    assert!(err.contains("timed out"), "{err}");
+
+    let pid: u32 = std::fs::read_to_string(&pid_file)
+        .expect("the fixture records its pid when it is called")
+        .trim()
+        .parse()
+        .expect("pid");
+
+    // Killing is asynchronous: allow the signal and the reaping to land.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while process_is_alive(pid) && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(
+        !process_is_alive(pid),
+        "the timed-out plugin (pid {pid}) is still running"
+    );
+}
+
 #[tokio::test]
 async fn non_json_output_is_reported_with_what_was_actually_returned() {
     // "invalid output" without the output is not debuggable.

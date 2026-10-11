@@ -82,6 +82,9 @@ impl PluginTool {
 fn command(entry: &PluginEntry) -> Command {
     let mut cmd = Command::new(&entry.command);
     cmd.args(&entry.args);
+    // A call abandoned on timeout drops its child; without this the process
+    // outlives the caller and keeps running (a hung plugin leaked forever).
+    cmd.kill_on_drop(true);
     if let Some(cwd) = &entry.cwd {
         cmd.current_dir(cwd);
     }
@@ -125,8 +128,8 @@ impl Tool for PluginTool {
             Ok(Ok(o)) => o,
             Ok(Err(e)) => return Err(Error::tool_failed(name, format!("process error: {e}"))),
             Err(_) => {
-                // The child is detached at this point; the timeout is what
-                // protects the caller, not the process table.
+                // Dropping the future dropped the child, and `kill_on_drop`
+                // sent it SIGKILL, so a timed-out plugin does not linger.
                 return Err(Error::tool_failed(
                     name,
                     format!("timed out after {}s", self.entry.timeout_secs),

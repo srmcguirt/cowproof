@@ -17,6 +17,7 @@ mod hook;
 mod logging;
 mod verify;
 
+use std::ffi::OsString;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -42,7 +43,28 @@ pub async fn run_with<F>(build: F) -> ExitCode
 where
     F: FnOnce(&Config) -> Registry,
 {
-    let cli = Cli::parse();
+    run_from(std::env::args_os(), build).await
+}
+
+/// Run with explicit arguments, for embedding in other binaries.
+///
+/// Parse arguments from the provided iterator and run the requested command.
+/// The first argument should be argv[0] (the program name).
+pub async fn run_from<I, T, F>(args: I, build: F) -> ExitCode
+where
+    I: IntoIterator<Item = T>,
+    T: Into<OsString> + Clone,
+    F: FnOnce(&Config) -> Registry,
+{
+    let cli = match Cli::try_parse_from(args) {
+        Ok(cli) => cli,
+        Err(err) => {
+            // Help and version are not failures: clap routes them to stdout
+            // and exit code 0, and real usage errors to stderr and code 2.
+            let _ = err.print();
+            return ExitCode::from(u8::try_from(err.exit_code()).unwrap_or(2));
+        }
+    };
 
     let config = match Config::load(cli.config.as_deref()) {
         Ok(mut config) => {
