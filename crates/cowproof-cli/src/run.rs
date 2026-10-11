@@ -68,7 +68,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::process::Command;
-use tokio::sync::{Semaphore, mpsc::UnboundedReceiver};
+use tokio::signal::unix::{Signal, SignalKind, signal};
+use tokio::sync::{Semaphore, mpsc::UnboundedReceiver, watch};
 use tokio::task::JoinHandle;
 use tokio::time::Instant as TokioInstant;
 
@@ -96,6 +97,13 @@ const TERM_GRACE: Duration = Duration::from_secs(10);
 /// the stream pump may still wait for EOF. A process that escaped the group
 /// could hold the pipe open forever; the pump is abandoned after this.
 const PUMP_DRAIN: Duration = Duration::from_secs(5);
+
+/// The exit code when the run is interrupted by a signal (SIGINT or SIGTERM).
+const INTERRUPTED_EXIT_CODE: i32 = 130;
+
+/// On the first SIGINT or SIGTERM, how long past [`TERM_GRACE`] the runner waits
+/// for the launcher to finish ending the builder's group before it stops waiting.
+const INTERRUPT_SLACK: Duration = Duration::from_secs(5);
 
 /// What the builder is allowed to use, per R15 ("tool permissions are set
 /// explicitly per policy; the OS sandbox is the boundary"). Web tools are
@@ -381,14 +389,77 @@ struct SegmentRun {
     estimated_cost_usd: f64,
 }
 
+/// The first SIGINT or SIGTERM, shared between the signal handler in
+/// [`run_one`] and the launcher.
+///
+/// The launcher records the builder's process group here when it spawns and
+/// clears it when the launch is over, so `builder_pgid` is `Some` exactly while
+/// a builder may be running. `raise` is the handler telling the launcher to end
+/// that group (SIGTERM, then SIGKILL after [`TERM_GRACE`]) and stop.
+struct Interrupt {
+    builder_pgid: Mutex<Option<u32>>,
+    raised: watch::Sender<bool>,
+}
+
+impl Interrupt {
+    fn new() -> Arc<Self> {
+        Arc::new(Interrupt {
+            builder_pgid: Mutex::new(None),
+            raised: watch::channel(false).0,
+        })
+    }
+
+    fn builder_pgid(&self) -> Option<u32> {
+        *self.builder_pgid.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn set_builder_pgid(&self, pgid: Option<u32>) {
+        *self.builder_pgid.lock().unwrap_or_else(|e| e.into_inner()) = pgid;
+    }
+
+    fn raise(&self) {
+        self.raised.send_replace(true);
+    }
+
+    fn subscribe(&self) -> watch::Receiver<bool> {
+        self.raised.subscribe()
+    }
+}
+
+/// What a launch (and so the resume loop) returns when the run was interrupted:
+/// not a failure of the builder, and never to be proved.
+#[derive(Debug)]
+struct Interrupted;
+
+impl std::fmt::Display for Interrupted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("interrupted by a signal")
+    }
+}
+
+impl std::error::Error for Interrupted {}
+
 /// SIGKILLs a process group when dropped, so no early return leaves a builder's
 /// background children running. The group is also ended explicitly after every
 /// launch; this is the safety net for the error paths between spawn and that.
-struct GroupGuard(u32);
+///
+/// Creating it records the group in [`Interrupt`]; dropping it clears the record.
+struct GroupGuard {
+    pgid: u32,
+    interrupt: Arc<Interrupt>,
+}
+
+impl GroupGuard {
+    fn new(pgid: u32, interrupt: Arc<Interrupt>) -> Self {
+        interrupt.set_builder_pgid(Some(pgid));
+        GroupGuard { pgid, interrupt }
+    }
+}
 
 impl Drop for GroupGuard {
     fn drop(&mut self) {
-        kill_process_group(self.0);
+        self.interrupt.set_builder_pgid(None);
+        kill_process_group(self.pgid);
     }
 }
 
@@ -501,6 +572,8 @@ struct Launcher {
     /// no signal can be missed; the sender is cloned into the observer.
     end_tx: SessionEndSignal,
     end_rx: tokio::sync::Mutex<UnboundedReceiver<SessionEnd>>,
+    /// The signal handler's side: the builder's group, and the order to end it.
+    interrupt: Arc<Interrupt>,
 }
 
 impl Launcher {
@@ -524,6 +597,12 @@ impl Launcher {
         spent_before_usd: f64,
     ) -> Result<SegmentRun> {
         let started = Instant::now();
+        // Subscribed before anything else: an interrupt raised from here on is
+        // seen, and one raised earlier stops the launch before a builder exists.
+        let mut interrupted_rx = self.interrupt.subscribe();
+        if *interrupted_rx.borrow_and_update() {
+            return Err(Interrupted.into());
+        }
         let layout = &self.layout;
         let settings_file = layout.home.join("settings.json");
         fs::write(
@@ -611,7 +690,7 @@ impl Launcher {
         .context("launching the builder in its sandbox")?;
         // `process_group(0)` makes the child its own leader, so its pid is the pgid.
         let pgid = child.id().context("reading the builder's process id")?;
-        let _group = GroupGuard(pgid);
+        let _group = GroupGuard::new(pgid, self.interrupt.clone());
         let stdout = child.stdout.take().context("taking the builder's stdout")?;
 
         let mut meter = StreamMeter::new(launch.resume.is_some());
@@ -642,6 +721,7 @@ impl Launcher {
         let mut kill_at: Option<TokioInstant> = None;
         let mut drain_until: Option<TokioInstant> = None;
         let mut abandoned = false;
+        let mut interrupted = false;
         {
             let mut observe = |m: &StreamMeter| live.observe(m);
             let pump = pump_stream(
@@ -683,6 +763,18 @@ impl Launcher {
                             None => signals_open = false,
                         }
                     }
+                    // The first SIGINT or SIGTERM: end the builder's group the way a
+                    // parked session is ended, without waiting out PARK_GRACE.
+                    _ = interrupted_rx.changed(), if !interrupted => {
+                        interrupted = true;
+                        if status.is_none() {
+                            eprintln!("[{}] interrupted: ending the builder", self.lane_id);
+                            terminate_process_group(pgid);
+                            killed = true;
+                            term_at = None;
+                            kill_at = Some(TokioInstant::now() + TERM_GRACE);
+                        }
+                    }
                     _ = sleep_until_opt(term_at), if term_at.is_some() => {
                         terminate_process_group(pgid);
                         killed = true;
@@ -700,6 +792,9 @@ impl Launcher {
             }
         }
         // The group is already ended; the guard's drop is a second, harmless kill.
+        if interrupted || *interrupted_rx.borrow() {
+            return Err(Interrupted.into());
+        }
         let status = status.context("the builder's exit status was never read")?;
         let stats = if abandoned {
             eprintln!(
@@ -1446,6 +1541,47 @@ pub(crate) fn lanes_root(arg: Option<&Path>, cwd: &Path, home: &Path) -> PathBuf
     }
 }
 
+/// The name of the next SIGINT or SIGTERM.
+async fn next_signal(sigint: &mut Signal, sigterm: &mut Signal) -> &'static str {
+    tokio::select! {
+        _ = sigint.recv() => "SIGINT",
+        _ = sigterm.recv() => "SIGTERM",
+    }
+}
+
+/// What an interrupted run leaves behind, after the servers are stopped: the
+/// builder's group ended for good (a no-op when the launcher already did it),
+/// the three sockets removed and `run.json` saying `interrupted`. Nothing here
+/// waits, so a second signal never has to cut it short.
+fn record_interrupted(
+    layout: &LaneLayout,
+    lane_id: &str,
+    signal_name: &str,
+    builder_pgid: Option<u32>,
+    proxy_socket: &Path,
+    started: Instant,
+) {
+    if let Some(pgid) = builder_pgid {
+        kill_process_group(pgid);
+    }
+    let _ = fs::remove_file(&layout.sock);
+    let _ = fs::remove_file(layout.control.join("director.sock"));
+    let _ = fs::remove_file(proxy_socket);
+    let run = json!({
+        "id": lane_id,
+        "status": "interrupted",
+        "signal": signal_name,
+        "exitCode": INTERRUPTED_EXIT_CODE,
+        "durationMs": started.elapsed().as_millis() as u64,
+    });
+    if let Err(e) = fs::write(
+        layout.control.join("run.json"),
+        serde_json::to_vec_pretty(&run).unwrap_or_default(),
+    ) {
+        eprintln!("[{lane_id}] writing run.json: {e}");
+    }
+}
+
 pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
     let started = Instant::now();
     if args.turn_budget == 0 {
@@ -1599,6 +1735,9 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
 
     // 5. Launch inside the builder sandbox, and relaunch on the director's
     // rulings while a blocking escalation is parked.
+    let interrupt = Interrupt::new();
+    // The proxy's socket, read before the endpoint is moved: removed if interrupted.
+    let proxy_sock = endpoint.socket.clone();
     let launcher = Launcher {
         layout: layout.clone(),
         claude_bin: claude_bin.clone(),
@@ -1617,6 +1756,7 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
         cost_cap_usd: args.cost_cap_usd,
         end_tx,
         end_rx: tokio::sync::Mutex::new(end_rx),
+        interrupt: interrupt.clone(),
     };
     let drive = Drive {
         launcher: &launcher,
@@ -1626,9 +1766,58 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
         repo: &repo,
         plans: &plans,
     };
-    let lane_run = drive
-        .run(&mut verdict_rx, &args.model, &packet_text)
-        .await?;
+
+    // 5b. SIGINT and SIGTERM. The builder is not in the terminal's foreground
+    // group, so the default action would end the runner and leave it running.
+    // On the first signal: end the builder's group (the launcher sends SIGTERM,
+    // then SIGKILL after TERM_GRACE, and gives up the launch), stop the tools,
+    // director and proxy tasks, remove the three sockets, write `run.json` as
+    // `interrupted`, skip the proof and exit 130. A second signal while that
+    // waits skips the wait.
+    let mut sigint = signal(SignalKind::interrupt()).context("installing the SIGINT handler")?;
+    let mut sigterm = signal(SignalKind::terminate()).context("installing the SIGTERM handler")?;
+    let drive_run = drive.run(&mut verdict_rx, &args.model, &packet_text);
+    tokio::pin!(drive_run);
+    let first = tokio::select! {
+        result = &mut drive_run => Ok(result?),
+        name = next_signal(&mut sigint, &mut sigterm) => Err(name),
+    };
+    let lane_run = match first {
+        Ok(run) => run,
+        Err(signal_name) => {
+            eprintln!("[{}] {signal_name}: ending the run", header.id);
+            interrupt.raise();
+            // A builder is running: the launcher ends its group and returns.
+            // With none (waiting for a ruling, say) there is nothing to wait for.
+            if interrupt.builder_pgid().is_some() {
+                tokio::select! {
+                    _ = &mut drive_run => {}
+                    _ = tokio::time::sleep(TERM_GRACE + INTERRUPT_SLACK) => {}
+                    second = next_signal(&mut sigint, &mut sigterm) => {
+                        eprintln!("[{}] {second} again: not waiting", header.id);
+                    }
+                }
+            }
+            drop(_tools);
+            drop(_director);
+            drop(_proxy);
+            record_interrupted(
+                &layout,
+                &header.id,
+                signal_name,
+                interrupt.builder_pgid(),
+                &proxy_sock,
+                started,
+            );
+            return Ok(INTERRUPTED_EXIT_CODE);
+        }
+    };
+    // Past the builder, a signal ends the process at once, as it did before
+    // the handlers existed (the tokio handlers would otherwise swallow it).
+    tokio::spawn(async move {
+        next_signal(&mut sigint, &mut sigterm).await;
+        std::process::exit(INTERRUPTED_EXIT_CODE);
+    });
     let status = lane_run.status;
     let stats = &lane_run.stats;
     let end = &lane_run.end;

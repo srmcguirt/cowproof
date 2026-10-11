@@ -1144,7 +1144,13 @@ fn run_help_documents_every_exit_code() {
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ");
-    for code in ["0 proved", "2 refuted", "3 incomplete", "4 infrastructure"] {
+    for code in [
+        "0 proved",
+        "2 refuted",
+        "3 incomplete",
+        "4 infrastructure",
+        "130 interrupted by SIGINT or SIGTERM",
+    ] {
         assert!(help.contains(code), "no {code:?} in: {help}");
     }
 }
@@ -2094,4 +2100,209 @@ fn net_bridge_wrapper_passes_argv_whole_and_forwards_the_exit_status() {
     );
     assert_eq!(fs::read_to_string(&out_file).unwrap(), hostile);
     assert!(!dir.path().join("PWNED").exists());
+}
+
+// ---- SIGINT and SIGTERM end the run (130) -----------------------------------
+//
+// A builder is not in the terminal's foreground group, so without a handler the
+// default signal action would end the runner and leave the builder (and what it
+// started) running. Every wait below is bounded.
+
+/// How long after the first signal the run must have exited: SIGTERM to the
+/// builder's group, then the leader's exit, with a wide margin for a loaded CI
+/// machine. A builder that ignores SIGTERM would take 10 s; none here does.
+const INTERRUPT_EXIT_WITHIN: Duration = Duration::from_secs(20);
+
+/// `kill -<signal> <pid>` of a process this test started.
+fn send_signal(signal: &str, child: &Child) {
+    let out = output(Command::new("kill").args([&format!("-{signal}"), &child.id().to_string()]));
+    assert!(
+        out.status.success(),
+        "kill -{signal}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// Wait for the file the fake writes once its background child runs.
+fn wait_for_file(run: &mut Watched, path: &Path) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !path.exists() {
+        assert!(
+            run.child.try_wait().unwrap().is_none(),
+            "the run ended before {} appeared:\n{}",
+            path.display(),
+            run.stderr()
+        );
+        if Instant::now() > deadline {
+            let _ = run.child.kill();
+            let _ = run.child.wait();
+            panic!("{} never appeared:\n{}", path.display(), run.stderr());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Wait for the run to exit by itself within `within`; a run still going is
+/// killed (by its pid) and fails the test.
+fn exit_within(run: &mut Watched, within: Duration) -> std::process::ExitStatus {
+    let deadline = Instant::now() + within;
+    loop {
+        if let Some(status) = run.child.try_wait().unwrap() {
+            return status;
+        }
+        if Instant::now() > deadline {
+            let _ = run.child.kill();
+            let _ = run.child.wait();
+            panic!(
+                "cowproof run was still going {within:?} after the signal:\n{}",
+                run.stderr()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// The three sockets of a lane: the builder tools socket, the director control
+/// socket and the egress proxy socket.
+fn lane_sockets(h: &Harness) -> [PathBuf; 3] {
+    [
+        h.lane().join("sock/runner.sock"),
+        h.lane().join("control/director.sock"),
+        h.lane().join("proxy.sock"),
+    ]
+}
+
+/// What an interrupted run must leave: exit 130, `interrupted` in `run.json`,
+/// no verdict, no socket.
+fn assert_interrupted_cleanly(h: &Harness, status: std::process::ExitStatus, run: &Watched) {
+    assert_eq!(status.code(), Some(130), "{}", run.stderr());
+    let run_json = h.run_json();
+    assert_eq!(run_json["status"], "interrupted", "{run_json}");
+    assert_eq!(run_json["exitCode"], 130);
+    assert!(
+        !h.lane().join("control/verdict.json").exists(),
+        "an interrupted lane must not be proved"
+    );
+    assert!(
+        !h.lane().join("control/capsule").exists(),
+        "an interrupted lane must not be sealed"
+    );
+    for socket in lane_sockets(h) {
+        assert!(
+            std::fs::symlink_metadata(&socket).is_err(),
+            "{} still exists",
+            socket.display()
+        );
+    }
+}
+
+/// The fake: starts two background children that ignore SIGTERM (a marker
+/// writer, and one whose pid it records), then sleeps.
+fn builder_with_background_children() -> String {
+    format!(
+        "{}( trap '' TERM; sleep 6; echo alive > \"$HOME/survived\" ) &\n( trap '' TERM; sleep 300 ) &\necho $! > \"$HOME/bgpid\"\nsleep 120\n",
+        init_line()
+    )
+}
+
+/// The signal is sent while the builder runs; the builder's whole group is gone.
+fn a_signal_ends_the_builder_its_children_and_the_servers(signal: &str) {
+    let h = owned_packet(&builder_with_background_children());
+    let mut run = start_watched(&h, &[]);
+    wait_for_file(&mut run, &h.lane().join("home/bgpid"));
+    let started = Instant::now();
+    // Before the signal the sockets exist, so their absence afterwards shows the cleanup.
+    for socket in &lane_sockets(&h) {
+        assert!(
+            socket.exists(),
+            "{} is not there to remove",
+            socket.display()
+        );
+    }
+
+    send_signal(signal, &run.child);
+    let status = exit_within(&mut run, INTERRUPT_EXIT_WITHIN);
+    assert_interrupted_cleanly(&h, status, &run);
+    assert_eq!(
+        h.run_json()["signal"],
+        if signal == "INT" { "SIGINT" } else { "SIGTERM" }
+    );
+    assert_eq!(h.launches(), 1, "an interrupted run never relaunches");
+
+    // By pid where the sandbox shares the host's pid space (macOS). bwrap runs
+    // with --unshare-pid, so on Linux the recorded pid means nothing outside.
+    if cfg!(target_os = "macos") {
+        let pid = h.read("home/bgpid");
+        assert_pid_gone(pid.trim());
+    }
+    // By effect everywhere: a surviving child writes its marker at six seconds.
+    std::thread::sleep(Duration::from_secs(9).saturating_sub(started.elapsed()));
+    assert!(
+        !h.lane().join("home/survived").exists(),
+        "a background child outlived the interrupted run and wrote its marker"
+    );
+}
+
+#[test]
+fn sigint_ends_the_builders_whole_group_removes_the_sockets_and_exits_130() {
+    if !sandbox_available() {
+        return;
+    }
+    a_signal_ends_the_builder_its_children_and_the_servers("INT");
+}
+
+#[test]
+fn sigterm_ends_the_builders_whole_group_removes_the_sockets_and_exits_130() {
+    if !sandbox_available() {
+        return;
+    }
+    a_signal_ends_the_builder_its_children_and_the_servers("TERM");
+}
+
+#[test]
+fn a_signal_while_the_lane_waits_for_a_ruling_ends_the_run_without_a_builder() {
+    if !sandbox_available() {
+        return;
+    }
+    let ask = mcp_session("ask.out", &[(3, "ask", blocking_ask("Choose A or B?"))]);
+    let h = owned_packet(&format!("{}{ask}sleep 120\n", init_line()));
+    let mut run = start_watched(&h, &[]);
+    wait_for_ask(&h, &mut run.child, 1);
+    run.wait_for_stderr(WAITING, SESSION_END_WITHIN);
+
+    send_signal("INT", &run.child);
+    let status = exit_within(&mut run, INTERRUPT_EXIT_WITHIN);
+    assert_interrupted_cleanly(&h, status, &run);
+    assert_eq!(h.launches(), 1);
+}
+
+#[test]
+fn a_second_signal_does_not_wait_out_a_builder_that_ignores_sigterm() {
+    if !sandbox_available() {
+        return;
+    }
+    // The leader ignores SIGTERM, so the first signal would take ten seconds to
+    // become a SIGKILL. The second must not wait for them.
+    let body = format!(
+        "{}trap '' TERM\n( trap '' TERM; sleep 300 ) &\necho $! > \"$HOME/bgpid\"\nwhile true; do sleep 1; done\n",
+        init_line()
+    );
+    let h = owned_packet(&body);
+    let mut run = start_watched(&h, &[]);
+    wait_for_file(&mut run, &h.lane().join("home/bgpid"));
+
+    send_signal("INT", &run.child);
+    run.wait_for_stderr("ending the builder", Duration::from_secs(10));
+    let second = Instant::now();
+    send_signal("INT", &run.child);
+    let status = exit_within(&mut run, Duration::from_secs(5));
+    assert!(
+        second.elapsed() < Duration::from_secs(5),
+        "the second signal waited for the SIGTERM grace"
+    );
+    assert_interrupted_cleanly(&h, status, &run);
+    if cfg!(target_os = "macos") {
+        let pid = h.read("home/bgpid");
+        assert_pid_gone(pid.trim());
+    }
 }

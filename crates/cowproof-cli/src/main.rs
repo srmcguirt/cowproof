@@ -50,7 +50,9 @@ enum Action {
     ///
     /// Exit codes: 0 proved; 2 refuted (a recorded check failed, verify diverged, or a gate
     /// failed); 3 incomplete (a declared check was never run); 4 infrastructure (the proof could
-    /// not run, never a refutation); 1 the run itself failed before a verdict.
+    /// not run, never a refutation); 1 the run itself failed before a verdict; 130 interrupted
+    /// by SIGINT or SIGTERM (the builder's process group is ended, nothing is proved, and
+    /// `control/run.json` says `interrupted`).
     Run(RunOneArgs),
     /// Replay a proof capsule against a repository, from any directory
     ///
