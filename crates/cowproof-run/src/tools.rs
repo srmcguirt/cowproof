@@ -51,7 +51,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 
 /// The most check output returned to the builder, in bytes.
-const MAX_OUTPUT: usize = 32 * 1024;
+pub const MAX_OUTPUT: usize = 32 * 1024;
 
 pub use wire::MAX_LINE;
 

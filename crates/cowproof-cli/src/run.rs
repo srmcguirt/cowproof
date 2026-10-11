@@ -91,7 +91,7 @@ use tokio::time::Instant as TokioInstant;
 const UPSTREAM: &str = "https://api.anthropic.com";
 
 /// The longest one `run_check` may run before it is killed.
-const CHECK_TIMEOUT: Duration = Duration::from_secs(20 * 60);
+pub(crate) const CHECK_TIMEOUT: Duration = Duration::from_secs(20 * 60);
 
 /// The longest builder stdout line the meter will parse, in bytes. A longer
 /// line is still written to `stream.jsonl`, whole, but is not metered.
@@ -105,20 +105,20 @@ const PARK_GRACE: Duration = Duration::from_secs(2);
 
 /// After SIGTERM to the builder's process group, how long the leader gets to
 /// exit before the group is SIGKILLed.
-const TERM_GRACE: Duration = Duration::from_secs(10);
+pub(crate) const TERM_GRACE: Duration = Duration::from_secs(10);
 
 /// Once the builder's leader has exited and its group has been killed, how long
 /// the stream pump may still wait for EOF. A process that escaped the group
 /// could hold the pipe open forever; the pump is abandoned after this.
-const PUMP_DRAIN: Duration = Duration::from_secs(5);
+pub(crate) const PUMP_DRAIN: Duration = Duration::from_secs(5);
 
 /// The most builder stderr text held while it waits for a newline. A longer
 /// unterminated line is redacted and written in pieces (cut at whitespace where
 /// there is any), so memory stays bounded however the builder writes.
-const MAX_STDERR_LINE: usize = 64 * 1024;
+pub(crate) const MAX_STDERR_LINE: usize = 64 * 1024;
 
 /// The exit code when the run is interrupted by a signal (SIGINT or SIGTERM).
-const INTERRUPTED_EXIT_CODE: i32 = 130;
+pub(crate) const INTERRUPTED_EXIT_CODE: i32 = 130;
 
 /// The exit code for an infrastructure failure: a failed preflight check, or a lane that
 /// could not be run (`Outcome::Infrastructure`).
@@ -257,7 +257,7 @@ fn next_model(current: &str) -> Option<&'static str> {
 
 /// A model name the director named in a ruling goes into the builder's argv,
 /// so it is held to a conservative alphabet (and never starts like a flag).
-fn valid_model(model: &str) -> bool {
+pub(crate) fn valid_model(model: &str) -> bool {
     !model.is_empty()
         && model.len() <= 64
         && !model.starts_with('-')
@@ -268,7 +268,7 @@ fn valid_model(model: &str) -> bool {
 
 /// The shape `claude --resume` accepts, the same rule `claude_command`
 /// enforces. A session id outside it is treated as "no session to resume".
-fn resumable(session_id: &str) -> bool {
+pub(crate) fn resumable(session_id: &str) -> bool {
     (8..=64).contains(&session_id.len())
         && session_id
             .chars()
@@ -581,11 +581,148 @@ impl LiveEscalation {
 
 /// Sleep until `deadline`, or forever when there is none (for a `select!`
 /// branch that is switched off by its precondition, whose future is still built).
-async fn sleep_until_opt(deadline: Option<TokioInstant>) {
+pub(crate) async fn sleep_until_opt(deadline: Option<TokioInstant>) {
     match deadline {
         Some(at) => tokio::time::sleep_until(at).await,
         None => std::future::pending().await,
     }
+}
+
+/// The three files a builder reads from its lane home.
+pub(crate) struct LaneFiles {
+    pub settings: PathBuf,
+    pub mcp_config: PathBuf,
+    pub system_prompt: PathBuf,
+}
+
+/// Write `settings.json`, `mcp.json` and `system-prompt.md` into the lane home.
+///
+/// The lane home is writable by the builder, so a launch calls this before EVERY start (a
+/// resume must never trust what the previous session left there). `mcp.json` names one
+/// stdio server, `cowproof lane-tools --socket <runner_socket>`. The local launcher and the
+/// remote `host-agent builder` (D27) both call this, so the files are the same bytes.
+pub(crate) fn write_lane_files(
+    layout: &LaneLayout,
+    settings: &Value,
+    cowproof_exe: &Path,
+    runner_socket: &Path,
+    system_append: &str,
+) -> Result<LaneFiles> {
+    let settings_file = layout.home.join("settings.json");
+    fs::write(&settings_file, serde_json::to_vec_pretty(settings)?)?;
+    let mcp_config = layout.home.join("mcp.json");
+    fs::write(
+        &mcp_config,
+        serde_json::to_vec_pretty(&json!({
+            "mcpServers": {
+                "cowproof-tools": {
+                    "type": "stdio",
+                    "command": cowproof_exe,
+                    "args": ["lane-tools", "--socket", runner_socket],
+                }
+            }
+        }))?,
+    )?;
+    let system_prompt = layout.home.join("system-prompt.md");
+    fs::write(&system_prompt, system_append)?;
+    Ok(LaneFiles {
+        settings: settings_file,
+        mcp_config,
+        system_prompt,
+    })
+}
+
+/// Everything that decides one builder invocation.
+pub(crate) struct BuilderLaunch<'a> {
+    pub layout: &'a LaneLayout,
+    pub files: LaneFiles,
+    /// The `claude` executable, absolute.
+    pub claude_bin: &'a Path,
+    pub cowproof_exe: &'a Path,
+    /// The portkit CLI, when the settings carry its hooks: the builder may execute it.
+    pub pk_exe: Option<&'a Path>,
+    /// The lane's portkit state dir, which the builder may write.
+    pub portkit_dir: &'a Path,
+    pub path: &'a str,
+    pub base_url: &'a str,
+    pub bridge_port: u16,
+    pub proxy_socket: &'a Path,
+    pub placeholder_key: &'a str,
+    pub network: NetworkMode,
+    pub max_turns: u32,
+    /// The builder tools socket, canonical (`COWPROOF_RUNNER_SOCKET`).
+    pub runner_socket: &'a Path,
+    pub lane_id: &'a str,
+    pub port_base: u16,
+    pub model: &'a str,
+    pub prompt: &'a str,
+    pub resume: Option<&'a str>,
+    /// Launch without the OS sandbox (trusted local experiments only).
+    pub unsandboxed: bool,
+}
+
+/// The builder's command: the bridge wrapper, then `claude`, under the builder sandbox policy
+/// with exactly the lane's environment. Not yet started; the caller picks the stdio. The
+/// command makes the builder the leader of its own process group, so the caller can end
+/// the whole group. The one place a builder command is built, for `cowproof run` and for
+/// `host-agent builder`.
+pub(crate) fn builder_command(l: &BuilderLaunch<'_>) -> Result<Command> {
+    let mut invocation = claude_command(&ClaudeSpec {
+        lane: l.layout.clone(),
+        model: l.model.to_string(),
+        proxy_base_url: l.base_url.to_string(),
+        placeholder_key: l.placeholder_key.to_string(),
+        settings_file: l.files.settings.clone(),
+        mcp_config: l.files.mcp_config.clone(),
+        append_system_prompt_file: l.files.system_prompt.clone(),
+        prompt: l.prompt.to_string(),
+        max_turns: l.max_turns,
+        resume_session_id: l.resume.map(str::to_string),
+        cache_ttl: "1h".to_string(),
+        path: l.path.to_string(),
+    })?;
+    invocation.env.push((
+        "COWPROOF_RUNNER_SOCKET".to_string(),
+        l.runner_socket.to_string_lossy().into_owned(),
+    ));
+    invocation.env.extend(port_block_env(l.port_base));
+    invocation.env.extend(portkit_env(l.portkit_dir, l.lane_id));
+    invocation.program = l.claude_bin.to_string_lossy().into_owned();
+    let claude: Vec<String> = std::iter::once(invocation.program.clone())
+        .chain(invocation.args.iter().cloned())
+        .collect();
+    let argv = builder_argv(l.cowproof_exe, l.bridge_port, l.proxy_socket, &claude);
+    // The builder may execute claude, cowproof and, when there is one, `pk`
+    // (the hooks call it). It may write the lane's portkit state dir.
+    let mut executables = vec![l.claude_bin.to_path_buf(), l.cowproof_exe.to_path_buf()];
+    executables.extend(l.pk_exe.map(Path::to_path_buf));
+    let mut policy =
+        SandboxPolicy::builder_with_executables(l.layout, l.network.clone(), &executables)?;
+    policy.rw_paths.push(l.portkit_dir.to_path_buf());
+    let mut command = if l.unsandboxed {
+        // The same argv and environment (the policy's own variables included), run
+        // directly: only the OS sandbox is missing.
+        let mut env = invocation.env;
+        policy.apply_env(&mut env);
+        let mut cmd = Command::new(&argv[0]);
+        cmd.args(&argv[1..])
+            .env_clear()
+            .envs(env)
+            .current_dir(&invocation.cwd)
+            .stdin(Stdio::null())
+            .kill_on_drop(true);
+        cmd
+    } else {
+        sandboxed_command(
+            &policy,
+            &l.layout.control.join("builder.sb"),
+            &argv,
+            invocation.env,
+            &invocation.cwd,
+        )?
+    };
+    command.process_group(0);
+    Ok(command)
 }
 
 /// Everything a launch needs that does not change between launches.
@@ -691,67 +828,36 @@ impl Launcher {
             return Err(Interrupted.into());
         }
         let layout = &self.layout;
-        let settings_file = layout.home.join("settings.json");
-        fs::write(
-            &settings_file,
-            serde_json::to_vec_pretty(&builder_settings(self.pk_exe.as_deref()))?,
-        )?;
-        let mcp_config = layout.home.join("mcp.json");
-        fs::write(
-            &mcp_config,
-            serde_json::to_vec_pretty(&json!({
-                "mcpServers": {
-                    "cowproof-tools": {
-                        "type": "stdio",
-                        "command": self.cowproof_exe,
-                        "args": ["lane-tools", "--socket", self.socket],
-                    }
-                }
-            }))?,
-        )?;
         let assembled = assemble_prompt(self.project_instructions.as_deref(), &launch.packet);
-        let system_prompt = layout.home.join("system-prompt.md");
-        fs::write(&system_prompt, &assembled.system_append)?;
-
-        let mut invocation = claude_command(&ClaudeSpec {
-            lane: layout.clone(),
-            model: launch.model.clone(),
-            proxy_base_url: self.base_url.clone(),
-            placeholder_key: self.placeholder_key.clone(),
-            settings_file,
-            mcp_config,
-            append_system_prompt_file: system_prompt,
-            prompt: launch.prompt.clone(),
-            max_turns: self.max_turns,
-            resume_session_id: launch.resume.clone(),
-            cache_ttl: "1h".to_string(),
-            path: self.path.clone(),
-        })?;
-        invocation.env.push((
-            "COWPROOF_RUNNER_SOCKET".to_string(),
-            self.socket.to_string_lossy().into_owned(),
-        ));
-        invocation.env.extend(port_block_env(self.port_base));
-        invocation
-            .env
-            .extend(portkit_env(&self.portkit_dir, &self.lane_id));
-        invocation.program = self.claude_bin.to_string_lossy().into_owned();
-        let claude: Vec<String> = std::iter::once(invocation.program.clone())
-            .chain(invocation.args.iter().cloned())
-            .collect();
-        let argv = builder_argv(
+        let files = write_lane_files(
+            layout,
+            &builder_settings(self.pk_exe.as_deref()),
             &self.cowproof_exe,
-            self.bridge_port,
-            &self.proxy_socket,
-            &claude,
-        );
-        // The builder may execute claude, cowproof and, when there is one, `pk`
-        // (the hooks call it). It may write the lane's portkit state dir.
-        let mut executables = vec![self.claude_bin.clone(), self.cowproof_exe.clone()];
-        executables.extend(self.pk_exe.clone());
-        let mut policy =
-            SandboxPolicy::builder_with_executables(layout, self.network.clone(), &executables)?;
-        policy.rw_paths.push(self.portkit_dir.clone());
+            &self.socket,
+            &assembled.system_append,
+        )?;
+        let mut child_cmd = builder_command(&BuilderLaunch {
+            layout,
+            files,
+            claude_bin: &self.claude_bin,
+            cowproof_exe: &self.cowproof_exe,
+            pk_exe: self.pk_exe.as_deref(),
+            portkit_dir: &self.portkit_dir,
+            path: &self.path,
+            base_url: &self.base_url,
+            bridge_port: self.bridge_port,
+            proxy_socket: &self.proxy_socket,
+            placeholder_key: &self.placeholder_key,
+            network: self.network.clone(),
+            max_turns: self.max_turns,
+            runner_socket: &self.socket,
+            lane_id: &self.lane_id,
+            port_base: self.port_base,
+            model: &launch.model,
+            prompt: &launch.prompt,
+            resume: launch.resume.as_deref(),
+            unsandboxed: self.unsandboxed,
+        })?;
         // The first launch starts the lane's stream and stderr files; every
         // later one appends, so they hold the whole lane in order.
         let first = index == 0;
@@ -767,33 +873,10 @@ impl Launcher {
         let mut end_rx = self.end_rx.lock().await;
         while end_rx.try_recv().is_ok() {}
 
-        // Only the builder gets its own process group (so the runner can end
-        // it whole); `run_check` and the git steps keep the runner's group, so
-        // a terminal Ctrl-C still reaches them.
-        let mut child_cmd = if self.unsandboxed {
-            // The same argv and environment (the policy's own variables included), run
-            // directly: only the OS sandbox is missing.
-            let mut env = invocation.env;
-            policy.apply_env(&mut env);
-            let mut cmd = Command::new(&argv[0]);
-            cmd.args(&argv[1..])
-                .env_clear()
-                .envs(env)
-                .current_dir(&invocation.cwd)
-                .stdin(Stdio::null())
-                .kill_on_drop(true);
-            cmd
-        } else {
-            sandboxed_command(
-                &policy,
-                &layout.control.join("builder.sb"),
-                &argv,
-                invocation.env,
-                &invocation.cwd,
-            )?
-        };
+        // Only the builder gets its own process group (so the runner can end it whole;
+        // `builder_command` sets it); `run_check` and the git steps keep the runner's group,
+        // so a terminal Ctrl-C still reaches them.
         let mut child = child_cmd
-            .process_group(0)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -1599,36 +1682,74 @@ async fn run_declared_check(ctx: Arc<CheckContext>, id: String) -> CheckOutcome 
     let Ok(_slot) = ctx.slot.acquire().await else {
         return refused("the check queue is closed");
     };
-    let policy = SandboxPolicy::run_check(&ctx.layout);
-    let argv = ["/bin/sh".to_string(), "-c".to_string(), command.clone()];
+    run_check_command(
+        &ctx.layout,
+        &ctx.path,
+        command,
+        Some(ctx.port_base),
+        CHECK_TIMEOUT,
+        &id,
+    )
+    .await
+    .outcome
+}
+
+/// What running one check command did.
+pub(crate) struct CheckRun {
+    pub outcome: CheckOutcome,
+    /// The command ran past its timeout and was killed.
+    pub timed_out: bool,
+}
+
+/// Run `command` (`sh -c`) in the lane's clone inside a fresh `SandboxPolicy::run_check`
+/// sandbox, with `timeout`, and report what it did. `label` names the check in messages.
+/// Fails closed: if the sandbox cannot be built, nothing runs. The one place a declared check
+/// runs, for the local `run_check` tool and for `host-agent check` (D27).
+pub(crate) async fn run_check_command(
+    layout: &LaneLayout,
+    path: &str,
+    command: &str,
+    port_base: Option<u16>,
+    timeout: Duration,
+    label: &str,
+) -> CheckRun {
+    let done = |outcome| CheckRun {
+        outcome,
+        timed_out: false,
+    };
+    let policy = SandboxPolicy::run_check(layout);
+    let argv = ["/bin/sh".to_string(), "-c".to_string(), command.to_string()];
     let mut env = vec![
-        ("PATH".to_string(), ctx.path.clone()),
+        ("PATH".to_string(), path.to_string()),
         (
             "HOME".to_string(),
-            ctx.layout.home.to_string_lossy().into_owned(),
+            layout.home.to_string_lossy().into_owned(),
         ),
     ];
-    env.extend(port_block_env(ctx.port_base));
+    env.extend(port_base.into_iter().flat_map(port_block_env));
     let mut child = match sandboxed_command(
         &policy,
-        &ctx.layout.control.join("run_check.sb"),
+        &layout.control.join("run_check.sb"),
         &argv,
         env,
-        &ctx.layout.clone,
+        &layout.clone,
     ) {
         Ok(c) => c,
-        Err(e) => return refused(format!("sandbox unavailable: {e:#}")),
+        Err(e) => return done(refused(format!("sandbox unavailable: {e:#}"))),
     };
-    match tokio::time::timeout(CHECK_TIMEOUT, child.output()).await {
-        Err(_) => refused(format!("check {id:?} timed out after {CHECK_TIMEOUT:?}")),
-        Ok(Err(e)) => refused(format!("could not start check {id:?}: {e}")),
+    match tokio::time::timeout(timeout, child.output()).await {
+        Err(_) => CheckRun {
+            outcome: refused(format!("check {label:?} timed out after {timeout:?}")),
+            timed_out: true,
+        },
+        Ok(Err(e)) => done(refused(format!("could not start check {label:?}: {e}"))),
         Ok(Ok(out)) => {
             let mut output = String::from_utf8_lossy(&out.stdout).into_owned();
             output.push_str(&String::from_utf8_lossy(&out.stderr));
-            CheckOutcome {
+            done(CheckOutcome {
                 exit_status: out.status.code().unwrap_or(-1),
                 output,
-            }
+            })
         }
     }
 }
@@ -1777,7 +1898,7 @@ where
 /// secret that straddles such a forced cut can escape redaction; that needs a
 /// single unterminated run of 64 KiB or more. With `eof` the whole buffer is
 /// ready. Invalid UTF-8 becomes U+FFFD.
-fn redact_ready(pending: &mut Vec<u8>, max: usize, eof: bool) -> Vec<u8> {
+pub(crate) fn redact_ready(pending: &mut Vec<u8>, max: usize, eof: bool) -> Vec<u8> {
     let mut out = Vec::new();
     loop {
         let mut cut = if eof {
@@ -1823,7 +1944,7 @@ fn redact_ready(pending: &mut Vec<u8>, max: usize, eof: bool) -> Vec<u8> {
 /// Each batch is flushed before the next read, so the file never lags the
 /// builder by more than the line in progress. A write error stops writing but
 /// not reading: the builder must never block on a full pipe or get SIGPIPE.
-async fn pump_stderr<R, W>(
+pub(crate) async fn pump_stderr<R, W>(
     mut reader: R,
     sink: &mut W,
     pending: &mut Vec<u8>,
@@ -3102,7 +3223,7 @@ async fn tool_version(tool: &str) -> Option<String> {
 /// regular, executable file named `pk` with a path that is valid UTF-8, because the
 /// hook command strings in the settings file carry it. `exe` is canonical, so the
 /// result is absolute and never relies on the builder's `PATH`.
-fn sibling_pk(exe: &Path) -> Option<PathBuf> {
+pub(crate) fn sibling_pk(exe: &Path) -> Option<PathBuf> {
     let pk = exe.parent()?.join("pk");
     pk.to_str()?;
     let meta = fs::metadata(&pk).ok()?;

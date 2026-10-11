@@ -1,4 +1,5 @@
-//! `cowproof host-agent` (D27): the remote verbs `prepare`, `patch`, `doctor` and `cleanup`.
+//! `cowproof host-agent` (D27): the remote verbs `prepare`, `patch`, `doctor`, `cleanup`,
+//! `builder` and `check`.
 //!
 //! Every test drives the real binary against temporary directories under `/var/tmp`, with a
 //! `HOME` of its own and the working directory set to one of them, so nothing reads the real
@@ -8,12 +9,16 @@
 #[allow(dead_code)] // this file needs only a few of the shared helpers
 mod common;
 
-use common::{fork_lock, git, output, sandbox_available, var_tmp};
-use serde_json::Value;
+use common::{REAL_KEY, fork_lock, git, output, sandbox_available, unique_lane_id, var_tmp};
+use cowproof_run::bridge::bridge_port;
+use serde_json::{Value, json};
 use std::fs;
+use std::io::Write;
 use std::os::unix::fs::{PermissionsExt, symlink};
+use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Child, Command, Output, Stdio};
+use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -618,4 +623,712 @@ fn cleanup_unlinks_a_planted_symlink_and_never_touches_its_target() {
     fs::write(fx.root.join("afile"), "x").unwrap();
     assert_refused(&fx.agent(&["cleanup", "--lane-id", "afile"], None));
     assert!(fx.root.join("afile").is_file());
+}
+
+// ---------------------------------------------------------------------------------------------
+// `builder` and `check` (D27)
+// ---------------------------------------------------------------------------------------------
+
+/// The placeholder the director's proxy would have made for the lane.
+const PLACEHOLDER: &str = "placeholder-0123abcd-test";
+
+/// What the fake builder prints on stdout: two JSON lines, then bytes that are not UTF-8 and
+/// no final newline, so only a byte-for-byte copy gives them back.
+fn fake_stdout() -> Vec<u8> {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(
+        b"{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"0a1b2c3d-1111-2222-3333-444455556666\"}\n",
+    );
+    bytes.extend_from_slice(
+        b"{\"type\":\"result\",\"subtype\":\"success\",\"result\":\"done \\u00e9\",\"num_turns\":1}\n",
+    );
+    bytes.extend_from_slice(&[0xff, 0xfe]);
+    bytes.extend_from_slice(b"tail-without-a-newline");
+    bytes
+}
+
+/// The shell text that prints [`fake_stdout`].
+const FAKE_PRINT: &str = concat!(
+    r#"printf '%s\n' '{"type":"system","subtype":"init","session_id":"0a1b2c3d-1111-2222-3333-444455556666"}'"#,
+    "\n",
+    r#"printf '%s\n' '{"type":"result","subtype":"success","result":"done \u00e9","num_turns":1}'"#,
+    "\n",
+    r#"printf '\377\376tail-without-a-newline'"#,
+    "\n",
+);
+
+/// A prepared remote lane with forwarded sockets, a copy of `cowproof` outside the home, and a
+/// fake `claude` that records what it sees under `$HOME/fake` (the lane's `home/fake`).
+struct Bfx {
+    fx: Fx,
+    id: String,
+    /// Holds the `cowproof` copy and the fake.
+    _tools: TempDir,
+    /// A directory outside the lane that the fake tries to write to.
+    outside: TempDir,
+    cowproof: PathBuf,
+    fake: PathBuf,
+    /// What stands in for the `ssh -R` forwards; kept open for the life of the test.
+    _sockets: Vec<UnixListener>,
+}
+
+impl Bfx {
+    fn new(body: &str) -> Self {
+        let fx = Fx::new();
+        let id = unique_lane_id();
+        assert_ok(&fx.prepare(&id, &[]));
+        let tools = var_tmp("cp-hostagent-tools-");
+        let outside = var_tmp("cp-hostagent-outside-");
+        // The test binary lives under the home in a normal checkout, which the sandbox hides, so
+        // a copy outside it is what runs.
+        let cowproof = tools.path().join("cowproof");
+        {
+            let _g = fork_lock();
+            fs::copy(env!("CARGO_BIN_EXE_cowproof"), &cowproof).unwrap();
+        }
+        let fake = tools.path().join("fake-claude");
+        let script = format!(
+            r#"#!/bin/sh
+if [ "$1" = "--version" ]; then echo "fake-claude 0.0.0"; exit 0; fi
+rec="$HOME/fake"
+mkdir -p "$rec"
+{body}
+"#
+        );
+        {
+            let _g = fork_lock();
+            fs::write(&fake, script).unwrap();
+            fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let lane = fx.root.join(&id);
+        let sockets = vec![
+            UnixListener::bind(lane.join("proxy.sock")).unwrap(),
+            UnixListener::bind(lane.join("sock/runner.sock")).unwrap(),
+        ];
+        Bfx {
+            fx,
+            id,
+            _tools: tools,
+            outside,
+            cowproof,
+            fake,
+            _sockets: sockets,
+        }
+    }
+
+    fn lane(&self) -> PathBuf {
+        self.fx.root.join(&self.id)
+    }
+
+    /// Where the fake records, as the test sees it.
+    fn rec(&self) -> PathBuf {
+        self.lane().join("home/fake")
+    }
+
+    fn spec(&self) -> Value {
+        json!({
+            "model": "haiku",
+            "prompt": "Do the thing.",
+            "system_prompt": "You are a builder.\n",
+            "settings": {"permissions": {"allow": ["Bash"], "deny": ["WebFetch"]}},
+            "placeholder_key": PLACEHOLDER,
+            "bridge_port": bridge_port(&self.id),
+            "port_base": 57040,
+            "max_turns": 5,
+            "claude_bin": self.fake,
+        })
+    }
+
+    /// `host-agent <verb> --lane-id <id> ...` on the binary copy, with the real key in the
+    /// environment (it must never reach the builder), stdin and stdout piped.
+    fn command(&self, verb: &[&str], lane_id: &str) -> Command {
+        let mut cmd = Command::new(&self.cowproof);
+        cmd.arg("host-agent")
+            .args(verb)
+            .arg("--lane-id")
+            .arg(lane_id)
+            .arg("--root")
+            .arg(&self.fx.root)
+            .current_dir(self.fx.work.path())
+            .env("HOME", self.fx.home.path())
+            .env("ANTHROPIC_API_KEY", REAL_KEY)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        cmd
+    }
+
+    fn start(&self, verb: &[&str], stdin: &Value) -> Child {
+        self.start_lane(verb, &self.id, stdin)
+    }
+
+    fn start_lane(&self, verb: &[&str], lane_id: &str, stdin: &Value) -> Child {
+        let mut cmd = self.command(verb, lane_id);
+        let mut child = {
+            let _g = fork_lock();
+            cmd.spawn().unwrap()
+        };
+        let mut pipe = child.stdin.take().unwrap();
+        // A refusal can exit before it has read everything; that is not a failure here.
+        let _ = pipe.write_all(stdin.to_string().as_bytes());
+        child
+    }
+
+    fn run_builder(&self, spec: &Value) -> Output {
+        self.start(&["builder"], spec).wait_with_output().unwrap()
+    }
+
+    fn run_check(&self, check_id: &str, spec: &Value) -> Output {
+        self.start(&["check", "--check-id", check_id], spec)
+            .wait_with_output()
+            .unwrap()
+    }
+
+    fn recorded(&self, name: &str) -> String {
+        fs::read_to_string(self.rec().join(name))
+            .unwrap_or_else(|e| panic!("the fake recorded no {name}: {e}"))
+    }
+
+    fn escape_target(&self) -> PathBuf {
+        self.outside.path().join("pwned")
+    }
+}
+
+/// A fake that records its surroundings, writes in its clone, tries to write outside it, sends
+/// stdout and stderr and exits 7.
+fn recording_body(escape_target: &Path) -> String {
+    format!(
+        r#"cp "$HOME/settings.json" "$HOME/mcp.json" "$HOME/system-prompt.md" "$rec/"
+env | sort > "$rec/env.txt"
+printf '%s\n' "$@" > "$rec/args.txt"
+pwd > "$rec/pwd.txt"
+echo made > made.txt
+echo "oops sk-synthetic0123456789abcdef" >&2
+if ( echo x > '{}' ) 2>/dev/null; then echo allowed > "$rec/escape"; else echo denied > "$rec/escape"; fi
+{FAKE_PRINT}exit 7
+"#,
+        escape_target.display()
+    )
+}
+
+/// `Bfx::new` for a body that needs the escape target, which exists only after the fixture.
+fn recording_fixture() -> Bfx {
+    // The outside directory is made inside `new`; the body is written afterwards.
+    let bfx = Bfx::new("exit 99");
+    let script = format!(
+        "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo fake-claude; exit 0; fi\nrec=\"$HOME/fake\"\nmkdir -p \"$rec\"\n{}",
+        recording_body(&bfx.escape_target())
+    );
+    {
+        let _g = fork_lock();
+        fs::write(&bfx.fake, script).unwrap();
+    }
+    bfx
+}
+
+fn env_lines(text: &str) -> Vec<&str> {
+    text.lines().collect()
+}
+
+#[test]
+fn builder_runs_the_fake_in_the_remote_sandbox_and_hands_back_its_stdout_and_exit_code() {
+    if !sandbox_available() {
+        return;
+    }
+    let bfx = recording_fixture();
+    let out = bfx.run_builder(&bfx.spec());
+
+    // The fake's stdout is ours, byte for byte, and its exit code is ours.
+    assert_eq!(
+        out.stdout,
+        fake_stdout(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(7),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // The lane files are in the fake's home, written by the shared code.
+    let settings: Value = serde_json::from_str(&bfx.recorded("settings.json")).unwrap();
+    assert_eq!(settings["permissions"]["deny"], json!(["WebFetch"]));
+    assert_eq!(bfx.recorded("system-prompt.md"), "You are a builder.\n");
+
+    // `mcp.json` points `lane-tools` at the remote lane's runner socket.
+    let mcp: Value = serde_json::from_str(&bfx.recorded("mcp.json")).unwrap();
+    let server = &mcp["mcpServers"]["cowproof-tools"];
+    let lane = bfx.fx.root.canonicalize().unwrap().join(&bfx.id);
+    assert_eq!(server["type"], "stdio");
+    assert_eq!(
+        server["command"],
+        bfx.cowproof.canonicalize().unwrap().to_str().unwrap()
+    );
+    assert_eq!(
+        server["args"],
+        json!([
+            "lane-tools",
+            "--socket",
+            lane.join("sock/runner.sock").to_str().unwrap()
+        ])
+    );
+
+    // The environment: the bridge, the placeholder and nothing of the real key.
+    let env = bfx.recorded("env.txt");
+    let lines = env_lines(&env);
+    let has = |line: String| lines.contains(&line.as_str());
+    assert!(
+        has(format!(
+            "ANTHROPIC_BASE_URL=http://127.0.0.1:{}",
+            bridge_port(&bfx.id)
+        )),
+        "{env}"
+    );
+    assert!(has(format!("ANTHROPIC_API_KEY={PLACEHOLDER}")), "{env}");
+    assert!(
+        has(format!(
+            "COWPROOF_RUNNER_SOCKET={}",
+            lane.join("sock/runner.sock").display()
+        )),
+        "{env}"
+    );
+    assert!(has("COWPROOF_PORT_BASE=57040".to_string()), "{env}");
+    assert!(
+        has(format!("HOME={}", lane.join("home").display())),
+        "{env}"
+    );
+    assert!(
+        !env.contains(REAL_KEY),
+        "the real key reached the builder: {env}"
+    );
+    let args = bfx.recorded("args.txt");
+    assert!(args.lines().any(|l| l == "haiku"), "{args}");
+    assert_eq!(args.lines().last(), Some("Do the thing."));
+    assert_eq!(
+        bfx.recorded("pwd.txt").trim(),
+        lane.join("clone").to_str().unwrap()
+    );
+
+    // It worked in its clone, and the sandbox kept it out of everything else.
+    assert_eq!(
+        fs::read_to_string(bfx.fx.clone_of(&bfx.id).join("made.txt")).unwrap(),
+        "made\n"
+    );
+    assert_eq!(bfx.recorded("escape").trim(), "denied");
+    assert!(
+        !bfx.escape_target().exists(),
+        "the builder wrote outside its clone"
+    );
+
+    // Its stderr is in the control directory, redacted by the runner's own pump.
+    let stderr = fs::read_to_string(bfx.lane().join("control/builder.stderr")).unwrap();
+    assert!(stderr.contains("oops [redacted]"), "{stderr}");
+    assert!(!stderr.contains("sk-synthetic"), "{stderr}");
+}
+
+#[test]
+fn builder_refuses_a_spec_that_carries_an_api_key_and_starts_nothing() {
+    if !sandbox_available() {
+        return;
+    }
+    let bfx = Bfx::new("echo started > \"$rec/started\"\nexit 0");
+    let real = "sk-test-real-xyz-0123456789";
+    let mut cases: Vec<(&str, Value)> = Vec::new();
+    for (name, edit) in [
+        (
+            "a key in the settings env",
+            json!({"settings": {"env": {"ANTHROPIC_API_KEY": real}}}),
+        ),
+        (
+            "a key-shaped value anywhere",
+            json!({"settings": {"note": format!("use {real}")}}),
+        ),
+        ("a top-level api key", json!({"api_key": real})),
+        (
+            "an auth token field",
+            json!({"settings": {"hooks": {"auth_token": "x"}}}),
+        ),
+        (
+            "a real key as the placeholder",
+            json!({"placeholder_key": real}),
+        ),
+        (
+            "a key in the prompt",
+            json!({"prompt": format!("export KEY={real}")}),
+        ),
+    ] {
+        let mut spec = bfx.spec();
+        for (k, v) in edit.as_object().unwrap() {
+            spec[k] = v.clone();
+        }
+        cases.push((name, spec));
+    }
+    for (name, spec) in cases {
+        let out = bfx.run_builder(&spec);
+        let json = json_of(&out);
+        assert_eq!(out.status.code(), Some(1), "{name}: {json}");
+        assert_eq!(json["ok"], false, "{name}: {json}");
+        let error = json["error"].as_str().unwrap();
+        assert!(error.contains("API key or credential"), "{name}: {error}");
+        assert!(
+            !error.contains(real) && !error.contains("sk-"),
+            "{name}: the error repeats the key"
+        );
+        assert!(
+            !String::from_utf8_lossy(&out.stderr).contains("sk-test"),
+            "{name}: stderr repeats the key"
+        );
+    }
+    // Nothing started, and no lane file was written.
+    assert!(!bfx.rec().exists(), "a builder started");
+    assert!(!bfx.lane().join("home/settings.json").exists());
+    assert!(!bfx.lane().join("control/builder.stderr").exists());
+}
+
+#[test]
+fn builder_accepts_a_prompt_that_only_explains_bearer_auth() {
+    if !sandbox_available() {
+        return;
+    }
+    let bfx = Bfx::new(&format!(
+        "echo started > \"$rec/started\"\n{FAKE_PRINT}exit 0"
+    ));
+    let mut spec = bfx.spec();
+    spec["prompt"] = json!("Send the header Authorization: Bearer <token> to the API.");
+    let out = bfx.run_builder(&spec);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.stdout, fake_stdout());
+    assert_eq!(bfx.recorded("started").trim(), "started");
+}
+
+#[test]
+fn builder_refuses_a_launch_that_does_not_fit_the_lane() {
+    if !sandbox_available() {
+        return;
+    }
+    let bfx = Bfx::new("echo started > \"$rec/started\"\nexit 0");
+    let edits: Vec<(&str, Value)> = vec![
+        (
+            "another lane's bridge port",
+            json!({"bridge_port": bridge_port(&bfx.id).wrapping_add(1)}),
+        ),
+        ("a port block outside the range", json!({"port_base": 1000})),
+        (
+            "a placeholder that is not one",
+            json!({"placeholder_key": "hello"}),
+        ),
+        (
+            "a model that looks like a flag",
+            json!({"model": "--dangerous"}),
+        ),
+        ("a relative claude", json!({"claude_bin": "claude"})),
+        (
+            "a missing claude",
+            json!({"claude_bin": "/var/tmp/cp-no-such-claude"}),
+        ),
+        (
+            "a bad session id",
+            json!({"resume_session_id": "not a session"}),
+        ),
+        ("no turns", json!({"max_turns": 0})),
+        ("an unknown field", json!({"mcp": {"mcpServers": {}}})),
+    ];
+    for (name, edit) in edits {
+        let mut spec = bfx.spec();
+        for (k, v) in edit.as_object().unwrap() {
+            spec[k] = v.clone();
+        }
+        let out = bfx.run_builder(&spec);
+        let json = json_of(&out);
+        assert_eq!(out.status.code(), Some(1), "{name}: {json}");
+        assert_eq!(json["ok"], false, "{name}: {json}");
+    }
+    assert!(!bfx.rec().exists(), "a builder started");
+
+    // A socket that was never forwarded: refused, and the message says what to do.
+    fs::remove_file(bfx.lane().join("sock/runner.sock")).unwrap();
+    let out = bfx.run_builder(&bfx.spec());
+    let error = assert_refused(&out);
+    assert!(
+        error.contains("runner.sock") && error.contains("ssh -R"),
+        "{error}"
+    );
+    fs::remove_file(bfx.lane().join("proxy.sock")).unwrap();
+    let error = assert_refused(&bfx.run_builder(&bfx.spec()));
+    assert!(error.contains("proxy.sock"), "{error}");
+
+    // No lane, no builder.
+    let out = bfx
+        .start_lane(&["builder"], "no-such-lane", &bfx.spec())
+        .wait_with_output()
+        .unwrap();
+    assert!(assert_refused(&out).contains("no lane"));
+    assert!(!bfx.rec().exists(), "a builder started");
+}
+
+/// Wait until `path` exists (the fake has got that far), or fail after a minute.
+fn wait_for(path: &Path) {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !path.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "{} never appeared",
+            path.display()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn wait_exit(child: &mut Child, limit: Duration) -> std::process::ExitStatus {
+    let deadline = Instant::now() + limit;
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            return status;
+        }
+        assert!(Instant::now() < deadline, "host-agent builder did not exit");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn signal_pid(signal: &str, pid: &str) -> bool {
+    let _g = fork_lock();
+    Command::new("kill")
+        .args([signal, pid])
+        .stderr(Stdio::null())
+        .status()
+        .unwrap()
+        .success()
+}
+
+/// Kills the fake's background child by the pid it recorded, whatever the test did.
+struct Reaper(PathBuf);
+
+impl Drop for Reaper {
+    fn drop(&mut self) {
+        if let Ok(pid) = fs::read_to_string(&self.0) {
+            signal_pid("-KILL", pid.trim());
+        }
+    }
+}
+
+/// SIGTERM to `host-agent builder` ends the builder and a background child of it, by effect: the
+/// child writes a marker line every 0.2 s, and after the exit the marker stops growing.
+fn assert_sigterm_ends_the_builder(body: &str, limit: Duration) {
+    let bfx = Bfx::new(body);
+    let _reaper = Reaper(bfx.rec().join("bg.pid"));
+    let mut child = bfx.start(&["builder"], &bfx.spec());
+    let marker = bfx.rec().join("marker");
+    wait_for(&marker);
+    let pid = child.id().to_string();
+    assert!(signal_pid("-TERM", &pid), "could not signal host-agent");
+
+    let status = wait_exit(&mut child, limit);
+    assert_eq!(status.code(), Some(130), "an interrupted builder exits 130");
+    let size = fs::metadata(&marker).unwrap().len();
+    std::thread::sleep(Duration::from_millis(1500));
+    assert_eq!(
+        fs::metadata(&marker).unwrap().len(),
+        size,
+        "a child kept writing after the kill"
+    );
+    let bg = fs::read_to_string(bfx.rec().join("bg.pid")).unwrap();
+    assert!(
+        !signal_pid("-0", bg.trim()),
+        "the background child is still alive"
+    );
+}
+
+#[test]
+fn sigterm_to_builder_ends_the_fake_and_a_background_child_that_ignores_sigterm() {
+    if !sandbox_available() {
+        return;
+    }
+    assert_sigterm_ends_the_builder(
+        r#"( trap '' TERM; while :; do echo tick >> "$rec/marker"; sleep 0.2; done ) >/dev/null 2>&1 &
+echo $! > "$rec/bg.pid"
+sleep 600
+"#,
+        Duration::from_secs(30),
+    );
+}
+
+#[test]
+fn a_builder_that_ignores_sigterm_is_killed_after_the_grace() {
+    if !sandbox_available() {
+        return;
+    }
+    assert_sigterm_ends_the_builder(
+        r#"trap '' TERM
+echo $$ > "$rec/bg.pid"
+while :; do echo tick >> "$rec/marker"; sleep 0.2; done
+"#,
+        Duration::from_secs(60),
+    );
+}
+
+fn check_spec(command: &str, timeout_secs: u64) -> Value {
+    json!({"command": command, "timeout_secs": timeout_secs, "port_base": 57040})
+}
+
+#[test]
+fn check_reports_the_exit_code_of_a_passing_and_a_failing_command() {
+    if !sandbox_available() {
+        return;
+    }
+    let bfx = Bfx::new("exit 0");
+    let out = bfx.run_check("c-pass", &check_spec("echo fine; exit 0", 60));
+    let json = assert_ok(&out);
+    assert_eq!(json["exit_code"], 0);
+    assert_eq!(json["timed_out"], false);
+    assert_eq!(json["output_tail"], "fine\n");
+
+    // A failing check is a report, not a refusal: exit 0 for the verb, ok false, the code kept.
+    let out = bfx.run_check("c-fail", &check_spec("echo broken >&2; exit 3", 60));
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let json = json_of(&out);
+    assert_eq!(json["ok"], false);
+    assert_eq!(json["exit_code"], 3);
+    assert_eq!(json["timed_out"], false);
+    assert_eq!(json["output_tail"], "broken\n");
+
+    // It runs in the clone, in the check sandbox: the clone is writable, the rest is not.
+    let target = bfx.escape_target();
+    let command = format!(
+        "pwd; echo from-check > made-by-check.txt; (echo x > '{}') 2>/dev/null && echo allowed || echo denied; echo $COWPROOF_PORT_BASE",
+        target.display()
+    );
+    let json = assert_ok(&bfx.run_check("c-sandbox", &check_spec(&command, 60)));
+    let clone = bfx.lane().canonicalize().unwrap().join("clone");
+    assert_eq!(
+        json["output_tail"],
+        format!("{}\ndenied\n57040\n", clone.display())
+    );
+    assert!(!target.exists());
+    assert_eq!(
+        fs::read_to_string(bfx.fx.clone_of(&bfx.id).join("made-by-check.txt")).unwrap(),
+        "from-check\n"
+    );
+}
+
+#[test]
+fn check_redacts_a_token_and_caps_the_output() {
+    if !sandbox_available() {
+        return;
+    }
+    let bfx = Bfx::new("exit 0");
+    let json = assert_ok(&bfx.run_check(
+        "c-secret",
+        // Built at run time: a spec that held the token itself would be refused.
+        &check_spec(
+            "echo token $(printf 'sk-%s' synthetic0123456789abcdef) here",
+            60,
+        ),
+    ));
+    assert_eq!(json["output_tail"], "token [redacted] here\n");
+
+    // The cap keeps the end of the output, at most the local run_check limit, and says so.
+    let json = assert_ok(&bfx.run_check(
+        "c-big",
+        &check_spec(
+            "head -c 200000 /dev/zero | tr '\\0' x; echo; echo the-end",
+            60,
+        ),
+    ));
+    let tail = json["output_tail"].as_str().unwrap();
+    assert!(tail.starts_with("[output truncated]\n"), "{}", &tail[..40]);
+    assert!(tail.ends_with("x\nthe-end\n"));
+    assert!(
+        tail.len() <= 32 * 1024 + "[output truncated]\n".len(),
+        "{}",
+        tail.len()
+    );
+}
+
+#[test]
+fn check_kills_a_command_that_runs_past_its_timeout() {
+    if !sandbox_available() {
+        return;
+    }
+    let bfx = Bfx::new("exit 0");
+    // The command sleeps 30 s and the limit is 1 s. The bound is far above the limit because the
+    // process start (a fresh binary copy, assessed by the OS on first run, and the fork lock
+    // other tests hold while they copy theirs) can take seconds under load; it is still below
+    // the sleep, so a timeout that did not kill the command would show.
+    let child = bfx.start(
+        &["check", "--check-id", "c-slow"],
+        &check_spec("sleep 30", 1),
+    );
+    let started = Instant::now();
+    let out = child.wait_with_output().unwrap();
+    assert!(
+        started.elapsed() < Duration::from_secs(25),
+        "the timeout did not fire: {:?}",
+        started.elapsed()
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let json = json_of(&out);
+    assert_eq!(json["ok"], false);
+    assert_eq!(json["timed_out"], true);
+    assert_eq!(json["exit_code"], -1);
+    assert!(json["output_tail"].as_str().unwrap().contains("timed out"));
+}
+
+#[test]
+fn check_refuses_a_key_a_bad_spec_and_a_lane_that_is_not_there() {
+    if !sandbox_available() {
+        return;
+    }
+    let bfx = Bfx::new("exit 0");
+    let mut with_key = check_spec("true", 60);
+    with_key["command"] =
+        json!("curl -H 'x-api-key: sk-test-real-xyz-0123456789' http://example.invalid");
+    let error = assert_refused(&bfx.run_check("c-key", &with_key));
+    assert!(error.contains("API key or credential"), "{error}");
+    assert!(!error.contains("sk-test"));
+
+    for (name, spec) in [
+        ("no timeout", json!({"command": "true", "timeout_secs": 0})),
+        ("a timeout past the local limit", check_spec("true", 1201)),
+        ("an empty command", check_spec("", 60)),
+        (
+            "an unknown field",
+            json!({"command": "true", "timeout_secs": 5, "env": {}}),
+        ),
+        (
+            "a port block outside the range",
+            json!({"command": "true", "timeout_secs": 5, "port_base": 80}),
+        ),
+    ] {
+        let out = bfx.run_check("c-bad", &spec);
+        assert_eq!(json_of(&out)["ok"], false, "{name}");
+        assert_eq!(out.status.code(), Some(1), "{name}");
+    }
+    assert!(!bfx.lane().join("clone/made-by-check.txt").exists());
+
+    let out = bfx
+        .start_lane(
+            &["check", "--check-id", "x"],
+            "no-such-lane",
+            &check_spec("true", 5),
+        )
+        .wait_with_output()
+        .unwrap();
+    assert!(assert_refused(&out).contains("no lane"));
 }
