@@ -632,6 +632,15 @@ impl Launcher {
     /// `spent_before_usd` is the estimated cost of this queue segment so far,
     /// `lane_spent_before_usd` that of the whole lane (the hard cost stop).
     ///
+    /// A third thing ends the launch the same way, at once: the director's
+    /// wake channel (`rulings`). A stop, reassign or redirect ruling on a
+    /// NON-blocking ask (the queue says which) ends the live session with no
+    /// grace period, reported as [`SessionEnd::Ruled`]; the resume loop then
+    /// acts on the ruling. An `answer`, or any ruling on a blocking ask, does
+    /// not end it here. The channel only wakes the launch; the queue is the
+    /// truth, so a wake that was consumed here never starves
+    /// [`Drive::wait_for_ruling`], which reads the queue first.
+    ///
     /// Two hard limits end the launch the same way (SIGTERM to the group, then
     /// SIGKILL after [`TERM_GRACE`], reported through `session_end`): the
     /// wall-clock timeout, for what is left of it after the earlier launches,
@@ -642,6 +651,7 @@ impl Launcher {
         launch: &Launch,
         spent_before_usd: f64,
         lane_spent_before_usd: f64,
+        rulings: &mut UnboundedReceiver<VerdictEvent>,
     ) -> Result<SegmentRun> {
         let started = Instant::now();
         // Subscribed before anything else: an interrupt raised from here on is
@@ -767,6 +777,7 @@ impl Launcher {
         let mut status: Option<ExitStatus> = None;
         let mut session_end: Option<SessionEnd> = None;
         let mut signals_open = true;
+        let mut rulings_open = true;
         let mut killed = false;
         let mut term_at: Option<TokioInstant> = None;
         let mut kill_at: Option<TokioInstant> = None;
@@ -828,6 +839,31 @@ impl Launcher {
                                 term_at = Some(TokioInstant::now() + grace);
                             }
                             None => signals_open = false,
+                        }
+                    }
+                    // A ruling wakes the launch. If it is a stop, reassign or
+                    // redirect on a non-blocking ask that nothing has acted on,
+                    // the session ends now (no PARK_GRACE: a fresh session or
+                    // the end of the lane follows, so nothing needs flushing).
+                    event = rulings.recv(), if session_end.is_none() && rulings_open && status.is_none() => {
+                        match event {
+                            Some(_) => {
+                                let directive = self
+                                    .queue
+                                    .lock()
+                                    .map(|q| q.pending_directive(&self.lane_id))
+                                    .unwrap_or(None);
+                                if let Some((id, verdict)) = directive {
+                                    eprintln!(
+                                        "[{}] ruling on {id} ({}): ending the builder now",
+                                        self.lane_id,
+                                        verdict.kind()
+                                    );
+                                    session_end = Some(SessionEnd::Ruled(id));
+                                    term_at = Some(TokioInstant::now());
+                                }
+                            }
+                            None => rulings_open = false,
                         }
                     }
                     // The first SIGINT or SIGTERM: end the builder's group the way a
@@ -952,7 +988,8 @@ struct LaneRun {
 
 /// What waiting for the director found.
 enum Waited {
-    /// No blocking escalation is parked: the builder is simply done.
+    /// No blocking escalation is parked and no non-blocking stop, reassign or
+    /// redirect awaits action: the builder is simply done.
     Nothing,
     Ruling(EscalationId, EscalationVerdict),
     /// A parked escalation passed the park limit; the queue ended the lane.
@@ -1014,12 +1051,25 @@ impl Drive<'_> {
         }
     }
 
-    /// Wait for a ruling on a parked blocking escalation. There is no timeout
+    /// Wait for a ruling the lane must act on. A stop, reassign or redirect
+    /// ruling on a non-blocking ask that nothing has acted on comes first (it
+    /// ended the live session, or arrived as the builder exited, and either
+    /// way is acted on once: carrying it out records it delivered). Then, on a
+    /// parked blocking escalation, there is no timeout
     /// but the queue's own park limit: when that passes, the queue ends the
     /// lane as `escalation-limit` (a ruling would only be refused after it).
     async fn wait_for_ruling(&self, rx: &mut UnboundedReceiver<VerdictEvent>) -> Result<Waited> {
         loop {
-            let pending = self.lock()?.pending_blocking(self.lane_id);
+            let (pending, directive) = {
+                let queue = self.lock()?;
+                (
+                    queue.pending_blocking(self.lane_id),
+                    queue.pending_directive(self.lane_id),
+                )
+            };
+            if let Some((id, verdict)) = directive {
+                return Ok(Waited::Ruling(id, verdict));
+            }
             let Some(oldest) = pending.first() else {
                 return Ok(Waited::Nothing);
             };
@@ -1114,6 +1164,7 @@ impl Drive<'_> {
                 SessionEnd::LimitReached => "escalation-limit",
                 SessionEnd::Timeout => "timeout",
                 SessionEnd::CostCap => "cost-cap",
+                SessionEnd::Ruled(_) => "ruled",
             }),
             "killedByRunner": seg.killed,
             "turns": seg.summary.turns.len(),
@@ -1158,7 +1209,7 @@ impl Drive<'_> {
         let (end, status) = loop {
             let seg = self
                 .launcher
-                .launch(segments.len(), &launch, segment_cost_usd, lane_cost_usd)
+                .launch(segments.len(), &launch, segment_cost_usd, lane_cost_usd, rx)
                 .await?;
             segment_cost_usd += seg.estimated_cost_usd;
             lane_cost_usd += seg.estimated_cost_usd;
@@ -1201,9 +1252,17 @@ impl Drive<'_> {
                 }
             }
 
-            let parked = self.lock()?.pending_blocking(self.lane_id);
+            let (parked, directive) = {
+                let queue = self.lock()?;
+                (
+                    queue.pending_blocking(self.lane_id),
+                    queue.pending_directive(self.lane_id),
+                )
+            };
             if let Some(first) = parked.first() {
                 record["endedBy"] = json!(first.id.0);
+            } else if let Some((id, _)) = &directive {
+                record["endedBy"] = json!(id.0);
             }
             segments.push(record);
             summaries.push(seg.summary);

@@ -1220,6 +1220,31 @@ impl Queue {
         pending.into_iter().map(|(_, p)| p).collect()
     }
 
+    /// The oldest NON-blocking escalation whose ruling is a stop, a reassign or
+    /// a redirect and has not been acted on yet, with that ruling. These rulings
+    /// end the builder's live session (an `answer` does not: the builder reads
+    /// it with `check_ruling`). Acting on one is recorded with
+    /// [`Queue::redeliver`], after which it is no longer returned, so one ruling
+    /// is never acted on twice. Oldest first by number, as for
+    /// [`Queue::pending_blocking`].
+    pub fn pending_directive(&self, lane: &str) -> StdOption<(EscalationId, Verdict)> {
+        self.escalations
+            .iter()
+            .filter(|(_, e)| e.lane == lane && !e.ask.blocking && !e.delivered)
+            .filter_map(|(id, e)| match &e.verdict {
+                StdOption::Some(v) if !matches!(v, Verdict::Answer { .. }) => {
+                    let number =
+                        id.0.rsplit_once(":E")
+                            .and_then(|(_, n)| n.parse().ok())
+                            .unwrap_or(usize::MAX);
+                    Some((number, id.clone(), v.clone()))
+                }
+                _ => None,
+            })
+            .min_by(|a, b| (a.0, &a.1).cmp(&(b.0, &b.1)))
+            .map(|(_, id, v)| (id, v))
+    }
+
     /// End the lane as `escalation-limit` if a blocking escalation has waited
     /// for a ruling past the park limit, and return its id. Nothing else ever
     /// ends a lane whose director is silent: [`Queue::rule`] only checks the
@@ -2127,6 +2152,55 @@ mod tests {
             .unwrap();
         assert_eq!(queue.pending_blocking("lane1").len(), 9);
         assert_eq!(queue.pending_blocking("lane1")[0].id, ids[1]);
+    }
+
+    #[test]
+    fn pending_directive_is_an_unacted_stop_reassign_or_redirect_on_a_non_blocking_ask() {
+        let tmpdir = tempfile::TempDir::new().unwrap();
+        let mut queue = Queue::with_limits(
+            tmpdir.path(),
+            Box::new(SystemClock),
+            Duration::from_secs(30 * 60),
+            20,
+        )
+        .unwrap();
+        let blocking = new_ask("blocks?");
+        let mut non_blocking = new_ask("later?");
+        non_blocking.blocking = false;
+        let b = queue.ask("lane1", &blocking, Origin::Builder).unwrap();
+        let ids: Vec<EscalationId> = (0..10)
+            .map(|_| queue.ask("lane1", &non_blocking, Origin::Builder).unwrap())
+            .collect();
+        let other = queue.ask("other", &non_blocking, Origin::Builder).unwrap();
+        assert_eq!(queue.pending_directive("lane1"), None, "nothing ruled");
+
+        // A blocking ask's ruling, another lane's, and an answer are not directives.
+        queue.rule("lane1", &b, &Verdict::Stop).unwrap();
+        queue.rule("other", &other, &Verdict::Stop).unwrap();
+        queue
+            .rule("lane1", &ids[0], &Verdict::Answer { text: "go".into() })
+            .unwrap();
+        assert_eq!(queue.pending_directive("lane1"), None);
+
+        // Oldest first by number (E10 after E2), and acting on one hides it.
+        queue.rule("lane1", &ids[9], &Verdict::Stop).unwrap();
+        let reassign = Verdict::Reassign { model: None };
+        queue.rule("lane1", &ids[1], &reassign).unwrap();
+        assert_eq!(
+            queue.pending_directive("lane1"),
+            Some((ids[1].clone(), reassign))
+        );
+        queue
+            .redeliver("lane1", &ids[1], &mut RecordingDelivery::new())
+            .unwrap();
+        assert_eq!(
+            queue.pending_directive("lane1"),
+            Some((ids[9].clone(), Verdict::Stop))
+        );
+        queue
+            .redeliver("lane1", &ids[9], &mut RecordingDelivery::new())
+            .unwrap();
+        assert_eq!(queue.pending_directive("lane1"), None);
     }
 
     #[test]

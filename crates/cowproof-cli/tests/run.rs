@@ -1939,6 +1939,209 @@ fn a_non_blocking_ask_never_ends_the_session_and_the_builders_own_exit_is_record
     assert_eq!(queue_events(&h, "asked").len(), 1);
 }
 
+// ---- A ruling on a NON-blocking ask, while the builder is running ----------
+//
+// A stop, reassign or redirect ruling on a non-blocking ask ends the live
+// session at once (SIGTERM to the group, SIGKILL after the grace), and the
+// resume loop acts on it with the handler blocking asks use. An answer does
+// not end the session: the builder reads it with `check_ruling`.
+
+/// The ruling must take effect within this long of the director giving it,
+/// against a builder that would otherwise sleep for two minutes.
+const RULED_WITHIN: Duration = Duration::from_secs(15);
+
+/// A fake that, on its first launch, records its pid, asks NON-blocking and
+/// sleeps 120 s (in a background child, so the group has two members); later
+/// launches run the checks.
+fn nonblocking_sleeper(question: &str) -> String {
+    let mut ask = blocking_ask(question);
+    ask["blocking"] = json!(false);
+    let first = format!(
+        "{}echo $$ > \"$HOME/fakepid\"\n{}sleep 120 &\necho $! > \"$HOME/sleeppid\"\nwait\n",
+        init_line(),
+        mcp_session("ask.out", &[(3, "ask", ask)])
+    );
+    first_then(&first, &then_checks())
+}
+
+/// Start the run, wait for the first ask to be recorded, rule on it at once.
+/// Returns the run, the escalation id and the moment the ruling was given.
+fn rule_the_moment_it_is_asked(h: &Harness, verdict: &[&str]) -> (Child, String, Instant) {
+    let mut child = start(h);
+    let id = wait_for_ask(h, &mut child, 1);
+    let ruled_at = Instant::now();
+    rule(h, &id, verdict);
+    (child, id, ruled_at)
+}
+
+/// Wait for the run to end, at most `RULED_WITHIN` after `ruled_at`. A run
+/// that is still going is killed (by its pid), and so is the first builder's
+/// process group (by the pid the fake recorded: it is the group leader), and
+/// the test fails.
+fn ends_within_of_the_ruling(h: &Harness, mut child: Child, ruled_at: Instant) -> Output {
+    loop {
+        if child.try_wait().unwrap().is_some() {
+            return child.wait_with_output().unwrap();
+        }
+        if ruled_at.elapsed() > RULED_WITHIN {
+            let _ = child.kill();
+            let _ = child.wait();
+            if let Ok(pid) = fs::read_to_string(h.lane().join("home/fakepid")) {
+                let group = format!("-{}", pid.trim());
+                let _ = Command::new("kill").args(["-KILL", "--", &group]).output();
+            }
+            panic!("the run was still going {RULED_WITHIN:?} after the ruling");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Wait until the fake's `n`th launch has begun, at most `RULED_WITHIN` after
+/// `ruled_at`; a run that gets there late is killed (by pid) and fails.
+fn second_segment_starts_within(h: &Harness, child: &mut Child, ruled_at: Instant) {
+    while h.launches() < 2 {
+        if ruled_at.elapsed() > RULED_WITHIN {
+            let _ = child.kill();
+            let _ = child.wait();
+            if let Ok(pid) = fs::read_to_string(h.lane().join("home/fakepid")) {
+                let group = format!("-{}", pid.trim());
+                let _ = Command::new("kill").args(["-KILL", "--", &group]).output();
+            }
+            panic!("no second segment {RULED_WITHIN:?} after the ruling");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// What every live ruling must leave behind in the first segment.
+fn assert_first_builder_was_ruled_away(h: &Harness, id: &str) {
+    let segs = segments(h);
+    assert_eq!(segs[0]["sessionEnd"], "ruled", "{segs:?}");
+    assert_eq!(segs[0]["killedByRunner"], true, "{segs:?}");
+    assert_eq!(segs[0]["status"], "ended-by-runner");
+    assert_eq!(segs[0]["signal"], 15, "SIGTERM ended the group: {segs:?}");
+    assert_eq!(segs[0]["endedBy"], id);
+    // The first builder's whole group is gone: by pid where the sandbox shares
+    // the host's pid space (macOS); bwrap's --unshare-pid hides it on Linux.
+    if cfg!(target_os = "macos") {
+        assert_pid_gone(h.read("home/fakepid").trim());
+        assert_pid_gone(h.read("home/sleeppid").trim());
+    }
+    // Acted on once: one ruling, one delivery.
+    assert_eq!(queue_events(h, "ruled").len(), 1);
+    assert_eq!(queue_events(h, "delivered").len(), 1);
+}
+
+#[test]
+fn a_stop_on_a_non_blocking_ask_ends_the_live_session_and_the_lane() {
+    if !sandbox_available() {
+        return;
+    }
+    let h = owned_packet(&nonblocking_sleeper("Quit?"));
+    let (child, id, ruled_at) = rule_the_moment_it_is_asked(&h, &["--stop"]);
+    let out = ends_within_of_the_ruling(&h, child, ruled_at);
+    assert_eq!(out.status.code(), Some(1), "{}", stdout_of(&out));
+    assert_eq!(h.launches(), 1, "no second launch");
+    assert_eq!(h.run_json()["status"], "stopped");
+    assert_eq!(segments(&h).len(), 1);
+    assert_first_builder_was_ruled_away(&h, &id);
+    // The work is kept; the lane is not proved.
+    assert!(h.read("control/lane.patch").contains("+edited"));
+    assert!(!h.lane().join("control/verdict.json").exists());
+}
+
+#[test]
+fn a_reassign_on_a_non_blocking_ask_ends_the_live_session_and_starts_the_next_model() {
+    if !sandbox_available() {
+        return;
+    }
+    let h = owned_packet(&nonblocking_sleeper("Which design?"));
+    let (mut child, id, ruled_at) = rule_the_moment_it_is_asked(&h, &["--reassign"]);
+    second_segment_starts_within(&h, &mut child, ruled_at);
+    let out = finish(child);
+    assert_eq!(out.status.code(), Some(0), "{}", stdout_of(&out));
+    let segs = segments(&h);
+    assert_eq!(segs.len(), 2, "{segs:?}");
+    assert_eq!(segs[0]["model"], "haiku");
+    assert_eq!(segs[1]["model"], "sonnet", "{segs:?}");
+    assert_eq!(segs[1]["start"], "fresh");
+    assert_eq!(segs[1]["startedBy"], id.as_str());
+    assert_eq!(h.seg(2, "resume"), "", "a reassign never resumes");
+    assert!(h.seg(2, "prompt").contains("reassign to sonnet"));
+    assert_first_builder_was_ruled_away(&h, &id);
+    assert_eq!(h.verdict()["verdict"], "proved");
+}
+
+#[test]
+fn a_redirect_on_a_non_blocking_ask_ends_the_live_session_and_starts_the_new_packet() {
+    if !sandbox_available() {
+        return;
+    }
+    let h = owned_packet(&nonblocking_sleeper("Right task?"));
+    let redirected = h
+        .packet_text
+        .replace("Change the README.", "Change the README, then stop.");
+    assert_ne!(redirected, h.packet_text);
+    let packet = h.work.path().join("redirect.md");
+    fs::write(&packet, &redirected).unwrap();
+    let (mut child, id, ruled_at) =
+        rule_the_moment_it_is_asked(&h, &["--redirect", packet.to_str().unwrap()]);
+    second_segment_starts_within(&h, &mut child, ruled_at);
+    let out = finish(child);
+    assert_eq!(out.status.code(), Some(0), "{}", stdout_of(&out));
+    let segs = segments(&h);
+    assert_eq!(segs.len(), 2, "{segs:?}");
+    assert_eq!(segs[1]["start"], "fresh");
+    assert_eq!(h.seg(2, "resume"), "");
+    assert_eq!(h.seg(2, "prompt"), redirected, "the packet's body, exactly");
+    assert_first_builder_was_ruled_away(&h, &id);
+}
+
+#[test]
+fn an_answer_on_a_non_blocking_ask_does_not_end_the_session_the_builder_reads_it() {
+    if !sandbox_available() {
+        return;
+    }
+    // The first session asks non-blocking, then polls `check_ruling` until
+    // the answer is there (the runner must leave it running), notes that it
+    // got it, and exits by itself; the lane is proved.
+    let mut ask = blocking_ask("Which colour?");
+    ask["blocking"] = json!(false);
+    let poll = r#"lane="$(basename "$(dirname "$HOME")")"
+i=0
+while [ $i -lt 150 ]; do
+  {
+    printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"fake","version":"0"}}}'
+    printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/initialized"}'
+    printf '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"check_ruling","arguments":{"id":"%s:E1"}}}\n' "$lane"
+  } | "$cp_bin" lane-tools --socket "$sock" > "$rec/cr.out" 2>/dev/null
+  if grep -q 'use option B' "$rec/cr.out"; then echo got > "$HOME/gotanswer"; break; fi
+  i=$((i+1)); sleep 0.2
+done
+"#;
+    let first = format!(
+        "{}{}{poll}{}",
+        init_line(),
+        mcp_session("ask.out", &[(3, "ask", ask)]),
+        then_checks()
+    );
+    let h = owned_packet(&first_then(&first, ":\n"));
+    let (child, id, _) = rule_the_moment_it_is_asked(&h, &["--answer", "use option B"]);
+    let out = finish(child);
+    assert_eq!(out.status.code(), Some(0), "{}", stdout_of(&out));
+    assert_eq!(h.read("home/gotanswer").trim(), "got");
+    assert_eq!(h.launches(), 1, "the session was not ended");
+    let segs = segments(&h);
+    assert_eq!(segs.len(), 1, "{segs:?}");
+    assert_eq!(segs[0]["sessionEnd"], Value::Null, "{segs:?}");
+    assert_eq!(segs[0]["killedByRunner"], false);
+    assert_eq!(segs[0]["endedBy"], Value::Null);
+    assert_eq!(h.verdict()["verdict"], "proved");
+    let ruled = queue_events(&h, "ruled");
+    assert_eq!(ruled[0]["id"], id.as_str());
+    assert_eq!(ruled[0]["verdict"]["verdict"], "answer");
+}
+
 /// The one forced escalation in the queue: its id, after checking it is forced.
 fn forced_escalation(h: &Harness) -> Value {
     let asked = queue_events(h, "asked");

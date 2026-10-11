@@ -107,6 +107,12 @@ pub enum SessionEnd {
     /// The running cost estimate reached 100% of the cap: the lane ends now,
     /// without a grace period, and is not proved.
     CostCap,
+    /// The director ruled stop, reassign or redirect on a NON-blocking ask
+    /// while the builder was running: the session ends at once, with no
+    /// grace period, and the resume loop acts on the ruling. Only the
+    /// launcher decides this (it hears of the ruling on the director's wake
+    /// channel), so it is never sent through [`SessionEndSignal`].
+    Ruled(EscalationId),
 }
 
 /// Where [`serve_signalling`] sends a [`SessionEnd`]. Create the channel
