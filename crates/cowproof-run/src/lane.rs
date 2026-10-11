@@ -456,60 +456,57 @@ fn clone_isolated(repo: &Path, clone: &Path, base_commit: &str) -> Result<String
     Ok(clone_method)
 }
 
-/// Copy the source's object store using copy-on-write where available.
-/// Returns the method used: "clonefile" on macOS, "reflink" on Linux, or "copy" as fallback.
-/// The method label is honest: "reflink" means reflink was actually used, not just attempted.
-fn copy_objects_cow(src: &Path, dst: &Path) -> Result<String> {
-    // Try copy-on-write methods in order.
+/// One way to copy the object store: a label for `lane.json`, the program
+/// and its leading arguments (the source and destination are appended).
+type CopyStrategy = (&'static str, &'static str, &'static [&'static str]);
+
+/// Copy-on-write first where the platform has it, then a plain copy. The
+/// label is honest: `reflink=always` fails instead of silently copying.
+fn copy_strategies() -> Vec<CopyStrategy> {
+    let mut strategies: Vec<CopyStrategy> = Vec::new();
     if cfg!(target_os = "macos") {
-        // macOS: try APFS clonefile with cp -c
-        let out = Command::new("cp")
-            .arg("-c")
-            .arg("-R")
-            .arg(src)
-            .arg(dst)
-            .output()
-            .context("running cp -c -R")?;
-        if out.status.success() {
-            return Ok("clonefile".to_string());
-        }
-        // clonefile failed or not supported; clean up partial copy and fall through
-        if dst.exists() {
-            fs::remove_dir_all(dst).ok();
-        }
+        strategies.push(("clonefile", "cp", &["-c", "-R"]));
     }
-
     if cfg!(target_os = "linux") {
-        // Linux: try reflink with cp --reflink=always (fails if reflink unavailable)
-        let out = Command::new("cp")
-            .arg("--reflink=always")
-            .arg("-R")
+        strategies.push(("reflink", "cp", &["--reflink=always", "-R"]));
+    }
+    strategies.push(("copy", "cp", &["-R"]));
+    strategies
+}
+
+/// Copy the source's object store using copy-on-write where available.
+/// Returns the method used: "clonefile" on macOS, "reflink" on Linux, or "copy".
+fn copy_objects_cow(src: &Path, dst: &Path) -> Result<String> {
+    copy_objects_with(src, dst, &copy_strategies())
+}
+
+/// Try each strategy in order. A strategy that fails may leave a partial
+/// destination behind; it is removed before the next one runs, or a later
+/// `cp -R src dst` would copy into it and nest `objects/objects`.
+fn copy_objects_with(src: &Path, dst: &Path, strategies: &[CopyStrategy]) -> Result<String> {
+    let mut last_error = String::new();
+    for (label, program, args) in strategies {
+        if dst.exists() {
+            fs::remove_dir_all(dst).context("removing a partial object-store copy")?;
+        }
+        let out = Command::new(program)
+            .args(*args)
             .arg(src)
             .arg(dst)
             .output()
-            .context("running cp --reflink=always")?;
+            .with_context(|| format!("running {program} for the {label} copy"))?;
         if out.status.success() {
-            return Ok("reflink".to_string());
+            return Ok((*label).to_string());
         }
-        // reflink not available; clean up partial copy and fall through
-        if dst.exists() {
-            fs::remove_dir_all(dst).ok();
-        }
+        last_error = format!(
+            "{label} copy failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
     }
-
-    // Fallback: plain recursive copy.
-    // Ensure no partial destination exists before copying.
     if dst.exists() {
-        fs::remove_dir_all(dst).context("removing partial destination")?;
+        fs::remove_dir_all(dst).ok();
     }
-    let out = Command::new("cp")
-        .arg("-R")
-        .arg(src)
-        .arg(dst)
-        .output()
-        .context("running cp -R")?;
-    check(out, &["cp"])?;
-    Ok("copy".to_string())
+    bail!("every object-store copy strategy failed; last: {last_error}")
 }
 
 fn git_apply(clone: &Path, patch: &[u8]) -> Result<()> {
@@ -905,6 +902,45 @@ mod tests {
         let clone_inodes = object_inodes(clone);
         let shared: Vec<_> = source_inodes.intersection(&clone_inodes).copied().collect();
         assert!(shared.is_empty(), "shared inodes: {shared:?}");
+    }
+
+    #[test]
+    fn a_failed_copy_strategy_leaves_nothing_for_the_fallback_to_nest_into() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("objects");
+        fs::create_dir_all(src.join("pack")).unwrap();
+        fs::write(src.join("pack/p.pack"), b"pack").unwrap();
+        let dst = tmp.path().join("clone-objects");
+        // Creates a partial destination, then fails, as a copy-on-write
+        // attempt can on a filesystem that refuses it halfway.
+        let strategies: Vec<CopyStrategy> = vec![
+            (
+                "broken",
+                "sh",
+                &["-c", "mkdir -p \"$2/objects/stale\"; exit 1", "sh"],
+            ),
+            ("copy", "cp", &["-R"]),
+        ];
+        let method = copy_objects_with(&src, &dst, &strategies).unwrap();
+        assert_eq!(method, "copy");
+        assert_eq!(fs::read(dst.join("pack/p.pack")).unwrap(), b"pack");
+        assert!(
+            !dst.join("objects").exists(),
+            "nested objects/ from the partial copy"
+        );
+    }
+
+    #[test]
+    fn every_strategy_failing_is_an_error_and_leaves_no_destination() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("objects");
+        fs::create_dir_all(&src).unwrap();
+        let dst = tmp.path().join("clone-objects");
+        let strategies: Vec<CopyStrategy> =
+            vec![("broken", "sh", &["-c", "mkdir -p \"$2\"; exit 1", "sh"])];
+        let err = copy_objects_with(&src, &dst, &strategies).unwrap_err();
+        assert!(err.to_string().contains("broken copy failed"), "{err}");
+        assert!(!dst.exists());
     }
 
     #[test]
