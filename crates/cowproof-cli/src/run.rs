@@ -69,7 +69,7 @@ use cowproof_run::{
     stream::{MeterSummary, StreamMeter},
     tools::{self, CheckOutcome, CheckTable, RunCheck, SessionEnd, SessionEndSignal},
 };
-use serde_json::json;
+use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io;
@@ -1633,6 +1633,51 @@ struct PumpStats {
     oversized: u64,
 }
 
+/// Redact JSON string values while preserving structure and numeric values.
+/// If the line is valid JSON, walk it and redact every string value.
+/// If not, redact the line as plain text.
+/// Numbers, booleans, keys and structure are left unchanged.
+fn redact_for_stream(line: &str) -> String {
+    // A line with nothing to redact is written byte for byte: re-serializing it would
+    // change spacing, escapes or number formatting that the builder emitted.
+    if redact(line) == line {
+        return line.to_string();
+    }
+    match serde_json::from_str::<Value>(line) {
+        Ok(mut value) => {
+            redact_json_strings(&mut value);
+            value.to_string()
+        }
+        Err(_) => {
+            // Not JSON, redact as text
+            redact(line)
+        }
+    }
+}
+
+/// Walk a JSON value and redact all string values in place.
+/// Numbers, booleans, keys and structure are unchanged.
+fn redact_json_strings(value: &mut Value) {
+    match value {
+        Value::String(s) => {
+            *s = redact(s);
+        }
+        Value::Array(arr) => {
+            for item in arr {
+                redact_json_strings(item);
+            }
+        }
+        Value::Object(obj) => {
+            for (_, val) in obj.iter_mut() {
+                redact_json_strings(val);
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) => {
+            // Leave unchanged
+        }
+    }
+}
+
 impl PumpStats {
     fn add(&mut self, other: &PumpStats) {
         self.metered += other.metered;
@@ -1641,10 +1686,12 @@ impl PumpStats {
     }
 }
 
-/// Copy `reader` to `sink` byte for byte and feed each complete line to the
-/// meter. Memory per line is bounded by `max_line`. After every line the meter
-/// accepts, `on_line` sees the meter, which is where escalate-early reads the
-/// new turns and the running cost estimate.
+/// Copy `reader` to `sink` (redacted for stream.jsonl) and feed each complete
+/// line to the meter (original, unredacted). Memory per line is bounded by
+/// `max_line`. After every line the meter accepts, `on_line` sees the meter,
+/// which is where escalate-early reads the new turns and the running cost
+/// estimate. The meter reads the original values so costs and turns are accurate;
+/// only what is written to stream.jsonl is redacted.
 async fn pump_stream<R, W, F>(
     reader: R,
     sink: &mut W,
@@ -1670,7 +1717,6 @@ where
         if n == 0 {
             break;
         }
-        sink.write_all(&buf).await?;
         // A full buffer without a newline is a fragment of a longer line.
         let fragment = !buf.ends_with(b"\n") && n >= max_line;
         if fragment || mid_oversized {
@@ -1678,19 +1724,33 @@ where
                 stats.oversized += 1;
             }
             mid_oversized = fragment;
+            // Write oversized fragments as-is (they may be part of a line with secrets)
+            sink.write_all(&buf).await?;
             continue;
         }
         let text = String::from_utf8_lossy(&buf);
         let line = text.trim_end_matches(['\n', '\r']);
         if line.trim().is_empty() {
+            // Empty lines are written as-is (just whitespace/newline)
+            sink.write_all(&buf).await?;
             continue;
         }
+        // Feed the original line to the meter first, so it sees original numbers
         match meter.feed(line) {
             Ok(_) => {
                 stats.metered += 1;
                 on_line(meter);
             }
             Err(_) => stats.unparsed += 1,
+        }
+        // Redact and write the line to the file
+        let redacted = redact_for_stream(line);
+        sink.write_all(redacted.as_bytes()).await?;
+        // Preserve the original line ending
+        if text.ends_with("\r\n") {
+            sink.write_all(b"\r\n").await?;
+        } else if text.ends_with('\n') {
+            sink.write_all(b"\n").await?;
         }
     }
     sink.flush().await?;
@@ -3209,6 +3269,147 @@ body"#;
         );
         // Only the short line after the long one was metered.
         assert_eq!(meter.summary().session_id.as_deref(), Some("after"));
+    }
+
+    #[tokio::test]
+    async fn pump_stream_redacts_json_string_values_but_meters_original() {
+        // Input with a secret in a JSON string value and numeric usage fields
+        let input = r#"{"type":"assistant","message":{"id":"m1","content":"Bearer sk-secrettoken123","usage":{"input_tokens":100,"output_tokens":50}}}"#.to_owned() + "\n";
+        let mut sink: Vec<u8> = Vec::new();
+        let mut meter = StreamMeter::new(false);
+        pump_stream(
+            input.as_bytes(),
+            &mut sink,
+            &mut meter,
+            1024,
+            &mut |_: &StreamMeter| {},
+        )
+        .await
+        .unwrap();
+
+        // The meter sees the original data (100 input tokens)
+        let summary = meter.summary();
+        assert_eq!(summary.turns.len(), 1);
+        assert_eq!(summary.turns[0].input_tokens, 100);
+        assert_eq!(summary.turns[0].output_tokens, 50);
+
+        // The file contains the redacted version
+        let sink_str = String::from_utf8(sink).unwrap();
+        let written: Value = serde_json::from_str(sink_str.trim()).unwrap();
+        let content = written
+            .get("message")
+            .and_then(|m| m.get("content"))
+            .and_then(|c| c.as_str())
+            .unwrap();
+        assert_eq!(content, "Bearer [redacted]");
+        // Numeric values are unchanged
+        let input_tokens = written
+            .get("message")
+            .and_then(|m| m.get("usage"))
+            .and_then(|u| u.get("input_tokens"))
+            .and_then(|t| t.as_u64())
+            .unwrap();
+        assert_eq!(input_tokens, 100);
+    }
+
+    #[tokio::test]
+    async fn pump_stream_redacts_non_json_lines_but_meters_json() {
+        // Input with both JSON and plain text lines
+        let input = "Bearer sk-secrettoken123\n{\"type\":\"system\",\"session_id\":\"s1\"}\n";
+        let mut sink: Vec<u8> = Vec::new();
+        let mut meter = StreamMeter::new(false);
+        let stats = pump_stream(
+            input.as_bytes(),
+            &mut sink,
+            &mut meter,
+            1024,
+            &mut |_: &StreamMeter| {},
+        )
+        .await
+        .unwrap();
+
+        // One line was metered (the JSON), one was not
+        assert_eq!(stats.metered, 1);
+        assert_eq!(stats.unparsed, 1);
+
+        // Both lines are redacted in the output
+        let sink_str = String::from_utf8(sink).unwrap();
+        assert!(sink_str.contains("Bearer [redacted]\n"));
+        assert!(sink_str.contains("\"session_id\":\"s1\""));
+    }
+
+    #[test]
+    fn redact_for_stream_handles_json_with_nested_secrets() {
+        let input = r#"{"message":{"content":"sk-secrettoken123","nested":{"value":"Bearer tok123"}},"usage":{"tokens":100}}"#;
+        let output = redact_for_stream(input);
+        let parsed: Value = serde_json::from_str(&output).unwrap();
+
+        // Strings are redacted
+        let content = parsed
+            .get("message")
+            .and_then(|m| m.get("content"))
+            .and_then(|c| c.as_str())
+            .unwrap();
+        assert_eq!(content, "[redacted]");
+
+        let nested = parsed
+            .get("message")
+            .and_then(|m| m.get("nested"))
+            .and_then(|n| n.get("value"))
+            .and_then(|v| v.as_str())
+            .unwrap();
+        assert!(nested.contains("[redacted]"));
+
+        // Numbers are unchanged
+        let tokens = parsed
+            .get("usage")
+            .and_then(|u| u.get("tokens"))
+            .and_then(|t| t.as_u64())
+            .unwrap();
+        assert_eq!(tokens, 100);
+    }
+
+    #[test]
+    fn redact_for_stream_handles_non_json_text() {
+        let input = "error: Bearer sk-secrettoken123 failed";
+        let output = redact_for_stream(input);
+        assert_eq!(output, "error: Bearer [redacted] failed");
+    }
+
+    #[test]
+    fn redact_json_strings_preserves_structure() {
+        let mut value: Value = serde_json::json!({
+            "type": "system",
+            "session_id": "sk-secret123",
+            "nested": {
+                "array": [1, true, "Bearer token456"],
+                "number": 42
+            }
+        });
+        redact_json_strings(&mut value);
+
+        // Session ID should be redacted
+        assert_eq!(
+            value.get("session_id").and_then(|s| s.as_str()).unwrap(),
+            "[redacted]"
+        );
+        // String in array should be redacted
+        let array = value
+            .get("nested")
+            .and_then(|n| n.get("array"))
+            .and_then(|a| a.as_array())
+            .unwrap();
+        assert_eq!(array[2].as_str().unwrap(), "Bearer [redacted]");
+        // Numbers and booleans unchanged
+        assert_eq!(array[0], 1);
+        assert_eq!(array[1], true);
+        assert_eq!(
+            value
+                .get("nested")
+                .and_then(|n| n.get("number"))
+                .and_then(|n| n.as_u64()),
+            Some(42)
+        );
     }
 
     #[test]

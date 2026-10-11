@@ -3413,3 +3413,46 @@ fn run_help_says_unsandboxed_is_for_trusted_local_experiments_and_what_it_gives_
         assert!(help.contains(needle), "no {needle:?} in: {help}");
     }
 }
+
+/// What the builder prints on stdout reaches `control/stream.jsonl` redacted: string
+/// values of a JSON event and a plain text line. The usage numbers in the file are the
+/// builder's own, and a line with nothing to redact is kept byte for byte.
+#[test]
+fn stream_jsonl_is_redacted_and_keeps_the_usage_numbers() {
+    if !sandbox_available() {
+        return;
+    }
+    let fake_body = r#"
+printf '%s\n' '{"type":"assistant","message":{"id":"mt","content":[{"type":"text","text":"key sk-streamtokenabc and Bearer streambearer"}],"usage":{"input_tokens":3,"output_tokens":5}}}'
+printf '%s\n' 'plain line with sk-plainstreamtoken in it'
+printf '%s\n' '{"type":"system", "subtype":"note"}'
+"#;
+    let h = Harness::new(fake_body);
+    h.run_ok();
+    let stream = h.read("control/stream.jsonl");
+    for raw in ["sk-streamtokenabc", "streambearer", "sk-plainstreamtoken"] {
+        assert!(
+            !stream.contains(raw),
+            "{raw} reached stream.jsonl:\n{stream}"
+        );
+    }
+    assert!(stream.contains("Bearer [redacted]"), "{stream}");
+    assert!(
+        stream.contains("plain line with [redacted] in it"),
+        "{stream}"
+    );
+    let event: Value = stream
+        .lines()
+        .find(|l| l.contains("\"id\":\"mt\""))
+        .map(|l| serde_json::from_str(l).unwrap())
+        .expect("the assistant event is in stream.jsonl");
+    assert_eq!(
+        event["message"]["usage"],
+        json!({"input_tokens":3,"output_tokens":5})
+    );
+    // Nothing to redact: the builder's own bytes, spacing included.
+    assert!(
+        stream.contains(r#"{"type":"system", "subtype":"note"}"#),
+        "{stream}"
+    );
+}
