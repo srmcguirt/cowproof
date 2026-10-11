@@ -9,13 +9,19 @@
 use anyhow::{Context, Result, anyhow, bail};
 use clap::Parser;
 use cowproof_prove::{
-    VerifyError,
-    runner::{SandboxedRunner, host_platform},
+    Capsule, VerifyError,
+    runner::{SandboxedRunner, host_platform, verifier_toolchain},
     verify::{VerifyOptions, VerifyResult, verify},
 };
-use cowproof_run::LaneLayout;
+use cowproof_run::{
+    LaneLayout,
+    deps::{self, FETCH_TIMEOUT, FetchNetwork, FetchOutcome, FetchTools, Prefetch},
+    link_dependency_cache,
+};
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Parser)]
@@ -23,7 +29,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 Exit codes: 0 reproduced (every recorded check matched and every held-out check passed); \
 2 diverged (a recorded check's pass or fail differs, or a held-out check failed; the check \
 is named); 4 infrastructure (the capsule was refused as tampered, unsandboxed or unreadable, \
-or the replay could not run; never a refutation).")]
+or the replay could not run, or the dependency fetch the checks need failed; never a \
+refutation).
+
+Dependencies: a capsule whose tree has a Cargo.lock names a dependency cache key. The cache \
+is <cache root>/deps/<key>, the cache root being ~/.cache/cowproof or $COWPROOF_CACHE_ROOT; \
+verify fetches it (cargo fetch --locked, in a sandbox; the network is $COWPROOF_FETCH_NETWORK, \
+`open` by default or `none`) when it is absent, and mounts it read-only for the checks.")]
 pub struct VerifyArgs {
     /// The capsule directory (`control/capsule` of a lane)
     capsule_dir: PathBuf,
@@ -40,18 +52,198 @@ pub struct VerifyArgs {
 /// `cowproof verify`. `verify_dir` is the directory `verify` rebuilds in: the runner's
 /// layout names only it as scratch, so nothing else the lane left in its own scratch is
 /// visible to a check. Clears any earlier `verify_dir` (the builder owned the lane's
-/// scratch), then creates it with the verifier's own dependency cache inside.
-pub(crate) fn verifier_runner(layout: &LaneLayout, verify_dir: &Path) -> Result<SandboxedRunner> {
+/// scratch), then creates it with the verifier's own `CARGO_HOME` inside. `deps` is the
+/// fetched dependency cache (D6): its `registry` (and `git`) are linked into that
+/// `CARGO_HOME` and mounted read-only, and nothing else of it is visible.
+pub(crate) fn verifier_runner(
+    layout: &LaneLayout,
+    verify_dir: &Path,
+    deps: Option<&Path>,
+) -> Result<SandboxedRunner> {
     remove_path(verify_dir).context("clearing the verify directory")?;
     let cache = verify_dir.join("cache");
     fs::create_dir_all(cache.join(".cargo")).context("creating the verify directory")?;
     let mut verify_layout = layout.clone();
     verify_layout.scratch = verify_dir.to_path_buf();
-    Ok(SandboxedRunner::new(
-        verify_layout,
-        cache,
-        host_platform().to_string(),
-    ))
+    let mut runner =
+        SandboxedRunner::new(verify_layout, cache.clone(), host_platform().to_string());
+    if let Some(deps) = deps {
+        link_dependency_cache(deps, &cache.join(".cargo"))?;
+        runner = runner.with_dependency_cache(deps.to_path_buf());
+    }
+    Ok(runner)
+}
+
+/// What rebuilds the tree a lane's dependencies are fetched for: the same four steps
+/// `verify` takes (base commit, `base.patch`, launch baseline, `lane.patch`).
+pub(crate) struct Rebuild {
+    pub repo: PathBuf,
+    pub base_commit: String,
+    pub base_patch: Option<Vec<u8>>,
+    pub launch_removed: Vec<String>,
+    pub lane_patch: Vec<u8>,
+}
+
+impl Rebuild {
+    /// Build the tree in `tree`, an empty directory. The registry configuration is the
+    /// tree's BEFORE `lane.patch` (D14): a patch that touches it changes nothing here.
+    fn build(&self, tree: &Path) -> Result<()> {
+        git(
+            None,
+            &["clone", "--quiet", "--no-checkout", "--"],
+            &[self.repo.as_os_str(), tree.as_os_str()],
+            None,
+        )
+        .context("cloning the repository")?;
+        git(
+            Some(tree),
+            &["checkout", "--quiet", "--detach", &self.base_commit],
+            &[],
+            None,
+        )
+        .context("checking out the base commit")?;
+        if let Some(patch) = &self.base_patch {
+            apply(tree, patch).context("applying base.patch")?;
+        }
+        remove_launch_paths(tree, &self.launch_removed)?;
+        let config = deps::RegistryConfigSnapshot::take(tree)?;
+        apply(tree, &self.lane_patch).context("applying lane.patch")?;
+        config.restore(tree)
+    }
+}
+
+/// `git` with hooks off, in `dir` or at the top, with `stdin` when given.
+fn git(
+    dir: Option<&Path>,
+    args: &[&str],
+    paths: &[&std::ffi::OsStr],
+    stdin: Option<&[u8]>,
+) -> Result<()> {
+    let mut command = Command::new("git");
+    command.args(["-c", "core.hooksPath=/dev/null"]);
+    if let Some(dir) = dir {
+        command.arg("-C").arg(dir);
+    }
+    command.args(args).args(paths);
+    command
+        .stdin(if stdin.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().context("starting git")?;
+    if let (Some(bytes), Some(mut pipe)) = (stdin, child.stdin.take()) {
+        pipe.write_all(bytes).context("writing to git")?;
+    }
+    let out = child.wait_with_output().context("waiting for git")?;
+    if !out.status.success() {
+        bail!(
+            "git {} failed: {}",
+            args.first().copied().unwrap_or(""),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+fn apply(tree: &Path, patch: &[u8]) -> Result<()> {
+    if patch.iter().all(u8::is_ascii_whitespace) {
+        return Ok(());
+    }
+    git(Some(tree), &["apply", "-"], &[], Some(patch))
+}
+
+/// Delete the launch baseline's paths (R15), refusing anything but a relative path to a
+/// file inside the tree that no symlink or `.git` component leads through.
+fn remove_launch_paths(tree: &Path, removed: &[String]) -> Result<()> {
+    for rel in removed {
+        let parts: Vec<&str> = rel.split('/').collect();
+        let bad = rel.is_empty()
+            || parts
+                .iter()
+                .any(|c| c.is_empty() || *c == "." || *c == ".." || c.eq_ignore_ascii_case(".git"));
+        if bad || rel.contains('\0') {
+            bail!("launch baseline: refused path {rel:?}");
+        }
+        let mut current = tree.to_path_buf();
+        for (i, c) in parts.iter().enumerate() {
+            current.push(c);
+            let last = i + 1 == parts.len();
+            match fs::symlink_metadata(&current) {
+                Ok(m) if last && m.is_file() => fs::remove_file(&current)?,
+                Ok(m) if !last && m.is_dir() => {}
+                Ok(_) => bail!("launch baseline: {rel:?} is not a plain file path"),
+                Err(e) => bail!("launch baseline: cannot remove {rel:?}: {e}"),
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Fetch (or find in the cache) the dependencies of the tree `rebuild` describes, before
+/// verify runs (D6, D11, D14). `Ok(None)`: nothing to fetch. The fetch is blocking work,
+/// so it runs off the async threads.
+pub(crate) async fn fetch_dependencies(
+    rebuild: Rebuild,
+    layout: &LaneLayout,
+) -> Result<Option<Prefetch>> {
+    let network = FetchNetwork::from_env()?;
+    let (path, cargo) = verifier_toolchain().map_err(|e| anyhow!("{e}"))?;
+    let root = deps::cache_root(&layout.real_home);
+    let layout = layout.clone();
+    tokio::task::spawn_blocking(move || {
+        deps::prefetch(
+            |tree| rebuild.build(tree),
+            &root,
+            &layout,
+            network,
+            &FetchTools { path, cargo },
+            FETCH_TIMEOUT,
+        )
+    })
+    .await
+    .context("the dependency fetch task died")?
+}
+
+/// The dependency cache a capsule's checks need, for `cowproof verify`: the capsule's
+/// key, fetched here when this machine lacks it. `Err` is an infrastructure reason.
+async fn capsule_dependencies(
+    capsule_dir: &Path,
+    repo: &Path,
+    layout: &LaneLayout,
+) -> std::result::Result<Option<PathBuf>, String> {
+    // An unreadable or tampered capsule is `verify`'s to refuse, with its own message.
+    let Ok(capsule) = Capsule::read(capsule_dir) else {
+        return Ok(None);
+    };
+    let Some(key) = capsule.dependency_cache_key.clone() else {
+        return Ok(None);
+    };
+    let read = |name: &str| fs::read(capsule_dir.join(name)).ok();
+    let rebuild = Rebuild {
+        repo: repo.to_path_buf(),
+        base_commit: capsule.base_commit.clone(),
+        base_patch: read("base.patch"),
+        launch_removed: capsule.launch_removed.clone(),
+        lane_patch: read("lane.patch").unwrap_or_default(),
+    };
+    match fetch_dependencies(rebuild, layout).await {
+        Err(e) => Err(format!("dependency fetch could not run: {e:#}")),
+        Ok(None) => Err(format!(
+            "the capsule names dependency cache {key}, but the rebuilt tree has no Cargo.lock"
+        )),
+        Ok(Some(p)) if p.key != key => Err(format!(
+            "the rebuilt tree's dependency cache key {} is not the capsule's {key}",
+            p.key
+        )),
+        Ok(Some(Prefetch {
+            outcome: FetchOutcome::Failed(why),
+            ..
+        })) => Err(format!("dependency fetch failed: {why}")),
+        Ok(Some(p)) => Ok(Some(p.dir)),
+    }
 }
 
 /// Remove `path` whatever it is, without following a symlink.
@@ -119,7 +311,17 @@ pub async fn verify_capsule(args: VerifyArgs) -> Result<i32> {
         fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     }
     let verify_dir = layout.scratch.join("verify");
-    let runner = verifier_runner(&layout, &verify_dir)?;
+    let deps_dir = match capsule_dependencies(&capsule_dir, &repo, &layout).await {
+        Ok(dir) => dir,
+        Err(why) => {
+            eprintln!("infrastructure: {why}");
+            if ours {
+                let _ = fs::remove_dir_all(&root);
+            }
+            return Ok(4);
+        }
+    };
+    let runner = verifier_runner(&layout, &verify_dir, deps_dir.as_deref())?;
 
     let code = match verify(
         &capsule_dir,

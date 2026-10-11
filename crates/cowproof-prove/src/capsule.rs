@@ -98,6 +98,12 @@ pub struct Capsule {
     pub file_hashes: HashMap<String, String>,
     #[serde(default)]
     pub flaky_checks: HashSet<String>,
+    /// Dependency cache key computed on the rebuilt tree (D11, D14).
+    #[serde(default)]
+    pub dependency_cache_key: Option<String>,
+    /// Dependency fetch outcome: "hit", "fetched", or an error message (D6, F-1).
+    #[serde(default)]
+    pub dependency_fetch_outcome: Option<String>,
     /// Paths removed during the launch baseline, relative and sorted. Verify replays
     /// them by deleting these exact paths from the rebuilt tree. Stored in the hashed
     /// `launch_removed.json`, not in `capsule.json`, so editing it after `write`
@@ -131,6 +137,8 @@ impl Capsule {
             unsandboxed: false,
             file_hashes: HashMap::new(),
             flaky_checks: HashSet::new(),
+            dependency_cache_key: None,
+            dependency_fetch_outcome: None,
             launch_removed: Vec::new(),
         }
     }

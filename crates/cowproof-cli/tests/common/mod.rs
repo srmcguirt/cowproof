@@ -6,6 +6,7 @@
 //! files use this module so there is one copy to move it to.
 
 use serde_json::{Value, json};
+use std::ffi::OsString;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -143,6 +144,8 @@ pub struct Lane {
     packet: PathBuf,
     fake: PathBuf,
     pub cowproof: PathBuf,
+    /// Extra environment for every `cowproof` child (see [`Lane::set_env`]).
+    envs: Vec<(String, OsString)>,
 }
 
 static LANE_COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -237,7 +240,28 @@ exit 0
             packet,
             fake,
             cowproof,
+            envs: Vec::new(),
         }
+    }
+
+    /// Set an environment variable for every later `cowproof` child of this lane.
+    #[allow(dead_code)] // `tests/deps.rs` uses it; the other test crates that share this module do not
+    pub fn set_env(&mut self, key: &str, value: impl Into<OsString>) {
+        self.envs.retain(|(k, _)| k != key);
+        self.envs.push((key.to_string(), value.into()));
+    }
+
+    /// Add `files` (relative path, content) to the repository and commit them, so they
+    /// are part of the base the lane starts from.
+    #[allow(dead_code)] // `tests/deps.rs` uses it; the other test crates that share this module do not
+    pub fn commit_files(&self, files: &[(&str, &str)]) {
+        for (rel, content) in files {
+            let path = self.repo.join(rel);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, content).unwrap();
+        }
+        git(&self.repo, &["add", "-A"]);
+        git(&self.repo, &["commit", "-q", "-m", "project files"]);
     }
 
     /// `cowproof` with the lane's `HOME` and no inherited API key.
@@ -245,6 +269,9 @@ exit 0
         let mut c = Command::new(&self.cowproof);
         c.env("HOME", self.home.path())
             .env_remove("ANTHROPIC_API_KEY");
+        for (k, v) in &self.envs {
+            c.env(k, v);
+        }
         c
     }
 

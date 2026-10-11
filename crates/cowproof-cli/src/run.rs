@@ -29,7 +29,7 @@
 //! (`env_clear`), so the director's `ANTHROPIC_API_KEY` is never inherited:
 //! the builder sees only the proxy's placeholder key.
 
-use crate::verify::verifier_runner;
+use crate::verify::{Rebuild, fetch_dependencies, verifier_runner};
 use anyhow::{Context, Result, anyhow, bail};
 use cowproof_core::parse_header;
 use cowproof_prove::{
@@ -43,6 +43,7 @@ use cowproof_run::{
     LaneLayout, NetworkMode, SandboxPolicy,
     bridge::bridge_port,
     claude::{ClaudeSpec, claude_command},
+    deps::FetchOutcome,
     director::{self, VerdictEvent},
     escalate::{
         Ask, DEFAULT_COST_FRACTION, DEFAULT_MAX_ESCALATIONS, DEFAULT_PARK_LIMIT, Delivery,
@@ -2309,6 +2310,44 @@ async fn replay_and_gate(
         .collect();
     capsule.launch_removed = input.prepared.launch_removed.clone();
 
+    // Fetch the dependencies the checks need before verify runs (D6, D11, D14), on the
+    // rebuilt tree, outside any builder. The capsule records the cache key and what the
+    // fetch did, and a fetch that fails ends the lane as infrastructure, never
+    // `refuted` (F-1): the checks would only fail for want of crates.
+    let mut fetch_failed = false;
+    let rebuild = Rebuild {
+        repo: input.repo.to_path_buf(),
+        base_commit: input.prepared.base_commit.clone(),
+        base_patch: input.prepared.base_patch.clone(),
+        launch_removed: input.prepared.launch_removed.clone(),
+        lane_patch: lane_patch.clone(),
+    };
+    let mut deps_dir = None;
+    match fetch_dependencies(rebuild, layout).await {
+        Ok(None) => {}
+        Ok(Some(fetch)) => {
+            capsule.dependency_cache_key = Some(fetch.key.clone());
+            capsule.dependency_fetch_outcome = Some(fetch.outcome.name().to_string());
+            match fetch.outcome {
+                FetchOutcome::Failed(why) => {
+                    fetch_failed = true;
+                    evidence.infrastructure.push(format!(
+                        "dependency fetch (cargo fetch --locked) failed: {}",
+                        one_line(&why)
+                    ));
+                }
+                _ => deps_dir = Some(fetch.dir),
+            }
+        }
+        Err(e) => {
+            fetch_failed = true;
+            evidence.infrastructure.push(format!(
+                "dependency fetch (cargo fetch --locked) could not run: {}",
+                one_line(&format!("{e:#}"))
+            ));
+        }
+    }
+
     if let Some(base_patch) = &input.prepared.base_patch {
         fs::write(capsule_dir.join("base.patch"), base_patch)?;
     }
@@ -2348,8 +2387,11 @@ async fn replay_and_gate(
     // layout's scratch read and write, so the runner's layout names only that
     // directory: whatever the builder left in the lane's scratch is hidden, and
     // anything it left at `scratch/verify` is cleared first (`verifier_runner`).
+    if fetch_failed {
+        return Ok(());
+    }
     let verify_dir = layout.scratch.join("verify");
-    let runner = verifier_runner(layout, &verify_dir)?;
+    let runner = verifier_runner(layout, &verify_dir, deps_dir.as_deref())?;
     // The builder's class slot (D12) is not held in this flow, so the
     // verifier takes the lane's class slot without waiting on itself.
     let options = VerifyOptions {

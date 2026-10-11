@@ -13,6 +13,7 @@
 
 pub mod bridge;
 pub mod claude;
+pub mod deps;
 pub mod director;
 pub mod lane;
 pub mod prefix;
@@ -149,13 +150,34 @@ impl SandboxPolicy {
             ro_paths: vec![lane.real_home.join(".rustup")],
             deny_paths: vec![lane.control.clone()],
             network: NetworkMode::None,
-            env_set: vec![cargo_home(&verifier_cargo)],
+            // Checks never reach a registry (D6): cargo is told so, and fails fast
+            // instead of retrying a network that is not there.
+            env_set: vec![
+                cargo_home(&verifier_cargo),
+                ("CARGO_NET_OFFLINE".to_string(), "true".to_string()),
+            ],
             env_allowlist: None,
             home: lane.real_home.clone(),
             connect_socket: None,
             lanes_root: lane.lanes_root.clone(),
             executables: vec![],
         }
+    }
+
+    /// Mount the trusted dependency cache (D6) into this policy: the cache's
+    /// `cargo/registry`, and `cargo/git` when it has one, become READ-ONLY grants.
+    /// The caller links them into the verifier's own `CARGO_HOME`
+    /// ([`link_dependency_cache`]), so cargo finds them there and can write nothing
+    /// into them. On macOS the profile also denies writes to every read-only grant,
+    /// so the mount stays read-only wherever the cache lives.
+    pub fn with_dependency_cache(mut self, deps_dir: &Path) -> Self {
+        for name in DEPENDENCY_CACHE_DIRS {
+            let dir = deps_dir.join("cargo").join(name);
+            if dir.is_dir() {
+                self.ro_paths.push(dir);
+            }
+        }
+        self
     }
 
     /// Run check: read-write to clone and scratch (and the lane's own cargo
@@ -222,6 +244,33 @@ impl SandboxPolicy {
     }
 }
 
+/// The directories of a fetched `CARGO_HOME` that the verifier gets (D6): the
+/// registry index, `.crate` files and unpacked sources, and git dependencies.
+pub const DEPENDENCY_CACHE_DIRS: [&str; 2] = ["registry", "git"];
+
+/// Link the cache's `registry` (and `git`, when present) into `cargo_home`, the
+/// verifier's private `CARGO_HOME`. The links point at the cache, which
+/// [`SandboxPolicy::with_dependency_cache`] grants read-only; the rest of
+/// `cargo_home` (its package lock, config) stays writable and private to the verifier.
+pub fn link_dependency_cache(deps_dir: &Path, cargo_home: &Path) -> Result<()> {
+    for name in DEPENDENCY_CACHE_DIRS {
+        let target = deps_dir.join("cargo").join(name);
+        if !target.is_dir() {
+            continue;
+        }
+        let link = cargo_home.join(name);
+        match std::fs::symlink_metadata(&link) {
+            Ok(m) if m.is_dir() => std::fs::remove_dir_all(&link),
+            Ok(_) => std::fs::remove_file(&link),
+            Err(_) => Ok(()),
+        }
+        .with_context(|| format!("clearing {}", link.display()))?;
+        std::os::unix::fs::symlink(&target, &link)
+            .with_context(|| format!("linking {} into the verifier's CARGO_HOME", name))?;
+    }
+    Ok(())
+}
+
 fn cargo_home(path: &Path) -> (String, String) {
     (
         "CARGO_HOME".to_string(),
@@ -261,8 +310,10 @@ const LOCKFILES: &[&str] = &[
     "Gemfile.lock",
 ];
 
-/// Registry and source configuration, relative to the tree root (D14).
-const REGISTRY_CONFIGS: &[&str] = &[
+/// Registry and source configuration, relative to the tree root (D14). The cache key
+/// hashes them, the fetch reads them from the base only, and the protected-paths gate
+/// refuses a lane patch that touches them.
+pub const REGISTRY_CONFIGS: &[&str] = &[
     ".cargo/config.toml",
     ".cargo/config",
     ".npmrc",
@@ -747,6 +798,13 @@ pub fn render_macos_profile(policy: &SandboxPolicy) -> Result<String> {
     }
     for p in &r.ro {
         out.push_str(&format!("(allow file-read* (subpath {}))\n", sbpl(p)?));
+    }
+    // `(allow default)` allows writes outside the hidden home, so a read-only grant
+    // needs its own deny, after every grant: a mount of the dependency cache must
+    // stay read-only wherever it lives, and a read-only path inside a read-write
+    // one stays read-only.
+    for p in &r.ro {
+        out.push_str(&format!("(deny file-write* (subpath {}))\n", sbpl(p)?));
     }
     for e in &r.executables {
         out.push_str(&format!("(allow file-read* (literal {}))\n", sbpl(e)?));
@@ -2087,5 +2145,122 @@ mod tests {
             lanes_root_tmpfs_idx,
             exe_bind_idx
         );
+    }
+    /// A fetched `CARGO_HOME` on disk: `registry` and `git`.
+    fn fetched_cache(root: &Path, with_git: bool) -> PathBuf {
+        let deps = root.join("deps/key");
+        std::fs::create_dir_all(deps.join("cargo/registry")).unwrap();
+        if with_git {
+            std::fs::create_dir_all(deps.join("cargo/git")).unwrap();
+        }
+        deps
+    }
+
+    #[test]
+    fn the_dependency_cache_mount_is_read_only_and_only_registry_and_git() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let deps = fetched_cache(tmp.path(), true);
+        std::fs::create_dir_all(deps.join("cargo/other")).unwrap();
+        let lane = test_lane();
+        let policy = SandboxPolicy::verifier(&lane, Path::new("/nonexistent-cp/cache"))
+            .with_dependency_cache(&deps);
+        for dir in ["registry", "git"] {
+            let p = deps.join("cargo").join(dir);
+            assert!(policy.ro_paths.contains(&p), "{dir}: {:?}", policy.ro_paths);
+            assert!(
+                !policy.rw_paths.contains(&p),
+                "{dir} must never be writable"
+            );
+        }
+        assert!(
+            !policy.ro_paths.iter().any(|p| p.ends_with("other")),
+            "only registry and git are mounted: {:?}",
+            policy.ro_paths
+        );
+        // No git directory in the cache: nothing to mount for it.
+        let no_git = fetched_cache(&tmp.path().join("b"), false);
+        let policy = SandboxPolicy::verifier(&lane, Path::new("/nonexistent-cp/cache"))
+            .with_dependency_cache(&no_git);
+        assert!(!policy.ro_paths.iter().any(|p| p.ends_with("git")));
+    }
+
+    #[test]
+    fn the_verifier_tells_cargo_it_is_offline_and_no_other_policy_is_changed() {
+        let lane = test_lane();
+        let verifier = SandboxPolicy::verifier(&lane, Path::new("/nonexistent-cp/cache"));
+        assert!(
+            verifier
+                .env_set
+                .contains(&("CARGO_NET_OFFLINE".to_string(), "true".to_string())),
+            "{:?}",
+            verifier.env_set
+        );
+        assert_eq!(verifier.network, NetworkMode::None);
+        assert!(
+            !SandboxPolicy::run_check(&lane)
+                .env_set
+                .iter()
+                .any(|(k, _)| k == "CARGO_NET_OFFLINE")
+        );
+    }
+
+    #[test]
+    fn macos_read_only_grants_deny_writes_after_every_grant() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let deps = fetched_cache(tmp.path(), false).canonicalize().unwrap();
+        let registry = deps.join("cargo/registry");
+        let lane = test_lane();
+        let policy = SandboxPolicy::verifier(&lane, Path::new("/nonexistent-cp/cache"))
+            .with_dependency_cache(&deps);
+        let profile = render_macos_profile(&policy).unwrap();
+        let quoted = format!("(subpath {})", sbpl(&registry).unwrap());
+        let grant = profile
+            .find(&format!("(allow file-read* {quoted})"))
+            .expect("read grant");
+        let deny = profile
+            .find(&format!("(deny file-write* {quoted})"))
+            .expect("write deny");
+        let last_rw = profile.rfind("(allow file-read* file-write*").unwrap();
+        assert!(
+            grant < deny && last_rw < deny,
+            "the write deny must follow every grant (last match wins):\n{profile}"
+        );
+        // Linux: the whole filesystem is read-only already; the registry is bound
+        // read-only and never with `--bind`.
+        let args = render_bwrap_args(&policy_without_deny(policy.clone()), &[]).unwrap();
+        let reg = registry.to_str().unwrap();
+        assert!(
+            args.windows(3)
+                .any(|w| w[0] == "--ro-bind" && w[1] == reg && w[2] == reg),
+            "{args:?}"
+        );
+        assert!(
+            !args.windows(3).any(|w| w[0] == "--bind" && w[1] == reg),
+            "{args:?}"
+        );
+    }
+
+    #[test]
+    fn linking_the_dependency_cache_points_registry_and_git_at_it_and_replaces_stale_dirs() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let deps = fetched_cache(tmp.path(), true);
+        let cargo_home = tmp.path().join("verify/.cargo");
+        // A stale real directory (an earlier lane's) is replaced, not merged.
+        std::fs::create_dir_all(cargo_home.join("registry/stale")).unwrap();
+        link_dependency_cache(&deps, &cargo_home).unwrap();
+        for dir in ["registry", "git"] {
+            assert_eq!(
+                std::fs::read_link(cargo_home.join(dir)).unwrap(),
+                deps.join("cargo").join(dir)
+            );
+        }
+        assert!(!cargo_home.join("registry/stale").exists());
+        // Nothing fetched means nothing linked.
+        let bare = tmp.path().join("bare");
+        std::fs::create_dir_all(&bare).unwrap();
+        let home2 = tmp.path().join("home2");
+        std::fs::create_dir_all(&home2).unwrap();
+        link_dependency_cache(&bare, &home2).unwrap();
+        assert_eq!(std::fs::read_dir(&home2).unwrap().count(), 0);
     }
 }

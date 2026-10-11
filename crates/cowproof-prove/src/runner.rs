@@ -231,6 +231,17 @@ fn find_in_path(path_env: &OsStr, name: &str) -> Option<PathBuf> {
     std::env::split_paths(path_env).find(|dir| dir.is_absolute() && dir.join(name).is_file())
 }
 
+/// The verifier's `PATH` and the `cargo` executable it finds, resolved in the caller's
+/// environment: what the dependency fetch needs to run the same toolchain the checks do.
+pub fn verifier_toolchain() -> Result<(String, Option<PathBuf>), InfraError> {
+    let cargo_dir = resolve_cargo_dir(
+        std::env::var_os("CARGO").as_deref(),
+        std::env::var_os("PATH").as_deref(),
+    );
+    let cargo = cargo_dir.as_ref().map(|d| d.join("cargo"));
+    Ok((compose_path(cargo_dir.as_deref())?, cargo))
+}
+
 /// SandboxedRunner executes checks inside SandboxPolicy::verifier, with no network
 /// and no credentials (D6).
 ///
@@ -239,6 +250,9 @@ pub struct SandboxedRunner {
     lane: LaneLayout,
     cache_dir: PathBuf,
     platform: String,
+    /// The trusted dependency cache (D6): its `cargo/registry` and `cargo/git` are
+    /// mounted read-only into every check. `None` for a lane with nothing fetched.
+    deps_cache: Option<PathBuf>,
     /// Resolved once, here, in the caller's environment and outside any sandbox. An
     /// unusable `PATH` is reported when the first check runs.
     path: Result<String, InfraError>,
@@ -261,8 +275,17 @@ impl SandboxedRunner {
             lane,
             cache_dir,
             platform,
+            deps_cache: None,
             path: compose_path(cargo_dir.as_deref()),
         }
+    }
+
+    /// Mount the fetched dependency cache at `deps_dir` (`<cache root>/deps/<key>`) into
+    /// every check, read-only. The caller links it into the verifier's `CARGO_HOME`
+    /// (`cowproof_run::link_dependency_cache`).
+    pub fn with_dependency_cache(mut self, deps_dir: PathBuf) -> Self {
+        self.deps_cache = Some(deps_dir);
+        self
     }
 }
 
@@ -279,7 +302,10 @@ impl CheckRunner for SandboxedRunner {
         // the policy is built around it, not around the lane's own clone.
         let mut lane = self.lane.clone();
         lane.clone = tree.to_path_buf();
-        let policy = SandboxPolicy::verifier(&lane, &self.cache_dir);
+        let mut policy = SandboxPolicy::verifier(&lane, &self.cache_dir);
+        if let Some(deps) = &self.deps_cache {
+            policy = policy.with_dependency_cache(deps);
+        }
 
         // On macOS, write the profile to a temp file outside the clone. It lives until
         // the check has finished.

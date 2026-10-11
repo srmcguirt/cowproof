@@ -201,6 +201,17 @@ fn check_protected_paths(
         "cowproof/**".into(),
     ]);
 
+    // Registry configuration (D14): the dependency fetch and the cache key read it
+    // from the base only, and a builder never chooses where its dependencies come
+    // from. The one list lives in cowproof-run, beside the key that hashes it; a
+    // nested copy (a workspace member's own `.cargo/config.toml`) counts too, and
+    // `.yarnrc*` covers every yarn rc file.
+    for name in cowproof_run::REGISTRY_CONFIGS {
+        protected.push((*name).to_string());
+        protected.push(format!("**/{name}"));
+    }
+    protected.extend([".yarnrc*".to_string(), "**/.yarnrc*".to_string()]);
+
     // The default pack and every pack named in the base `cowproof.toml`
     // `[proof] packs` are gate inputs, so a patch may not touch them.
     protected.push(DEFAULT_FLAW_PACK.to_string());
@@ -796,6 +807,37 @@ diff --git a/AGENTS.md b/AGENTS.md
         )?;
         assert!(!result.passed);
         assert!(result.evidence[0].contains("secret/key.txt"));
+        Ok(())
+    }
+
+    #[test]
+    fn registry_config_is_protected_by_default() -> Result<()> {
+        // Registry configs are protected: a builder cannot modify them, and fetch
+        // always uses the base commit's config (D14).
+        let repo = TestRepo::new(&[])?;
+        for config_file in &[
+            ".cargo/config.toml",
+            ".cargo/config",
+            ".npmrc",
+            ".yarnrc",
+            ".yarnrc.yml",
+            "crates/member/.cargo/config.toml",
+            "web/.npmrc",
+            ".yarnrc.local",
+        ] {
+            let result = check_protected_paths(
+                repo.path(),
+                &repo.base,
+                &touching(config_file),
+                &packet(&["docs/**"]),
+            )?;
+            assert!(!result.passed, "{} should be protected", config_file);
+            assert!(
+                result.evidence[0].contains(config_file),
+                "evidence should name {}",
+                config_file
+            );
+        }
         Ok(())
     }
 
