@@ -104,6 +104,15 @@ pub struct Capsule {
     /// Dependency fetch outcome: "hit", "fetched", or an error message (D6, F-1).
     #[serde(default)]
     pub dependency_fetch_outcome: Option<String>,
+    /// The version of the builder preamble (sha256 hash of PREAMBLE bytes).
+    /// Used to detect when the protocol has changed.
+    #[serde(default)]
+    pub prefix_version: Option<String>,
+    /// The SHA256 hash of the project instructions (CLAUDE.md from the base commit),
+    /// or null if the base had no project instructions. Used to show which CLAUDE.md
+    /// the builder saw.
+    #[serde(default)]
+    pub project_instructions_sha256: Option<String>,
     /// Paths removed during the launch baseline, relative and sorted. Verify replays
     /// them by deleting these exact paths from the rebuilt tree. Stored in the hashed
     /// `launch_removed.json`, not in `capsule.json`, so editing it after `write`
@@ -139,6 +148,8 @@ impl Capsule {
             flaky_checks: HashSet::new(),
             dependency_cache_key: None,
             dependency_fetch_outcome: None,
+            prefix_version: None,
+            project_instructions_sha256: None,
             launch_removed: Vec::new(),
         }
     }

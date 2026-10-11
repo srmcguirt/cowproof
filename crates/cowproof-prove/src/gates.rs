@@ -5,7 +5,9 @@
 
 use crate::flaws::{check_rules, parse_rules};
 use anyhow::{Context, Result, bail};
-use cowproof_core::{glob_matches, outside_ownership, parse_patch, removed_lines};
+use cowproof_core::{
+    git_show_optional, glob_matches, outside_ownership, parse_patch, removed_lines,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -444,35 +446,6 @@ fn configured_packs(repo: &Path, commit: &str) -> Result<Vec<String>> {
         .filter_map(|p| p.as_str())
         .map(|p| p.trim_start_matches("./").to_string())
         .collect())
-}
-
-/// `git show <commit>:<path>`; `Ok(None)` when the path is not in the commit.
-fn git_show_optional(repo: &Path, commit: &str, path: &str) -> Result<Option<String>> {
-    let spec = format!("{commit}:{path}");
-    let exists = Command::new("git")
-        .current_dir(repo)
-        .args(["cat-file", "-e", &spec])
-        .output()
-        .context("git cat-file failed to start")?;
-    if !exists.status.success() {
-        return Ok(None);
-    }
-    run_git_show(repo, commit, path).map(Some)
-}
-
-/// Run `git show` in a repository to read a file from a commit.
-fn run_git_show(repo: &Path, commit: &str, path: &str) -> Result<String> {
-    let output = Command::new("git")
-        .current_dir(repo)
-        .args(["show", &format!("{}:{}", commit, path)])
-        .output()
-        .context("git show command failed")?;
-
-    if !output.status.success() {
-        bail!("git show {}:{} failed", commit, path);
-    }
-
-    String::from_utf8(output.stdout).context("git show output was not valid UTF-8")
 }
 
 #[cfg(test)]

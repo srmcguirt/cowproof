@@ -2375,3 +2375,196 @@ fn a_second_signal_does_not_wait_out_a_builder_that_ignores_sigterm() {
         assert_pid_gone(pid.trim());
     }
 }
+
+// ---------------------------------------------------------------------------
+// Project instructions and the prefix version (D20, audit r15-1)
+// ---------------------------------------------------------------------------
+
+/// The SHA-256 of `bytes`, computed here and not by the code under test.
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+/// The capsule's raw `capsule.json`, which the seal covers.
+fn capsule_json(h: &Harness) -> Value {
+    serde_json::from_str(&h.read("control/capsule/capsule.json")).unwrap()
+}
+
+/// `value[key]` where the key must be present: a missing key is not a null.
+fn field<'a>(value: &'a Value, key: &str) -> &'a Value {
+    value
+        .get(key)
+        .unwrap_or_else(|| panic!("no {key:?} in {value}"))
+}
+
+#[test]
+fn the_builder_gets_claude_md_from_the_base_commit_not_the_working_tree() {
+    if !sandbox_available() {
+        return;
+    }
+    let h = owned_packet(&run_checks(&[]));
+    let base = "BASE-MARKER: committed project rules\n";
+    fs::write(h.repo.join("CLAUDE.md"), base).unwrap();
+    git(&h.repo, &["add", "CLAUDE.md"]);
+    git(&h.repo, &["commit", "-q", "-m", "project instructions"]);
+
+    // The director edits CLAUDE.md and does not commit. A run refuses a dirty tree, and
+    // `--allow-dirty` refuses a dirty CLAUDE.md too (a launch-removed path would travel in
+    // base.patch), so the edit is hidden from `git status` with --assume-unchanged: the
+    // working-tree file differs from the base and the run starts anyway.
+    git(
+        &h.repo,
+        &["update-index", "--assume-unchanged", "CLAUDE.md"],
+    );
+    fs::write(h.repo.join("CLAUDE.md"), "DIRTY-MARKER: uncommitted edit\n").unwrap();
+    assert_eq!(git_out(&h.repo, &["status", "--porcelain"]), "");
+    assert!(
+        fs::read_to_string(h.repo.join("CLAUDE.md"))
+            .unwrap()
+            .contains("DIRTY-MARKER")
+    );
+
+    h.run_ok();
+
+    // The instructions section is exactly the committed bytes, after the preamble.
+    let system = h.seg(1, "system-prompt.md");
+    assert!(system.contains("BASE-MARKER"), "{system}");
+    assert!(!system.contains("DIRTY-MARKER"), "{system}");
+    assert_eq!(system, format!("{PREAMBLE}\n{base}"));
+    assert!(!h.seg(1, "prompt").contains("DIRTY-MARKER"));
+    for arg in h.argv() {
+        assert!(!arg.contains("DIRTY-MARKER"), "{arg}");
+    }
+
+    // What was recorded is the hash of the committed bytes.
+    let expected = sha256_hex(base.as_bytes());
+    let run = h.run_json();
+    assert_eq!(field(&run, "projectInstructionsSha256"), &json!(expected));
+    assert_eq!(
+        field(&capsule_json(&h), "project_instructions_sha256"),
+        &json!(expected)
+    );
+    let capsule = Capsule::read(&h.lane().join("control/capsule")).unwrap();
+    assert_eq!(
+        capsule.project_instructions_sha256.as_deref(),
+        Some(expected.as_str())
+    );
+}
+
+#[test]
+fn no_claude_md_at_the_base_means_no_instructions_section_and_a_null_hash() {
+    if !sandbox_available() {
+        return;
+    }
+    let h = owned_packet(&run_checks(&[]));
+    // Untrack CLAUDE.md and exclude it, so the tree is clean but still has the file:
+    // the working tree has instructions and the base has none.
+    git(&h.repo, &["rm", "-q", "--cached", "CLAUDE.md"]);
+    git(&h.repo, &["commit", "-q", "-m", "stop tracking CLAUDE.md"]);
+    fs::write(h.repo.join("CLAUDE.md"), "DIRTY-MARKER: untracked file\n").unwrap();
+    let exclude = h.repo.join(".git/info/exclude");
+    let mut text = fs::read_to_string(&exclude).unwrap_or_default();
+    text.push_str("/CLAUDE.md\n");
+    fs::write(&exclude, text).unwrap();
+    assert_eq!(git_out(&h.repo, &["status", "--porcelain"]), "");
+
+    h.run_ok();
+
+    // The prompt is the preamble alone: no section, no separator, nothing from the tree.
+    let system = h.seg(1, "system-prompt.md");
+    assert_eq!(system, PREAMBLE);
+    assert!(!system.contains("DIRTY-MARKER"));
+
+    assert!(field(&h.run_json(), "projectInstructionsSha256").is_null());
+    assert!(field(&capsule_json(&h), "project_instructions_sha256").is_null());
+    let capsule = Capsule::read(&h.lane().join("control/capsule")).unwrap();
+    assert_eq!(capsule.project_instructions_sha256, None);
+}
+
+/// Replace the harness's committed `CLAUDE.md` with a committed symlink to `target`.
+fn commit_claude_md_link(h: &Harness, target: &str) {
+    git(&h.repo, &["rm", "-q", "CLAUDE.md"]);
+    std::os::unix::fs::symlink(target, h.repo.join("CLAUDE.md")).unwrap();
+    git(&h.repo, &["add", "-A"]);
+    git(&h.repo, &["commit", "-q", "-m", "CLAUDE.md is a link"]);
+    assert_eq!(git_out(&h.repo, &["status", "--porcelain"]), "");
+}
+
+#[test]
+fn a_committed_claude_md_symlink_to_agents_md_gives_the_builder_agents_md() {
+    if !sandbox_available() {
+        return;
+    }
+    let h = owned_packet(&run_checks(&["edit", "made"]));
+    let agents = "AGENTS-MARKER: the real project rules\n";
+    fs::write(h.repo.join("AGENTS.md"), agents).unwrap();
+    commit_claude_md_link(&h, "AGENTS.md");
+
+    h.run_expecting(0);
+
+    // The instructions are the link target's bytes, not the link's text.
+    let system = h.seg(1, "system-prompt.md");
+    assert_eq!(system, format!("{PREAMBLE}\n{agents}"));
+    assert!(system.contains("AGENTS-MARKER"));
+    let expected = sha256_hex(agents.as_bytes());
+    assert_eq!(
+        field(&h.run_json(), "projectInstructionsSha256"),
+        &json!(expected)
+    );
+    assert_eq!(
+        field(&capsule_json(&h), "project_instructions_sha256"),
+        &json!(expected)
+    );
+}
+
+#[test]
+fn a_claude_md_symlink_that_leaves_the_tree_gives_no_instructions_and_a_warning() {
+    if !sandbox_available() {
+        return;
+    }
+    let h = owned_packet(&run_checks(&["edit", "made"]));
+    // A file the link would reach if it were followed on disk, one level above the repo.
+    fs::write(h.work.path().join("outside"), "OUTSIDE-MARKER\n").unwrap();
+    commit_claude_md_link(&h, "../outside");
+
+    let out = h.run_expecting(0);
+
+    let system = h.seg(1, "system-prompt.md");
+    assert_eq!(system, PREAMBLE);
+    assert!(!system.contains("OUTSIDE-MARKER"));
+    assert!(field(&h.run_json(), "projectInstructionsSha256").is_null());
+    assert!(field(&capsule_json(&h), "project_instructions_sha256").is_null());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let warnings: Vec<&str> = stderr
+        .lines()
+        .filter(|l| l.contains("no project instructions for the builder"))
+        .collect();
+    assert_eq!(warnings.len(), 1, "one warning: {stderr}");
+    assert!(warnings[0].contains("outside the repository"), "{stderr}");
+    assert_eq!(h.verdict()["verdict"], "proved");
+}
+
+#[test]
+fn prefix_version_in_run_json_and_the_capsule_is_the_runners_prefix_version() {
+    if !sandbox_available() {
+        return;
+    }
+    let h = owned_packet(&run_checks(&[]));
+    h.run_ok();
+
+    let expected = cowproof_run::prefix::prefix_version();
+    // Not merely a hex string: it is the version of this preamble, which is the hash of
+    // its bytes.
+    assert_eq!(expected, sha256_hex(PREAMBLE.as_bytes()));
+    assert_eq!(field(&h.run_json(), "prefixVersion"), &json!(expected));
+    assert_eq!(field(&capsule_json(&h), "prefix_version"), &json!(expected));
+    let capsule = Capsule::read(&h.lane().join("control/capsule")).unwrap();
+    assert_eq!(capsule.prefix_version.as_deref(), Some(expected.as_str()));
+
+    // The harness commits "root instructions\n"; the default case records its hash too.
+    assert_eq!(
+        field(&h.run_json(), "projectInstructionsSha256"),
+        &json!(sha256_hex(b"root instructions\n"))
+    );
+}

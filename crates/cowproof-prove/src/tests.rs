@@ -45,6 +45,63 @@ fn test_capsule_roundtrip() {
     assert_eq!(read_capsule.estimated_tokens, 12345);
 }
 
+/// The prefix version and the project instructions hash are in `capsule.json`, which the
+/// seal covers, and an older capsule without them still reads.
+#[test]
+fn test_prefix_version_and_instructions_hash_round_trip_and_are_sealed() {
+    let dir = TempDir::new().unwrap();
+    let mut capsule = Capsule::new(
+        "abc".to_string(),
+        "def".to_string(),
+        fingerprint(),
+        "claude:haiku".to_string(),
+        "api-key".to_string(),
+    );
+    capsule.prefix_version = Some("v".repeat(64));
+    capsule.project_instructions_sha256 = Some("i".repeat(64));
+    capsule.write(dir.path()).unwrap();
+
+    let read = Capsule::read(dir.path()).unwrap();
+    assert_eq!(read.prefix_version, Some("v".repeat(64)));
+    assert_eq!(read.project_instructions_sha256, Some("i".repeat(64)));
+
+    // The seal covers them: a hand edit of either is refused.
+    edit_capsule_json(dir.path(), &"i".repeat(64), &"j".repeat(64));
+    assert_capsule_json_mismatch(dir.path());
+}
+
+#[test]
+fn test_a_capsule_written_before_the_two_fields_still_reads() {
+    let dir = TempDir::new().unwrap();
+    let mut capsule = Capsule::new(
+        "abc".to_string(),
+        "def".to_string(),
+        fingerprint(),
+        "claude:haiku".to_string(),
+        "api-key".to_string(),
+    );
+    capsule.prefix_version = Some("v".repeat(64));
+    capsule.project_instructions_sha256 = Some("i".repeat(64));
+    capsule.write(dir.path()).unwrap();
+
+    // Make it an older capsule: neither key in capsule.json, and the seal recomputed
+    // over those bytes, as the older writer would have sealed it.
+    let path = dir.path().join("capsule.json");
+    let mut json: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let object = json.as_object_mut().unwrap();
+    assert!(object.remove("prefix_version").is_some());
+    assert!(object.remove("project_instructions_sha256").is_some());
+    let raw = serde_json::to_vec_pretty(&json).unwrap();
+    std::fs::write(&path, &raw).unwrap();
+    std::fs::write(dir.path().join("capsule.sha256"), Capsule::hash_bytes(&raw)).unwrap();
+
+    let read = Capsule::read(dir.path()).expect("an older capsule reads");
+    assert_eq!(read.prefix_version, None);
+    assert_eq!(read.project_instructions_sha256, None);
+    assert_eq!(read.base_commit, "abc");
+}
+
 /// Test that editing a tracked file in the capsule causes hash mismatch on read.
 #[test]
 fn test_capsule_hash_mismatch_detected() {

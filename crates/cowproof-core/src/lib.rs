@@ -8,10 +8,12 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
+pub mod git_show;
 pub mod heldout;
 pub mod patch;
 pub mod status;
 
+pub use git_show::{LinkedFile, git_show_following_links, git_show_optional};
 pub use patch::{PatchDelta, parse_patch};
 pub use status::{LaneStatus, StatusClass, StatusFacts, classify_opencode, classify_status};
 

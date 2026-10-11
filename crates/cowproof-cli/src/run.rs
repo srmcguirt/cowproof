@@ -31,7 +31,7 @@
 
 use crate::verify::{Rebuild, fetch_dependencies, verifier_runner};
 use anyhow::{Context, Result, anyhow, bail};
-use cowproof_core::parse_header;
+use cowproof_core::{LinkedFile, git_show_following_links, parse_header};
 use cowproof_prove::{
     capsule::HELDOUT_FILE,
     capsule::{Capsule, CheckResult, EnvironmentFingerprint},
@@ -52,7 +52,7 @@ use cowproof_run::{
     },
     lane::{PrepareOptions, prepare_lane},
     lane_tmp,
-    prefix::assemble_prompt,
+    prefix::{assemble_prompt, prefix_version},
     proxy::{ProxyConfig, ProxyServer},
     render_macos_profile, sandbox_command,
     stream::{MeterSummary, StreamMeter},
@@ -563,8 +563,6 @@ struct Launcher {
     max_turns: u32,
     /// The builder tools socket, canonical.
     socket: PathBuf,
-    /// Where `CLAUDE.md` is read from.
-    repo: PathBuf,
     queue: Arc<Mutex<Queue>>,
     lane_id: String,
     /// The lane's cost cap in USD; escalate-early fires at the queue's share of it.
@@ -576,6 +574,16 @@ struct Launcher {
     end_rx: tokio::sync::Mutex<UnboundedReceiver<SessionEnd>>,
     /// The signal handler's side: the builder's group, and the order to end it.
     interrupt: Arc<Interrupt>,
+    /// The version of the builder preamble (sha256 hash of PREAMBLE bytes),
+    /// recorded in the capsule and run.json.
+    prefix_version: String,
+    /// The project instructions from the base commit (CLAUDE.md), or None if there
+    /// were none. Passed to the builder in the preamble.
+    project_instructions: Option<String>,
+    /// The SHA256 hash of the project instructions from the base commit,
+    /// or None if there were no project instructions. Recorded in the capsule
+    /// and run.json.
+    project_instructions_sha256: Option<String>,
 }
 
 impl Launcher {
@@ -626,8 +634,7 @@ impl Launcher {
                 }
             }))?,
         )?;
-        let project_instructions = fs::read_to_string(self.repo.join("CLAUDE.md")).ok();
-        let assembled = assemble_prompt(project_instructions.as_deref(), &launch.packet);
+        let assembled = assemble_prompt(self.project_instructions.as_deref(), &launch.packet);
         let system_prompt = layout.home.join("system-prompt.md");
         fs::write(&system_prompt, &assembled.system_append)?;
 
@@ -1738,6 +1745,32 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
 
     // 5. Launch inside the builder sandbox, and relaunch on the director's
     // rulings while a blocking escalation is parked.
+    //
+    // The prefix version, and the project instructions as they are in the base commit,
+    // read once: neither a dirty working tree nor a later commit can reach the builder
+    // (D20), and a relaunch after a ruling sends the same bytes. A missing `CLAUDE.md`
+    // means no project-instructions section. A committed `CLAUDE.md -> AGENTS.md` is
+    // followed inside the base tree; a link that cannot be used gives no instructions
+    // and a warning, and the run goes on.
+    let preamble_version = prefix_version();
+    let project_instructions_content =
+        match git_show_following_links(&repo, &prepared.base_commit, "CLAUDE.md")
+            .context("reading CLAUDE.md from the base commit")?
+        {
+            LinkedFile::Text(text) => Some(text),
+            LinkedFile::Absent => None,
+            LinkedFile::Unusable(reason) => {
+                eprintln!(
+                    "[{}] warning: no project instructions for the builder: {reason}",
+                    header.id
+                );
+                None
+            }
+        };
+    let project_instructions_hash = project_instructions_content
+        .as_ref()
+        .map(|text| Capsule::hash_bytes(text.as_bytes()));
+
     let interrupt = Interrupt::new();
     // The proxy's socket, read before the endpoint is moved: removed if interrupted.
     let proxy_sock = endpoint.socket.clone();
@@ -1753,13 +1786,15 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
         network: endpoint.network,
         max_turns: args.max_turns,
         socket,
-        repo: repo.clone(),
         queue: queue.clone(),
         lane_id: header.id.clone(),
         cost_cap_usd: args.cost_cap_usd,
         end_tx,
         end_rx: tokio::sync::Mutex::new(end_rx),
         interrupt: interrupt.clone(),
+        prefix_version: preamble_version.clone(),
+        project_instructions: project_instructions_content.clone(),
+        project_instructions_sha256: project_instructions_hash.clone(),
     };
     let drive = Drive {
         launcher: &launcher,
@@ -1902,6 +1937,8 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
             "patch": patch_path,
             "stderr": layout.control.join("builder.stderr"),
         },
+        "prefixVersion": &launcher.prefix_version,
+        "projectInstructionsSha256": &launcher.project_instructions_sha256,
     });
     fs::write(
         layout.control.join("run.json"),
@@ -1953,6 +1990,8 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
             cost_usd: total_cost_usd,
             tokens: total_tokens,
             heldout_path: heldout.as_deref(),
+            prefix_version: launcher.prefix_version.clone(),
+            project_instructions_sha256: launcher.project_instructions_sha256.clone(),
         },
         results,
     )
@@ -2107,6 +2146,11 @@ struct ProofInput<'a> {
     /// The director's held-out checks for this lane, outside the repository. `None`
     /// means the lane has none (the gate warns, or fails when the base requires them).
     heldout_path: Option<&'a Path>,
+    /// The version of the builder preamble (sha256 hash of PREAMBLE bytes).
+    prefix_version: String,
+    /// The SHA256 hash of the project instructions from the base commit,
+    /// or None if there were no project instructions.
+    project_instructions_sha256: Option<String>,
 }
 
 /// Find the lane's held-out checks (D5): the explicit `--heldout` path, which must exist,
@@ -2311,6 +2355,8 @@ async fn replay_and_gate(
         .map(|c| c.id.clone())
         .collect();
     capsule.launch_removed = input.prepared.launch_removed.clone();
+    capsule.prefix_version = Some(input.prefix_version.clone());
+    capsule.project_instructions_sha256 = input.project_instructions_sha256.clone();
 
     // Fetch the dependencies the checks need before verify runs (D6, D11, D14), on the
     // rebuilt tree, outside any builder. The capsule records the cache key and what the

@@ -158,7 +158,9 @@ fn apply(tree: &Path, patch: &[u8]) -> Result<()> {
 }
 
 /// Delete the launch baseline's paths (R15), refusing anything but a relative path to a
-/// file inside the tree that no symlink or `.git` component leads through.
+/// file or symlink inside the tree that no symlink or `.git` component leads through. A
+/// symlink at the end is unlinked, never followed (a committed `CLAUDE.md -> AGENTS.md`
+/// is a launch-removed path).
 fn remove_launch_paths(tree: &Path, removed: &[String]) -> Result<()> {
     for rel in removed {
         let parts: Vec<&str> = rel.split('/').collect();
@@ -174,7 +176,9 @@ fn remove_launch_paths(tree: &Path, removed: &[String]) -> Result<()> {
             current.push(c);
             let last = i + 1 == parts.len();
             match fs::symlink_metadata(&current) {
-                Ok(m) if last && m.is_file() => fs::remove_file(&current)?,
+                Ok(m) if last && (m.is_file() || m.file_type().is_symlink()) => {
+                    fs::remove_file(&current)?
+                }
                 Ok(m) if !last && m.is_dir() => {}
                 Ok(_) => bail!("launch baseline: {rel:?} is not a plain file path"),
                 Err(e) => bail!("launch baseline: cannot remove {rel:?}: {e}"),
@@ -374,4 +378,36 @@ fn quote_ids(ids: &[String]) -> String {
         .map(|id| format!("{id:?}"))
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_launch_removed_symlink_is_unlinked_and_its_target_is_left_alone() {
+        let dir = tempfile::TempDir::new().unwrap();
+        fs::write(dir.path().join("AGENTS.md"), "rules").unwrap();
+        std::os::unix::fs::symlink("AGENTS.md", dir.path().join("CLAUDE.md")).unwrap();
+        remove_launch_paths(dir.path(), &["CLAUDE.md".to_string()]).unwrap();
+        assert!(fs::symlink_metadata(dir.path().join("CLAUDE.md")).is_err());
+        assert_eq!(
+            fs::read_to_string(dir.path().join("AGENTS.md")).unwrap(),
+            "rules"
+        );
+    }
+
+    #[test]
+    fn a_path_through_a_symlinked_directory_is_still_refused() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        fs::write(outside.path().join("CLAUDE.md"), "precious").unwrap();
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("sub")).unwrap();
+        let err = remove_launch_paths(dir.path(), &["sub/CLAUDE.md".to_string()]).unwrap_err();
+        assert!(err.to_string().contains("not a plain file path"), "{err}");
+        assert_eq!(
+            fs::read_to_string(outside.path().join("CLAUDE.md")).unwrap(),
+            "precious"
+        );
+    }
 }
