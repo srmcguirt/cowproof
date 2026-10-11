@@ -22,8 +22,9 @@
 //!    write `control/run.json`;
 //! 7. prove the lane: seal a capsule from the builder's last recorded
 //!    `run_check` results, replay it in the verifier, run the gates and write
-//!    `control/verdict.json`. The exit code is the verdict (0 proved, 2
-//!    refuted, 3 incomplete, 4 infrastructure). A lane the director stopped,
+//!    `control/verdict.json`. The exit code is the verdict (0 proved, or 0
+//!    finished for a `--unsandboxed` lane, which is checked the same way but
+//!    never proved; 2 refuted, 3 incomplete, 4 infrastructure). A lane the director stopped,
 //!    or one that hit the escalation limit, keeps its work and is not proved:
 //!    `run.json` says how it ended and the exit code is 1. The two hard limits
 //!    end a lane the same way, with its work kept and no proof: a wall-clock
@@ -633,6 +634,8 @@ struct Launcher {
     /// The first port of the lane's block, from the `port` slot it holds
     /// (`COWPROOF_PORT_BASE`). Not the D24 bridge port, which is `bridge_port` above.
     port_base: u16,
+    /// Launch the builder without the OS sandbox (trusted local experiments only).
+    unsandboxed: bool,
 }
 
 impl Launcher {
@@ -756,18 +759,34 @@ impl Launcher {
         // Only the builder gets its own process group (so the runner can end
         // it whole); `run_check` and the git steps keep the runner's group, so
         // a terminal Ctrl-C still reaches them.
-        let mut child = sandboxed_command(
-            &policy,
-            &layout.control.join("builder.sb"),
-            &argv,
-            invocation.env,
-            &invocation.cwd,
-        )?
-        .process_group(0)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context("launching the builder in its sandbox")?;
+        let mut child_cmd = if self.unsandboxed {
+            // The same argv and environment (the policy's own variables included), run
+            // directly: only the OS sandbox is missing.
+            let mut env = invocation.env;
+            policy.apply_env(&mut env);
+            let mut cmd = Command::new(&argv[0]);
+            cmd.args(&argv[1..])
+                .env_clear()
+                .envs(env)
+                .current_dir(&invocation.cwd)
+                .stdin(Stdio::null())
+                .kill_on_drop(true);
+            cmd
+        } else {
+            sandboxed_command(
+                &policy,
+                &layout.control.join("builder.sb"),
+                &argv,
+                invocation.env,
+                &invocation.cwd,
+            )?
+        };
+        let mut child = child_cmd
+            .process_group(0)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .context("launching the builder")?;
         // `process_group(0)` makes the child its own leader, so its pid is the pgid.
         let pgid = child.id().context("reading the builder's process id")?;
         let _group = GroupGuard::new(pgid, self.interrupt.clone());
@@ -1855,6 +1874,7 @@ fn record_interrupted(
     builder_pgid: Option<u32>,
     proxy_socket: &Path,
     started: Instant,
+    unsandboxed: bool,
 ) {
     if let Some(pgid) = builder_pgid {
         kill_process_group(pgid);
@@ -1865,6 +1885,7 @@ fn record_interrupted(
     let run = json!({
         "id": lane_id,
         "status": "interrupted",
+        "unsandboxed": unsandboxed,
         "signal": signal_name,
         "exitCode": INTERRUPTED_EXIT_CODE,
         "durationMs": started.elapsed().as_millis() as u64,
@@ -2005,6 +2026,13 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
     fs::create_dir_all(lane_tmp(&layout.scratch)).context("creating the lane's temp directory")?;
     let lane = lane_dir(&layout)?;
     eprintln!("[{}] lane {}", header.id, lane.display());
+    if args.unsandboxed {
+        eprintln!(
+            "[{}] WARNING: --unsandboxed: the builder runs with no OS sandbox and can read and \
+             write anything you can; this lane can end finished but never proved",
+            header.id
+        );
+    }
 
     // The builder's slots (D12), before anything runs. First one of the packet's resource
     // class: this machine's `rust` lanes (or `pg`, `light`, `crate`) are capped, and the cap
@@ -2041,6 +2069,7 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
                     None,
                     &layout.control.join("proxy.sock"),
                     started,
+                    args.unsandboxed,
                 );
                 return Ok(INTERRUPTED_EXIT_CODE);
             }
@@ -2190,6 +2219,7 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
         timeout,
         active: Mutex::new(Duration::ZERO),
         port_base,
+        unsandboxed: args.unsandboxed,
     };
     let drive = Drive {
         launcher: &launcher,
@@ -2240,6 +2270,7 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
                 interrupt.builder_pgid(),
                 &proxy_sock,
                 started,
+                args.unsandboxed,
             );
             return Ok(INTERRUPTED_EXIT_CODE);
         }
@@ -2304,6 +2335,7 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
         "id": header.id,
         "bridgePort": launcher.bridge_port,
         "status": status_name,
+        "unsandboxed": launcher.unsandboxed,
         "estimatedCostUsd": estimated_cost_usd,
         "costIsEstimate": true,
         "costCapUsd": launcher.cost_cap_usd,
@@ -2412,6 +2444,7 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
             slot_dir: &slot_dir,
             class_limit,
             port_base,
+            unsandboxed: launcher.unsandboxed,
         },
         results,
     )
@@ -2423,6 +2456,7 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Outcome {
     Proved,
+    Finished,
     Refuted,
     Incomplete,
     Infrastructure,
@@ -2432,6 +2466,7 @@ impl Outcome {
     fn name(self) -> &'static str {
         match self {
             Outcome::Proved => "proved",
+            Outcome::Finished => "finished",
             Outcome::Refuted => "refuted",
             Outcome::Incomplete => "incomplete",
             Outcome::Infrastructure => "infrastructure",
@@ -2441,6 +2476,7 @@ impl Outcome {
     fn exit_code(self) -> i32 {
         match self {
             Outcome::Proved => 0,
+            Outcome::Finished => 0,
             Outcome::Refuted => 2,
             Outcome::Incomplete => 3,
             Outcome::Infrastructure => INFRASTRUCTURE_EXIT_CODE,
@@ -2488,8 +2524,10 @@ struct Verdict {
 /// Judge the evidence. Infrastructure wins over everything (a proof that could
 /// not run proves and refutes nothing, F-1). A definite failure beats a
 /// missing result, and unrun checks are still listed beside it. `Proved`
-/// needs every declared check run, reproduced and passing, and no failed gate.
-fn judge(e: &Evidence) -> Verdict {
+/// needs every declared check run, reproduced and passing, and no failed gate. A lane whose
+/// builder ran `--unsandboxed` that would be `Proved` is `Finished` instead (exit 0, and
+/// the reason names the flag); every other outcome is as for any lane.
+fn judge(e: &Evidence, unsandboxed: bool) -> Verdict {
     if !e.infrastructure.is_empty() {
         return Verdict {
             outcome: Outcome::Infrastructure,
@@ -2533,6 +2571,11 @@ fn judge(e: &Evidence) -> Verdict {
         Outcome::Refuted
     } else if !e.unrun.is_empty() || e.no_checks_declared {
         Outcome::Incomplete
+    } else if unsandboxed {
+        reasons.push(
+            "the builder ran with --unsandboxed, so the lane is finished, not proved".to_string(),
+        );
+        Outcome::Finished
     } else {
         Outcome::Proved
     };
@@ -2582,6 +2625,8 @@ struct ProofInput<'a> {
     /// The first port of the run's `port` slot's block, which the verifier's checks get as
     /// well. The verifier takes no `port` slot of its own.
     port_base: u16,
+    /// Whether the builder ran without the OS sandbox.
+    unsandboxed: bool,
 }
 
 /// Find the lane's held-out checks (D5): the explicit `--heldout` path, which must exist,
@@ -2643,12 +2688,13 @@ async fn prove_lane(
     if let Err(e) = replay_and_gate(input, &ran, &mut evidence).await {
         evidence.infrastructure.push(format!("{e:#}"));
     }
-    let verdict = judge(&evidence);
+    let verdict = judge(&evidence, input.unsandboxed);
 
     let control = &input.layout.control;
     let details = json!({
         "id": header.id,
         "verdict": verdict.outcome.name(),
+        "unsandboxed": input.unsandboxed,
         "exitCode": verdict.outcome.exit_code(),
         "reasons": verdict.reasons,
         "unrun": evidence.unrun,
@@ -2777,7 +2823,7 @@ async fn replay_and_gate(
     );
     capsule.estimated_cost_usd = input.cost_usd;
     capsule.estimated_tokens = input.tokens;
-    capsule.unsandboxed = false;
+    capsule.unsandboxed = input.unsandboxed;
     capsule.local_replay_only = !remote_reachable;
     capsule.flaky_checks = header
         .checks
@@ -2880,6 +2926,9 @@ async fn replay_and_gate(
         slot_class: header.class_name.clone(),
         slot_limit: input.class_limit,
         held_slot_path: Some(input.builder_slot.to_path_buf()),
+        // This run's own check of its lane. The replay is sandboxed as always; only the
+        // refusal of an unsandboxed capsule is skipped, which `cowproof verify` keeps.
+        allow_unsandboxed: input.unsandboxed,
         ..VerifyOptions::default()
     };
     match verify(&capsule_dir, input.repo, &verify_dir, &runner, options).await {
@@ -3282,7 +3331,7 @@ body"#;
     }
 
     fn reasons_of(e: &Evidence) -> (Outcome, Vec<String>) {
-        let v = judge(e);
+        let v = judge(e, false);
         (v.outcome, v.reasons)
     }
 
@@ -3290,6 +3339,37 @@ body"#;
     fn judge_proves_only_when_nothing_is_wrong() {
         assert_eq!(reasons_of(&Evidence::default()), (Outcome::Proved, vec![]));
         assert_eq!(Outcome::Proved.exit_code(), 0);
+    }
+
+    #[test]
+    fn judge_an_unsandboxed_lane_is_finished_never_proved_and_otherwise_judged_as_usual() {
+        let finished = judge(&Evidence::default(), true);
+        assert_eq!(finished.outcome, Outcome::Finished);
+        assert_eq!(finished.outcome.exit_code(), 0);
+        assert_eq!(finished.outcome.name(), "finished");
+        assert_eq!(finished.reasons.len(), 1, "{:?}", finished.reasons);
+        assert!(finished.reasons[0].contains("--unsandboxed"));
+
+        let failed = Evidence {
+            failed_checks: vec!["unit".into()],
+            ..Evidence::default()
+        };
+        assert_eq!(judge(&failed, true).outcome, Outcome::Refuted);
+        let unrun = Evidence {
+            unrun: vec!["unit".into()],
+            ..Evidence::default()
+        };
+        assert_eq!(judge(&unrun, true).outcome, Outcome::Incomplete);
+        let none = Evidence {
+            no_checks_declared: true,
+            ..Evidence::default()
+        };
+        assert_eq!(judge(&none, true).outcome, Outcome::Incomplete);
+        let infra = Evidence {
+            infrastructure: vec!["verify could not run".into()],
+            ..Evidence::default()
+        };
+        assert_eq!(judge(&infra, true).outcome, Outcome::Infrastructure);
     }
 
     #[test]

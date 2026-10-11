@@ -44,7 +44,7 @@ enum Action {
     /// check is replayed by the verifier in a fresh sandbox, the gates run, and the verdict is
     /// written to `control/verdict.json` and printed on one line.
     ///
-    /// Exit codes: 0 proved; 2 refuted (a recorded check failed, verify diverged, or a gate
+    /// Exit codes: 0 proved (or finished, for a lane run with `--unsandboxed`); 2 refuted (a recorded check failed, verify diverged, or a gate
     /// failed); 3 incomplete (a declared check was never run); 4 infrastructure (the proof could
     /// not run, never a refutation); 5 timeout (wall-clock limit exceeded, nothing is proved,
     /// `control/run.json` says `timeout`); 6 cost-cap (cost estimate reached 100% of the cap,
@@ -267,6 +267,14 @@ struct RunOneArgs {
     /// Record uncommitted changes as the base patch instead of refusing a dirty tree
     #[arg(long)]
     allow_dirty: bool,
+    /// Launch the builder without the OS sandbox. For trusted local experiments only: the
+    /// builder can then read and write anything you can, and the lane and its capsule are
+    /// marked `unsandboxed`. It gives up proof, not checking: the checks, gates and the
+    /// sandboxed verifier still run, but the lane can end `finished` (exit 0), never `proved`,
+    /// and `cowproof verify` refuses its capsule. The preflight still requires a working
+    /// sandbox, because the verifier uses it
+    #[arg(long)]
+    unsandboxed: bool,
     /// The Claude Code executable, resolved once on the director's PATH
     #[arg(long, default_value = "claude")]
     claude_bin: String,

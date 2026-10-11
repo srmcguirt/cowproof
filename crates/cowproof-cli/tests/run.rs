@@ -317,6 +317,16 @@ exit 0
         )
     }
 
+    /// Run with --unsandboxed flag.
+    fn run_unsandboxed(&self) -> Output {
+        output(
+            self.command(self.lanes.path())
+                .arg("--unsandboxed")
+                .env("ANTHROPIC_API_KEY", REAL_KEY)
+                .env("DIRECTOR_ONLY_SECRET", DIRECTOR_CANARY),
+        )
+    }
+
     /// Run the whole flow and require this exit code (the verdict's).
     fn run_expecting(&self, code: i32) -> Output {
         let out = self.run();
@@ -3209,4 +3219,197 @@ fn sigint_leaves_no_raw_token_in_builder_stderr_even_for_an_unfinished_line() {
         text.contains("first [redacted]") && text.contains("second [redacted]"),
         "the unfinished line is written, redacted, when the stream ends: {text:?}"
     );
+}
+
+// `--unsandboxed` (R-U1): the builder runs without the OS sandbox, the lane is checked by
+// the same gates and a sandboxed verifier, and it can end `finished`, never `proved`.
+
+/// The path a builder tries to write, in a directory nothing grants: the sandbox denies it,
+/// `--unsandboxed` does not. (`/var/tmp`, so bwrap sees it too.)
+fn escape_target() -> (TempDir, PathBuf) {
+    let dir = var_tmp("cp-run-escape-");
+    let target = dir.path().join("escaped.txt");
+    (dir, target)
+}
+
+/// A fake builder body that tries to write `target`, records the shell's status in
+/// `$HOME/fake/escape.status`, and runs `ok` (a check that passes).
+fn escaping_builder(target: &Path) -> String {
+    format!(
+        "{{ echo escaped > '{}'; }} 2>/dev/null\necho $? > \"$HOME/fake/escape.status\"\n{}",
+        target.display(),
+        run_checks(&["ok"])
+    )
+}
+
+fn escaping_harness(target: &Path) -> Harness {
+    Harness::with_packet(
+        &escaping_builder(target),
+        json!(["README.md", "created.txt"]),
+        json!([{"id": "ok", "command": "true"}]),
+    )
+}
+
+#[test]
+fn a_builder_write_outside_its_lane_is_denied_by_the_sandbox_and_succeeds_with_unsandboxed() {
+    if !sandbox_available() {
+        return;
+    }
+    // Sandboxed: the write is denied, the shell says so, nothing appears.
+    let (_dir, target) = escape_target();
+    let h = escaping_harness(&target);
+    h.run_expecting(0);
+    assert_ne!(h.read("home/fake/escape.status").trim(), "0");
+    assert!(!target.exists(), "the sandbox let the write through");
+    assert_eq!(h.verdict()["verdict"], "proved");
+
+    // Unsandboxed: the same builder writes it.
+    let (_dir, target) = escape_target();
+    let h = escaping_harness(&target);
+    let out = h.run_unsandboxed();
+    assert_eq!(out.status.code(), Some(0), "{}", run_text(&out));
+    assert_eq!(h.read("home/fake/escape.status").trim(), "0");
+    assert_eq!(fs::read_to_string(&target).unwrap(), "escaped\n");
+}
+
+fn run_text(out: &Output) -> String {
+    format!(
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    )
+}
+
+#[test]
+fn an_unsandboxed_lane_with_passing_checks_is_finished_not_proved_and_verified_in_a_sandbox() {
+    if !sandbox_available() {
+        return;
+    }
+    // `marker` is written by the check into its own TMPDIR: the lane's when the builder
+    // runs it, the verifier's when verify replays it, so the verifier's copy is its record.
+    // `confined` passes only while its write outside the lane is denied, so a verifier
+    // that ran unsandboxed would diverge on it.
+    let (_dir, target) = escape_target();
+    let confined = format!("! {{ echo x > '{}'; }} 2>/dev/null", target.display());
+    let h = Harness::with_packet(
+        &run_checks(&["edit", "made", "marker", "confined"]),
+        json!(["README.md", "created.txt"]),
+        json!([
+            {"id": "edit", "command": "grep -q edited README.md"},
+            {"id": "made", "command": "test -f created.txt"},
+            {"id": "marker", "command": "echo ran > \"${TMPDIR:?}/verify-marker\""},
+            {"id": "confined", "command": confined},
+        ]),
+    );
+    let out = h.run_unsandboxed();
+    assert_eq!(out.status.code(), Some(0), "{}", run_text(&out));
+
+    // One loud warning line on stderr.
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    let warnings: Vec<_> = stderr.lines().filter(|l| l.contains("WARNING")).collect();
+    assert_eq!(warnings.len(), 1, "{stderr}");
+    assert!(warnings[0].contains("--unsandboxed"), "{stderr}");
+
+    // Finished, with a reason naming the flag; the last stdout line says so.
+    let verdict = h.verdict();
+    assert_eq!(verdict["verdict"], "finished", "{verdict}");
+    assert_eq!(verdict["exitCode"], 0);
+    assert_eq!(verdict["unsandboxed"], true);
+    assert_eq!(verdict["diverged"], json!([]));
+    assert_eq!(verdict["failedChecks"], json!([]));
+    assert_eq!(verdict["failedGates"], json!([]));
+    let reasons = reasons(&verdict);
+    assert_eq!(reasons.len(), 1, "{reasons:?}");
+    assert!(reasons[0].contains("--unsandboxed"), "{reasons:?}");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        stdout
+            .lines()
+            .last()
+            .unwrap()
+            .starts_with(&format!("{}: finished: ", h.id)),
+        "{stdout}"
+    );
+
+    // run.json and the capsule both record it, and the capsule's seal covers the field.
+    assert_eq!(h.run_json()["unsandboxed"], true);
+    let dir = h.lane().join("control/capsule");
+    let capsule = Capsule::read(&dir).expect("the capsule reads back");
+    assert!(capsule.unsandboxed);
+    assert_eq!(capsule.lane_state, "finished");
+    let raw = h.read("control/capsule/capsule.json");
+    assert!(raw.contains("\"unsandboxed\": true"), "{raw}");
+    fs::write(
+        dir.join("capsule.json"),
+        raw.replace("\"unsandboxed\": true", "\"unsandboxed\": false"),
+    )
+    .unwrap();
+    assert!(Capsule::read(&dir).is_err(), "the seal must cover the flag");
+
+    // The in-run verify ran and reproduced: it rebuilt the tree, ran the marker check in
+    // its own temp directory, and its sandbox held `confined`.
+    assert_eq!(
+        fs::read_to_string(h.lane().join("scratch/verify/tmp/verify-marker")).unwrap(),
+        "ran\n"
+    );
+    assert_eq!(
+        fs::read_to_string(h.lane().join("scratch/verify/tree/created.txt")).unwrap(),
+        "created\n"
+    );
+    assert!(!target.exists(), "the verifier wrote outside its sandbox");
+}
+
+#[test]
+fn an_unsandboxed_lane_with_a_failing_check_is_refuted() {
+    if !sandbox_available() {
+        return;
+    }
+    let h = Harness::with_packet(
+        &run_checks(&["bad"]),
+        json!(["README.md", "created.txt"]),
+        json!([{"id": "bad", "command": "false"}]),
+    );
+    let out = h.run_unsandboxed();
+    assert_eq!(out.status.code(), Some(2), "{}", run_text(&out));
+    let verdict = h.verdict();
+    assert_eq!(verdict["verdict"], "refuted", "{verdict}");
+    assert_eq!(verdict["unsandboxed"], true);
+    assert_eq!(verdict["failedChecks"], json!(["bad"]));
+    assert_eq!(h.run_json()["unsandboxed"], true);
+}
+
+#[test]
+fn a_sandboxed_run_records_unsandboxed_false_everywhere() {
+    if !sandbox_available() {
+        return;
+    }
+    let h = owned_packet(&run_checks(&["edit", "made"]));
+    let out = h.run_expecting(0);
+    assert!(
+        !String::from_utf8_lossy(&out.stderr).contains("WARNING"),
+        "{}",
+        run_text(&out)
+    );
+    assert_eq!(h.verdict()["unsandboxed"], false);
+    assert_eq!(h.run_json()["unsandboxed"], false);
+}
+
+#[test]
+fn run_help_says_unsandboxed_is_for_trusted_local_experiments_and_what_it_gives_up() {
+    let out = output(Command::new(env!("CARGO_BIN_EXE_cowproof")).args(["run", "--help"]));
+    assert!(out.status.success());
+    let help = String::from_utf8(out.stdout)
+        .unwrap()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    for needle in [
+        "--unsandboxed",
+        "trusted local experiments only",
+        "never `proved`",
+        "`cowproof verify` refuses its capsule",
+        "0 proved (or finished, for a lane run with `--unsandboxed`)",
+    ] {
+        assert!(help.contains(needle), "no {needle:?} in: {help}");
+    }
 }

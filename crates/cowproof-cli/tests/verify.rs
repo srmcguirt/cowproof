@@ -183,6 +183,49 @@ fn a_tampered_capsule_is_refused_naming_the_tamper() {
     assert_eq!(out.status.code(), Some(0), "{}", text(&out));
 }
 
+/// A capsule from a builder that ran unconfined is not a proof to hand to someone else:
+/// standalone `cowproof verify` refuses it with exit 4, naming `unsandboxed`, before it
+/// rebuilds anything. The run that made it checked it (and ended `finished`).
+#[test]
+fn a_capsule_from_an_unsandboxed_lane_is_refused_by_standalone_verify() {
+    if !sandbox_available() {
+        return;
+    }
+    let lane = lane();
+    let out = run_expecting(&lane, &[Path::new("--unsandboxed")], 0);
+    assert!(stdout(&out).contains(": finished"), "{}", text(&out));
+    assert_eq!(lane.verdict()["verdict"], "finished");
+    assert!(Capsule::read(&lane.capsule_dir()).unwrap().unsandboxed);
+
+    let fresh = fresh_clone(&lane);
+    let elsewhere = var_tmp("cp-ver-cwd-");
+    let workdir = var_tmp("cp-ver-wd-");
+    let out = verify(
+        &lane,
+        &lane.capsule_dir(),
+        &fresh.path().join("repo"),
+        workdir.path(),
+        elsewhere.path(),
+    );
+    assert_eq!(out.status.code(), Some(4), "{}", text(&out));
+    let err = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(err.contains("unsandboxed"), "{err}");
+    assert!(
+        !stdout(&out).contains("reproduced"),
+        "an unsandboxed capsule must not reproduce: {}",
+        text(&out)
+    );
+    // Refused before anything was rebuilt.
+    assert!(
+        !workdir
+            .path()
+            .canonicalize()
+            .unwrap()
+            .join("lane/scratch/verify/tree")
+            .exists()
+    );
+}
+
 /// A check the builder recorded as a pass that the rebuilt tree cannot reproduce: the
 /// builder owns the clone's `.git`, so it can keep a file out of the patch.
 #[test]

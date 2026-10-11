@@ -395,6 +395,7 @@ fn test_opts(work: &Path) -> VerifyOptions {
         slot_limit: 2,
         default_timeout: Duration::from_secs(60),
         held_slot_path: None,
+        allow_unsandboxed: false,
     }
 }
 
@@ -1180,6 +1181,45 @@ async fn test_unsandboxed_capsule_never_proved() {
     assert!(!work.path().join("tree").exists());
 }
 
+/// 7b. `allow_unsandboxed` (set only by `cowproof run`) replays the same capsule: the tree is
+/// built and the check runs. The default stays a refusal (test 7).
+#[tokio::test]
+async fn test_allow_unsandboxed_replays_an_unsandboxed_capsule() {
+    let c = chain();
+    let (capsule_dir, work) = dirs();
+    write_capsule(
+        capsule_dir.path(),
+        &CapsuleSpec {
+            base: &c.base,
+            patches: &[("lane.patch", &c.lane)],
+            launch_removed: &[".env"],
+            checks: &[("any", "true", 0)],
+            flaky: &[],
+            unsandboxed: true,
+        },
+    );
+    let runner = ScriptedRunner::new(&[("true", &[0])]);
+    let mut opts = test_opts(work.path());
+    opts.allow_unsandboxed = true;
+
+    let report = verify(
+        capsule_dir.path(),
+        c.repo.path(),
+        work.path(),
+        &runner,
+        opts,
+    )
+    .await
+    .expect("an allowed unsandboxed capsule is replayed");
+
+    assert!(
+        matches!(report.result, VerifyResult::Reproduced),
+        "{report:?}"
+    );
+    assert_eq!(runner.call_count(), 1);
+    assert!(work.path().join("tree").exists());
+}
+
 /// 8. A lane.patch altered after the capsule was written fails Capsule::read, and so
 /// verify, before any tree is built or check run.
 #[tokio::test]
@@ -1477,6 +1517,7 @@ async fn test_class_slot_caps_concurrent_verifications() {
         slot_limit: 2,
         default_timeout: Duration::from_secs(60),
         held_slot_path: None,
+        allow_unsandboxed: false,
     };
 
     let (a, b, d) = tokio::join!(

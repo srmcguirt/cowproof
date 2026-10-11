@@ -23,6 +23,12 @@ pub struct VerifyOptions {
     /// until `verify` returns. The verifier then acquires none. `cowproof run` sets it to
     /// the builder's slot, so the verifier never waits on a slot its own run holds.
     pub held_slot_path: Option<PathBuf>,
+    /// Replay a capsule marked `unsandboxed` instead of refusing it. Only `cowproof run`
+    /// sets it, to check a lane it just built with `--unsandboxed` before the lane can end
+    /// `finished` (the replay itself is sandboxed as always). It is false by default, so
+    /// `cowproof verify` refuses such a capsule: one from a builder that ran unconfined is
+    /// not a proof to hand to someone else.
+    pub allow_unsandboxed: bool,
 }
 
 impl Default for VerifyOptions {
@@ -35,6 +41,7 @@ impl Default for VerifyOptions {
             slot_limit: 2,
             default_timeout: Duration::from_secs(20 * 60),
             held_slot_path: None,
+            allow_unsandboxed: false,
         }
     }
 }
@@ -94,6 +101,8 @@ const FLAKY_ATTEMPTS: u32 = 3;
 /// Before it builds anything, `verify` holds a slot of `opts.slot_class` until it returns,
 /// on every path: success, divergence, error or check timeout (D12). It waits for one, unless
 /// `opts.held_slot_path` names a slot the caller already holds.
+/// A capsule marked `unsandboxed` is refused (`VerifyError::UnsandboxedNotProved`) before
+/// anything is built, unless `opts.allow_unsandboxed` is set.
 /// Every check runs under `opts.default_timeout`; one that overruns is an
 /// infrastructure error naming the check, never a divergence.
 ///
@@ -122,7 +131,7 @@ pub async fn verify(
 ) -> Result<VerifyReport, VerifyError> {
     let capsule = Capsule::read(capsule_dir)?;
 
-    if capsule.unsandboxed {
+    if capsule.unsandboxed && !opts.allow_unsandboxed {
         return Err(VerifyError::UnsandboxedNotProved);
     }
 
