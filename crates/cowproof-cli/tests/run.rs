@@ -937,6 +937,75 @@ fn every_check_run_and_reproduced_with_owned_edits_is_proved_and_sealed_in_a_cap
     assert!(Capsule::read(&dir).is_err());
 }
 
+/// A fake builder that makes a temp file under `$TMPDIR` and writes to it, as
+/// Claude Code's Bash tool and every tool that honours `TMPDIR` do. macOS denies
+/// every write outside the grants, so this fails unless the temp directory the
+/// builder is given is one it may write. (`${TMPDIR:?}` also fails when the
+/// variable is unset. Apple's own `mktemp` with no template ignores `TMPDIR` and
+/// uses the per-user `/var/folders` directory, so the tests name the template.)
+const FAKE_MKTEMP: &str = r#"
+t="$(mktemp "${TMPDIR:?}/builder.XXXXXX")" || { echo "mktemp failed" > "$HOME/fake/mktemp.err"; exit 1; }
+echo from-the-builder > "$t" || { echo "write failed" > "$HOME/fake/mktemp.err"; exit 1; }
+echo "$t" > "$HOME/fake/mktemp.path"
+"#;
+
+/// The declared check that makes and writes a temp file of its own.
+const MKTEMP_CHECK: &str =
+    r#"f="$(mktemp "${TMPDIR:?}/check.XXXXXX")" && echo x > "$f" && test -s "$f""#;
+
+/// A packet that owns what the fake touches, with one check that uses a temp file.
+fn mktemp_packet() -> Harness {
+    Harness::with_packet(
+        &format!("{FAKE_MKTEMP}{}", run_checks(&["edit", "temp"])),
+        json!(["README.md", "created.txt"]),
+        json!([
+            {"id": "edit", "command": "grep -q edited README.md"},
+            {"id": "temp", "command": MKTEMP_CHECK},
+        ]),
+    )
+}
+
+#[test]
+fn the_builder_and_every_check_get_a_temp_dir_inside_the_lane() {
+    if !sandbox_available() {
+        return;
+    }
+    let h = mktemp_packet();
+    h.run_expecting(0);
+    assert!(
+        !h.lane().join("home/fake/mktemp.err").exists(),
+        "the builder could not use mktemp: {}",
+        h.read("home/fake/mktemp.err")
+    );
+    // The builder's mktemp file is in the lane's scratch, which it may write.
+    let tmp = h.lane().join("scratch/tmp");
+    let made = h.read("home/fake/mktemp.path");
+    assert!(
+        Path::new(made.trim()).starts_with(&tmp),
+        "{made} is not under {}",
+        tmp.display()
+    );
+    // The builder's environment names that directory, for the shell tools and
+    // for Claude Code's own temp directory.
+    let env = h.read("home/fake/env.txt");
+    for var in ["TMPDIR", "CLAUDE_CODE_TMPDIR"] {
+        assert!(
+            env.lines().any(|l| l == format!("{var}={}", tmp.display())),
+            "{var} is not {}\n{env}",
+            tmp.display()
+        );
+    }
+    // The declared check that uses mktemp passed in the lane and again, in the
+    // verifier's own temp directory, in the rebuilt tree: the lane is proved.
+    assert!(
+        passed(&h, 3) && passed(&h, 4),
+        "both checks pass in the lane"
+    );
+    let verdict = h.verdict();
+    assert_eq!(verdict["verdict"], "proved", "{verdict}");
+    assert!(h.lane().join("scratch/verify/tmp").is_dir());
+}
+
 /// Every file under `dir` (not following symlinks) whose bytes contain `needle`.
 fn files_containing(dir: &Path, needle: &str) -> Vec<PathBuf> {
     let mut found = Vec::new();

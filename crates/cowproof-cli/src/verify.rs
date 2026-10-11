@@ -16,7 +16,7 @@ use cowproof_prove::{
 use cowproof_run::{
     LaneLayout,
     deps::{self, FETCH_TIMEOUT, FetchNetwork, FetchOutcome, FetchTools, Prefetch},
-    link_dependency_cache,
+    lane_tmp, link_dependency_cache,
 };
 use std::fs;
 use std::io::Write;
@@ -63,6 +63,8 @@ pub(crate) fn verifier_runner(
     remove_path(verify_dir).context("clearing the verify directory")?;
     let cache = verify_dir.join("cache");
     fs::create_dir_all(cache.join(".cargo")).context("creating the verify directory")?;
+    // The verifier's `TMPDIR` (a check that runs `mktemp`); macOS denies the rest.
+    fs::create_dir_all(lane_tmp(verify_dir)).context("creating the verifier's temp directory")?;
     let mut verify_layout = layout.clone();
     verify_layout.scratch = verify_dir.to_path_buf();
     let mut runner =

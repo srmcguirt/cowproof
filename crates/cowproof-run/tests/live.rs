@@ -1208,3 +1208,81 @@ kill $bridge
     );
     assert_bridge_outcome(&out, &describe(&o));
 }
+
+// ------------------------------------------- macOS: writes denied by default
+
+/// `(allow default)` alone lets a sandboxed process write anywhere outside the
+/// hidden home. The profile denies file writes first and grants them back, so
+/// a fresh file outside the grants is refused, a read-write grant works, a
+/// read-only grant nested in it stays read-only, and what a shell and git need
+/// (`/dev/null`, a repository) still works. The root is under `/var/tmp`, a
+/// symlink to `/private/var/tmp`, and is given to the policy in that spelling.
+#[cfg(target_os = "macos")]
+#[test]
+fn live_macos_writes_outside_the_grants_are_denied_and_the_grants_work() {
+    let tmp = tempfile::Builder::new()
+        .prefix("cpw-write-deny-")
+        .tempdir_in("/var/tmp")
+        .unwrap();
+    let root = tmp.path().to_path_buf();
+    assert!(root.starts_with("/var/tmp"), "{}", root.display());
+    let (rw, ro) = (root.join("rw"), root.join("rw/ro"));
+    for d in [
+        root.join("lane/clone"),
+        root.join("lane/control"),
+        root.join("lane/scratch"),
+        root.join("home"),
+        ro.clone(),
+    ] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    let lane = LaneLayout {
+        clone: root.join("lane/clone"),
+        home: root.join("lane/home"),
+        scratch: root.join("lane/scratch"),
+        control: root.join("lane/control"),
+        real_home: root.join("home"),
+        sock: root.join("lane/sock/runner.sock"),
+        lanes_root: root.join("lane"),
+    };
+    let mut policy = SandboxPolicy::capture(&lane);
+    policy.rw_paths = vec![rw.clone()];
+    policy.ro_paths = vec![ro.clone()];
+
+    let (outside, in_rw, in_ro) = (root.join("outside"), rw.join("inside"), ro.join("nested"));
+    let err = rw.join("stderr.log");
+    let script = format!(
+        r#"export HOME='{rw}'
+( : > '{outside}' ) 2>> '{err}' && echo "outside:wrote" || echo "outside:denied"
+( : > '{in_rw}' ) 2>> '{err}' && echo "rw:wrote" || echo "rw:denied"
+( : > '{in_ro}' ) 2>> '{err}' && echo "ro:wrote" || echo "ro:denied"
+( echo discarded > /dev/null ) 2>> '{err}' && echo "devnull:wrote" || echo "devnull:denied"
+cd '{rw}' && git init -q . 2>> '{err}' && git -c user.name=t -c user.email=t@localhost \
+  commit -q --allow-empty -m probe 2>> '{err}' && echo "git:ok" || echo "git:failed"
+"#,
+        rw = rw.display(),
+        outside = outside.display(),
+        in_rw = in_rw.display(),
+        in_ro = in_ro.display(),
+        err = err.display(),
+    );
+    let o = run(&policy, &root, &script);
+    let out = stdout(&o);
+    let why = format!("{}\nstderr.log:\n{}", describe(&o), read(&err));
+    for want in [
+        "outside:denied",
+        "rw:wrote",
+        "ro:denied",
+        "devnull:wrote",
+        "git:ok",
+    ] {
+        assert!(out.lines().any(|l| l == want), "missing {want}\n{why}");
+    }
+    assert!(!outside.exists(), "a write outside the grants landed");
+    assert!(in_rw.exists(), "the read-write grant did not take");
+    assert!(
+        !in_ro.exists(),
+        "a write in the nested read-only grant landed"
+    );
+    assert!(rw.join(".git/HEAD").exists(), "git init did not run");
+}

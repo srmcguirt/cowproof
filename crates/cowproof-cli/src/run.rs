@@ -51,6 +51,7 @@ use cowproof_run::{
         SystemClock, Verdict as EscalationVerdict,
     },
     lane::{PrepareOptions, prepare_lane},
+    lane_tmp,
     prefix::assemble_prompt,
     proxy::{ProxyConfig, ProxyServer},
     render_macos_profile, sandbox_command,
@@ -1652,6 +1653,9 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
         },
     )?;
     let layout = prepared.layout.clone();
+    // The builder's, `run_check`'s and the git steps' `TMPDIR`: inside the
+    // scratch they are granted, because macOS denies every other write.
+    fs::create_dir_all(lane_tmp(&layout.scratch)).context("creating the lane's temp directory")?;
     let lane = lane_dir(&layout)?;
     eprintln!("[{}] lane {}", header.id, lane.display());
 

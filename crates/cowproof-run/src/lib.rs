@@ -107,7 +107,17 @@ impl SandboxPolicy {
             ],
             deny_paths: vec![lane.control.clone()],
             network,
-            env_set: vec![cargo_home(&lane_cargo)],
+            // Claude Code builds its own temp directory as
+            // `$CLAUDE_CODE_TMPDIR/claude-<uid>` (from `$TMPDIR`, else `/tmp`, when
+            // unset), and its Bash tool cannot start without one it may write.
+            env_set: vec![
+                cargo_home(&lane_cargo),
+                tmpdir(lane),
+                (
+                    "CLAUDE_CODE_TMPDIR".to_string(),
+                    lane_tmp(&lane.scratch).to_string_lossy().into_owned(),
+                ),
+            ],
             env_allowlist: None,
             home: lane.real_home.clone(),
             connect_socket: Some(lane.sock.clone()),
@@ -154,6 +164,7 @@ impl SandboxPolicy {
             // instead of retrying a network that is not there.
             env_set: vec![
                 cargo_home(&verifier_cargo),
+                tmpdir(lane),
                 ("CARGO_NET_OFFLINE".to_string(), "true".to_string()),
             ],
             env_allowlist: None,
@@ -190,7 +201,7 @@ impl SandboxPolicy {
             ro_paths: vec![lane.real_home.join(".rustup")],
             deny_paths: vec![lane.control.clone()],
             network: NetworkMode::None,
-            env_set: vec![cargo_home(&lane_cargo)],
+            env_set: vec![cargo_home(&lane_cargo), tmpdir(lane)],
             env_allowlist: None,
             home: lane.real_home.clone(),
             connect_socket: Some(lane.sock.clone()),
@@ -223,7 +234,7 @@ impl SandboxPolicy {
             ro_paths: vec![],
             deny_paths: vec![lane.control.clone()],
             network: NetworkMode::None,
-            env_set: vec![],
+            env_set: vec![tmpdir(lane)],
             env_allowlist: None,
             home: lane.real_home.clone(),
             connect_socket: None,
@@ -269,6 +280,22 @@ pub fn link_dependency_cache(deps_dir: &Path, cargo_home: &Path) -> Result<()> {
             .with_context(|| format!("linking {} into the verifier's CARGO_HOME", name))?;
     }
     Ok(())
+}
+
+/// The temp directory a sandboxed process gets: a directory of the lane's own
+/// scratch, which every policy that writes temp files already grants read-write.
+/// On macOS the profile denies writes outside the grants, and a process with no
+/// `TMPDIR` falls back to `/tmp` or the system temp directory, both denied. The
+/// caller creates it before launch (`create_dir_all`).
+pub fn lane_tmp(scratch: &Path) -> PathBuf {
+    scratch.join("tmp")
+}
+
+fn tmpdir(lane: &LaneLayout) -> (String, String) {
+    (
+        "TMPDIR".to_string(),
+        lane_tmp(&lane.scratch).to_string_lossy().into_owned(),
+    )
 }
 
 fn cargo_home(path: &Path) -> (String, String) {
@@ -729,14 +756,27 @@ fn sbpl(path: &Path) -> Result<String> {
     Ok(serde_json::to_string(s)?)
 }
 
+/// The device files a sandboxed process may write. Everything else under `/dev`
+/// is covered by the global write deny. `/dev/null` and `/dev/zero` are the
+/// sinks shells and tools open for redirection, `/dev/tty` is what git and
+/// cargo open to test for a terminal, and `/dev/dtracehelper` is opened by
+/// the macOS system libraries at process start.
+const MACOS_DEV_WRITES: [&str; 4] = ["/dev/null", "/dev/zero", "/dev/tty", "/dev/dtracehelper"];
+
 /// Render a sandbox policy as a macOS Seatbelt profile.
 ///
-/// Seatbelt applies the last matching rule, so grants come before the denies
-/// that must win over them (credentials, then `deny_paths`). The lanes_root deny
-/// is placed before the RW/RO allows so that specific grants override it.
+/// Seatbelt applies the last matching rule, so the order is the policy. File
+/// writes are denied everywhere right after `(allow default)`, the grants come
+/// next (read-write grants, then the device files), and the denies that must
+/// win over a grant come last (read-only grants nested in a read-write one,
+/// credentials, then `deny_paths`). The lanes_root deny is placed before the
+/// RW/RO allows so that specific grants override it.
 pub fn render_macos_profile(policy: &SandboxPolicy) -> Result<String> {
     let r = resolve(policy)?;
     let mut out = String::from("(version 1)\n(allow default)\n");
+    // `(allow default)` allows file writes, so deny them everywhere first. Every
+    // write the builder needs is a later allow, which wins by order.
+    out.push_str("(deny file-write* (subpath \"/\"))\n");
     out.push_str(&format!(
         "(deny file-read* file-write* (subpath {}))\n",
         sbpl(&r.home)?
@@ -799,10 +839,15 @@ pub fn render_macos_profile(policy: &SandboxPolicy) -> Result<String> {
     for p in &r.ro {
         out.push_str(&format!("(allow file-read* (subpath {}))\n", sbpl(p)?));
     }
-    // `(allow default)` allows writes outside the hidden home, so a read-only grant
-    // needs its own deny, after every grant: a mount of the dependency cache must
-    // stay read-only wherever it lives, and a read-only path inside a read-write
-    // one stays read-only.
+    out.push_str("(allow file-write*");
+    for d in MACOS_DEV_WRITES {
+        out.push_str(&format!(" (literal {})", sbpl(Path::new(d))?));
+    }
+    out.push_str(")\n");
+    // The global write deny already makes a read-only grant unwritable, so this
+    // deny is only needed where a read-only grant sits inside a read-write one
+    // (the dependency cache mounted under the builder's home): it must come after
+    // every read-write allow to win.
     for p in &r.ro {
         out.push_str(&format!("(deny file-write* (subpath {}))\n", sbpl(p)?));
     }
@@ -1291,7 +1336,10 @@ mod tests {
         ];
         policy.apply_env(&mut env);
         assert_eq!(env[0].1, "/nonexistent-cp/lanes/l1/home/.cargo");
-        assert_eq!(env.len(), 2);
+        // The real value is replaced, not duplicated; the policy's other
+        // variables (the temp directories) are added once each.
+        assert_eq!(env.iter().filter(|(k, _)| k == "CARGO_HOME").count(), 1);
+        assert_eq!(env.len(), 2 + policy.env_set.len() - 1);
     }
 
     #[test]
@@ -2262,5 +2310,136 @@ mod tests {
         std::fs::create_dir_all(&home2).unwrap();
         link_dependency_cache(&bare, &home2).unwrap();
         assert_eq!(std::fs::read_dir(&home2).unwrap().count(), 0);
+    }
+
+    // The macOS profile denies file writes everywhere and grants them back.
+
+    const GLOBAL_WRITE_DENY: &str = "(deny file-write* (subpath \"/\"))";
+
+    /// A builder policy with a read-write grant and a read-only grant inside it.
+    fn nested_grant_profile() -> Vec<String> {
+        let mut policy = SandboxPolicy::builder(&test_lane(), NetworkMode::None);
+        policy.rw_paths.push(PathBuf::from("/nonexistent-cp/rw"));
+        policy.ro_paths.push(PathBuf::from("/nonexistent-cp/rw/ro"));
+        render_macos_profile(&policy)
+            .unwrap()
+            .lines()
+            .map(String::from)
+            .collect()
+    }
+
+    fn positions(lines: &[String], pred: impl Fn(&str) -> bool) -> Vec<usize> {
+        (0..lines.len()).filter(|&i| pred(&lines[i])).collect()
+    }
+
+    #[test]
+    fn the_global_write_deny_directly_follows_allow_default() {
+        for (name, p) in all_policies(&test_lane()) {
+            let profile = render_macos_profile(&p).unwrap();
+            let lines: Vec<&str> = profile.lines().collect();
+            assert_eq!(lines[1], "(allow default)", "{name}\n{profile}");
+            assert_eq!(lines[2], GLOBAL_WRITE_DENY, "{name}\n{profile}");
+            assert_eq!(
+                lines.iter().filter(|l| **l == GLOBAL_WRITE_DENY).count(),
+                1,
+                "{name}\n{profile}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_write_allow_comes_after_the_global_write_deny() {
+        let lines = nested_grant_profile();
+        let deny = lines.iter().position(|l| l == GLOBAL_WRITE_DENY).unwrap();
+        let rw = positions(&lines, |l| l.starts_with("(allow file-read* file-write*"));
+        let dev = positions(&lines, |l| l.starts_with("(allow file-write*"));
+        // The builder's own grants and the extra one, then the device files.
+        assert!(rw.len() >= 5, "rw allows: {rw:?}");
+        assert_eq!(dev.len(), 1, "device allow: {dev:?}");
+        for i in rw.iter().chain(dev.iter()) {
+            assert!(deny < *i, "line {i} is before the global deny:\n{lines:#?}");
+        }
+        assert!(
+            lines.contains(
+                &"(allow file-read* file-write* (subpath \"/nonexistent-cp/rw\"))".to_string()
+            ),
+            "{lines:#?}"
+        );
+    }
+
+    #[test]
+    fn every_read_only_write_deny_comes_after_every_write_allow() {
+        let lines = nested_grant_profile();
+        let allows = positions(&lines, |l| {
+            l.starts_with("(allow file-read* file-write*") || l.starts_with("(allow file-write*")
+        });
+        let last_allow = *allows.iter().max().unwrap();
+        let ro_denies = positions(&lines, |l| {
+            l.starts_with("(deny file-write* (subpath") && l != GLOBAL_WRITE_DENY
+        });
+        // The builder has three read-only mounts, and the nested one.
+        assert_eq!(ro_denies.len(), 4, "{lines:#?}");
+        for i in &ro_denies {
+            assert!(
+                last_allow < *i,
+                "read-only deny at {i} is before the write allow at {last_allow}:\n{lines:#?}"
+            );
+        }
+        assert!(
+            lines.contains(&"(deny file-write* (subpath \"/nonexistent-cp/rw/ro\"))".to_string()),
+            "{lines:#?}"
+        );
+    }
+
+    #[test]
+    fn the_device_files_a_process_needs_are_writable() {
+        let lines = nested_grant_profile();
+        let deny = lines.iter().position(|l| l == GLOBAL_WRITE_DENY).unwrap();
+        let allow = lines
+            .iter()
+            .position(|l| l.starts_with("(allow file-write* (literal"))
+            .unwrap();
+        assert!(deny < allow);
+        for dev in ["/dev/null", "/dev/zero", "/dev/tty", "/dev/dtracehelper"] {
+            assert!(
+                lines[allow].contains(&format!("(literal \"{dev}\")")),
+                "{dev} missing from {}",
+                lines[allow]
+            );
+        }
+        // Devices, not the directory: no other /dev path becomes writable.
+        assert!(!lines[allow].contains("subpath"), "{}", lines[allow]);
+    }
+
+    #[test]
+    fn every_policy_that_writes_scratch_gets_a_temp_dir_inside_it() {
+        let lane = test_lane();
+        let want = lane.scratch.join("tmp").to_string_lossy().into_owned();
+        assert_eq!(lane_tmp(&lane.scratch), lane.scratch.join("tmp"));
+        for (name, p) in all_policies(&lane) {
+            let tmpdir = p.env_set.iter().find(|(k, _)| k == "TMPDIR");
+            if name == "dependency_fetch" {
+                // It writes only its cache directory and runs no check.
+                assert!(tmpdir.is_none(), "{name}: {:?}", p.env_set);
+                continue;
+            }
+            assert_eq!(tmpdir.map(|(_, v)| v), Some(&want), "{name}");
+            // The temp dir is under a read-write grant, so macOS lets it be written.
+            assert!(
+                p.rw_paths
+                    .iter()
+                    .any(|g| lane.scratch.join("tmp").starts_with(g)),
+                "{name}: {want} is under no read-write grant"
+            );
+        }
+        // Claude Code reads its own variable first; only the builder runs it.
+        for (name, p) in all_policies(&lane) {
+            let claude = p.env_set.iter().find(|(k, _)| k == "CLAUDE_CODE_TMPDIR");
+            assert_eq!(
+                claude.map(|(_, v)| v),
+                (name == "builder").then_some(&want),
+                "{name}"
+            );
+        }
     }
 }
