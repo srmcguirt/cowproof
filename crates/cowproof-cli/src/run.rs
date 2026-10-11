@@ -1536,15 +1536,9 @@ async fn capture_patch(layout: &LaneLayout, launch_commit: &str, path: &str) -> 
     unreachable!("the diff step returns")
 }
 
-/// The lanes root: `--lanes-root` relative to the working directory, or
-/// `~/.cache/cowproof/lanes` (never under `/tmp`, which macOS cleans by access
-/// time). `cowproof run` and `cowproof watch` both use this one default.
-pub(crate) fn lanes_root(arg: Option<&Path>, cwd: &Path, home: &Path) -> PathBuf {
-    match arg {
-        Some(p) => cwd.join(p),
-        None => home.join(".cache/cowproof/lanes"),
-    }
-}
+/// The lanes root default lives in `root.rs`, which the director's tools in the
+/// library crate share; this is the one function under its old name.
+pub use crate::root::lanes_root;
 
 /// The name of the next SIGINT or SIGTERM.
 async fn next_signal(sigint: &mut Signal, sigterm: &mut Signal) -> &'static str {

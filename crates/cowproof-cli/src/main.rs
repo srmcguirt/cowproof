@@ -29,13 +29,15 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 
+mod director_tools;
 mod lane_tools;
+mod root;
 mod run;
 mod verify;
 mod watch;
 
 #[derive(Parser)]
-#[command(name = "lanes", about = "Run isolated engineering lanes")]
+#[command(name = "cowproof", about = "Run isolated engineering lanes", version)]
 struct Args {
     #[command(subcommand)]
     command: Action,
@@ -83,10 +85,17 @@ enum Action {
     /// runner socket; the builder runtime launches it, people do not.
     #[command(hide = true)]
     LaneTools(LaneToolsArgs),
+    /// The director's MCP server for Claude Code's `.mcp.json` (D4).
+    ///
+    /// `cowproof serve --director` serves the tools `lanes`, `events`, `rule` and
+    /// `note` over stdio, for the director's own Claude Code session:
+    /// `claude mcp add cowproof -- cowproof serve --director`. No tool waits for a
+    /// lane; `events` returns what is there and a cursor to poll with.
+    Serve(ServeArgs),
     /// The in-sandbox bridge from `127.0.0.1:<port>` to the lane's proxy
     /// socket (D24). Without a command it serves and prints `READY` on stderr
     /// once bound. With `-- <command>` it starts that bridge first, waits up to
-    /// five seconds for `READY`, then replaces itself with the command, so the
+    /// thirty seconds for `READY`, then replaces itself with the command, so the
     /// command's exit status is the process's own. The runtime launches it;
     /// people do not.
     #[command(hide = true)]
@@ -191,6 +200,17 @@ struct LaneToolsArgs {
     /// The lane's runner socket, `<lane>/sock/runner.sock`.
     #[arg(long)]
     socket: PathBuf,
+}
+
+#[derive(Parser)]
+struct ServeArgs {
+    /// Serve the director's tools (`lanes`, `events`, `rule`, `note`).
+    #[arg(long, required = true)]
+    director: bool,
+    /// Lanes root the tools use unless a call names its own `lanes_root`
+    /// (default: ~/.cache/cowproof/lanes, as for `cowproof run` and `watch`).
+    #[arg(long)]
+    lanes_root: Option<PathBuf>,
 }
 
 #[derive(Parser)]
@@ -379,6 +399,7 @@ async fn dispatch(command: Action) -> Result<()> {
         Action::Ruling(args) => ruling_command(args).await,
         Action::Check(args) => check_command(args).await,
         Action::LaneTools(args) => lane_tools::run(args.socket).await,
+        Action::Serve(args) => director_tools::run(args.lanes_root).await,
         Action::NetBridge(args) => net_bridge_command(args).await,
         Action::Pk { .. } | Action::Read { .. } => {
             unreachable!("pk and read return their own exit code from main")
@@ -387,7 +408,8 @@ async fn dispatch(command: Action) -> Result<()> {
 }
 
 /// How long the wrapper waits for its bridge to report `READY`.
-const BRIDGE_READY_TIMEOUT: Duration = Duration::from_secs(5);
+/// 30 s because a first launch of a freshly linked binary took 10.4 s on macOS.
+const BRIDGE_READY_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long a bridge retries a busy port before it gives up. Shorter than
 /// [`BRIDGE_READY_TIMEOUT`], so the wrapper sees the failure, not a timeout.
 const BRIDGE_BIND_RETRY: Duration = Duration::from_secs(3);
@@ -2868,146 +2890,52 @@ fn consume_event(e: &Value, line: &str, r: &mut WorkerResult, runner: &str) {
 }
 
 async fn rule_command(args: RuleArgs) -> Result<()> {
-    use serde_json::json;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::UnixStream;
-
     // The same default as `cowproof run` and `cowproof watch`, or the
     // director could not reach a lane started without `--lanes-root`.
-    let home = std::path::PathBuf::from(
-        std::env::var_os("HOME").ok_or_else(|| anyhow::anyhow!("HOME is not set"))?,
-    );
-    let lanes_root = run::lanes_root(args.lanes_root.as_deref(), &std::env::current_dir()?, &home);
-    let director_sock = lanes_root
-        .join(&args.lane_id)
-        .join("control")
-        .join("director.sock");
+    let lanes_root = root::current_lanes_root(args.lanes_root.as_deref())?;
 
-    if !director_sock.exists() {
-        eprintln!("lane {} is not running", args.lane_id);
-        std::process::exit(2);
-    }
-
-    // Parse the verdict
-    let verdict = if let Some(answer) = args.answer {
-        json!({"answer": answer})
+    let ruling = if let Some(answer) = args.answer {
+        director_tools::Ruling::Answer(answer)
     } else if let Some(redirect) = args.redirect {
-        json!({"redirect": redirect.to_string_lossy().into_owned()})
+        director_tools::Ruling::Redirect(redirect.to_string_lossy().into_owned())
     } else if args.reassign {
-        json!({"reassign": {"model": args.model}})
+        director_tools::Ruling::Reassign { model: args.model }
     } else if args.stop {
-        json!("stop")
+        director_tools::Ruling::Stop
     } else {
-        return Err(anyhow::anyhow!(
+        return Err(anyhow!(
             "must specify one verdict: --answer, --redirect, --reassign, or --stop"
         ));
     };
 
-    // Build the request
-    let request = json!({
-        "op": "rule",
-        "id": args.escalation_id,
-        "verdict": verdict
-    });
-
-    // Connect and send
-    let mut stream = UnixStream::connect(&director_sock)
-        .await
-        .map_err(|e| anyhow::anyhow!("cannot connect to director socket: {e}"))?;
-
-    let mut req_bytes = serde_json::to_vec(&request)?;
-    req_bytes.push(b'\n');
-    stream
-        .write_all(&req_bytes)
-        .await
-        .map_err(|e| anyhow::anyhow!("failed to write request: {e}"))?;
-
-    // Read response
-    let mut buf = vec![0u8; 8192];
-    let n = stream
-        .read(&mut buf)
-        .await
-        .map_err(|e| anyhow::anyhow!("failed to read response: {e}"))?;
-
-    if n == 0 {
-        return Err(anyhow::anyhow!("director socket closed unexpectedly"));
-    }
-
-    let response: serde_json::Value = serde_json::from_slice(&buf[..n])?;
-
-    if response["ok"].as_bool().unwrap_or(false) {
-        println!("{}", serde_json::to_string_pretty(&response["outcome"])?);
-        Ok(())
-    } else {
-        eprintln!(
-            "error: {}",
-            response["error"].as_str().unwrap_or("unknown error")
-        );
-        std::process::exit(1);
-    }
+    // The `rule` tool of `cowproof serve --director` calls the same function.
+    print_sent(
+        director_tools::send_rule(&lanes_root, &args.lane_id, &args.escalation_id, &ruling).await,
+    )
 }
 
 async fn note_command(args: NoteArgs) -> Result<()> {
-    use serde_json::json;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::UnixStream;
+    let lanes_root = root::current_lanes_root(args.lanes_root.as_deref())?;
+    // The `note` tool of `cowproof serve --director` calls the same function.
+    print_sent(director_tools::send_note(&lanes_root, &args.lane_id, &args.text).await)
+}
 
-    // The same default as `cowproof run` and `cowproof watch`, or the
-    // director could not reach a lane started without `--lanes-root`.
-    let home = std::path::PathBuf::from(
-        std::env::var_os("HOME").ok_or_else(|| anyhow::anyhow!("HOME is not set"))?,
-    );
-    let lanes_root = run::lanes_root(args.lanes_root.as_deref(), &std::env::current_dir()?, &home);
-    let director_sock = lanes_root
-        .join(&args.lane_id)
-        .join("control")
-        .join("director.sock");
-
-    if !director_sock.exists() {
-        eprintln!("lane {} is not running", args.lane_id);
-        std::process::exit(2);
-    }
-
-    // Build the request
-    let request = json!({
-        "op": "note",
-        "text": args.text
-    });
-
-    // Connect and send
-    let mut stream = UnixStream::connect(&director_sock)
-        .await
-        .map_err(|e| anyhow::anyhow!("cannot connect to director socket: {e}"))?;
-
-    let mut req_bytes = serde_json::to_vec(&request)?;
-    req_bytes.push(b'\n');
-    stream
-        .write_all(&req_bytes)
-        .await
-        .map_err(|e| anyhow::anyhow!("failed to write request: {e}"))?;
-
-    // Read response
-    let mut buf = vec![0u8; 8192];
-    let n = stream
-        .read(&mut buf)
-        .await
-        .map_err(|e| anyhow::anyhow!("failed to read response: {e}"))?;
-
-    if n == 0 {
-        return Err(anyhow::anyhow!("director socket closed unexpectedly"));
-    }
-
-    let response: serde_json::Value = serde_json::from_slice(&buf[..n])?;
-
-    if response["ok"].as_bool().unwrap_or(false) {
-        println!("{}", serde_json::to_string_pretty(&response["outcome"])?);
-        Ok(())
-    } else {
-        eprintln!(
-            "error: {}",
-            response["error"].as_str().unwrap_or("unknown error")
-        );
-        std::process::exit(1);
+/// Print a lane's reply to `rule` or `note`, or exit 2 when the lane is not
+/// running and 1 when it refused or could not be reached.
+fn print_sent(result: Result<Value, director_tools::SendError>) -> Result<()> {
+    match result {
+        Ok(outcome) => {
+            println!("{}", serde_json::to_string_pretty(&outcome)?);
+            Ok(())
+        }
+        Err(e @ director_tools::SendError::NotRunning(_)) => {
+            eprintln!("{e}");
+            std::process::exit(2);
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            std::process::exit(1);
+        }
     }
 }
 

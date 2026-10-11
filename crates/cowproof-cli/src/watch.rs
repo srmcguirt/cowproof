@@ -4,12 +4,18 @@
 //! - Without `--events`: print a table with lane status, parked escalation age, and event counts.
 //! - With `--events`: stream events as RFC3339-timestamped lines (one event per line, max 300 chars).
 //! - With `--follow`: keep running and emit events as they are appended to the queue.
+//!
+//! Reading and printing are separate. [`lane_snapshots`] and [`read_events`]
+//! return data; the table and the event lines print it, and the director's
+//! `lanes` and `events` tools (`director_tools`) serialize the same data.
 
 use anyhow::{Result, anyhow, bail};
-use cowproof_run::watch::parked;
-use std::collections::HashMap;
+use cowproof_run::watch::{Parked, parked};
+use serde::Serialize;
+use serde_json::Value;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
-use std::io::Seek;
+use std::io::{Read, Seek};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::time::sleep;
@@ -29,12 +35,15 @@ pub struct WatchArgs {
     pub follow: bool,
 
     /// Cache TTL for parked escalations (default: 1h)
-    #[arg(long, default_value = "1h")]
+    #[arg(long, default_value = DEFAULT_CACHE_TTL)]
     pub cache_ttl: String,
 }
 
+/// The cache lifetime `--cache-ttl` and the `lanes` tool use when none is given.
+pub const DEFAULT_CACHE_TTL: &str = "1h";
+
 /// Parse a duration string like "1h", "30m", "1h30m", etc.
-fn parse_duration(s: &str) -> Result<Duration> {
+pub fn parse_duration(s: &str) -> Result<Duration> {
     let mut total = Duration::ZERO;
     let mut remaining = s.trim();
 
@@ -92,7 +101,7 @@ fn format_age(duration: Duration) -> String {
 }
 
 /// Get current time as milliseconds since epoch.
-fn now_ms() -> u64 {
+pub fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -173,19 +182,13 @@ fn truncate_line(s: &str, max_chars: usize) -> String {
     }
 }
 
-fn expand_lanes_root(root: &Option<PathBuf>) -> Result<PathBuf> {
-    let home = PathBuf::from(std::env::var_os("HOME").ok_or_else(|| anyhow!("HOME is not set"))?);
-    let cwd = std::env::current_dir()?;
-    Ok(crate::run::lanes_root(root.as_deref(), &cwd, &home))
-}
-
 pub async fn watch(args: WatchArgs) -> Result<()> {
-    let lanes_root = expand_lanes_root(&args.lanes_root)?;
+    let lanes_root = crate::root::current_lanes_root(args.lanes_root.as_deref())?;
     let cache_ttl = parse_duration(&args.cache_ttl)?;
     let cache_ttl_ms = cache_ttl.as_millis() as u64;
 
     if args.events {
-        watch_events(&lanes_root, cache_ttl_ms, args.follow).await
+        watch_events(&lanes_root, args.follow).await
     } else {
         watch_table(&lanes_root, cache_ttl_ms)
     }
@@ -305,210 +308,248 @@ fn count_pending_notes(control_dir: &Path, lane_name: &str) -> Result<usize> {
     Ok(notes.values().filter(|&delivered| !delivered).count())
 }
 
+/// One lane as the table and the director's `lanes` tool show it.
+#[derive(Debug, Clone, Serialize)]
+pub struct LaneSnapshot {
+    pub id: String,
+    pub state: String,
+    /// The lane's parked blocking escalation: its id and age, not its text.
+    pub parked: Option<Parked>,
+    /// The queue could not be read, so `parked` and `pending_notes` are unknown.
+    pub queue_unreadable: bool,
+    pub pending_notes: Option<usize>,
+    pub last_event_ms: Option<u64>,
+}
+
+/// Every lane under `lanes_root`, sorted by name, as data.
+pub fn lane_snapshots(
+    lanes_root: &Path,
+    now_ms: u64,
+    cache_ttl_ms: u64,
+) -> Result<Vec<LaneSnapshot>> {
+    let mut rows = Vec::new();
+    for lane_dir in collect_lanes(lanes_root)? {
+        let id = lane_dir.file_name().and_then(|n| n.to_str()).unwrap_or("?");
+        let control_dir = lane_dir.join("control");
+        let parked = parked(&control_dir, id, now_ms, cache_ttl_ms);
+        let notes = count_pending_notes(&control_dir, id);
+        rows.push(LaneSnapshot {
+            id: id.to_string(),
+            state: get_lane_state(&lane_dir),
+            queue_unreadable: parked.is_err() || notes.is_err(),
+            parked: parked.ok().flatten(),
+            pending_notes: notes.ok(),
+            last_event_ms: get_last_event_time(&lane_dir),
+        });
+    }
+    Ok(rows)
+}
+
 fn watch_table(lanes_root: &Path, cache_ttl_ms: u64) -> Result<()> {
-    let lanes = collect_lanes(lanes_root)?;
     let now_ms = now_ms();
+    let rows = lane_snapshots(lanes_root, now_ms, cache_ttl_ms)?;
 
     println!("LANE\tSTATE\tPARKED\tAGE\tNOTES\tLAST EVENT");
 
-    for lane_dir in lanes {
-        let lane_name = lane_dir.file_name().and_then(|n| n.to_str()).unwrap_or("?");
-
-        let state = get_lane_state(&lane_dir);
-        let control_dir = lane_dir.join("control");
-
-        // Get parked escalation info
-        let parked_info = match parked(&control_dir, lane_name, now_ms, cache_ttl_ms) {
-            Ok(Some(p)) => {
-                let cache_marker = if p.past_cache { " past cache" } else { "" };
-                format!("{}{}", p.id, cache_marker)
-            }
-            Ok(None) => "-".to_string(),
-            Err(_) => "?".to_string(),
-        };
-
-        let parked_age = match parked(&control_dir, lane_name, now_ms, cache_ttl_ms) {
-            Ok(Some(p)) => format_age(Duration::from_millis(p.age_ms)),
-            Ok(None) => "-".to_string(),
-            Err(_) => "?".to_string(),
-        };
-
-        let notes = count_pending_notes(&control_dir, lane_name)
-            .map(|n| n.to_string())
-            .unwrap_or_else(|_| "?".to_string());
-
-        let last_event = if let Some(last_ms) = get_last_event_time(&lane_dir) {
-            if last_ms > 0 {
-                let age = now_ms.saturating_sub(last_ms);
-                format_age(Duration::from_millis(age))
-            } else {
-                "-".to_string()
-            }
+    for row in rows {
+        let (parked_info, parked_age) = if row.queue_unreadable {
+            ("?".to_string(), "?".to_string())
+        } else if let Some(p) = &row.parked {
+            let cache_marker = if p.past_cache { " past cache" } else { "" };
+            (
+                format!("{}{}", p.id, cache_marker),
+                format_age(Duration::from_millis(p.age_ms)),
+            )
         } else {
-            "-".to_string()
+            ("-".to_string(), "-".to_string())
+        };
+        let notes = row
+            .pending_notes
+            .map_or_else(|| "?".to_string(), |n| n.to_string());
+        let last_event = match row.last_event_ms {
+            Some(last_ms) => format_age(Duration::from_millis(now_ms.saturating_sub(last_ms))),
+            None => "-".to_string(),
         };
 
         println!(
             "{}\t{}\t{}\t{}\t{}\t{}",
-            lane_name, state, parked_info, parked_age, notes, last_event
+            row.id, row.state, parked_info, parked_age, notes, last_event
         );
     }
 
     Ok(())
 }
 
-async fn watch_events(lanes_root: &Path, _cache_ttl_ms: u64, follow: bool) -> Result<()> {
-    let mut offsets: HashMap<String, u64> = HashMap::new();
-    let mut last_lanes: HashMap<String, bool> = HashMap::new();
+/// One queue event as `watch --events` prints it and the `events` tool returns it.
+/// `summary` is runner-owned text: ids, flags and sizes, never the builder's words.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct EventRow {
+    pub at_ms: u64,
+    pub lane: String,
+    pub kind: String,
+    pub summary: String,
+}
 
-    loop {
-        let lanes = collect_lanes(lanes_root)?;
+/// How far into each lane's queue file has been read, in bytes, keyed by lane id.
+pub type Cursor = BTreeMap<String, u64>;
 
-        // Track which lanes existed in the previous iteration
-        let current_lanes: HashMap<String, bool> = lanes
-            .iter()
-            .map(|p| (p.to_string_lossy().to_string(), true))
-            .collect();
+/// A cursor as the text the `events` tool hands out and takes back.
+pub fn encode_cursor(cursor: &Cursor) -> String {
+    serde_json::to_string(cursor).unwrap_or_else(|_| "{}".to_string())
+}
 
-        // For new lanes, emit events from the start
-        for lane_dir in &lanes {
-            let lane_key = lane_dir.to_string_lossy().to_string();
-            if !last_lanes.contains_key(&lane_key) {
-                offsets.remove(&lane_key);
-            }
+/// The inverse of [`encode_cursor`]. A cursor that does not parse is an error:
+/// quietly starting over would repeat every event.
+pub fn decode_cursor(text: &str) -> Result<Cursor> {
+    serde_json::from_str(text).map_err(|e| anyhow!("invalid cursor: {e}"))
+}
+
+/// What one pass over the queues found.
+#[derive(Debug, Clone)]
+pub struct EventBatch {
+    pub events: Vec<EventRow>,
+    /// Pass this back as `since` to read only what comes after.
+    pub cursor: Cursor,
+    /// Lanes whose queue file could not be read this time.
+    pub unreadable: Vec<String>,
+}
+
+/// Project one queue line for lane `lane_name`; `None` when it is not an event of that lane.
+fn event_row(obj: &Value, lane_name: &str) -> Option<EventRow> {
+    let kind = obj.get("event")?.as_str()?;
+    if obj.get("lane")?.as_str()? != lane_name {
+        return None;
+    }
+    let str_field = |name: &str, default: &'static str| {
+        obj.get(name)
+            .and_then(|v| v.as_str())
+            .unwrap_or(default)
+            .to_string()
+    };
+    let summary = match kind {
+        "asked" => {
+            let blocking = obj
+                .get("ask")
+                .and_then(|a| a.get("blocking"))
+                .and_then(|b| b.as_bool())
+                .unwrap_or(false);
+            let blocking_text = if blocking { "blocking" } else { "non-blocking" };
+            format!("{} ({})", str_field("id", "?"), blocking_text)
+        }
+        "ruled" | "note-delivered" | "resume-fallback" => str_field("id", "?"),
+        "note" => {
+            let text_len = obj
+                .get("text")
+                .and_then(|v| v.as_str())
+                .map(|t| t.len())
+                .unwrap_or(0);
+            format!("{} ({} bytes)", str_field("id", "?"), text_len)
+        }
+        "rejected" => format!("{}: {}", str_field("id", "?"), str_field("reason", "?")),
+        "delivered" => {
+            let fresh = obj.get("fresh").and_then(|v| v.as_bool()).unwrap_or(false);
+            let fresh_text = if fresh { "fresh" } else { "resumed" };
+            format!("{} ({})", str_field("id", "?"), fresh_text)
+        }
+        "lane-escalation-limit" => str_field("id", "(no id)"),
+        _ => "?".to_string(),
+    };
+    Some(EventRow {
+        at_ms: obj.get("at_ms").and_then(|v| v.as_u64()).unwrap_or(0),
+        lane: lane_name.to_string(),
+        kind: kind.to_string(),
+        summary,
+    })
+}
+
+/// Read what each lane's queue has gained since `since`, optionally for one lane.
+///
+/// Only complete lines are consumed, so a line the runner is still writing is
+/// read whole on the next pass. A queue file shorter than its offset is read
+/// again from the start. Lanes not read this pass keep their old offset.
+pub fn read_events(
+    lanes_root: &Path,
+    since: &Cursor,
+    lane_filter: Option<&str>,
+) -> Result<EventBatch> {
+    let mut batch = EventBatch {
+        events: Vec::new(),
+        cursor: since.clone(),
+        unreadable: Vec::new(),
+    };
+
+    for lane_dir in collect_lanes(lanes_root)? {
+        let lane_name = lane_dir.file_name().and_then(|n| n.to_str()).unwrap_or("?");
+        if lane_filter.is_some_and(|f| f != lane_name) {
+            continue;
+        }
+        let queue_file = lane_dir.join("control").join("escalations.jsonl");
+        if !queue_file.is_file() {
+            continue;
         }
 
-        // Emit events from all lanes
-        for lane_dir in lanes {
-            let lane_key = lane_dir.to_string_lossy().to_string();
-            let lane_name = lane_dir.file_name().and_then(|n| n.to_str()).unwrap_or("?");
-            let control_dir = lane_dir.join("control");
-
-            // Read the queue file and only emit new events
-            let queue_file = control_dir.join("escalations.jsonl");
-            if !queue_file.is_file() {
+        let read = (|| -> std::io::Result<(u64, Vec<u8>)> {
+            let mut file = fs::File::open(&queue_file)?;
+            let size = file.metadata()?.len();
+            let mut offset = since.get(lane_name).copied().unwrap_or(0);
+            if offset > size {
+                offset = 0;
+            }
+            file.seek(std::io::SeekFrom::Start(offset))?;
+            let mut buffer = Vec::new();
+            file.read_to_end(&mut buffer)?;
+            Ok((offset, buffer))
+        })();
+        let (offset, buffer) = match read {
+            Ok(r) => r,
+            Err(_) => {
+                batch.unreadable.push(lane_name.to_string());
                 continue;
             }
+        };
 
-            let mut file = match fs::File::open(&queue_file) {
-                Ok(f) => f,
-                Err(_) => {
-                    eprintln!("error: {}", lane_name);
-                    continue;
-                }
-            };
-
-            // Get file size
-            let file_size = match file.metadata() {
-                Ok(m) => m.len(),
-                Err(_) => {
-                    eprintln!("error: {}", lane_name);
-                    continue;
-                }
-            };
-
-            // Get the offset from the last read
-            let start_offset = offsets.get(&lane_key).copied().unwrap_or(0);
-
-            // Only read if there's new data
-            if file_size > start_offset {
-                if file.seek(std::io::SeekFrom::Start(start_offset)).is_err() {
-                    eprintln!("error: {}", lane_name);
-                    continue;
-                }
-
-                let mut buffer = Vec::new();
-                if std::io::Read::read_to_end(&mut file, &mut buffer).is_err() {
-                    eprintln!("error: {}", lane_name);
-                    continue;
-                }
-
-                let content = String::from_utf8_lossy(&buffer);
-                for line in content.lines() {
-                    if line.trim().is_empty() {
-                        continue;
-                    }
-
-                    // Try to parse as a QueueEvent and emit as WatchEvent
-                    if let Ok(obj) = serde_json::from_str::<serde_json::Value>(line)
-                        && let Some(event_type) = obj.get("event").and_then(|v| v.as_str())
-                        && let Some(lane_in_event) = obj.get("lane").and_then(|v| v.as_str())
-                        && lane_in_event == lane_name
-                    {
-                        let at_ms = obj.get("at_ms").and_then(|v| v.as_u64()).unwrap_or(0);
-                        let kind_str = event_type;
-                        let summary = match event_type {
-                            "asked" => {
-                                let blocking = obj
-                                    .get("ask")
-                                    .and_then(|a| a.get("blocking"))
-                                    .and_then(|b| b.as_bool())
-                                    .unwrap_or(false);
-                                let id = obj.get("id").and_then(|v| v.as_str()).unwrap_or("?");
-                                let blocking_text =
-                                    if blocking { "blocking" } else { "non-blocking" };
-                                format!("{} ({})", id, blocking_text)
-                            }
-                            "ruled" => obj
-                                .get("id")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("?")
-                                .to_string(),
-                            "note" => {
-                                let id = obj.get("id").and_then(|v| v.as_str()).unwrap_or("?");
-                                let text_len = obj
-                                    .get("text")
-                                    .and_then(|v| v.as_str())
-                                    .map(|t| t.len())
-                                    .unwrap_or(0);
-                                format!("{} ({} bytes)", id, text_len)
-                            }
-                            "note-delivered" => obj
-                                .get("id")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("?")
-                                .to_string(),
-                            "rejected" => {
-                                let id = obj.get("id").and_then(|v| v.as_str()).unwrap_or("?");
-                                let reason =
-                                    obj.get("reason").and_then(|v| v.as_str()).unwrap_or("?");
-                                format!("{}: {}", id, reason)
-                            }
-                            "delivered" => {
-                                let id = obj.get("id").and_then(|v| v.as_str()).unwrap_or("?");
-                                let fresh =
-                                    obj.get("fresh").and_then(|v| v.as_bool()).unwrap_or(false);
-                                let fresh_text = if fresh { "fresh" } else { "resumed" };
-                                format!("{} ({})", id, fresh_text)
-                            }
-                            "resume-fallback" => obj
-                                .get("id")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("?")
-                                .to_string(),
-                            "lane-escalation-limit" => obj
-                                .get("id")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("(no id)")
-                                .to_string(),
-                            _ => "?".to_string(),
-                        };
-
-                        let rfc_time = ms_to_rfc3339(at_ms);
-                        let event_line =
-                            format!("{} {} {} {}", rfc_time, lane_name, kind_str, summary);
-                        let output = truncate_line(&event_line, 300);
-                        println!("{}", output);
-                    }
-                }
-
-                offsets.insert(lane_key.clone(), file_size);
+        let complete = buffer
+            .iter()
+            .rposition(|&b| b == b'\n')
+            .map_or(0, |i| i + 1);
+        let content = String::from_utf8_lossy(&buffer[..complete]);
+        for line in content.lines() {
+            if line.trim().is_empty() {
+                continue;
             }
-
-            last_lanes.insert(lane_key, true);
+            if let Ok(obj) = serde_json::from_str::<Value>(line)
+                && let Some(row) = event_row(&obj, lane_name)
+            {
+                batch.events.push(row);
+            }
         }
+        batch
+            .cursor
+            .insert(lane_name.to_string(), offset + complete as u64);
+    }
 
-        last_lanes = current_lanes;
+    Ok(batch)
+}
+
+async fn watch_events(lanes_root: &Path, follow: bool) -> Result<()> {
+    let mut cursor = Cursor::new();
+
+    loop {
+        let batch = read_events(lanes_root, &cursor, None)?;
+        for lane in &batch.unreadable {
+            eprintln!("error: {}", lane);
+        }
+        for e in &batch.events {
+            let line = format!(
+                "{} {} {} {}",
+                ms_to_rfc3339(e.at_ms),
+                e.lane,
+                e.kind,
+                e.summary
+            );
+            println!("{}", truncate_line(&line, 300));
+        }
+        cursor = batch.cursor;
 
         if !follow {
             break;
@@ -559,6 +600,25 @@ mod tests {
         let s = "hello world this is a long string";
         let truncated = truncate_line(s, 10);
         assert!(truncated.len() <= 13);
+    }
+
+    #[test]
+    fn a_cursor_round_trips_and_a_shortened_queue_is_read_again_from_the_start() {
+        let mut cursor = Cursor::new();
+        cursor.insert("lane-a".to_string(), 1000);
+        assert_eq!(decode_cursor(&encode_cursor(&cursor)).unwrap(), cursor);
+        assert!(decode_cursor("lane-a:7").is_err());
+
+        let root = tempfile::TempDir::new().unwrap();
+        let control = root.path().join("lane-a/control");
+        fs::create_dir_all(&control).unwrap();
+        let line = "{\"event\":\"ruled\",\"lane\":\"lane-a\",\"id\":\"lane-a:E1\",\"at_ms\":5}\n";
+        fs::write(control.join("escalations.jsonl"), line).unwrap();
+
+        // The offset is past the end of the file, as after a queue rewritten shorter.
+        let batch = read_events(root.path(), &cursor, None).unwrap();
+        assert_eq!(batch.events.len(), 1);
+        assert_eq!(batch.cursor["lane-a"], line.len() as u64);
     }
 
     #[test]
