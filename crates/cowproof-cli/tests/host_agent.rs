@@ -1513,6 +1513,11 @@ while :; do echo tick >> "$rec/marker"; sleep 0.2; done
     assert_eq!(json["removed"], true, "{json}");
     assert_eq!(json["group"]["pgid"].as_u64(), Some(pgid), "{json}");
     assert_eq!(json["group"]["state"], "ended", "{json}");
+    assert_eq!(json["group"]["signals"][0], "TERM", "{json}");
+    // macOS has no pid namespace, so the child that ignores SIGTERM needs the SIGKILL. On
+    // Linux the builder runs in bwrap's pid namespace: SIGTERM ends bwrap, and the kernel kills
+    // every process in a namespace whose init is gone, so the group may end before the grace.
+    #[cfg(target_os = "macos")]
     assert_eq!(json["group"]["signals"], json!(["TERM", "KILL"]), "{json}");
 
     assert!(group_gone(&pgid.to_string()), "the group is still alive");
