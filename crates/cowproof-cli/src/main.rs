@@ -24,6 +24,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 mod director_tools;
 mod doctor;
 mod host_agent;
+mod host_setup;
 mod lane_tools;
 mod preflight;
 mod remote;
@@ -371,6 +372,10 @@ enum HostAction {
         lane_dir: PathBuf,
     },
     SafeToStop,
+    /// Run by the OWNER of a remote host, on that host: print the authorized_keys line that
+    /// locks the director's public key to `cowproof host-agent --forced`, the hosts.json
+    /// entry for this machine, and this host's `host-agent doctor`. Writes nothing (D27).
+    Setup(host_setup::SetupArgs),
 }
 
 #[tokio::main]
@@ -413,6 +418,15 @@ async fn dispatch(command: Action) -> Result<()> {
             Ok(())
         }
         Action::Lint(args) => lint_command(args),
+        Action::Host(HostArgs {
+            command: HostAction::Setup(args),
+        }) => {
+            let code = host_setup::run(args).await?;
+            if code != 0 {
+                std::process::exit(code);
+            }
+            Ok(())
+        }
         Action::Host(args) => host_command(args.command),
         Action::Hosts => hosts_command(),
         Action::Plan(args) => match args.command {
@@ -746,6 +760,7 @@ fn host_command(action: HostAction) -> Result<()> {
             Ok(())
         }
         HostAction::Stop { lane_dir } => stop_lane(&lane_dir, &SystemRunner),
+        HostAction::Setup(_) => unreachable!("dispatch runs `host setup` before host_command"),
         HostAction::SafeToStop => {
             let root = std::env::var_os("LANE_ROOT")
                 .map(PathBuf::from)

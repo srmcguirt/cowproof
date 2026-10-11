@@ -549,6 +549,92 @@ fn a_failing_remote_doctor_is_infrastructure_and_nothing_is_prepared() {
     assert_pid_gone(remote.master_pid());
 }
 
+/// A remote whose ssh emulates a forced-command key (`command="<cowproof> host-agent
+/// --forced"`): the hosts config names `named` as the host's cowproof, the key names the real
+/// binary, and the fake ssh runs only the key's command with the director's as
+/// SSH_ORIGINAL_COMMAND.
+fn forced_remote(named: &'static str) -> Remote {
+    let mut remote = Remote::with_host(&proving_builder(), checks(), |_, entry| {
+        entry["cowproof"] = json!(named);
+    });
+    let real = remote.lane.cowproof.display().to_string();
+    remote.lane.set_env(
+        "FAKE_SSH_FORCED_COMMAND",
+        format!("{real} host-agent --forced"),
+    );
+    remote
+}
+
+#[test]
+fn a_remote_lane_is_proved_through_a_forced_command_key() {
+    if !sandbox_available() {
+        return;
+    }
+    // The director names a cowproof that does not exist on the host: the lane can only be
+    // proved if the host ran the binary the KEY names, and only the verbs it asked for.
+    let remote = forced_remote("/no/such/dir/cowproof");
+    let out = finish(remote.command(&[]));
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    assert_eq!(remote.lane.verdict()["verdict"], "proved", "{}", text(&out));
+    let patch = fs::read_to_string(remote.lane.lane_dir().join("control/lane.patch")).unwrap();
+    assert!(
+        patch.contains("+edited") && patch.contains("created.txt"),
+        "{patch}"
+    );
+    assert_eq!(
+        remote.steps(),
+        [
+            "master", "doctor", "prepare", "forward", "builder", "check", "patch", "stderr",
+            "cleanup", "exit"
+        ],
+        "{:?}",
+        remote.argvs()
+    );
+    // Every command the host ran went through the key's forced command, and carried the
+    // director's own words; the master and the forwards ran no command at all.
+    let log = remote.log();
+    let started: Vec<&Value> = log
+        .iter()
+        .filter(|e| e["event"] == "command-started")
+        .collect();
+    assert_eq!(
+        started.len(),
+        8,
+        "doctor prepare builder check*2 patch stderr cleanup"
+    );
+    for e in &started {
+        assert_eq!(e["forced"], true, "{e}");
+        let command = e["command"].as_str().unwrap();
+        assert!(
+            command.starts_with("/no/such/dir/cowproof host-agent "),
+            "{command}"
+        );
+    }
+    remote.assert_torn_down();
+}
+
+#[test]
+fn a_forced_key_refuses_a_cowproof_that_is_not_named_cowproof_and_nothing_is_prepared() {
+    if !sandbox_available() {
+        return;
+    }
+    // The director's hosts config names a file called `cowproof-evil`: the key's host-agent
+    // refuses the first command (doctor), which is an infrastructure error before any lane.
+    let remote = forced_remote("/no/such/dir/cowproof-evil");
+    let out = finish(remote.command(&[]));
+    assert_eq!(out.status.code(), Some(4), "{}", text(&out));
+    assert_eq!(
+        remote.steps(),
+        ["master", "doctor", "exit"],
+        "{:?}",
+        remote.argvs()
+    );
+    assert!(!remote.remote_lane().exists());
+    assert_eq!(remote.run_json()["status"], "infrastructure");
+    assert!(remote.log().iter().any(|e| e["event"] == "master-stopped"));
+    assert_pid_gone(remote.master_pid());
+}
+
 /// A fake builder that reports a session, records its pids and then waits: a leader, and a
 /// background child that ignores SIGTERM.
 fn waiting_builder() -> String {

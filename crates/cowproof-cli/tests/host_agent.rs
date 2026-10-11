@@ -1834,3 +1834,172 @@ fn check_refuses_a_key_a_bad_spec_and_a_lane_that_is_not_there() {
         .unwrap();
     assert!(assert_refused(&out).contains("no lane"));
 }
+
+// ---------------------------------------------------------------------------
+// `host-agent --forced`: what a forced-command key (`command="... host-agent --forced"`)
+// runs. sshd puts the client's command in SSH_ORIGINAL_COMMAND; only the closed set of verbs,
+// in the form the director writes, gets through.
+
+/// The exit code of a refused forced command (`FORCED_REFUSED_EXIT` in `src/host_agent.rs`).
+const FORCED_REFUSED: i32 = 77;
+
+impl Fx {
+    /// `cowproof host-agent --forced` with `original` as SSH_ORIGINAL_COMMAND (or none).
+    fn forced(&self, original: Option<&str>) -> Output {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_cowproof"));
+        cmd.args(["host-agent", "--forced"])
+            .current_dir(self.work.path())
+            .env("HOME", self.home.path())
+            .env_remove("ANTHROPIC_API_KEY")
+            .env_remove("SSH_ORIGINAL_COMMAND")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        if let Some(original) = original {
+            cmd.env("SSH_ORIGINAL_COMMAND", original);
+        }
+        let child = {
+            let _g = fork_lock();
+            cmd.spawn().unwrap()
+        };
+        child.wait_with_output().unwrap()
+    }
+}
+
+fn assert_forced_refusal(out: &Output) -> String {
+    let json = json_of(out);
+    assert_eq!(out.status.code(), Some(FORCED_REFUSED), "{json}");
+    assert_eq!(json["ok"], false, "{json}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).lines().count(),
+        1,
+        "one JSON line"
+    );
+    let error = json["error"].as_str().expect("an error string");
+    assert!(error.starts_with("refused: "), "{error}");
+    error.to_string()
+}
+
+#[test]
+fn forced_runs_the_verb_the_client_asked_for_in_this_process() {
+    let fx = Fx::new();
+    let claude = fx.work.path().join("fake-claude");
+    write_executable(
+        &claude,
+        "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo \"fake-claude 9.9.9\"; exit 0; fi\nexit 99\n",
+    );
+    // word 0 is not the binary that runs: it only has to be a path named cowproof.
+    let asked = format!(
+        "/nonexistent dir/it's/cowproof host-agent doctor --claude-bin {} --root {}",
+        claude.display(),
+        fx.root.display()
+    );
+    let asked = asked.replacen(
+        "/nonexistent dir/it's/cowproof",
+        "'/nonexistent dir/it'\\''s/cowproof'",
+        1,
+    );
+    let out = fx.forced(Some(&asked));
+    let json = json_of(&out);
+    assert_eq!(json["version"], VERSION, "{json}");
+    assert_eq!(json["protocol"].to_string(), PROTOCOL, "{json}");
+    assert_eq!(json["claude"], true, "{json}");
+    assert!(
+        json["claude_detail"]
+            .as_str()
+            .unwrap()
+            .contains("fake-claude 9.9.9"),
+        "{json}"
+    );
+    assert_eq!(json["sandbox"], sandbox_available(), "{json}");
+    // The same exit code as the verb called directly.
+    assert_eq!(
+        out.status.code(),
+        Some(if sandbox_available() { 0 } else { 1 })
+    );
+    assert!(!fx.root.exists(), "doctor does not create the lanes root");
+}
+
+#[test]
+fn forced_gives_a_verbs_own_failure_its_own_exit_code() {
+    let fx = Fx::new();
+    let out = fx.forced(Some(&format!(
+        "cowproof host-agent cleanup --lane-id ../escape --root {}",
+        fx.root.display()
+    )));
+    // A verb that ran and failed is exit 1 with its JSON error, not a forced-mode refusal.
+    assert_eq!(out.status.code(), Some(1));
+    let json = json_of(&out);
+    assert_eq!(json["ok"], false, "{json}");
+    assert!(
+        !json["error"].as_str().unwrap().starts_with("refused"),
+        "{json}"
+    );
+}
+
+#[test]
+fn forced_refuses_every_command_that_is_not_a_verb_and_runs_nothing() {
+    let fx = Fx::new();
+    let marker = fx.work.path().join("ran");
+    let before = fx.work_entries();
+    let asked = [
+        "cowproof verify /x".to_string(),
+        "bash".to_string(),
+        format!("cowproof host-agent doctor; touch {}", marker.display()),
+        format!(
+            "cowproof host-agent doctor --root {} && touch {}",
+            fx.root.display(),
+            marker.display()
+        ),
+        format!("touch {}", marker.display()),
+        "cowproof host-agent shell".to_string(),
+        "cowproof host-agent --forced doctor".to_string(),
+        "cowproof host-agent doctor --forced".to_string(),
+        "cowproof-evil host-agent doctor".to_string(),
+        "$(id)".to_string(),
+        "cowproof host-agent doctor \"x\"".to_string(),
+        "cowproof host-agent doctor\ntouch x".to_string(),
+        String::new(),
+    ];
+    for text in &asked {
+        let out = fx.forced(Some(text));
+        let error = assert_forced_refusal(&out);
+        // The message names what was wrong and never quotes the command.
+        // (The words the messages themselves use are not a quotation.)
+        let own = ["cowproof", "host-agent", "--forced"];
+        for word in text.split(' ').filter(|w| w.len() > 5 && !own.contains(w)) {
+            assert!(!error.contains(word), "{error:?} quotes {word:?}");
+        }
+        assert!(
+            out.stderr.is_empty(),
+            "{:?}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    assert!(!marker.exists(), "a refused command ran");
+    assert!(!fx.root.exists());
+    assert_eq!(fx.work_entries(), before);
+}
+
+#[test]
+fn forced_without_a_requested_command_is_an_interactive_login_and_is_refused() {
+    let fx = Fx::new();
+    let error = assert_forced_refusal(&fx.forced(None));
+    assert!(error.contains("interactive login"), "{error}");
+    assert_forced_refusal(&fx.forced(Some("")));
+}
+
+#[test]
+fn forced_is_a_flag_of_host_agent_not_of_a_verb_and_not_combined_with_one() {
+    let fx = Fx::new();
+    // On the real command line too: `--forced` and a verb together are a usage error.
+    let out = fx.agent(&["--forced", "doctor"], None);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(out.stdout.is_empty());
+    // Neither a verb nor `--forced`.
+    let out = fx.agent_in(&[], None, None);
+    assert_eq!(out.status.code(), Some(2));
+    // A verb has no `--forced` of its own.
+    let out = fx.agent(&["doctor", "--forced"], None);
+    assert_eq!(out.status.code(), Some(2));
+}

@@ -24,6 +24,13 @@ It emulates only what cowproof uses:
                             none. When this process dies the command's stdout and stderr pipes
                             lose their reader, as they do when sshd's channel closes.
 
+Forced command: when FAKE_SSH_FORCED_COMMAND is set, the fake emulates a key whose
+authorized_keys line says `command="<that text>"`, as sshd does for every session of the key
+(not for the `-M ... -N` master, which has no session, nor for `-O` requests): it does NOT run the
+words. It puts them, joined by spaces, in SSH_ORIGINAL_COMMAND and runs `/bin/sh -c
+"exec <that text>"` instead, which is what sshd does with the user's shell. The text is
+`<cowproof> host-agent --forced` in a test of forced mode.
+
 Every invocation appends one JSON line to $FAKE_SSH_LOG: its argv and, for a command, the file
 that holds the bytes it read on stdin ($FAKE_SSH_DIR/stdin.<pid>, written as they arrive), and a
 `command-started` line with the command's pid, this process's pid (`ssh_pid`) and the command
@@ -226,8 +233,11 @@ def run_command(ctl, words):
     }
     # Its own session, like a command sshd starts: a signal sent to this process's group does
     # not reach it. Its stdin is a pipe this process holds the only write end of.
+    forced = os.environ.get("FAKE_SSH_FORCED_COMMAND")
+    if forced:
+        env["SSH_ORIGINAL_COMMAND"] = " ".join(words)
     child = subprocess.Popen(
-        ["/bin/sh", "-c", "exec " + " ".join(words)],
+        ["/bin/sh", "-c", "exec " + (forced if forced else " ".join(words))],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -235,7 +245,7 @@ def run_command(ctl, words):
         cwd=home,
         start_new_session=True,
     )
-    log({"event": "command-started", "pid": child.pid, "ssh_pid": os.getpid(), "command": " ".join(words)})
+    log({"event": "command-started", "pid": child.pid, "ssh_pid": os.getpid(), "command": " ".join(words), "forced": bool(forced)})
 
     def relay_stdin():
         try:

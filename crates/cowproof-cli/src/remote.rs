@@ -171,13 +171,18 @@ fn root_arg(alias: &str, root: &str) -> Result<String> {
     bail!("host {alias:?}: remoteRoot must be absolute or start with ~/, not {root:?}")
 }
 
+/// A character [`sh_quote`] leaves bare. `host-agent --forced` splits the command it is given
+/// with the same set (`host_agent::split_command`), so the two cannot disagree about what a
+/// bare word is.
+pub(crate) fn is_bare_char(c: char) -> bool {
+    c.is_ascii_alphanumeric()
+        || matches!(c, '_' | '.' | '/' | ':' | '=' | '@' | '%' | '+' | ',' | '-')
+}
+
 /// `text` as one shell word for the host's login shell, which re-parses what ssh sends.
+/// `host_agent::split_command` reads exactly this form back.
 pub(crate) fn sh_quote(text: &str) -> String {
-    let safe = |c: char| {
-        c.is_ascii_alphanumeric()
-            || matches!(c, '_' | '.' | '/' | ':' | '=' | '@' | '%' | '+' | ',' | '-')
-    };
-    if !text.is_empty() && text.chars().all(safe) {
+    if !text.is_empty() && text.chars().all(is_bare_char) {
         text.to_string()
     } else {
         format!("'{}'", text.replace('\'', "'\\''"))

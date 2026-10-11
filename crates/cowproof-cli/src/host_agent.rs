@@ -62,6 +62,16 @@
 //! builder that is slow to stop and a director that already takes the patch, removes the lane or
 //! relaunches, and it ends a group whose `host-agent builder` died before it could.
 //!
+//! `--forced` (the form an `authorized_keys` `command="<cowproof> host-agent --forced"` names).
+//! sshd runs it for every session of the director's key and puts the client's command in
+//! `SSH_ORIGINAL_COMMAND`. That text must be `<path>/cowproof host-agent <verb> <args>` in the
+//! form `remote::agent_command` writes ([`split_command`] reads exactly `sh_quote`'s output and
+//! refuses everything else), with a verb of the closed set; the arguments go through the same
+//! clap definitions as a direct call, and the verb runs in this process. No shell is started and
+//! word 0 is never executed. A refusal (also: no command at all, an interactive login) prints one
+//! JSON error line and exits [`FORCED_REFUSED_EXIT`] (77), which a verb never returns on its own
+//! account; `--forced` inside the command is refused. The wire is unchanged.
+//!
 //! The protocol ([`HOST_PROTOCOL`]) names the stdin framings above. A director sends it to
 //! `prepare` and reads it from `doctor`; either side refuses a mismatch with a message naming
 //! both numbers, before any lane exists or any builder starts. Protocol 1 (no number) had a
@@ -69,6 +79,7 @@
 //! group record is not part of the wire, so it did not change the number.
 
 use crate::preflight::{Check, CheckStatus, PreflightOptions, preflight};
+use crate::remote::is_bare_char;
 use crate::run::{
     BuilderLaunch, CHECK_TIMEOUT, INTERRUPTED_EXIT_CODE, MAX_STDERR_LINE, PUMP_DRAIN, TERM_GRACE,
     builder_command, builder_path, capture_patch, pump_stderr, redact_ready, resumable,
@@ -98,9 +109,15 @@ use tokio::time::Instant as TokioInstant;
 
 /// The remote host's side of D27.
 #[derive(clap::Parser)]
+#[command(args_conflicts_with_subcommands = true)]
 pub struct HostAgentArgs {
+    /// Run the verb the client asked for in `SSH_ORIGINAL_COMMAND`, if it is one of the verbs
+    /// below, in the form `cowproof` writes it. This is what a forced-command key names
+    /// (`cowproof host setup` prints the line); nothing else is accepted.
+    #[arg(long)]
+    forced: bool,
     #[command(subcommand)]
-    command: HostAgentAction,
+    command: Option<HostAgentAction>,
 }
 
 #[derive(clap::Subcommand)]
@@ -172,7 +189,25 @@ enum HostAgentAction {
 
 /// Run one verb, print its output, and return the exit code (0 or 1).
 pub async fn run(args: HostAgentArgs) -> Result<i32> {
-    let outcome = match args.command {
+    match (args.forced, args.command) {
+        (true, None) => forced().await,
+        (false, Some(action)) => run_action(action).await,
+        (forced, command) => {
+            // `args_conflicts_with_subcommands` keeps `--forced` and a verb apart; this is
+            // the case with neither.
+            debug_assert!(!forced && command.is_none());
+            <HostAgentArgs as clap::CommandFactory>::command()
+                .error(
+                    clap::error::ErrorKind::MissingSubcommand,
+                    "a verb or --forced is required",
+                )
+                .exit()
+        }
+    }
+}
+
+async fn run_action(action: HostAgentAction) -> Result<i32> {
+    let outcome = match action {
         HostAgentAction::Prepare {
             lane_id,
             base,
@@ -253,9 +288,204 @@ fn print_outcome(outcome: Result<Value>) -> Result<i32> {
     Ok(if value["ok"] == true { 0 } else { 1 })
 }
 
+/// The exit code of `host-agent --forced` when it refuses the client's command (or has none):
+/// the JSON error is printed and nothing runs. Distinct from 0 and 1 (the verbs' own), from 2
+/// (clap's usage error) and from 255 (ssh's own failure). A verb that was accepted exits with
+/// its own code, as a direct call does.
+pub(crate) const FORCED_REFUSED_EXIT: i32 = 77;
+
+/// The closed set of verbs, as they are written on the command line. A test keeps it equal to
+/// [`HostAgentAction`], so a new verb cannot be added to one and not the other.
+const VERBS: [&str; 7] = [
+    "prepare", "builder", "check", "patch", "stderr", "doctor", "cleanup",
+];
+
+/// Why `--forced` refused a command. The message names what was wrong and never quotes the
+/// command, which may be long or hostile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Refusal {
+    /// `SSH_ORIGINAL_COMMAND` is not set (an interactive login) or is empty.
+    NoCommand,
+    /// It is not valid UTF-8.
+    NotUtf8,
+    /// A control character (a newline, a tab, NUL, escape...) anywhere in it.
+    Control,
+    /// Not the form `cowproof` writes: a word that is neither bare nor single-quoted, or
+    /// words not separated by one space.
+    Syntax,
+    /// `--forced` is among the words.
+    ForcedFlag,
+    /// Word 0 is not a path whose file name is `cowproof`.
+    Program,
+    /// Word 1 is not `host-agent`.
+    NotHostAgent,
+    /// Word 2 is missing or not a verb.
+    Verb,
+    /// The words after the verb do not fit it, by the same clap code as a direct call.
+    Arguments(clap::error::ErrorKind),
+}
+
+impl std::fmt::Display for Refusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Refusal::NoCommand => f.write_str(
+                "no command was requested: this key runs only `cowproof host-agent <verb>`, \
+                 so an interactive login is refused",
+            ),
+            Refusal::NotUtf8 => f.write_str("the requested command is not valid UTF-8"),
+            Refusal::Control => {
+                f.write_str("the requested command contains a control character or a newline")
+            }
+            Refusal::Syntax => f.write_str(
+                "the requested command is not in the form cowproof writes: bare words of \
+                 letters, digits and _./:=@%+,- or single-quoted words, separated by single spaces",
+            ),
+            Refusal::ForcedFlag => f.write_str("--forced is not accepted inside the command"),
+            Refusal::Program => {
+                f.write_str("the first word is not a path to a file named cowproof")
+            }
+            Refusal::NotHostAgent => f.write_str("the second word is not host-agent"),
+            Refusal::Verb => f.write_str("the third word is not a host-agent verb"),
+            Refusal::Arguments(kind) => write!(
+                f,
+                "the arguments do not fit the verb ({kind:?}); this host speaks host-agent \
+                 protocol {HOST_PROTOCOL}"
+            ),
+        }
+    }
+}
+
+/// `host-agent --forced`: run the verb the client asked for, in this process.
+///
+/// `sshd` ran this because the key's `command=` names it, and put what the client asked for
+/// in `SSH_ORIGINAL_COMMAND`. That text is split by [`split_command`] (no shell is involved,
+/// here or anywhere below), must name `<...>/cowproof host-agent <verb> ...` with a verb of
+/// the closed set, and its arguments go through the same clap definitions as a direct call.
+/// Word 0 only has to look like cowproof: it is never executed, the binary that runs is the
+/// one the key names.
+async fn forced() -> Result<i32> {
+    match forced_action(std::env::var_os("SSH_ORIGINAL_COMMAND")) {
+        Ok(action) => run_action(action).await,
+        Err(refusal) => {
+            println!(
+                "{}",
+                serde_json::to_string(
+                    &json!({"ok": false, "error": format!("refused: {refusal}")})
+                )?
+            );
+            Ok(FORCED_REFUSED_EXIT)
+        }
+    }
+}
+
+/// What `host-agent --forced` accepts for `SSH_ORIGINAL_COMMAND`, or why not.
+fn forced_action(original: Option<std::ffi::OsString>) -> Result<HostAgentAction, Refusal> {
+    let text = original
+        .ok_or(Refusal::NoCommand)?
+        .into_string()
+        .map_err(|_| Refusal::NotUtf8)?;
+    let words = split_command(&text)?;
+    if words.iter().any(|w| w == "--forced") {
+        return Err(Refusal::ForcedFlag);
+    }
+    // The file name, cut at the last `/`: `Path::file_name` would accept `x/cowproof/`.
+    if words[0].rsplit('/').next() != Some("cowproof") {
+        return Err(Refusal::Program);
+    }
+    if words.get(1).map(String::as_str) != Some("host-agent") {
+        return Err(Refusal::NotHostAgent);
+    }
+    match words.get(2) {
+        Some(verb) if VERBS.contains(&verb.as_str()) => {}
+        _ => return Err(Refusal::Verb),
+    }
+    <ForcedVerb as clap::Parser>::try_parse_from(&words[2..])
+        .map(|parsed| parsed.command)
+        .map_err(|e| Refusal::Arguments(e.kind()))
+}
+
+/// A verb and its arguments, parsed by the same definitions as `host-agent <verb> ...`; the
+/// first word is the verb itself, there is no program name.
+#[derive(clap::Parser)]
+#[command(no_binary_name = true, disable_help_subcommand = true)]
+struct ForcedVerb {
+    #[command(subcommand)]
+    command: HostAgentAction,
+}
+
+/// Split `text` into words, accepting exactly what `remote::sh_quote` produces, joined by
+/// single spaces: a bare word (only [`is_bare_char`] characters), or a single-quoted word in
+/// which each `'` of the text is written `'\''`. Everything else is refused, because it would
+/// mean something to a shell: `"`, `$`, backticks, `;`, `|`, `&`, `<`, `>`, `(`, `)`, `*`, `?`,
+/// `[`, `~`, `#`, `!`, `{`, a backslash outside `'\''`, a tab, a newline, a second space, a
+/// space at either end, and any control character even inside quotes. Nothing here expands or
+/// substitutes anything: the words come out exactly as `sh_quote` was given them.
+fn split_command(text: &str) -> Result<Vec<String>, Refusal> {
+    if text.is_empty() {
+        return Err(Refusal::NoCommand);
+    }
+    if text.chars().any(char::is_control) {
+        return Err(Refusal::Control);
+    }
+    let chars: Vec<char> = text.chars().collect();
+    let mut words = Vec::new();
+    let mut at = 0;
+    loop {
+        let (word, next) = split_word(&chars, at)?;
+        words.push(word);
+        at = next;
+        if at == chars.len() {
+            return Ok(words);
+        }
+        // One space, and a word after it.
+        if chars[at] != ' ' || at + 1 == chars.len() {
+            return Err(Refusal::Syntax);
+        }
+        at += 1;
+    }
+}
+
+/// One word starting at `chars[start]`, and the index just past it. The caller checks what
+/// follows (a space or the end).
+fn split_word(chars: &[char], start: usize) -> Result<(String, usize), Refusal> {
+    match chars.get(start) {
+        Some(&c) if is_bare_char(c) => {
+            let end = start
+                + chars[start..]
+                    .iter()
+                    .take_while(|c| is_bare_char(**c))
+                    .count();
+            Ok((chars[start..end].iter().collect(), end))
+        }
+        Some('\'') => {
+            let mut word = String::new();
+            let mut at = start;
+            loop {
+                // `chars[at]` is an opening quote.
+                at += 1;
+                let close = at
+                    + chars[at..]
+                        .iter()
+                        .position(|&c| c == '\'')
+                        .ok_or(Refusal::Syntax)?;
+                word.extend(&chars[at..close]);
+                at = close + 1;
+                // `'\''`: the closing quote, a quote of the text, and an opening quote.
+                if chars[at..].starts_with(&['\\', '\'', '\'']) {
+                    word.push('\'');
+                    at += 2;
+                    continue;
+                }
+                return Ok((word, at));
+            }
+        }
+        _ => Err(Refusal::Syntax),
+    }
+}
+
 /// `--root`, or `~/.cache/cowproof/remote-lanes`; a relative `--root` is taken from the
 /// working directory.
-fn remote_root(arg: Option<PathBuf>) -> Result<PathBuf> {
+pub(crate) fn remote_root(arg: Option<PathBuf>) -> Result<PathBuf> {
     match arg {
         Some(p) => Ok(std::env::current_dir()?.join(p)),
         None => Ok(real_home()?.join(".cache/cowproof/remote-lanes")),
@@ -516,7 +746,7 @@ fn builder_stderr(lane_id: &str, root: &Path) -> Result<Vec<u8>> {
 
 /// The preflight's `sandbox` and `claude` checks. `ok` means both pass; the key is not
 /// checked, because a remote host must not have one (D27).
-async fn doctor(claude_bin: &str, root: &Path) -> Result<Value> {
+pub(crate) async fn doctor(claude_bin: &str, root: &Path) -> Result<Value> {
     let cwd = std::env::current_dir()?;
     let home = real_home()?;
     let director_path = std::env::var("PATH").unwrap_or_default();
@@ -1693,5 +1923,266 @@ mod tests {
         ] {
             assert!(validate_commit_id(bad).is_err(), "{bad}");
         }
+    }
+}
+
+/// `--forced`: the parser reads back exactly what the director's `agent_command` writes, and
+/// refuses everything else (see `tests/host_agent.rs` for the real binary).
+#[cfg(test)]
+mod forced_tests {
+    use super::*;
+    use crate::remote::{RemoteHost, agent_command, sh_quote};
+    use clap::CommandFactory;
+    use clap::error::ErrorKind;
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    fn host() -> RemoteHost {
+        RemoteHost {
+            alias: "h".into(),
+            ssh: "h".into(),
+            cowproof: "/opt/my bin/it's/cowproof".into(),
+            claude: "/usr/bin/claude".into(),
+            root: Some("lanes dir/é \"x\"".into()),
+        }
+    }
+
+    fn awkward() -> Vec<String> {
+        [
+            "plain",
+            "with space",
+            "it's",
+            "'",
+            "''",
+            "a'b'c",
+            "é ü 日本",
+            "$(id)",
+            "`id`",
+            "a;b|c&d",
+            "say \"hi\"",
+            "back\\slash",
+            "*?[x]",
+            "~/x",
+            "",
+            "-x=y",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+    }
+
+    fn forced(text: &str) -> Result<HostAgentAction, Refusal> {
+        forced_action(Some(OsString::from(text)))
+    }
+
+    #[test]
+    fn what_agent_command_writes_is_read_back_word_for_word_for_every_verb() {
+        let host = host();
+        for verb in VERBS {
+            let line = agent_command(&host, verb, &awkward());
+            let words = split_command(&line).unwrap_or_else(|e| panic!("{verb}: {e:?}: {line}"));
+            let mut expect = vec![host.cowproof.clone(), "host-agent".into(), verb.to_string()];
+            expect.extend(awkward());
+            expect.push("--root".into());
+            expect.push(host.root.clone().unwrap());
+            assert_eq!(words, expect, "{verb}: {line}");
+        }
+        // No `--root`, no arguments.
+        let bare = RemoteHost { root: None, ..host };
+        assert_eq!(
+            split_command(&agent_command(&bare, "doctor", &[])).unwrap(),
+            vec![
+                bare.cowproof.clone(),
+                "host-agent".to_string(),
+                "doctor".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn sh_quote_and_the_parser_agree_on_any_text() {
+        // Every pair of characters from a set that holds the bare ones, every quote-like one
+        // and a multi-byte one.
+        let set: Vec<char> = "aZ09_./:=@%+,- '\"\\$`;|&<>*?é".chars().collect();
+        for a in &set {
+            for b in &set {
+                let text = format!("{a}{b}");
+                assert_eq!(
+                    split_command(&sh_quote(&text)).unwrap(),
+                    vec![text.clone()],
+                    "{text:?}"
+                );
+            }
+        }
+        assert_eq!(split_command("''").unwrap(), vec![String::new()]);
+        assert_eq!(split_command("'a b' c").unwrap(), vec!["a b", "c"]);
+    }
+
+    #[test]
+    fn a_character_a_shell_would_read_is_never_part_of_a_bare_word() {
+        for c in ";|&<>$`\"\\*?[]{}()~#!^'\t\n\r\0\u{7f}é".chars() {
+            for text in [format!("a{c}b"), format!("{c}ab"), format!("ab{c}")] {
+                assert!(split_command(&text).is_err(), "{text:?} was accepted");
+            }
+        }
+        // Quoted, the same characters are plain text (except a control character).
+        assert_eq!(
+            split_command("'a;b|c$d`e\"f\\g*h'").unwrap(),
+            vec!["a;b|c$d`e\"f\\g*h"]
+        );
+        assert_eq!(split_command("'a\nb'"), Err(Refusal::Control));
+        assert_eq!(split_command("'a\tb'"), Err(Refusal::Control));
+    }
+
+    #[test]
+    fn a_command_that_is_not_one_cowproof_wrote_is_refused_for_the_right_reason() {
+        let cases: [(&str, Refusal); 32] = [
+            ("bash", Refusal::Program),
+            ("cowproof host-agent prepare; rm -rf ~", Refusal::Syntax),
+            ("cowproof host-agent prepare && id", Refusal::Syntax),
+            ("cowproof host-agent doctor | sh", Refusal::Syntax),
+            ("cowproof host-agent doctor > /x", Refusal::Syntax),
+            ("cowproof host-agent doctor *", Refusal::Syntax),
+            ("$(id)", Refusal::Syntax),
+            ("`id`", Refusal::Syntax),
+            ("cowproof host-agent doctor $HOME", Refusal::Syntax),
+            ("cowproof run x", Refusal::NotHostAgent),
+            ("cowproof", Refusal::NotHostAgent),
+            ("cowproof host-agent", Refusal::Verb),
+            ("cowproof host-agent shell", Refusal::Verb),
+            ("cowproof host-agent help", Refusal::Verb),
+            ("cowproof host-agent --forced doctor", Refusal::ForcedFlag),
+            ("cowproof host-agent doctor --forced", Refusal::ForcedFlag),
+            ("cowproof host-agent doctor '--forced'", Refusal::ForcedFlag),
+            ("", Refusal::NoCommand),
+            ("cowproof-evil host-agent doctor", Refusal::Program),
+            ("/x/cowproof/ host-agent doctor", Refusal::Program),
+            ("/x/notcowproof host-agent doctor", Refusal::Program),
+            ("cowproof host-agent \"doctor\"", Refusal::Syntax),
+            ("cowproof host-agent doctor 'open", Refusal::Syntax),
+            ("cowproof host-agent doctor 'a'b", Refusal::Syntax),
+            ("cowproof  host-agent doctor", Refusal::Syntax),
+            (" cowproof host-agent doctor", Refusal::Syntax),
+            ("cowproof host-agent doctor ", Refusal::Syntax),
+            ("cowproof host-agent doctor\nid", Refusal::Control),
+            ("cowproof\thost-agent doctor", Refusal::Control),
+            (
+                "cowproof host-agent cleanup",
+                Refusal::Arguments(ErrorKind::MissingRequiredArgument),
+            ),
+            (
+                "cowproof host-agent doctor --nonsense",
+                Refusal::Arguments(ErrorKind::UnknownArgument),
+            ),
+            (
+                "cowproof host-agent doctor --help",
+                Refusal::Arguments(ErrorKind::DisplayHelp),
+            ),
+        ];
+        for (text, why) in cases {
+            assert_eq!(forced(text).err(), Some(why), "{text:?}");
+        }
+        assert_eq!(forced_action(None).err(), Some(Refusal::NoCommand));
+        assert_eq!(
+            forced_action(Some(OsString::from_vec(
+                b"cowproof host-agent \xff".to_vec()
+            )))
+            .err(),
+            Some(Refusal::NotUtf8)
+        );
+    }
+
+    #[test]
+    fn a_refusal_never_quotes_the_command() {
+        let hostile = "cowproof host-agent doctor; echo SECRET-MARKER-12345";
+        let message = forced(hostile).err().unwrap().to_string();
+        assert!(!message.contains("SECRET-MARKER"), "{message}");
+        let message = forced("cowproof host-agent doctor --SECRET-MARKER-12345")
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(!message.contains("SECRET-MARKER"), "{message}");
+    }
+
+    #[test]
+    fn each_verb_in_the_form_the_director_writes_parses_to_that_verb() {
+        let host = host();
+        let sha = "a".repeat(40);
+        let line = |verb: &str, args: &[&str]| {
+            let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+            agent_command(&host, verb, &args)
+        };
+        let root = host.root.clone().map(PathBuf::from);
+        match forced(&line("doctor", &["--claude-bin", "/o k/it's/claude"])).unwrap() {
+            HostAgentAction::Doctor {
+                claude_bin,
+                root: r,
+            } => {
+                assert_eq!(claude_bin, "/o k/it's/claude");
+                assert_eq!(r, root);
+            }
+            _ => panic!("not doctor"),
+        }
+        match forced(&line(
+            "prepare",
+            &[
+                "--lane-id",
+                "l-1",
+                "--base",
+                &sha,
+                "--director-version",
+                "0.1.0",
+                "--protocol",
+                "2",
+            ],
+        ))
+        .unwrap()
+        {
+            HostAgentAction::Prepare {
+                lane_id,
+                base,
+                protocol,
+                ..
+            } => {
+                assert_eq!(
+                    (lane_id.as_str(), base.as_str(), protocol),
+                    ("l-1", sha.as_str(), Some(2))
+                );
+            }
+            _ => panic!("not prepare"),
+        }
+        assert!(matches!(
+            forced(&line("builder", &["--lane-id", "l-1"])).unwrap(),
+            HostAgentAction::Builder { .. }
+        ));
+        assert!(matches!(
+            forced(&line("check", &["--lane-id", "l-1", "--check-id", "c 1"])).unwrap(),
+            HostAgentAction::Check { .. }
+        ));
+        assert!(matches!(
+            forced(&line("patch", &["--lane-id", "l-1"])).unwrap(),
+            HostAgentAction::Patch { .. }
+        ));
+        assert!(matches!(
+            forced(&line("stderr", &["--lane-id", "l-1"])).unwrap(),
+            HostAgentAction::Stderr { .. }
+        ));
+        assert!(matches!(
+            forced(&line("cleanup", &["--lane-id", "l-1"])).unwrap(),
+            HostAgentAction::Cleanup { .. }
+        ));
+    }
+
+    #[test]
+    fn the_closed_set_is_the_set_of_verbs_clap_knows() {
+        let mut known: Vec<String> = HostAgentArgs::command()
+            .get_subcommands()
+            .map(|c| c.get_name().to_string())
+            .filter(|n| n != "help")
+            .collect();
+        known.sort();
+        let mut closed: Vec<String> = VERBS.iter().map(|v| v.to_string()).collect();
+        closed.sort();
+        assert_eq!(known, closed);
     }
 }
