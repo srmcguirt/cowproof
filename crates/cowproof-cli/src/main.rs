@@ -266,9 +266,11 @@ struct RunOneArgs {
     /// Directory that holds the lanes (default: ~/.cache/cowproof/lanes)
     #[arg(long)]
     lanes_root: Option<PathBuf>,
-    /// Builder model
-    #[arg(long, default_value = "haiku")]
-    model: String,
+    /// The starting rung, `runtime:model` or a bare Claude model (`haiku`). Optional: it
+    /// beats the packet header's `rung`, the `[routing]` class route and the default (D28),
+    /// and it need not be on the ladder
+    #[arg(long)]
+    model: Option<String>,
     /// Record uncommitted changes as the base patch instead of refusing a dirty tree
     #[arg(long)]
     allow_dirty: bool,

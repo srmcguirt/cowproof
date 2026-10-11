@@ -10,11 +10,13 @@ use std::process::Stdio;
 
 pub mod git_show;
 pub mod heldout;
+pub mod ladder;
 pub mod patch;
 pub mod redact;
 pub mod status;
 
 pub use git_show::{LinkedFile, git_show_following_links, git_show_optional};
+pub use ladder::{PACKET_CLASSES, Routing, Rung, RungSource, Runtime, valid_model_name};
 pub use patch::{PatchDelta, parse_patch};
 pub use redact::redact;
 pub use status::{LaneStatus, StatusClass, StatusFacts, classify_opencode, classify_status};
@@ -93,6 +95,11 @@ pub struct Header {
     pub runner: String,
     #[serde(default)]
     pub model: Option<String>,
+    /// The rung this packet starts on (`runtime:model`, or a bare Claude model), which must be
+    /// on the base commit's ladder (D28). Syntax is checked here; the ladder, by lint and the
+    /// runner.
+    #[serde(default)]
+    pub rung: Option<String>,
     #[serde(default = "default_class", rename = "class")]
     pub class_name: String,
     #[serde(default)]
@@ -209,7 +216,10 @@ pub fn parse_header(text: &str) -> Result<Header> {
     if !["opencode", "codex"].contains(&h.runner.as_str()) {
         bail!("lane {}: runner must be opencode or codex (legacy)", h.id);
     }
-    if !["rust", "crate", "pg", "light"].contains(&h.class_name.as_str()) {
+    if let Some(rung) = &h.rung {
+        Rung::parse(rung).with_context(|| format!("lane {}: the header's \"rung\"", h.id))?;
+    }
+    if !PACKET_CLASSES.contains(&h.class_name.as_str()) {
         bail!(
             "lane {}: class must be one of rust, crate, pg, light, port",
             h.id
@@ -698,6 +708,26 @@ mod tests {
         // Packet with no runner key defaults to "opencode" for parsing (legacy default)
         let norunner = parse_header("<!-- lane {\"id\":\"lane-g\",\"owns\":[\"a\"]} -->").unwrap();
         assert_eq!(norunner.runner, "opencode");
+    }
+
+    #[test]
+    fn a_header_may_name_a_rung_and_a_bad_one_is_refused() {
+        let header = |rung: &str| {
+            parse_header(&format!(
+                "<!-- lane {{\"id\":\"lane-r\",\"owns\":[\"a\"],\"rung\":\"{rung}\"}} -->"
+            ))
+        };
+        assert_eq!(
+            header("claude:sonnet").unwrap().rung.as_deref(),
+            Some("claude:sonnet")
+        );
+        assert_eq!(header("opus").unwrap().rung.as_deref(), Some("opus"));
+        let none = parse_header("<!-- lane {\"id\":\"lane-r\",\"owns\":[\"a\"]} -->").unwrap();
+        assert_eq!(none.rung, None);
+        for bad in ["gemini:flash", "claude:--x", "claude:a b", ""] {
+            let e = format!("{:#}", header(bad).unwrap_err());
+            assert!(e.contains("rung"), "{bad:?}: {e}");
+        }
     }
 
     #[test]

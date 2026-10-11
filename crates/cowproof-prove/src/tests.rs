@@ -1762,6 +1762,62 @@ fn test_capsule_records_the_class_and_defaults_to_light() {
     assert_eq!(old.class, "light");
 }
 
+/// The builder's runtime and where its starting rung came from (D28) are written to
+/// `capsule.json`, sealed with the rest, and read back; a capsule from before they existed
+/// reads as a `claude` lane with no recorded source, the only kind there was.
+#[test]
+fn test_capsule_records_the_runtime_and_rung_source_sealed_and_older_capsules_still_read() {
+    let dir = TempDir::new().unwrap();
+    let mut capsule = Capsule::new(
+        "abc123".to_string(),
+        "tree_hash_123".to_string(),
+        fingerprint(),
+        "gpt-6-luna".to_string(),
+        "api-key".to_string(),
+    );
+    assert_eq!(capsule.builder_runtime, "claude");
+    assert_eq!(capsule.rung_source, None);
+    capsule.builder_runtime = "codex".to_string();
+    capsule.rung_source = Some("class".to_string());
+    capsule.write(dir.path()).unwrap();
+
+    let read = Capsule::read(dir.path()).unwrap();
+    assert_eq!(read.builder_runtime, "codex");
+    assert_eq!(read.builder_model, "gpt-6-luna");
+    assert_eq!(read.rung_source.as_deref(), Some("class"));
+
+    // The seal covers both: a hand edit of either is refused.
+    edit_capsule_json(
+        dir.path(),
+        "\"builder_runtime\": \"codex\"",
+        "\"builder_runtime\": \"claude\"",
+    );
+    assert_capsule_json_mismatch(dir.path());
+    capsule.write(dir.path()).unwrap();
+    edit_capsule_json(
+        dir.path(),
+        "\"rung_source\": \"class\"",
+        "\"rung_source\": \"flag\"",
+    );
+    assert_capsule_json_mismatch(dir.path());
+
+    // An older capsule: neither key in capsule.json, the seal recomputed over those bytes.
+    capsule.write(dir.path()).unwrap();
+    let path = dir.path().join("capsule.json");
+    let mut json: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let object = json.as_object_mut().unwrap();
+    assert!(object.remove("builder_runtime").is_some());
+    assert!(object.remove("rung_source").is_some());
+    let raw = serde_json::to_vec_pretty(&json).unwrap();
+    std::fs::write(&path, &raw).unwrap();
+    std::fs::write(dir.path().join("capsule.sha256"), Capsule::hash_bytes(&raw)).unwrap();
+    let old = Capsule::read(dir.path()).expect("an older capsule reads");
+    assert_eq!(old.builder_runtime, "claude");
+    assert_eq!(old.rung_source, None);
+    assert_eq!(old.builder_model, "gpt-6-luna");
+}
+
 /// Replace `from` with `to` in capsule.json, as a hand edit would, leaving the seal alone.
 fn edit_capsule_json(dir: &Path, from: &str, to: &str) {
     let path = dir.join("capsule.json");

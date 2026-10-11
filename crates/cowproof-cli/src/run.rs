@@ -42,8 +42,9 @@ use crate::root::resolve_executable;
 use crate::verify::{Rebuild, fetch_dependencies, verifier_runner};
 use anyhow::{Context, Result, anyhow, bail};
 use cowproof_core::{
-    LinkedFile, PORT_CLASS, class_limit_at_commit, get_slot_dir, git_show_following_links,
-    parse_header, port_base_for_slot, port_block_env, redact, release_slot,
+    LinkedFile, PORT_CLASS, Routing, Rung, Runtime, class_limit_at_commit, get_slot_dir,
+    git_show_following_links, parse_header, port_base_for_slot, port_block_env, redact,
+    release_slot, valid_model_name,
 };
 use cowproof_prove::{
     capsule::HELDOUT_FILE,
@@ -244,27 +245,19 @@ impl Drop for AbortOnDrop {
     }
 }
 
-/// The model ladder a `reassign` without a named model climbs (design: next
-/// model on the ladder).
-const MODEL_LADDER: [&str; 3] = ["haiku", "sonnet", "opus"];
-
-/// The rung above `current`, matched by name so full ids (`claude-haiku-5-5`)
-/// work. `None` for the top rung and for a model that is not on the ladder.
-fn next_model(current: &str) -> Option<&'static str> {
-    let lower = current.to_ascii_lowercase();
-    let rung = MODEL_LADDER.iter().position(|m| lower.contains(m))?;
-    MODEL_LADDER.get(rung + 1).copied()
-}
-
 /// A model name the director named in a ruling goes into the builder's argv,
 /// so it is held to a conservative alphabet (and never starts like a flag).
 pub(crate) fn valid_model(model: &str) -> bool {
-    !model.is_empty()
-        && model.len() <= 64
-        && !model.starts_with('-')
-        && model
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | ':' | '[' | ']'))
+    valid_model_name(model)
+}
+
+/// A rung as the carry-over text and the refusals name it: a Claude rung by its model
+/// (`sonnet`, as the old ladder did), any other runtime as `runtime:model`.
+fn rung_label(rung: &Rung) -> String {
+    match rung.runtime {
+        Runtime::Claude => rung.model.clone(),
+        _ => rung.to_string(),
+    }
 }
 
 /// The shape `claude --resume` accepts, the same rule `claude_command`
@@ -392,6 +385,8 @@ impl StartKind {
 
 /// One builder launch.
 struct Launch {
+    /// The runtime that drives this launch. Only `claude` has an adapter (D28 step 1).
+    runtime: Runtime,
     model: String,
     /// The packet this session works from (the system prompt is assembled
     /// from it).
@@ -831,6 +826,11 @@ impl Launcher {
         if *interrupted_rx.borrow_and_update() {
             return Err(Interrupted.into());
         }
+        // The callers refuse a rung with no adapter before they build a launch; this is the
+        // last line, so no other runtime's rung is ever started as a `claude` process.
+        if let Some(refusal) = launch.runtime.adapter_refusal() {
+            bail!("{refusal}");
+        }
         let layout = &self.layout;
         let assembled = assemble_prompt(self.project_instructions.as_deref(), &launch.packet);
         let (mut child_cmd, spec) = match &self.remote {
@@ -1193,7 +1193,8 @@ struct LaneRun {
     stats: PumpStats,
     /// How the last launch exited.
     status: ExitStatus,
-    /// The model of the last launch.
+    /// The runtime and the model of the last launch.
+    runtime: Runtime,
     model: String,
     /// The newest session id the stream reported.
     session_id: Option<String>,
@@ -1224,6 +1225,8 @@ enum Fallback {
 /// a parked blocking escalation, waits for the director's ruling and carries
 /// it out.
 struct Drive<'a> {
+    /// The ladder `reassign` climbs: the base commit's, read once before the lane existed.
+    routing: &'a Routing,
     launcher: &'a Launcher,
     queue: &'a Arc<Mutex<Queue>>,
     lane_id: &'a str,
@@ -1358,6 +1361,7 @@ impl Drive<'_> {
     fn segment_record(index: usize, launch: &Launch, seg: &SegmentRun) -> serde_json::Value {
         json!({
             "index": index,
+            "runtime": launch.runtime.name(),
             "model": launch.model,
             "start": launch.kind.name(),
             "resumedSession": launch.resume,
@@ -1393,13 +1397,14 @@ impl Drive<'_> {
     async fn run(
         &self,
         rx: &mut UnboundedReceiver<VerdictEvent>,
-        first_model: &str,
+        first_rung: &Rung,
         first_packet: &str,
     ) -> Result<LaneRun> {
-        let mut model = first_model.to_string();
+        let mut rung = first_rung.clone();
         let mut packet = first_packet.to_string();
         let mut launch = Launch {
-            model: model.clone(),
+            runtime: rung.runtime,
+            model: rung.model.clone(),
             packet: packet.clone(),
             prompt: packet.clone(),
             resume: None,
@@ -1448,7 +1453,8 @@ impl Drive<'_> {
                     summaries.push(seg.summary);
                     launch = match self.fall_back(&id)? {
                         Fallback::Fresh(summary) => Launch {
-                            model: model.clone(),
+                            runtime: rung.runtime,
+                            model: rung.model.clone(),
                             packet: packet.clone(),
                             prompt: format!("{packet}\n\n{summary}"),
                             resume: None,
@@ -1508,7 +1514,8 @@ impl Drive<'_> {
                     match session_id.clone().filter(|s| resumable(s)) {
                         Some(session) => {
                             launch = Launch {
-                                model: model.clone(),
+                                runtime: rung.runtime,
+                                model: rung.model.clone(),
                                 packet: packet.clone(),
                                 prompt,
                                 resume: Some(session),
@@ -1521,7 +1528,8 @@ impl Drive<'_> {
                         None => match self.fall_back(&id)? {
                             Fallback::Fresh(summary) => {
                                 launch = Launch {
-                                    model: model.clone(),
+                                    runtime: rung.runtime,
+                                    model: rung.model.clone(),
                                     packet: packet.clone(),
                                     prompt: format!("{packet}\n\n{summary}"),
                                     resume: None,
@@ -1539,7 +1547,8 @@ impl Drive<'_> {
                             self.mark_delivered(&id)?;
                             packet = text;
                             launch = Launch {
-                                model: model.clone(),
+                                runtime: rung.runtime,
+                                model: rung.model.clone(),
                                 packet: packet.clone(),
                                 prompt: packet.clone(),
                                 resume: None,
@@ -1559,7 +1568,15 @@ impl Drive<'_> {
                 }
                 EscalationVerdict::Reassign { model: named } => {
                     let to = match named {
-                        Some(m) if valid_model(&m) => m,
+                        Some(m) if valid_model(&m) => match Rung::parse(&m) {
+                            Ok(to) => to,
+                            Err(e) => {
+                                break (
+                                    LaneEnd::Refused(format!("reassign for {id} refused: {e:#}")),
+                                    status,
+                                );
+                            }
+                        },
                         Some(m) => {
                             break (
                                 LaneEnd::Refused(format!(
@@ -1568,23 +1585,36 @@ impl Drive<'_> {
                                 status,
                             );
                         }
-                        None => match next_model(&model) {
-                            Some(m) => m.to_string(),
+                        None => match self.routing.next_after(&rung) {
+                            Some(next) => next.clone(),
                             None => {
                                 break (
                                     LaneEnd::Refused(format!(
-                                        "reassign for {id} refused: no model above {model:?} on the ladder; name one with --model"
+                                        "reassign for {id} refused: no model above {:?} on the ladder; name one with --model",
+                                        rung_label(&rung)
                                     )),
                                     status,
                                 );
                             }
                         },
                     };
+                    // A rung with no adapter ends the lane exactly as the top of the ladder
+                    // does: refused, the work kept, the ruling left recorded and undelivered.
+                    if let Some(refusal) = to.runtime.adapter_refusal() {
+                        break (
+                            LaneEnd::Refused(format!(
+                                "reassign for {id} refused: {to} is the next rung, but {refusal}"
+                            )),
+                            status,
+                        );
+                    }
                     let summary = {
                         let mut queue = self.lock()?;
                         let summary = queue
                             .get(&id)
-                            .map(|(ask, _, _)| reassign_summary(&id, ask, &model, &to))
+                            .map(|(ask, _, _)| {
+                                reassign_summary(&id, ask, &rung_label(&rung), &rung_label(&to))
+                            })
                             .ok_or_else(|| anyhow!("escalation {id} is unknown"))?;
                         queue
                             .reassign(self.lane_id)
@@ -1593,9 +1623,10 @@ impl Drive<'_> {
                     };
                     self.mark_delivered(&id)?;
                     segment_cost_usd = 0.0;
-                    model = to;
+                    rung = to;
                     launch = Launch {
-                        model: model.clone(),
+                        runtime: rung.runtime,
+                        model: rung.model.clone(),
                         packet: packet.clone(),
                         prompt: format!("{packet}\n\n{summary}"),
                         resume: None,
@@ -1610,6 +1641,7 @@ impl Drive<'_> {
             summaries,
             stats,
             status,
+            runtime: launch.runtime,
             model: launch.model,
             session_id,
             end,
@@ -2227,9 +2259,11 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
     for finding in &findings {
         eprintln!("{finding}");
     }
+    // A header rung off the base commit's ladder is a lint error too, but the run refuses it
+    // itself below (exit 4, naming the rung), so that one does not stop the run here.
     if findings
         .iter()
-        .any(|f| f.severity == cowproof_lint::Severity::Error)
+        .any(|f| f.severity == cowproof_lint::Severity::Error && f.rule != "rung")
     {
         bail!("packet lint found errors");
     }
@@ -2288,6 +2322,39 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
         .any(|c| c.status == CheckStatus::Fail && needed(c))
     {
         eprintln!("nothing was started; `cowproof doctor` shows every check");
+        return Ok(INFRASTRUCTURE_EXIT_CODE);
+    }
+
+    // 2b. The builder's starting rung (D28): from the BASE commit's `cowproof.toml`, never the
+    // working tree, so a lane cannot rewrite its own routing. A ladder that does not parse, a
+    // rung that is not on it, and a rung whose runtime has no adapter all stop the run here,
+    // before any lane, slot, socket or proxy exists.
+    let routing = match Routing::at_commit(&repo, "HEAD") {
+        Ok(routing) => routing,
+        Err(e) => {
+            eprintln!("the builder ladder cannot be read: {e:#}");
+            eprintln!("nothing was started");
+            return Ok(INFRASTRUCTURE_EXIT_CODE);
+        }
+    };
+    let (first_rung, rung_source) = match routing.start(
+        args.model.as_deref(),
+        header.rung.as_deref(),
+        &header.class_name,
+    ) {
+        Ok(start) => start,
+        Err(e) => {
+            eprintln!("no starting rung: {e:#}");
+            eprintln!("nothing was started");
+            return Ok(INFRASTRUCTURE_EXIT_CODE);
+        }
+    };
+    if let Some(refusal) = first_rung.runtime.adapter_refusal() {
+        eprintln!(
+            "rung {first_rung} refused ({} chose it): {refusal}",
+            rung_source.name()
+        );
+        eprintln!("nothing was started");
         return Ok(INFRASTRUCTURE_EXIT_CODE);
     }
 
@@ -2619,6 +2686,7 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
         remote: remote.clone(),
     };
     let drive = Drive {
+        routing: &routing,
         launcher: &launcher,
         queue: &queue,
         lane_id: &header.id,
@@ -2635,7 +2703,7 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
     // director and proxy tasks, remove the three sockets, write `run.json` as
     // `interrupted`, skip the proof and exit 130. A second signal while that
     // waits skips the wait.
-    let drive_run = drive.run(&mut verdict_rx, &args.model, &packet_text);
+    let drive_run = drive.run(&mut verdict_rx, &first_rung, &packet_text);
     tokio::pin!(drive_run);
     let first = tokio::select! {
         result = &mut drive_run => Ok(result?),
@@ -2786,7 +2854,10 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
         },
         "exitCode": status.code(),
         "signal": status.signal(),
+        "runtime": lane_run.runtime.name(),
         "model": lane_run.model,
+        "startRung": first_rung.to_string(),
+        "rungSource": rung_source.name(),
         "turns": total_turns,
         "sessionId": lane_run.session_id,
         "meter": summary,
@@ -2871,7 +2942,9 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
             repo: &repo,
             prepared: &prepared,
             header: &header,
+            runtime: lane_run.runtime.name(),
             model: &lane_run.model,
+            rung_source: rung_source.name(),
             cost_usd: total_cost_usd,
             tokens: total_tokens,
             heldout_path: heldout.as_deref(),
@@ -3042,7 +3115,11 @@ struct ProofInput<'a> {
     repo: &'a Path,
     prepared: &'a cowproof_run::lane::PreparedLane,
     header: &'a cowproof_core::Header,
+    /// The runtime and the model of the last segment, and where the starting rung came from
+    /// (`flag`, `header`, `class`, `default`): recorded in the capsule (D28).
+    runtime: &'a str,
     model: &'a str,
+    rung_source: &'a str,
     cost_usd: f64,
     tokens: u64,
     /// The director's held-out checks for this lane, outside the repository. `None`
@@ -3264,6 +3341,8 @@ async fn replay_and_gate(
         input.model.to_string(),
         "api-key".to_string(),
     );
+    capsule.builder_runtime = input.runtime.to_string();
+    capsule.rung_source = Some(input.rung_source.to_string());
     capsule.estimated_cost_usd = input.cost_usd;
     capsule.estimated_tokens = input.tokens;
     capsule.unsandboxed = input.unsandboxed;
@@ -4268,11 +4347,26 @@ body"#;
 
     #[test]
     fn the_model_ladder_climbs_by_name_and_stops_at_the_top() {
-        assert_eq!(next_model("haiku"), Some("sonnet"));
-        assert_eq!(next_model("claude-haiku-5-5"), Some("sonnet"));
-        assert_eq!(next_model("sonnet"), Some("opus"));
-        assert_eq!(next_model("Opus"), None);
-        assert_eq!(next_model("gpt-6"), None, "not on the ladder");
+        let routing = Routing::default();
+        let next = |current: &str| {
+            routing
+                .next_after(&Rung::parse(current).unwrap())
+                .map(rung_label)
+        };
+        assert_eq!(next("haiku").as_deref(), Some("sonnet"));
+        assert_eq!(next("claude-haiku-5-5").as_deref(), Some("sonnet"));
+        assert_eq!(next("sonnet").as_deref(), Some("opus"));
+        assert_eq!(next("Opus"), None);
+        assert_eq!(next("gpt-6"), None, "not on the ladder");
+    }
+
+    #[test]
+    fn a_rung_is_named_by_its_model_on_claude_and_in_full_elsewhere() {
+        assert_eq!(rung_label(&Rung::parse("claude:sonnet").unwrap()), "sonnet");
+        assert_eq!(
+            rung_label(&Rung::parse("codex:gpt-6-luna").unwrap()),
+            "codex:gpt-6-luna"
+        );
     }
 
     #[test]

@@ -135,6 +135,35 @@ fn a_proved_lane_reproduces_from_another_directory_on_a_fresh_clone() {
     );
 }
 
+/// A capsule written before D28 has no `builder_runtime` and no `rung_source`. Sealed again
+/// over those bytes, as the older writer would have sealed it, it still reproduces.
+#[test]
+fn a_capsule_without_the_runtime_and_rung_source_fields_still_reproduces() {
+    if !sandbox_available() {
+        return;
+    }
+    let lane = lane();
+    run_expecting(&lane, &[], 0);
+    let capsule = lane.capsule_dir();
+    let path = capsule.join("capsule.json");
+    let mut json: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    assert_eq!(json["builder_runtime"], "claude", "the new run records it");
+    assert_eq!(json["rung_source"], "default");
+    let object = json.as_object_mut().unwrap();
+    assert!(object.remove("builder_runtime").is_some());
+    assert!(object.remove("rung_source").is_some());
+    let raw = serde_json::to_vec_pretty(&json).unwrap();
+    fs::write(&path, &raw).unwrap();
+    fs::write(capsule.join("capsule.sha256"), Capsule::hash_bytes(&raw)).unwrap();
+
+    let old = Capsule::read(&capsule).expect("an older capsule reads");
+    assert_eq!(old.builder_runtime, "claude");
+    assert_eq!(old.rung_source, None);
+    let out = replay(&lane);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    assert_eq!(stdout(&out).trim(), "reproduced");
+}
+
 /// The capsule is read byte for byte: a hand edit to `capsule.json` and to `lane.patch`
 /// are each refused and named, and the untouched capsule still reproduces.
 #[test]

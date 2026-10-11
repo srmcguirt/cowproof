@@ -24,6 +24,27 @@ Status: design stage. Nothing here is ready to use yet. See [docs/design.md](doc
 
 `cowproof run --unsandboxed` launches the builder without the OS sandbox, for trusted local experiments only: the builder can then touch anything you can, the lane and its capsule are marked `unsandboxed`, and the lane can end `finished` (checked by the gates and the sandboxed verifier) but never `proved`; `cowproof verify` refuses its capsule.
 
+## Choose the builder: `[ladder]` and `[routing]`
+
+A builder is a runtime and a model, written `runtime:model` and called a rung. The ladder is the ordered list of rungs a `reassign` climbs, and routing says which rung a lane starts on. Both are read from `cowproof.toml` in the lane's base commit, never from a working tree, so a lane cannot rewrite its own routing (the class limits work the same way).
+
+```toml
+[ladder]
+rungs = ["claude:haiku", "claude:sonnet", "claude:opus"]   # the default when there is no [ladder]
+
+[routing]
+default = "claude:haiku"                  # the first rung, unless you say otherwise
+classes = { rust = "claude:sonnet", pg = "claude:sonnet" }
+```
+
+- A rung is `runtime:model`. The runtime is one of `claude`, `openrouter`, `codex`. The model is a name of letters, digits and `.` `_` `-` `:` `[` `]`, at most 64 characters, never starting with `-`. A bare `haiku` is read as `claude:haiku`. The first `:` ends the runtime, so a model name that contains a `:` needs the `claude:` prefix.
+- The ladder may not be empty or list a rung twice. A table with an unknown key, an unknown runtime, a bad model name, a class that is not `rust`, `crate`, `pg` or `light`, or a routing rung that is not on the ladder is an error.
+- The starting rung is, in order: `cowproof run --model` (when given; it need not be on the ladder), the packet header's `"rung": "claude:sonnet"`, the `[routing] classes` entry for the packet's class, then `[routing] default`. `run.json` records the runtime and model of every segment, and `rungSource` (`flag`, `header`, `class` or `default`); the capsule records `builder_runtime` and `rung_source` beside `builder_model`.
+- A header rung that is not on the ladder is an error in `cowproof lint`, and `cowproof run` refuses it with exit 4, naming the rung, before it creates a lane. So does a ladder or routing that does not parse.
+- `reassign` without a model moves one rung up the ladder. At the top, the lane ends as it always has: refused, the work kept, the ruling left undelivered.
+
+Only the `claude` runtime has an adapter so far. The ladder may list `openrouter` and `codex` rungs, but a lane that would start on one is refused with exit 4 ("runtime `codex` has no adapter yet (D28 step 1)"), and a `reassign` that would land on one ends the lane the way the top of the ladder does.
+
 ## Run a lane on another machine
 
 `cowproof run packet.md --host buildbox` runs the builder, and the checks it asks for, on another machine over SSH. Your machine stays the director: it keeps the escalation queue and your rulings, the egress proxy and so the API key, the held-out checks, the proof and the capsule. The host runs only what runs sandboxed. The key never leaves the director: no argument, spec, bundle or environment sent to the host holds it, and the builder on the host presents the lane's own `placeholder-...` key, which only your proxy accepts, through two sockets that SSH forwards from the host back to you.

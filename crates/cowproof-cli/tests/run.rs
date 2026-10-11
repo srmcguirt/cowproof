@@ -3656,3 +3656,426 @@ fn a_doctor_that_fails_makes_the_lane_untraced_and_never_changes_the_verdict() {
     let raw: Value = serde_json::from_str(&h.read("control/capsule/capsule.json")).unwrap();
     assert_eq!(raw["traced"], false);
 }
+
+// ----------------------------------------------------------------------------------------
+// The ladder and routing (D28 step 1): `cowproof.toml` `[ladder]` and `[routing]` at the base
+// commit, a packet header's `rung`, `--model`, and the Claude-only adapter.
+// ----------------------------------------------------------------------------------------
+
+impl Harness {
+    /// Put `text` in the repository's `cowproof.toml` and commit it, so it is part of the
+    /// base commit the lane starts from.
+    fn commit_config(&self, text: &str) {
+        fs::write(self.repo.join("cowproof.toml"), text).unwrap();
+        git(&self.repo, &["add", "cowproof.toml"]);
+        git(&self.repo, &["commit", "-q", "-m", "config"]);
+    }
+
+    /// `cowproof run` with the real key set and `extra` arguments after the usual ones.
+    fn run_with(&self, extra: &[&str]) -> Output {
+        output(
+            self.command(self.lanes.path())
+                .args(extra)
+                .env("ANTHROPIC_API_KEY", REAL_KEY),
+        )
+    }
+}
+
+/// The lane reached a verdict, whatever it was (exit 0, 2 or 3).
+fn reached_a_verdict(out: &Output) {
+    assert!(
+        matches!(out.status.code(), Some(0 | 2 | 3)),
+        "cowproof run did not reach a verdict:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// What the first launch ran on: the `--model` the fake saw, and what `run.json` recorded.
+fn started_on(h: &Harness, model: &str, source: &str) {
+    let run = h.run_json();
+    assert_eq!(h.seg(1, "model"), model, "the argv of the first launch");
+    assert_eq!(run["segments"][0]["model"], model, "{run}");
+    assert_eq!(run["segments"][0]["runtime"], "claude", "{run}");
+    assert_eq!(run["runtime"], "claude", "{run}");
+    assert_eq!(run["model"], model, "{run}");
+    assert_eq!(run["rungSource"], source, "{run}");
+    assert_eq!(run["startRung"], format!("claude:{model}"), "{run}");
+}
+
+#[test]
+fn with_no_config_the_lane_starts_on_the_default_ladders_first_rung() {
+    if !sandbox_available() {
+        return;
+    }
+    let h = Harness::new("");
+    reached_a_verdict(&h.run_with(&[]));
+    started_on(&h, "haiku", "default");
+}
+
+#[test]
+fn the_flag_names_the_starting_rung_and_the_runtime_prefix_never_reaches_the_argv() {
+    if !sandbox_available() {
+        return;
+    }
+    let h = Harness::new("");
+    h.commit_config("[routing]\ndefault = \"claude:sonnet\"\n");
+    reached_a_verdict(&h.run_with(&["--model", "claude:opus"]));
+    started_on(&h, "opus", "flag");
+}
+
+#[test]
+fn a_bare_flag_model_still_means_claude() {
+    if !sandbox_available() {
+        return;
+    }
+    let h = Harness::new("");
+    reached_a_verdict(&h.run_with(&["--model", "sonnet"]));
+    started_on(&h, "sonnet", "flag");
+}
+
+#[test]
+fn the_packet_headers_rung_names_the_starting_rung() {
+    if !sandbox_available() {
+        return;
+    }
+    let mut h = Harness::new("");
+    h.commit_config("[routing]\ndefault = \"claude:opus\"\n");
+    h.set_header_field("rung", json!("claude:sonnet"));
+    reached_a_verdict(&h.run_with(&[]));
+    started_on(&h, "sonnet", "header");
+}
+
+#[test]
+fn the_class_route_names_the_starting_rung() {
+    if !sandbox_available() {
+        return;
+    }
+    let h = Harness::new("");
+    h.commit_config(
+        "[routing]\ndefault = \"claude:opus\"\nclasses = { light = \"claude:sonnet\" }\n",
+    );
+    reached_a_verdict(&h.run_with(&[]));
+    started_on(&h, "sonnet", "class");
+}
+
+#[test]
+fn the_routing_default_names_the_starting_rung() {
+    if !sandbox_available() {
+        return;
+    }
+    let h = Harness::new("");
+    // A class route for another class does not apply to this `light` packet.
+    h.commit_config(
+        "[routing]\ndefault = \"claude:sonnet\"\nclasses = { rust = \"claude:opus\" }\n",
+    );
+    reached_a_verdict(&h.run_with(&[]));
+    started_on(&h, "sonnet", "default");
+}
+
+#[test]
+fn the_flag_beats_the_header_beats_the_class_beats_the_default_in_a_real_run() {
+    if !sandbox_available() {
+        return;
+    }
+    let config = "[routing]\ndefault = \"claude:opus\"\nclasses = { light = \"claude:sonnet\" }\n";
+
+    let mut all = Harness::new("");
+    all.commit_config(config);
+    all.set_header_field("rung", json!("claude:haiku"));
+    reached_a_verdict(&all.run_with(&["--model", "claude:x-flag-model"]));
+    started_on(&all, "x-flag-model", "flag");
+
+    let mut header = Harness::new("");
+    header.commit_config(config);
+    header.set_header_field("rung", json!("claude:haiku"));
+    reached_a_verdict(&header.run_with(&[]));
+    started_on(&header, "haiku", "header");
+
+    let class = Harness::new("");
+    class.commit_config(config);
+    reached_a_verdict(&class.run_with(&[]));
+    started_on(&class, "sonnet", "class");
+}
+
+#[test]
+fn the_base_commits_routing_wins_over_the_working_trees() {
+    if !sandbox_available() {
+        return;
+    }
+    let h = Harness::new("");
+    h.commit_config("[routing]\ndefault = \"claude:sonnet\"\n");
+    // The director's tree has an uncommitted edit of the routing (recorded as the base
+    // patch with --allow-dirty): the lane's configuration is still the committed one.
+    fs::write(
+        h.repo.join("cowproof.toml"),
+        "[routing]\ndefault = \"claude:opus\"\n",
+    )
+    .unwrap();
+    reached_a_verdict(&h.run_with(&["--allow-dirty"]));
+    started_on(&h, "sonnet", "default");
+}
+
+/// A fake that asks a blocking question on its first `last` launches, then runs the checks.
+fn asks_until(last: usize, later: &str) -> String {
+    let ask = blocking_ask("Which design?");
+    format!(
+        "if [ \"$n\" -le {last} ]; then\n{}else\n{later}fi\n",
+        mcp_session("ask.out", &[(3, "ask", ask)])
+    )
+}
+
+#[test]
+fn reassign_follows_a_custom_four_rung_claude_ladder() {
+    if !sandbox_available() {
+        return;
+    }
+    let h = owned_packet(&asks_until(2, &then_checks()));
+    h.commit_config(
+        "[ladder]\nrungs = [\"claude:alpha\", \"claude:beta\", \"claude:gamma\", \"claude:delta\"]\n",
+    );
+    let mut child = start(&h);
+    let first = wait_for_ask(&h, &mut child, 1);
+    rule(&h, &first, &["--reassign"]);
+    let second = wait_for_ask(&h, &mut child, 2);
+    rule(&h, &second, &["--reassign"]);
+    let out = finish(child);
+    assert_eq!(out.status.code(), Some(0), "{}", stdout_of(&out));
+
+    assert_eq!(h.launches(), 3);
+    for (n, model) in [(1, "alpha"), (2, "beta"), (3, "gamma")] {
+        assert_eq!(h.seg(n, "model"), model, "launch {n}");
+    }
+    let segs = segments(&h);
+    let recorded: Vec<(&str, &str)> = segs
+        .iter()
+        .map(|s| (s["runtime"].as_str().unwrap(), s["model"].as_str().unwrap()))
+        .collect();
+    assert_eq!(
+        recorded,
+        [("claude", "alpha"), ("claude", "beta"), ("claude", "gamma")]
+    );
+    assert!(h.seg(2, "prompt").contains("reassign to beta"));
+    assert!(h.seg(3, "prompt").contains("reassign to gamma"));
+    let run = h.run_json();
+    assert_eq!(run["model"], "gamma", "{run}");
+    assert_eq!(run["rungSource"], "default");
+    assert_eq!(queue_events(&h, "delivered").len(), 2);
+    assert_eq!(h.verdict()["verdict"], "proved");
+    let capsule = Capsule::read(&h.lane().join("control/capsule")).unwrap();
+    assert_eq!(capsule.builder_model, "gamma");
+}
+
+/// A reassign that was refused: the lane failed with `why` in its error, the work is kept,
+/// only `launches` builders ran, `delivered` rulings reached a builder, and nothing was proved.
+fn assert_reassign_refused(
+    h: &Harness,
+    out: &Output,
+    why: &str,
+    launches: usize,
+    delivered: usize,
+) {
+    assert_eq!(out.status.code(), Some(1), "{}", stdout_of(out));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains(why), "{stderr}");
+    assert!(stderr.contains("reassign for"), "{stderr}");
+    assert_eq!(h.launches(), launches);
+    let run = h.run_json();
+    assert_eq!(run["status"], "failed", "{run}");
+    assert!(run["error"].as_str().unwrap().contains(why), "{run}");
+    assert_eq!(queue_events(h, "delivered").len(), delivered);
+    assert!(h.read("control/lane.patch").contains("+edited"));
+    assert!(!h.lane().join("control/verdict.json").exists());
+    assert!(!h.lane().join("control/capsule").exists());
+}
+
+#[test]
+fn reassign_at_the_top_of_a_custom_ladder_is_refused_as_today() {
+    if !sandbox_available() {
+        return;
+    }
+    let h = owned_packet(&asks_until(9, &then_checks()));
+    h.commit_config("[ladder]\nrungs = [\"claude:alpha\", \"claude:beta\"]\n");
+    let mut child = start(&h);
+    let first = wait_for_ask(&h, &mut child, 1);
+    rule(&h, &first, &["--reassign"]);
+    let second = wait_for_ask(&h, &mut child, 2);
+    rule(&h, &second, &["--reassign"]);
+    let out = finish(child);
+    assert_reassign_refused(&h, &out, "no model above \"beta\" on the ladder", 2, 1);
+}
+
+#[test]
+fn reassign_onto_a_rung_with_no_adapter_ends_the_lane_like_the_top_of_the_ladder() {
+    if !sandbox_available() {
+        return;
+    }
+    let h = owned_packet(&asks_until(9, &then_checks()));
+    h.commit_config(
+        "[ladder]\nrungs = [\"claude:alpha\", \"codex:gpt-6-luna\", \"claude:omega\"]\n",
+    );
+    let mut child = start(&h);
+    let first = wait_for_ask(&h, &mut child, 1);
+    rule(&h, &first, &["--reassign"]);
+    let out = finish(child);
+    assert_reassign_refused(
+        &h,
+        &out,
+        "runtime `codex` has no adapter yet (D28 step 1)",
+        1,
+        0,
+    );
+    // The same state as the top of the ladder: the ruling stays recorded, undelivered.
+    assert_eq!(queue_events(&h, "ruled").len(), 1);
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("codex:gpt-6-luna"),
+        "the refusal names the rung"
+    );
+}
+
+#[test]
+fn a_named_reassign_onto_a_runtime_with_no_adapter_is_refused_too() {
+    if !sandbox_available() {
+        return;
+    }
+    let h = owned_packet(&asks_until(9, &then_checks()));
+    let mut child = start(&h);
+    let first = wait_for_ask(&h, &mut child, 1);
+    rule(
+        &h,
+        &first,
+        &["--reassign", "--model", "openrouter:glm-5.3-flash"],
+    );
+    let out = finish(child);
+    assert_reassign_refused(
+        &h,
+        &out,
+        "runtime `openrouter` has no adapter yet (D28 step 1)",
+        1,
+        0,
+    );
+}
+
+/// A run that stopped before anything existed: exit 4, `needle` on stderr, no lane directory
+/// and no builder launched.
+fn assert_refused_before_start(h: &Harness, out: &Output, needle: &str) {
+    assert_eq!(
+        out.status.code(),
+        Some(4),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains(needle), "{stderr}");
+    assert!(stderr.contains("nothing was started"), "{stderr}");
+    assert!(!h.lane().exists(), "no lane directory may exist");
+}
+
+#[test]
+fn starting_on_a_runtime_with_no_adapter_is_exit_4_before_anything_starts() {
+    if !sandbox_available() {
+        return;
+    }
+    let no_adapter = "runtime `codex` has no adapter yet (D28 step 1)";
+
+    // The ladder's first rung is the default start.
+    let by_default = Harness::new("");
+    by_default.commit_config("[ladder]\nrungs = [\"codex:gpt-6-luna\", \"claude:haiku\"]\n");
+    let out = by_default.run_with(&[]);
+    assert_refused_before_start(&by_default, &out, no_adapter);
+    assert!(
+        String::from_utf8_lossy(&out.stderr)
+            .contains("rung codex:gpt-6-luna refused (default chose it)"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // The flag.
+    let by_flag = Harness::new("");
+    let out = by_flag.run_with(&["--model", "openrouter:glm-5.3-flash"]);
+    assert_refused_before_start(
+        &by_flag,
+        &out,
+        "runtime `openrouter` has no adapter yet (D28 step 1)",
+    );
+
+    // The header, on a ladder that lists the rung.
+    let mut by_header = Harness::new("");
+    by_header.commit_config("[ladder]\nrungs = [\"claude:haiku\", \"codex:gpt-6-luna\"]\n");
+    by_header.set_header_field("rung", json!("codex:gpt-6-luna"));
+    let out = by_header.run_with(&[]);
+    assert_refused_before_start(&by_header, &out, no_adapter);
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("(header chose it)"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn a_rung_that_is_not_on_the_ladder_is_exit_4_naming_it() {
+    if !sandbox_available() {
+        return;
+    }
+    // A header rung off the base commit's ladder: lint reports it, and the run refuses it.
+    let mut header = Harness::new("");
+    header.commit_config("[ladder]\nrungs = [\"claude:haiku\"]\n");
+    header.set_header_field("rung", json!("claude:opus"));
+    let out = header.run_with(&[]);
+    assert_refused_before_start(&header, &out, "rung claude:opus is not on the ladder");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("error [rung]"),
+        "lint named it too: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // The flag overriding it does not excuse it.
+    let mut flagged = Harness::new("");
+    flagged.commit_config("[ladder]\nrungs = [\"claude:haiku\"]\n");
+    flagged.set_header_field("rung", json!("claude:opus"));
+    let out = flagged.run_with(&["--model", "claude:haiku"]);
+    assert_refused_before_start(&flagged, &out, "rung claude:opus is not on the ladder");
+
+    // A routing rung off the ladder is a broken configuration at the base commit.
+    let routing = Harness::new("");
+    routing.commit_config(
+        "[ladder]\nrungs = [\"claude:haiku\"]\n[routing]\ndefault = \"claude:opus\"\n",
+    );
+    let out = routing.run_with(&[]);
+    assert_refused_before_start(&routing, &out, "rung claude:opus is not on the ladder");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("[routing] default"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // So is an empty ladder, and a routing mistake no packet asked about.
+    let empty = Harness::new("");
+    empty.commit_config("[ladder]\nrungs = []\n");
+    let out = empty.run_with(&[]);
+    assert_refused_before_start(&empty, &out, "must not be empty");
+}
+
+#[test]
+fn the_capsule_records_the_runtime_the_model_and_where_the_rung_came_from() {
+    if !sandbox_available() {
+        return;
+    }
+    let h = owned_packet(&run_checks(&["edit", "made"]));
+    h.commit_config("[routing]\nclasses = { light = \"claude:sonnet\" }\n");
+    let out = h.run_with(&[]);
+    assert_eq!(out.status.code(), Some(0), "{}", stdout_of(&out));
+    assert_eq!(h.verdict()["verdict"], "proved");
+
+    let capsule = Capsule::read(&h.lane().join("control/capsule")).unwrap();
+    assert_eq!(capsule.builder_runtime, "claude");
+    assert_eq!(capsule.builder_model, "sonnet");
+    assert_eq!(capsule.rung_source.as_deref(), Some("class"));
+    let raw: Value = serde_json::from_str(&h.read("control/capsule/capsule.json")).unwrap();
+    assert_eq!(raw["builder_runtime"], "claude");
+    assert_eq!(raw["rung_source"], "class");
+    let run = h.run_json();
+    assert_eq!(run["rungSource"], "class");
+    assert_eq!(run["runtime"], "claude");
+}

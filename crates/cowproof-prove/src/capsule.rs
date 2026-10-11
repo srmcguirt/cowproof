@@ -158,6 +158,15 @@ pub struct Capsule {
     pub environment: EnvironmentFingerprint,
     pub lane_state: String,
     pub builder_model: String,
+    /// The runtime of the builder's last segment (D28): `claude`, `openrouter` or `codex`.
+    /// Sealed in `capsule.json`. A capsule from before D28 has no such field and reads as
+    /// `claude`, the only runtime there was.
+    #[serde(default = "default_runtime")]
+    pub builder_runtime: String,
+    /// Where the lane's starting rung came from (D28): `flag`, `header`, `class` or
+    /// `default`. Sealed in `capsule.json`; absent in older capsules, which read as null.
+    #[serde(default)]
+    pub rung_source: Option<String>,
     pub auth_mode: String,
     pub estimated_cost_usd: f64,
     pub estimated_tokens: u64,
@@ -212,6 +221,10 @@ fn default_class() -> String {
     "light".to_string()
 }
 
+fn default_runtime() -> String {
+    "claude".to_string()
+}
+
 impl Capsule {
     /// Create a new capsule with the given parameters.
     pub fn new(
@@ -229,6 +242,8 @@ impl Capsule {
             environment,
             lane_state: "finished".to_string(),
             builder_model,
+            builder_runtime: default_runtime(),
+            rung_source: None,
             auth_mode,
             estimated_cost_usd: 0.0,
             estimated_tokens: 0,

@@ -73,7 +73,7 @@ cowproof run packet.md --repo <repo-path>
 
 Useful flags, with their defaults from `cowproof run --help`:
 
-- `--model <name>`: the builder model (default `haiku`).
+- `--model <rung>`: the starting rung, `runtime:model` or a bare Claude model such as `haiku`. Without it the lane starts on the packet header's `rung`, else the `[routing]` class route in the base commit's `cowproof.toml`, else its default (`claude:haiku` when there is no `[ladder]`).
 - `--max-turns <n>`: hard cap on builder turns per session (60).
 - `--turn-budget <n>`: escalate early when the builder reaches this many assistant turns (40).
 - `--cost-cap-usd <usd>`: the lane's cost cap (5). It is a trigger, not a hard stop: at 40% of it, on an estimate, the lane escalates.

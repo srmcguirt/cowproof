@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use cowproof_core::{Header, parse_header};
+use cowproof_core::{Header, Routing, parse_header};
 use cowproof_plan::{Plan, check_packet_reservations};
 use globset::Glob;
 use std::collections::BTreeSet;
@@ -55,6 +55,7 @@ pub fn lint_packet(packet_text: &str, repo_root: &Path, plans: &[Plan]) -> Vec<F
         lint_ownership(header, repo_root, &mut findings);
         lint_migrations(packet_text, header, repo_root, plans, &mut findings);
         lint_header_checks(header, packet_text, &mut findings);
+        lint_rung(header, repo_root, &mut findings);
     }
     lint_secrets(packet_text, &mut findings);
     if let Some((start, section)) = checks_section(packet_text) {
@@ -86,6 +87,34 @@ fn warn(rule: &'static str, line: Option<usize>, message: impl Into<String>) -> 
         rule,
         line,
         message: message.into(),
+    }
+}
+
+/// The header's `rung` must be on the ladder of the base commit's `cowproof.toml` (D28). The
+/// base commit is what `cowproof run` would take as the repository's `HEAD`; a directory with
+/// no commit has no base to read, so there the rung is checked for its syntax only (by the
+/// header parser). Rule `rung`: `cowproof run` leaves this one to its own refusal, which exits 4.
+fn lint_rung(header: &Header, repo_root: &Path, findings: &mut Vec<Finding>) {
+    let Some(rung) = &header.rung else {
+        return;
+    };
+    let has_head = std::process::Command::new("git")
+        .current_dir(repo_root)
+        .args(["rev-parse", "--verify", "--quiet", "HEAD^{commit}"])
+        .output()
+        .is_ok_and(|out| out.status.success());
+    if !has_head {
+        return;
+    }
+    let routing = match Routing::at_commit(repo_root, "HEAD") {
+        Ok(routing) => routing,
+        Err(e) => {
+            findings.push(error("rung", None, format!("{e:#}")));
+            return;
+        }
+    };
+    if let Err(e) = routing.ladder_rung(rung) {
+        findings.push(error("rung", None, format!("the header's \"rung\": {e:#}")));
     }
 }
 
@@ -837,6 +866,104 @@ mod tests {
 
     fn has(findings: &[Finding], rule: &str) -> bool {
         findings.iter().any(|finding| finding.rule == rule)
+    }
+
+    /// A repository of its own with one commit, holding `cowproof.toml` when given.
+    fn repo_with_config(config: Option<&str>) -> PathBuf {
+        let dir = root();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .current_dir(&dir)
+                .args(["-c", "user.name=t", "-c", "user.email=t@localhost"])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{args:?}: {out:?}");
+        };
+        git(&["init", "-q"]);
+        fs::write(dir.join("README.md"), "x\n").unwrap();
+        if let Some(config) = config {
+            fs::write(dir.join("cowproof.toml"), config).unwrap();
+        }
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "base"]);
+        dir
+    }
+
+    fn rung_packet(rung: &str) -> String {
+        packet(
+            &format!(r#"{{"id":"lane-x","owns":["README.md"],"rung":"{rung}"}}"#),
+            "",
+        )
+    }
+
+    #[test]
+    fn a_header_rung_on_the_base_commits_ladder_is_clean() {
+        let dir = repo_with_config(Some(
+            "[ladder]\nrungs = [\"claude:haiku\", \"codex:gpt-6-luna\"]\n",
+        ));
+        for rung in ["claude:haiku", "haiku", "codex:gpt-6-luna"] {
+            let findings = lint_packet(&rung_packet(rung), &dir, &[]);
+            assert!(!has(&findings, "rung"), "{rung}: {findings:?}");
+        }
+        // The default ladder when the base has no cowproof.toml.
+        let plain = repo_with_config(None);
+        assert!(!has(
+            &lint_packet(&rung_packet("claude:opus"), &plain, &[]),
+            "rung"
+        ));
+        fs::remove_dir_all(dir).unwrap();
+        fs::remove_dir_all(plain).unwrap();
+    }
+
+    #[test]
+    fn a_header_rung_off_the_base_commits_ladder_is_an_error_naming_it() {
+        let dir = repo_with_config(Some("[ladder]\nrungs = [\"claude:haiku\"]\n"));
+        let findings = lint_packet(&rung_packet("claude:opus"), &dir, &[]);
+        let finding = findings
+            .iter()
+            .find(|f| f.rule == "rung")
+            .expect("a rung finding");
+        assert_eq!(finding.severity, Severity::Error);
+        assert!(
+            finding
+                .message
+                .contains("rung claude:opus is not on the ladder"),
+            "{finding}"
+        );
+        // The working tree does not count: an uncommitted ladder that lists it changes nothing.
+        fs::write(
+            dir.join("cowproof.toml"),
+            "[ladder]\nrungs = [\"claude:haiku\", \"claude:opus\"]\n",
+        )
+        .unwrap();
+        assert!(has(
+            &lint_packet(&rung_packet("claude:opus"), &dir, &[]),
+            "rung"
+        ));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_broken_ladder_at_the_base_is_a_rung_error_and_no_repository_skips_the_check() {
+        let dir = repo_with_config(Some("[ladder]\nrungs = []\n"));
+        let findings = lint_packet(&rung_packet("claude:haiku"), &dir, &[]);
+        let finding = findings
+            .iter()
+            .find(|f| f.rule == "rung")
+            .expect("a rung finding");
+        assert!(finding.message.contains("must not be empty"), "{finding}");
+        // A header with no rung never reads the config.
+        let no_rung = packet(r#"{"id":"lane-x","owns":["README.md"]}"#, "");
+        assert!(!has(&lint_packet(&no_rung, &dir, &[]), "rung"));
+        fs::remove_dir_all(dir).unwrap();
+        // Not a repository, or no commit yet: nothing to read, so nothing to report.
+        let bare = root();
+        assert!(!has(
+            &lint_packet(&rung_packet("codex:whatever"), &bare, &[]),
+            "rung"
+        ));
+        fs::remove_dir_all(bare).unwrap();
     }
 
     #[test]
