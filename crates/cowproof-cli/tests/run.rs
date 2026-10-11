@@ -3994,16 +3994,12 @@ fn a_named_reassign_onto_a_runtime_with_no_adapter_is_refused_too() {
     let h = owned_packet(&asks_until(9, &then_checks()));
     let mut child = start(&h);
     let first = wait_for_ask(&h, &mut child, 1);
-    rule(
-        &h,
-        &first,
-        &["--reassign", "--model", "openrouter:glm-5.3-flash"],
-    );
+    rule(&h, &first, &["--reassign", "--model", "codex:gpt-6-luna"]);
     let out = finish(child);
     assert_reassign_refused(
         &h,
         &out,
-        "runtime `openrouter` has no adapter yet (D28 step 1)",
+        "runtime `codex` has no adapter yet (D28 step 1)",
         1,
         0,
     );
@@ -4046,12 +4042,8 @@ fn starting_on_a_runtime_with_no_adapter_is_exit_4_before_anything_starts() {
 
     // The flag.
     let by_flag = Harness::new("");
-    let out = by_flag.run_with(&["--model", "openrouter:glm-5.3-flash"]);
-    assert_refused_before_start(
-        &by_flag,
-        &out,
-        "runtime `openrouter` has no adapter yet (D28 step 1)",
-    );
+    let out = by_flag.run_with(&["--model", "codex:gpt-6-luna"]);
+    assert_refused_before_start(&by_flag, &out, no_adapter);
 
     // The header, on a ladder that lists the rung.
     let mut by_header = Harness::new("");
