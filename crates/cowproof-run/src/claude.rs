@@ -8,6 +8,17 @@ use anyhow::{Result, bail};
 use std::fmt;
 use std::path::PathBuf;
 
+/// Built-in tools a coding builder needs, and only those.
+///
+/// Builders must never spawn agents (Task, Workflow), schedule work
+/// (CronCreate, CronDelete, CronList, ScheduleWakeup), message others
+/// (SendMessage, ListAgents), load skills (Skill), or make worktrees
+/// (EnterWorktree, ExitWorktree). This list names the safe subset for
+/// coding work: reading files, editing code, running shell commands,
+/// searching, and writing results. Pass this to `--tools` and complement
+/// it with `--disallowedTools` for defence in depth.
+const BUILDER_BUILTIN_TOOLS: &str = "Bash,Read,Edit,Write,Glob,Grep";
+
 /// Complete specification for a Claude Code invocation.
 ///
 /// Contains lane configuration, model selection, credentials, paths to configuration files,
@@ -180,6 +191,10 @@ pub fn claude_command(spec: &ClaudeSpec) -> Result<ClaudeInvocation> {
             .into_owned(),
         "--max-turns".to_string(),
         spec.max_turns.to_string(),
+        "--tools".to_string(),
+        BUILDER_BUILTIN_TOOLS.to_string(),
+        "--disallowedTools".to_string(),
+        "Task,Workflow,SendMessage,ScheduleWakeup,CronCreate,Skill,EnterWorktree".to_string(),
     ];
 
     // Add resume session ID only when given
@@ -293,6 +308,10 @@ mod tests {
             "/nonexistent-cp/system-prompt.txt",
             "--max-turns",
             "5",
+            "--tools",
+            "Bash,Read,Edit,Write,Glob,Grep",
+            "--disallowedTools",
+            "Task,Workflow,SendMessage,ScheduleWakeup,CronCreate,Skill,EnterWorktree",
             "Test prompt",
         ];
 
@@ -330,6 +349,10 @@ mod tests {
             "/nonexistent-cp/system-prompt.txt",
             "--max-turns",
             "5",
+            "--tools",
+            "Bash,Read,Edit,Write,Glob,Grep",
+            "--disallowedTools",
+            "Task,Workflow,SendMessage,ScheduleWakeup,CronCreate,Skill,EnterWorktree",
             "--resume",
             "abc123def456",
             "Test prompt",
@@ -627,6 +650,59 @@ mod tests {
             spec.path = path.to_string();
             let err = claude_command(&spec).unwrap_err();
             assert!(err.to_string().contains("empty entry"), "{path}: {err}");
+        }
+    }
+
+    #[test]
+    fn args_contain_tools_flag() {
+        let spec = test_spec();
+        let inv = claude_command(&spec).unwrap();
+
+        let idx = inv
+            .args
+            .iter()
+            .position(|a| a == "--tools")
+            .expect("--tools not found in args");
+        assert_eq!(
+            inv.args[idx + 1],
+            BUILDER_BUILTIN_TOOLS,
+            "tool list mismatch"
+        );
+    }
+
+    #[test]
+    fn args_contain_disallowed_tools_flag() {
+        let spec = test_spec();
+        let inv = claude_command(&spec).unwrap();
+
+        let idx = inv
+            .args
+            .iter()
+            .position(|a| a == "--disallowedTools")
+            .expect("--disallowedTools not found in args");
+        let disallowed = &inv.args[idx + 1];
+        assert!(disallowed.contains("Task"), "Task must be disallowed");
+        assert!(
+            disallowed.contains("Workflow"),
+            "Workflow must be disallowed"
+        );
+        assert!(disallowed.contains("Skill"), "Skill must be disallowed");
+        assert!(
+            disallowed.contains("EnterWorktree"),
+            "EnterWorktree must be disallowed"
+        );
+    }
+
+    #[test]
+    fn forbidden_tools_not_in_allowed_list() {
+        // Ensure Task, Workflow, Skill, EnterWorktree are not in BUILDER_BUILTIN_TOOLS
+        let forbidden = ["Task", "Workflow", "Skill", "EnterWorktree"];
+        for tool in forbidden {
+            assert!(
+                !BUILDER_BUILTIN_TOOLS.contains(tool),
+                "{} must not be in BUILDER_BUILTIN_TOOLS",
+                tool
+            );
         }
     }
 }
