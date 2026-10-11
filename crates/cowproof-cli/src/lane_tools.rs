@@ -189,23 +189,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_registry_tools_match_lane_tools() {
-        // Verify that the registry tools are built from LANE_TOOLS
-        // This catches drift between lane_tools and cowproof_run::prefix::LANE_TOOLS
-        let expected_tools: std::collections::HashSet<_> =
-            cowproof_run::prefix::LANE_TOOLS.iter().copied().collect();
-        let mut actual_tools = std::collections::HashSet::new();
-        for tool_name in cowproof_run::prefix::LANE_TOOLS {
-            match *tool_name {
-                "ask" | "check_ruling" | "run_check" => {
-                    actual_tools.insert(*tool_name);
-                }
-                _ => panic!("unknown tool in LANE_TOOLS: {}", tool_name),
-            }
-        }
-        assert_eq!(
-            actual_tools, expected_tools,
-            "registry tools must match LANE_TOOLS exactly"
-        );
+    fn the_served_tools_are_exactly_lane_tools() {
+        // The real server's registry, so a tool added to or dropped from
+        // either side fails here.
+        let server = server(PathBuf::from("/nonexistent-cp/runner.sock"));
+        let mut served: Vec<&str> = server.registry().names();
+        served.sort_unstable();
+        let mut expected: Vec<&str> = cowproof_run::prefix::LANE_TOOLS.to_vec();
+        expected.sort_unstable();
+        assert_eq!(served, expected);
     }
 }

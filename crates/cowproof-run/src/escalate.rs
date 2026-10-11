@@ -868,7 +868,11 @@ impl Queue {
                     // A fallback counts against the escalation limit.
                     *self.escalation_count.entry(lane).or_insert(0) += 1;
                 }
-                QueueEvent::LaneEscalationLimit { lane, id: _, at_ms: _ } => {
+                QueueEvent::LaneEscalationLimit {
+                    lane,
+                    id: _,
+                    at_ms: _,
+                } => {
                     self.lane_state.insert(lane, LaneState::EscalationLimit);
                 }
                 QueueEvent::Rejected { .. } => {

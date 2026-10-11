@@ -101,8 +101,10 @@ pub fn events(
     let reader = BufReader::new(file);
 
     // Track blocking asks and their timestamps for past-cache detection
-    let mut blocking_asks: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
-    let mut past_cache_emitted: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut blocking_asks: std::collections::HashMap<String, u64> =
+        std::collections::HashMap::new();
+    let mut past_cache_emitted: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
 
     for line in reader.lines() {
         let line = line?;
@@ -633,7 +635,10 @@ this is not json
             .iter()
             .find(|e| e.kind == WatchKind::Ruling)
             .unwrap();
-        assert_eq!(ruled_event.at_ms, 2000, "at_ms should be recorded and readable");
+        assert_eq!(
+            ruled_event.at_ms, 2000,
+            "at_ms should be recorded and readable"
+        );
     }
 
     #[test]
@@ -653,7 +658,10 @@ this is not json
         let report = events(control_dir, "l1", None, None, None).unwrap();
         assert_eq!(report.events.len(), 1);
         assert_eq!(report.events[0].kind, WatchKind::Ruling);
-        assert_eq!(report.events[0].at_ms, 0, "missing at_ms should default to 0");
+        assert_eq!(
+            report.events[0].at_ms, 0,
+            "missing at_ms should default to 0"
+        );
     }
 
     #[test]
