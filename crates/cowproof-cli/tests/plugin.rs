@@ -317,3 +317,221 @@ fn the_example_packet_in_the_dispatch_skill_lints_clean() {
     assert!(out.status.success(), "lint failed:\n{stderr}");
     assert_eq!(stderr, "", "lint printed findings");
 }
+
+/// The plugin's `.mcp.json` must parse as valid JSON and declare exactly one server
+/// named `cowproof` with command `cowproof` and args `["serve", "--director"]`.
+#[test]
+fn the_mcp_json_declares_the_cowproof_director_server() {
+    let mcp = json("plugin/.mcp.json");
+    assert!(mcp["mcpServers"].is_object(), "mcpServers is an object");
+
+    let servers = mcp["mcpServers"].as_object().expect("mcpServers object");
+    assert_eq!(servers.len(), 1, "exactly one server declared");
+
+    let (name, config) = servers
+        .iter()
+        .next()
+        .expect("at least one server, just checked len == 1");
+    assert_eq!(name, "cowproof", "server name is cowproof");
+
+    assert_eq!(config["command"], "cowproof", "command is cowproof");
+    assert_eq!(
+        config["args"],
+        serde_json::json!(["serve", "--director"]),
+        "args are [\"serve\", \"--director\"]"
+    );
+}
+
+/// The real cowproof binary accepts `serve --director` as arguments and serves the four
+/// director tools. Test by driving the process over stdio with initialize and tools/list.
+#[test]
+fn the_cowproof_binary_serves_the_director_tools_over_stdio() {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let root = scratch();
+    let mut child = cowproof()
+        .args(["serve", "--director"])
+        .env("HOME", root.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start cowproof serve --director");
+
+    let mut stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+
+    // Send the MCP initialize request.
+    let frames = [
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": {"name": "test", "version": "0"}
+            }
+        }),
+        serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}),
+    ];
+    for frame in frames {
+        writeln!(stdin, "{frame}").expect("write frame");
+    }
+    drop(stdin);
+
+    // Collect responses.
+    let reader = std::io::BufReader::new(stdout);
+    use std::io::BufRead;
+    let mut responses = Vec::new();
+    for line in reader.lines() {
+        match line {
+            Ok(line) if !line.is_empty() => {
+                match serde_json::from_str::<serde_json::Value>(&line) {
+                    Ok(val) => responses.push(val),
+                    Err(e) => panic!("invalid JSON response: {e}\n{line}"),
+                }
+            }
+            Ok(_) => {}
+            Err(e) => panic!("failed to read stdout: {e}"),
+        }
+    }
+
+    let _ = child.wait();
+
+    // Find the tools/list response.
+    let tools_response = responses
+        .iter()
+        .find(|r| r.get("id") == Some(&serde_json::json!(2)))
+        .expect("received tools/list response");
+
+    let mut tool_names: Vec<&str> = tools_response
+        .get("result")
+        .and_then(|r| r.get("tools"))
+        .and_then(|t| t.as_array())
+        .expect("tools array in result")
+        .iter()
+        .filter_map(|t| t.get("name").and_then(|n| n.as_str()))
+        .collect();
+    tool_names.sort_unstable();
+
+    assert_eq!(tool_names, ["events", "lanes", "note", "rule"]);
+}
+
+/// Every MCP tool mentioned in the skills is served by the real binary.
+/// Parse tool references as "the `<name>` tool", assert each one is served, and assert
+/// at least one tool reference was found.
+#[test]
+fn every_mcp_tool_named_in_the_skills_is_served() {
+    use std::collections::HashSet;
+    use std::io::Write;
+    use std::process::Stdio;
+
+    // Parse tool references from all three skills. Extract any identifier in backticks
+    // that appears after "Use the" or "The" to catch actual tool references.
+    let mut referenced_tools = HashSet::new();
+    for skill_name in [
+        "cowproof-dispatch",
+        "cowproof-escalate",
+        "cowproof-handback",
+    ] {
+        let skill = read(&format!("plugin/skills/{skill_name}/SKILL.md"));
+        for line in skill.lines() {
+            // Extract tool names from lines containing "the `<name>` tool" or "Use the `<name>` tool".
+            if (line.contains("the `") && line.contains("` tool"))
+                || (line.contains("Use the `") && line.contains("` "))
+            {
+                // Simple extraction: look for `<name>` after "the " or "Use the ".
+                let searches = [("the `", "` tool"), ("Use the `", "` ")];
+                for (prefix, suffix) in &searches {
+                    if let Some(start_pos) = line.find(prefix) {
+                        let after_prefix = &line[start_pos + prefix.len()..];
+                        if let Some(end_pos) = after_prefix.find(suffix) {
+                            let tool_name = &after_prefix[..end_pos];
+                            // Only accept valid tool-like names (alphanumeric + underscore).
+                            if tool_name.chars().all(|c| c.is_alphanumeric() || c == '_') {
+                                referenced_tools.insert(tool_name.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // At least one tool reference must be found.
+    assert!(
+        !referenced_tools.is_empty(),
+        "no tool references found in skills"
+    );
+
+    // Get the live tools/list from the real binary.
+    let root = scratch();
+    let mut child = cowproof()
+        .args(["serve", "--director"])
+        .env("HOME", root.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start cowproof serve --director");
+
+    let mut stdin = child.stdin.take().expect("stdin");
+    let frames = [
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": {"name": "test", "version": "0"}
+            }
+        }),
+        serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}),
+    ];
+    for frame in frames {
+        writeln!(stdin, "{frame}").expect("write frame");
+    }
+    drop(stdin);
+
+    let reader = std::io::BufReader::new(child.stdout.take().expect("stdout"));
+    use std::io::BufRead;
+    let mut responses = Vec::new();
+    for line in reader.lines() {
+        match line {
+            Ok(line) if !line.is_empty() => {
+                if let Ok(val) = serde_json::from_str::<serde_json::Value>(&line) {
+                    responses.push(val);
+                }
+            }
+            Ok(_) => {}
+            Err(_) => break,
+        }
+    }
+    let _ = child.wait();
+
+    // Extract served tool names.
+    let empty = vec![];
+    let tools_array = responses
+        .iter()
+        .find(|r| r.get("id") == Some(&serde_json::json!(2)))
+        .and_then(|r| {
+            r.get("result")
+                .and_then(|res| res.get("tools").and_then(|t| t.as_array()))
+        })
+        .unwrap_or(&empty);
+    let served_tools: HashSet<&str> = tools_array
+        .iter()
+        .filter_map(|t| t.get("name").and_then(|n| n.as_str()))
+        .collect();
+
+    // Every referenced tool must be served.
+    for tool in &referenced_tools {
+        assert!(
+            served_tools.contains(tool.as_str()),
+            "tool `{tool}` named in a skill is not served by the server"
+        );
+    }
+}

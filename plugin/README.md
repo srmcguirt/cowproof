@@ -33,6 +33,13 @@ cargo install --git https://github.com/srmcguirt/cowproof cowproof-cli
 
 `cowproof run` also needs `claude` on the PATH and `ANTHROPIC_API_KEY` in the environment.
 
-## Not here yet
+## The director MCP server
 
-There is no `.mcp.json`. The director MCP server (`cowproof serve --director`) does not exist yet. It is the next step for this plugin, tracked at the top of `docs/backlog.md`. Until then the skills drive `cowproof` through the shell.
+The plugin includes `.mcp.json`, which declares the director MCP server. It runs `cowproof serve --director` and exposes four tools:
+
+- `lanes`: list every lane with its state, its parked blocking escalation and its pending notes.
+- `events`: return the escalation-queue events since a cursor (asks, rulings, notes, deliveries) and the next cursor.
+- `rule`: rule on an open escalation of a running lane with an answer, a redirect, a reassign or a stop.
+- `note`: send a note to a running lane.
+
+The MCP server starts automatically when the plugin loads. The skills prefer these tools to the shell commands where both are available.

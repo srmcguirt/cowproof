@@ -11,17 +11,21 @@ Pass the same `--lanes-root` to `watch`, `rule` and `note` that you gave `cowpro
 
 ## Watch
 
+Use the `lanes` tool to list every lane with its state, its parked blocking escalation and its pending notes. The tool returns the most recent state; no waiting or following.
+
 ```sh
 cowproof watch
 ```
 
-A table of lanes: `LANE`, `STATE`, `PARKED`, `AGE`, `NOTES` and `LAST EVENT`. `STATE` is `running` until the lane ends, then the lane's final status from `run.json` (`finished`, `failed`, `stopped`, `escalation-limit`, `interrupted`). `PARKED` shows the open blocking escalation, and marks it `past cache` once it has waited longer than `--cache-ttl` (default `1h`), so rule before then when you can. `NOTES` counts notes the builder has not read yet.
+The shell equivalent is a table of lanes: `LANE`, `STATE`, `PARKED`, `AGE`, `NOTES` and `LAST EVENT`. `STATE` is `running` until the lane ends, then the lane's final status from `run.json` (`finished`, `failed`, `stopped`, `escalation-limit`, `interrupted`). `PARKED` shows the open blocking escalation, and marks it `past cache` once it has waited longer than `--cache-ttl` (default `1h`), so rule before then when you can. `NOTES` counts notes the builder has not read yet.
+
+Use the `events` tool (with the cursor it returns) to follow escalation-queue events. It never waits: you poll it, passing back the cursor from the previous call.
 
 ```sh
 cowproof watch --events --follow
 ```
 
-One line per event, `<UTC time> <lane> <kind> <summary>`, kept running. Start it with the Bash tool's `run_in_background` option and read its output as lines arrive. Without `--follow` it prints what exists and exits. The kinds are:
+The shell equivalent starts a feed of events, one line per event: `<UTC time> <lane> <kind> <summary>`, kept running. The kinds are:
 
 - `asked`: a new escalation, with its id and whether it is `blocking` or `non-blocking`
 - `ruled`: you ruled on it
@@ -31,7 +35,7 @@ One line per event, `<UTC time> <lane> <kind> <summary>`, kept running. Start it
 - `note` and `note-delivered`
 - `lane-escalation-limit`: the lane ended because it used up its escalations
 
-The event line carries the id and nothing else. To read the question, open `<lanes-root>/<lane>/control/escalations.jsonl` and find the `asked` line with that id. Its `ask` object has `kind` (`blocker`, `design`, `scope` or `environment`), `question`, `tried`, `options` (each with `id`, `summary`, `cost`), `recommend` and `blocking`. Its `origin` says whether the builder asked or cowproof forced it. Escalation ids look like `<lane-id>:E1`.
+The `events` tool returns summaries (ids and sizes), not what a builder wrote. To read the question in an escalation, open `<lanes-root>/<lane>/control/escalations.jsonl` and find the `asked` line with that id. Its `ask` object has `kind` (`blocker`, `design`, `scope` or `environment`), `question`, `tried`, `options` (each with `id`, `summary`, `cost`), `recommend` and `blocking`. Its `origin` says whether the builder asked or cowproof forced it. Escalation ids look like `<lane-id>:E1`.
 
 Why a lane escalates:
 
@@ -42,11 +46,13 @@ Why a lane escalates:
 
 ## Rule
 
+Use the `rule` tool to rule on an open escalation of a running lane. Exactly one of `answer`, `redirect`, `reassign` or `stop` per ruling. The tool reaches the lane through its control socket, so it works only while `cowproof run` is still going; against a lane that has ended it fails.
+
+The shell equivalent is:
+
 ```sh
 cowproof rule <lane-id> <escalation-id> --answer "<text>"
 ```
-
-Exactly one of `--answer`, `--redirect`, `--reassign` or `--stop` per ruling. `cowproof rule` talks to the lane through its control socket, so it works only while `cowproof run` is still going; against a lane that has ended it fails. On success it prints the outcome, including `delivery`.
 
 **Answer.** Text for the builder. A parked builder's session is resumed with your text as the director's ruling. If the session cannot be resumed, a fresh session starts from the packet plus a summary of the question. A non-blocking ask gets the text on its next `check_ruling`. Name the choice and the reason, not only "yes".
 
@@ -77,11 +83,13 @@ End the lane. Its status is `stopped`, its work stays in `<lanes-root>/<lane-id>
 
 ## Notes
 
+Use the `note` tool to send a note to a running lane: guidance the builder reads on its next `check_ruling`, with no escalation opened. The text must not be empty and may be up to 4000 bytes. A lane that has ended refuses it.
+
+The shell equivalent is:
+
 ```sh
 cowproof note <lane-id> "<text>"
 ```
-
-Guidance for a running lane, with no escalation behind it. The builder reads it on its next `check_ruling` and keeps working. The text must not be empty and may be up to 4000 bytes. A lane that has ended refuses it.
 
 ## How to rule
 

@@ -78,10 +78,10 @@ Useful flags, with their defaults from `cowproof run --help`:
 - `--turn-budget <n>`: escalate early when the builder reaches this many assistant turns (40).
 - `--cost-cap-usd <usd>`: the lane's cost cap (5). It is a trigger, not a hard stop: at 40% of it, on an estimate, the lane escalates.
 - `--allow-dirty`: record uncommitted changes as the base patch.
-- `--lanes-root <dir>`: where lanes live (default `~/.cache/cowproof/lanes`). Pass the same value to `watch`, `rule` and `note`.
+- `--lanes-root <dir>`: where lanes live (default `~/.cache/cowproof/lanes`). Pass the same value to the `lanes`, `events`, `rule` and `note` MCP tools, or to the `watch`, `rule` and `note` shell commands.
 - `--heldout <file>`: held-out checks, kept outside the repository and never shown to the builder. The runner copies the file into the capsule, and `cowproof verify` runs it.
 
-Escalations arrive while the lane runs. Rule on them with `cowproof-escalate`.
+Escalations arrive while the lane runs. Rule on them with the `cowproof-escalate` skill, which uses the MCP tools.
 
 ## What the run writes
 

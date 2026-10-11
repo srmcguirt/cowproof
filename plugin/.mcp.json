@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "cowproof": {
+      "command": "cowproof",
+      "args": ["serve", "--director"]
+    }
+  }
+}
