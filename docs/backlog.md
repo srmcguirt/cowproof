@@ -2,6 +2,7 @@
 
 Work the crate port (2026-10-09) deferred or exposed. Newest first.
 
+- **Two copies of the launch-path replay (2026-10-11).** `remove_launch_paths` exists in `crates/cowproof-cli/src/verify.rs` and in cowproof-prove's replay. The base-commit `CLAUDE.md` lane taught the CLI copy to unlink a symlink at the end of a removed path, which the prove copy already did. Merge them into one function in cowproof-prove and delete the CLI copy.
 - **Q-2: the legacy runner is gone (2026-10-11); what went with it.** `cowproof host run` now starts `cowproof run <packet> --repo <cwd> --lanes-root <root>` (`host_run_argv`), and `legacy-run` with its lane loop is deleted from `main.rs` (3,049 to 1,586 lines). Removed with it, and not yet provided by `cowproof run`:
   - **Remote dispatch over SSH** (`legacy-run --host`, `remote_run`). `cowproof run` has no `--host`; the D24 remote path (sockets forwarded over SSH, the key staying with the director) is open, and O-1 depends on it.
   - **Codex and OpenCode builders.** `cowproof run` drives Claude Code only (D2).
