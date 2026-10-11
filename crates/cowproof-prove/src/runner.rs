@@ -139,8 +139,9 @@ pub fn terminate_process_group(pgid: u32) {
 }
 
 fn signal_process_group(pgid: u32, signal: libc::c_int) {
-    // A pgid of 0 would make `-pgid` the caller's own group.
-    if let Some(pgid) = positive_pid(pgid) {
+    // A pgid of 0 would make `-pgid` the caller's own group, and 1 would make it -1: every
+    // process the caller may signal.
+    if let Some(pgid) = group_id(pgid) {
         // SAFETY: `kill(2)` takes two integers and touches no memory.
         unsafe {
             libc::kill(-pgid, signal);
@@ -153,6 +154,12 @@ fn signal_process_group(pgid: u32, signal: libc::c_int) {
 /// function below goes through this before it reaches `kill(2)`.
 fn positive_pid(id: u32) -> Option<libc::pid_t> {
     libc::pid_t::try_from(id).ok().filter(|p| *p > 0)
+}
+
+/// `pgid` as a group to negate for `kill(2)`, or `None` for 0, 1 and anything too large:
+/// `kill(-1, ..)` reaches every process the caller may signal, and pid 1's group is init's.
+fn group_id(pgid: u32) -> Option<libc::pid_t> {
+    positive_pid(pgid).filter(|p| *p > 1)
 }
 
 /// What `kill(target, 0)` says about `target` (a pid, or a negated pgid): EPERM means it
@@ -179,7 +186,7 @@ pub fn pid_exists(pid: u32) -> Option<bool> {
 
 /// Whether any process is left in the group `pgid`, answered like [`pid_exists`].
 pub fn group_exists(pgid: u32) -> Option<bool> {
-    target_exists(-positive_pid(pgid)?)
+    target_exists(-group_id(pgid)?)
 }
 
 /// Send `signal` to the one process `pid`. Whether `kill(2)` accepted it; false, with nothing
@@ -540,6 +547,11 @@ pub(crate) mod tests {
         // (pid 0 is the caller's own group); the answer must still be false.
         assert!(!signal_pid(0, 0));
         assert!(!signal_pid(u32::MAX, 0));
+        // A group of 1 would be kill(-1, ..): every process this user may signal.
+        assert_eq!(group_id(1), None);
+        assert_eq!(group_id(0), None);
+        assert_eq!(group_id(2), Some(2));
+        assert_eq!(group_exists(1), None);
         // This process is still here and so is the test.
         assert_eq!(pid_exists(std::process::id()), Some(true));
     }
