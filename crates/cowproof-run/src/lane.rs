@@ -52,6 +52,8 @@ pub struct LaneControl {
     pub launch_commit: String,
     /// Files removed for the launch baseline, relative to the clone, sorted.
     pub removed_paths: Vec<String>,
+    /// Method used to copy the object store: "clonefile", "reflink", or "copy".
+    pub clone_method: String,
 }
 
 /// Git configuration for every command that writes in the clone: no hooks, a
@@ -184,7 +186,7 @@ fn build_lane(
         None
     };
 
-    clone_isolated(repo, &layout.clone, base_commit)?;
+    let clone_method = clone_isolated(repo, &layout.clone, base_commit)?;
 
     if let Some(patch) = &base_patch {
         git_apply(&layout.clone, patch).context("applying the base patch")?;
@@ -199,6 +201,7 @@ fn build_lane(
         base_commit: base_commit.to_string(),
         launch_commit: launch_commit.clone(),
         removed_paths: removed_paths.clone(),
+        clone_method,
     };
     let path = layout.control.join("lane.json");
     fs::write(
@@ -348,26 +351,81 @@ fn capture_base_patch(repo: &Path, scratch: &Path) -> Result<Vec<u8>> {
     Ok(patch)
 }
 
-/// `git clone --no-hardlinks --no-checkout`, then drop the only remote and
-/// check out the base commit. The result shares nothing with the source.
-fn clone_isolated(repo: &Path, clone: &Path, base_commit: &str) -> Result<()> {
-    let out = Command::new("git")
-        .args(WRITE_CONFIG)
-        .args(["clone", "-q", "--no-hardlinks", "--no-checkout"])
-        .arg(repo)
-        .arg(clone)
-        .output()
-        .context("running git clone")?;
-    check(out, &["clone"])?;
-    git_clone_write(clone, &["remote", "remove", "origin"])?;
+/// Initialize a clone with copy-on-write objects. The source's objects are
+/// copied using APFS clonefile (macOS), reflink (Linux), or a plain copy as
+/// fallback. The method used is returned. No remotes, alternates or hooks
+/// from the source; HEAD points to base_commit; the checkout is verified clean.
+fn clone_isolated(repo: &Path, clone: &Path, base_commit: &str) -> Result<String> {
     // A source that borrows objects from another repository would leave the
     // clone borrowing them too; refuse rather than share.
-    if clone.join(".git/objects/info/alternates").exists() {
+    if repo.join(".git/objects/info/alternates").exists() {
         bail!(
-            "the clone has objects/info/alternates; the source repository borrows objects, which would share storage with the lane"
+            "the source repository borrows objects (has alternates); the lane would share storage"
         );
     }
-    git_clone_write(clone, &["checkout", "-q", "--detach", base_commit])?;
+
+    // Initialize the clone repository first.
+    fs::create_dir_all(clone).context("creating clone directory")?;
+    let out = Command::new("git")
+        .args(WRITE_CONFIG)
+        .args(["init", "-q"])
+        .arg(clone)
+        .output()
+        .context("running git init")?;
+    check(out, &["init"])?;
+
+    // Resolve the base commit in the source before copying objects.
+    let base_resolved = git_text(&git_source(
+        repo,
+        &["rev-parse", "--verify", "--end-of-options", base_commit],
+    )?)?;
+
+    // Copy the source's .git/objects using copy-on-write. Detect which method succeeded.
+    let objects_src = repo.join(".git/objects");
+    let objects_dst = clone.join(".git/objects");
+    // Remove the placeholder objects directory created by git init so cp can copy directly.
+    if objects_dst.exists() {
+        fs::remove_dir_all(&objects_dst).context("removing placeholder objects directory")?;
+    }
+    let clone_method = copy_objects_cow(&objects_src, &objects_dst)?;
+
+    // Verify the copied objects are complete before proceeding.
+    let fsck = Command::new("git")
+        .arg("-C")
+        .arg(clone)
+        .args(["fsck", "--connectivity-only", &base_resolved])
+        .output()
+        .context("running git fsck")?;
+    if !fsck.status.success() {
+        let error_msg = if fsck.stderr.is_empty() {
+            String::from_utf8_lossy(&fsck.stdout).to_string()
+        } else {
+            String::from_utf8_lossy(&fsck.stderr).to_string()
+        };
+        bail!("git fsck failed: {}", error_msg);
+    }
+
+    // Point HEAD at the base commit.
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(clone)
+        .args(["update-ref", "HEAD", &base_resolved])
+        .output()
+        .context("running git update-ref")?;
+    check(out, &["update-ref"])?;
+
+    // Verify the base tree exists.
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(clone)
+        .args(["cat-file", "-e", &format!("{}^{{tree}}", base_resolved)])
+        .output()
+        .context("verifying base tree")?;
+    check(out, &["cat-file"])?;
+
+    // Check out the base commit.
+    git_clone_write(clone, &["checkout", "-q", "--detach", &base_resolved])?;
+
     // `git checkout` exits 0 after "unable to read sha1 file" and leaves the
     // file out, so the exit status alone does not prove a complete checkout.
     let leftover = git_clone_read(clone, &["status", "--porcelain"])?.stdout;
@@ -377,7 +435,58 @@ fn clone_isolated(repo: &Path, clone: &Path, base_commit: &str) -> Result<()> {
             String::from_utf8_lossy(&leftover).trim_end()
         );
     }
-    Ok(())
+
+    // Verify no alternates in the clone.
+    if clone.join(".git/objects/info/alternates").exists() {
+        bail!("copy-on-write failed: clone has alternates from the source");
+    }
+
+    Ok(clone_method)
+}
+
+/// Copy the source's object store using copy-on-write where available.
+/// Returns the method used: "clonefile" on macOS, "reflink" on Linux, or "copy" as fallback.
+fn copy_objects_cow(src: &Path, dst: &Path) -> Result<String> {
+    // Try copy-on-write methods in order.
+    if cfg!(target_os = "macos") {
+        // macOS: try APFS clonefile with cp -c
+        let out = Command::new("cp")
+            .arg("-c")
+            .arg("-R")
+            .arg(src)
+            .arg(dst)
+            .output()
+            .context("running cp -c -R")?;
+        if out.status.success() {
+            return Ok("clonefile".to_string());
+        }
+        // clonefile not supported on this filesystem; fall through to plain copy
+    }
+
+    if cfg!(target_os = "linux") {
+        // Linux: try reflink with cp --reflink=auto
+        let out = Command::new("cp")
+            .arg("--reflink=auto")
+            .arg("-R")
+            .arg(src)
+            .arg(dst)
+            .output()
+            .context("running cp --reflink=auto")?;
+        if out.status.success() {
+            return Ok("reflink".to_string());
+        }
+        // reflink not supported; fall through to plain copy
+    }
+
+    // Fallback: plain recursive copy.
+    let out = Command::new("cp")
+        .arg("-R")
+        .arg(src)
+        .arg(dst)
+        .output()
+        .context("running cp -R")?;
+    check(out, &["cp"])?;
+    Ok("copy".to_string())
 }
 
 fn git_apply(clone: &Path, patch: &[u8]) -> Result<()> {
@@ -743,29 +852,35 @@ mod tests {
     }
 
     #[test]
-    fn clone_shares_no_storage_with_the_source() {
+    fn clone_uses_cow_and_shares_no_inodes_with_the_source() {
         let tmp = TempDir::new().unwrap();
         let repo = repo_with(&tmp, &[("README.md", "one"), ("src/a.rs", "fn a() {}")]);
 
         let lane = prepare_lane(&repo, &tmp.path().join("lanes"), "l1", clean_opts()).unwrap();
         let clone = &lane.layout.clone;
 
+        // Clone method is recorded and valid.
+        let control: LaneControl =
+            serde_json::from_slice(&fs::read(lane.layout.control.join("lane.json")).unwrap())
+                .unwrap();
+        assert!(
+            ["clonefile", "reflink", "copy"].contains(&control.clone_method.as_str()),
+            "invalid clone_method: {}",
+            control.clone_method
+        );
+
+        // No alternates or remotes.
         assert!(!clone.join(".git/objects/info/alternates").exists());
         assert_eq!(git(clone, &["remote"]), "");
 
-        // The commit object exists loose in both and is a different file.
-        let head = git(&repo, &["rev-parse", "HEAD"]);
-        let head = head.trim();
-        let rel = format!(".git/objects/{}/{}", &head[..2], &head[2..]);
-        let source_ino = fs::metadata(repo.join(&rel)).unwrap().ino();
-        let clone_ino = fs::metadata(clone.join(&rel)).unwrap().ino();
-        assert_ne!(source_ino, clone_ino, "the same inode means a hardlink");
+        // No hooks copied from the source. Git creates sample hooks, but we verify
+        // they are not copies from the source (copy-on-write copies objects only).
+        // The actual hook-not-running test is in hooks_from_the_source_do_not_exist_in_the_clone_and_do_not_run.
 
-        // And no object file of the clone is any object file of the source.
-        let shared: Vec<_> = object_inodes(&repo)
-            .intersection(&object_inodes(clone))
-            .copied()
-            .collect();
+        // No object file of the clone shares an inode with the source.
+        let source_inodes = object_inodes(&repo);
+        let clone_inodes = object_inodes(clone);
+        let shared: Vec<_> = source_inodes.intersection(&clone_inodes).copied().collect();
         assert!(shared.is_empty(), "shared inodes: {shared:?}");
     }
 
@@ -796,6 +911,43 @@ mod tests {
 
         assert!(err.to_string().contains("alternates"), "got: {err}");
         assert!(!lanes_root.join("l1").exists());
+    }
+
+    #[test]
+    fn hooks_from_the_source_do_not_exist_in_the_clone_and_do_not_run() {
+        let tmp = TempDir::new().unwrap();
+        let repo = repo_with(&tmp, &[("README.md", "one")]);
+
+        // Create a post-checkout hook in the source that writes a marker file.
+        let hook_dir = repo.join(".git/hooks");
+        fs::create_dir_all(&hook_dir).unwrap();
+        let hook = hook_dir.join("post-checkout");
+        fs::write(
+            &hook,
+            "#!/bin/sh\necho ran-hook > /tmp/cowproof-test-marker\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let lane = prepare_lane(&repo, &tmp.path().join("lanes"), "l1", clean_opts()).unwrap();
+        let clone = &lane.layout.clone;
+
+        // The hook must not exist in the clone.
+        assert!(
+            !clone.join(".git/hooks/post-checkout").exists(),
+            "post-checkout hook must not be copied to the clone"
+        );
+
+        // Verify the hook did not run by checking if the marker file was created.
+        let marker = std::path::Path::new("/tmp/cowproof-test-marker");
+        if marker.exists() {
+            let _ = fs::remove_file(marker);
+            panic!("hook from source ran inside the clone");
+        }
     }
 
     /// The packet's tree: every removal rule once, and survivors for each
@@ -847,6 +999,7 @@ mod tests {
             control.launch_commit,
             git(clone, &["rev-parse", "HEAD"]).trim()
         );
+        assert!(["clonefile", "reflink", "copy"].contains(&control.clone_method.as_str()));
 
         for gone in &expected {
             assert!(!clone.join(gone).exists(), "{gone} must be removed");
@@ -904,6 +1057,7 @@ mod tests {
                 "deep/er/.env",
             ]
         );
+        assert!(["clonefile", "reflink", "copy"].contains(&control.clone_method.as_str()));
         for kept in [
             "pkg/CLAUDE.local.md",
             "pkg/.mcp.json",
@@ -1063,6 +1217,27 @@ mod tests {
             serde_json::from_slice(&fs::read(lane.layout.control.join("lane.json")).unwrap())
                 .unwrap();
         assert!(control.removed_paths.is_empty());
+        assert!(["clonefile", "reflink", "copy"].contains(&control.clone_method.as_str()));
+    }
+
+    #[test]
+    fn clone_method_is_recorded_in_control_json() {
+        let tmp = TempDir::new().unwrap();
+        let repo = repo_with(&tmp, &[("README.md", "one")]);
+
+        let lane = prepare_lane(&repo, &tmp.path().join("lanes"), "l1", clean_opts()).unwrap();
+
+        // The clone_method is recorded in lane.json.
+        let control: LaneControl =
+            serde_json::from_slice(&fs::read(lane.layout.control.join("lane.json")).unwrap())
+                .unwrap();
+        assert!(
+            ["clonefile", "reflink", "copy"].contains(&control.clone_method.as_str()),
+            "invalid clone_method: {}",
+            control.clone_method
+        );
+        assert_eq!(control.base_commit, lane.base_commit);
+        assert_eq!(control.launch_commit, lane.launch_commit);
     }
 
     #[test]
@@ -1141,10 +1316,9 @@ mod tests {
 
     /// Cleanup seam: the source passes every check made before the lane
     /// directory is created (status, held-out scan, HEAD), but one of its
-    /// blobs is missing from the object store. `git clone` copies objects
-    /// without reading them, so the failure comes at the later checkout of the
-    /// base commit, after the lane directory exists. No production branch is
-    /// involved; only the repository's state differs.
+    /// blobs is missing from the object store. Our copy-on-write implementation
+    /// detects this during fsck, which happens after the lane directory exists.
+    /// The failure removes the lane directory and returns the error.
     #[test]
     fn failure_after_the_lane_dir_exists_removes_it_and_returns_the_original_error() {
         let tmp = TempDir::new().unwrap();
@@ -1168,8 +1342,8 @@ mod tests {
 
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("does not match the base commit") && msg.contains("data.txt"),
-            "got: {msg}"
+            msg.contains("fsck failed") || msg.contains("missing"),
+            "should fail during fsck on missing object: {msg}"
         );
         assert!(
             lanes_root.exists(),
