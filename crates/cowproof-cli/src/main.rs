@@ -72,6 +72,12 @@ enum Action {
     Rule(RuleArgs),
     /// Send a note to a running lane: `cowproof note <lane-id> <text> [--lanes-root <dir>]`
     Note(NoteArgs),
+    /// Ask the director a question (mirrors the MCP `ask` tool for runtimes without MCP).
+    Ask(AskArgs),
+    /// Check the status of an ask or retrieve notes (mirrors the MCP `check_ruling` tool).
+    Ruling(RulingArgs),
+    /// Run a declared check (mirrors the MCP `run_check` tool).
+    Check(CheckArgs),
     /// The builder's tools (`ask`, `check_ruling`, `run_check`) as an MCP
     /// stdio server. It runs inside the sandbox and is only a client of the
     /// runner socket; the builder runtime launches it, people do not.
@@ -121,6 +127,49 @@ struct NoteArgs {
     /// Lanes root directory (auto-detected if not specified).
     #[arg(long)]
     lanes_root: Option<PathBuf>,
+}
+
+#[derive(Parser)]
+struct AskArgs {
+    /// The question kind: blocker, design, scope, or environment.
+    #[arg(long)]
+    kind: String,
+    /// The question text (one paragraph); use `-` to read from stdin.
+    #[arg(long)]
+    question: String,
+    /// What was attempted and what happened (repeatable).
+    #[arg(long)]
+    tried: Vec<String>,
+    /// An option the director can choose from (repeatable, format: id:summary:cost).
+    #[arg(long)]
+    option: Vec<String>,
+    /// The id of the recommended option.
+    #[arg(long)]
+    recommend: String,
+    /// Whether this ask blocks the builder until ruled (default: false).
+    #[arg(long, action = clap::ArgAction::SetTrue)]
+    blocking: bool,
+    /// The runner socket path (defaults to env var COWPROOF_RUNNER_SOCKET).
+    #[arg(long)]
+    socket: Option<PathBuf>,
+}
+
+#[derive(Parser)]
+struct RulingArgs {
+    /// The ask ID to check (optional; omit to check for notes only).
+    id: Option<String>,
+    /// The runner socket path (defaults to env var COWPROOF_RUNNER_SOCKET).
+    #[arg(long)]
+    socket: Option<PathBuf>,
+}
+
+#[derive(Parser)]
+struct CheckArgs {
+    /// The check ID declared in the packet.
+    check_id: String,
+    /// The runner socket path (defaults to env var COWPROOF_RUNNER_SOCKET).
+    #[arg(long)]
+    socket: Option<PathBuf>,
 }
 
 #[derive(Parser)]
@@ -297,6 +346,9 @@ async fn main() -> Result<()> {
         Action::Watch(args) => watch::watch(args).await,
         Action::Rule(args) => rule_command(args).await,
         Action::Note(args) => note_command(args).await,
+        Action::Ask(args) => ask_command(args).await,
+        Action::Ruling(args) => ruling_command(args).await,
+        Action::Check(args) => check_command(args).await,
         Action::LaneTools(args) => lane_tools::run(args.socket).await,
         Action::NetBridge(args) => net_bridge_command(args).await,
     }
@@ -2925,6 +2977,90 @@ async fn note_command(args: NoteArgs) -> Result<()> {
         );
         std::process::exit(1);
     }
+}
+
+/// Get the runner socket path from --socket flag or COWPROOF_RUNNER_SOCKET env var.
+fn get_runner_socket(explicit: Option<PathBuf>) -> Result<PathBuf> {
+    if let Some(socket) = explicit {
+        return Ok(socket);
+    }
+    std::env::var("COWPROOF_RUNNER_SOCKET")
+        .map(PathBuf::from)
+        .map_err(|_| anyhow!("missing --socket or COWPROOF_RUNNER_SOCKET env var"))
+}
+
+/// Forward one builder-tool call to the runner and print its response as JSON.
+async fn print_forwarded(op: lane_tools::Op, socket: &Path, input: &Value) -> Result<()> {
+    match lane_tools::forward(op, socket, input).await {
+        Ok(response) => {
+            println!("{}", serde_json::to_string_pretty(&response)?);
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+async fn ask_command(args: AskArgs) -> Result<()> {
+    use std::io::Read;
+
+    let socket = get_runner_socket(args.socket)?;
+
+    // Read question from stdin if needed (- means stdin)
+    let question = if args.question == "-" {
+        let mut q = String::new();
+        std::io::stdin().read_to_string(&mut q)?;
+        q
+    } else {
+        args.question
+    };
+
+    // Parse options from the repeatable --option flags (format: id:summary:cost)
+    let mut options = Vec::new();
+    for opt_str in args.option {
+        let parts: Vec<&str> = opt_str.splitn(3, ':').collect();
+        if parts.len() != 3 {
+            return Err(anyhow!("each --option must be in format: id:summary:cost"));
+        }
+        options.push(json!({
+            "id": parts[0],
+            "summary": parts[1],
+            "cost": parts[2],
+        }));
+    }
+
+    // Build the ask request
+    let input = json!({
+        "kind": args.kind,
+        "question": question,
+        "tried": args.tried,
+        "options": options,
+        "recommend": args.recommend,
+        "blocking": args.blocking,
+    });
+
+    print_forwarded(lane_tools::Op::Ask, &socket, &input).await
+}
+
+async fn ruling_command(args: RulingArgs) -> Result<()> {
+    let socket = get_runner_socket(args.socket)?;
+
+    let input = if let Some(id) = args.id {
+        json!({ "id": id })
+    } else {
+        json!({})
+    };
+
+    print_forwarded(lane_tools::Op::CheckRuling, &socket, &input).await
+}
+
+async fn check_command(args: CheckArgs) -> Result<()> {
+    let socket = get_runner_socket(args.socket)?;
+
+    let input = json!({ "id": args.check_id });
+    print_forwarded(lane_tools::Op::RunCheck, &socket, &input).await
 }
 
 #[cfg(test)]

@@ -11,7 +11,7 @@ use anyhow::{Result, anyhow};
 use portkit_core::{Error, Registry, Tool, ToolSpec, async_trait};
 use portkit_mcp::{McpServer, ServerInfo};
 use serde_json::{Value, json};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
@@ -20,7 +20,7 @@ use tokio::net::UnixStream;
 const MAX_RESPONSE: u64 = 1024 * 1024;
 
 #[derive(Clone, Copy)]
-enum Op {
+pub(crate) enum Op {
     Ask,
     CheckRuling,
     RunCheck,
@@ -108,29 +108,27 @@ impl Tool for Forward {
 
     async fn call(&self, input: Value) -> portkit_core::Result<Value> {
         let name = self.op.name();
-        // Only the fields each op defines are forwarded.
-        let request = match self.op {
-            Op::Ask => json!({ "op": name, "ask": input }),
-            Op::CheckRuling => {
-                if input.get("id").is_some() && input["id"] != json!(null) {
-                    json!({ "op": name, "id": input["id"] })
-                } else {
-                    json!({ "op": name })
-                }
-            }
-            Op::RunCheck => json!({ "op": name, "id": input["id"] }),
-        };
-        let mut response = round_trip(&self.socket, &request)
+        forward(self.op, &self.socket, &input)
             .await
-            .map_err(|e| Error::tool_failed(name, e.to_string()))?;
-        if response["ok"] != json!(true) {
-            let reason = response["error"].as_str().unwrap_or("the runner refused");
-            return Err(Error::tool_failed(name, reason));
+            .map_err(|e| Error::tool_failed(name, e.to_string()))
+    }
+}
+
+/// Build a request for the runner from an operation and input.
+/// The input must match the operation's schema.
+fn build_request(op: Op, input: &Value) -> Result<Value> {
+    let name = op.name();
+    // Only the fields each op defines are forwarded.
+    match op {
+        Op::Ask => Ok(json!({ "op": name, "ask": input })),
+        Op::CheckRuling => {
+            if input.get("id").is_some() && input["id"] != json!(null) {
+                Ok(json!({ "op": name, "id": input["id"] }))
+            } else {
+                Ok(json!({ "op": name }))
+            }
         }
-        if let Some(fields) = response.as_object_mut() {
-            fields.remove("ok");
-        }
-        Ok(response)
+        Op::RunCheck => Ok(json!({ "op": name, "id": input["id"] })),
     }
 }
 
@@ -150,6 +148,22 @@ async fn round_trip(socket: &PathBuf, request: &Value) -> Result<Value> {
         return Err(anyhow!("the runner closed the connection without a reply"));
     }
     serde_json::from_slice(&response).map_err(|e| anyhow!("the runner sent an invalid reply: {e}"))
+}
+
+/// Forward a request through the runner socket, handle the response, and strip the ok field.
+/// Returns an error if the runner responded with ok=false. The MCP tools and the
+/// `ask`, `ruling` and `check` commands all go through here.
+pub(crate) async fn forward(op: Op, socket: &Path, input: &Value) -> Result<Value> {
+    let request = build_request(op, input)?;
+    let mut response = round_trip(&socket.to_path_buf(), &request).await?;
+    if response["ok"] != json!(true) {
+        let reason = response["error"].as_str().unwrap_or("the runner refused");
+        return Err(anyhow!("{}", reason));
+    }
+    if let Some(fields) = response.as_object_mut() {
+        fields.remove("ok");
+    }
+    Ok(response)
 }
 
 /// The MCP server for a lane's socket: exactly three tools.

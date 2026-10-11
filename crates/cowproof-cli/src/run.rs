@@ -644,6 +644,10 @@ impl Launcher {
             cache_ttl: "1h".to_string(),
             path: self.path.clone(),
         })?;
+        invocation.env.push((
+            "COWPROOF_RUNNER_SOCKET".to_string(),
+            self.socket.to_string_lossy().into_owned(),
+        ));
         invocation.program = self.claude_bin.to_string_lossy().into_owned();
         let claude: Vec<String> = std::iter::once(invocation.program.clone())
             .chain(invocation.args.iter().cloned())
