@@ -117,6 +117,14 @@ pub struct Capsule {
     /// `cowproof verify` uses the same class slot. Defaults to "light".
     #[serde(default = "default_class")]
     pub class: String,
+    /// Whether the lane was traced: `pk doctor` found at least one recorded hook
+    /// call in the lane's portkit state dir at lane end (D5). Sealed in
+    /// `capsule.json`. A lane without `pk`, without hooks or whose doctor failed is
+    /// untraced, as are Codex and OpenRouter lanes by construction. It says how the
+    /// lane was watched and never enters the verdict. Absent in older capsules, which
+    /// read as false.
+    #[serde(default)]
+    pub traced: bool,
     /// Paths removed during the launch baseline, relative and sorted. Verify replays
     /// them by deleting these exact paths from the rebuilt tree. Stored in the hashed
     /// `launch_removed.json`, not in `capsule.json`, so editing it after `write`
@@ -159,6 +167,7 @@ impl Capsule {
             prefix_version: None,
             project_instructions_sha256: None,
             class: "light".to_string(),
+            traced: false,
             launch_removed: Vec::new(),
         }
     }

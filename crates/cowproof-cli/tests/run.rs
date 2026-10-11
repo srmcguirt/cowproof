@@ -219,6 +219,9 @@ impl Harness {
         {
             let _g = fork_lock();
             fs::copy(env!("CARGO_BIN_EXE_cowproof"), &cowproof).unwrap();
+            // `pk` goes beside it, as an install puts them: the runner finds the
+            // portkit CLI as the sibling of its own executable (G8).
+            fs::copy(env!("CARGO_BIN_EXE_pk"), work.path().join("pk")).unwrap();
         }
 
         let fake = work.path().join("fake-claude");
@@ -3455,4 +3458,201 @@ printf '%s\n' '{"type":"system", "subtype":"note"}'
         stream.contains(r#"{"type":"system", "subtype":"note"}"#),
         "{stream}"
     );
+}
+
+// Portkit hooks, the lane-private state dir and the lane-end doctor (D5, G8).
+
+/// A hook payload as Claude Code sends it after a `Read`: the minimum that makes
+/// `pk hook post-tool-use` write one agent-surface record.
+const POST_TOOL_USE: &str = r#"{"session_id":"s1","hook_event_name":"PostToolUse","tool_name":"Read","tool_input":{"file_path":"README.md"},"tool_response":{"content":"base"}}"#;
+
+/// Shell for a fake that fires `pk hook post-tool-use` once, with `pk` found
+/// beside the copied cowproof, then runs the packet's two checks.
+fn hook_once_then_checks() -> String {
+    format!(
+        "printf '%s' '{POST_TOOL_USE}' | \"$(dirname \"$cp_bin\")/pk\" hook post-tool-use\n{}",
+        run_checks(&["edit", "made"])
+    )
+}
+
+fn hook_command(settings: &Value, event: &str) -> String {
+    settings["hooks"][event][0]["hooks"][0]["command"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no {event} hook in {settings}"))
+        .to_string()
+}
+
+#[test]
+fn the_builder_settings_have_the_three_hooks_with_the_absolute_pk_beside_cowproof() {
+    if !sandbox_available() {
+        return;
+    }
+    let h = Harness::new("");
+    h.run_ok();
+    let settings: Value = serde_json::from_str(&h.seg(1, "settings.json")).unwrap();
+    let pk = h.work.path().canonicalize().unwrap().join("pk");
+    for (event, arg) in [
+        ("PostToolUse", "post-tool-use"),
+        ("UserPromptSubmit", "user-prompt-submit"),
+        ("SessionEnd", "session-end"),
+    ] {
+        let command = hook_command(&settings, event);
+        let program = command.split_whitespace().next().unwrap();
+        assert!(Path::new(program).is_absolute(), "{command}");
+        assert!(program.ends_with("/pk"), "{command}");
+        assert!(Path::new(program).is_file(), "{command}");
+        assert_eq!(command, format!("{} hook {arg}", pk.display()));
+    }
+    // The permissions are still there beside the hooks.
+    assert!(settings["permissions"]["allow"].is_array(), "{settings}");
+    assert!(settings["permissions"]["deny"].is_array(), "{settings}");
+}
+
+#[test]
+fn the_builder_env_names_the_lane_private_portkit_state_dir_and_session() {
+    if !sandbox_available() {
+        return;
+    }
+    let h = Harness::new("");
+    h.run_ok();
+    let env = h.read("home/fake/env.txt");
+    let state = h.lane().join("portkit");
+    for line in [
+        format!("PORTKIT_STATE_DIR={}", state.display()),
+        format!("PORTKIT_SESSION={}", h.id),
+        // portkit traces nothing unless asked: without this the hooks would be idle.
+        "PK_TRACE__ENABLED=true".to_string(),
+    ] {
+        assert!(env.lines().any(|l| l == line), "{line} not in\n{env}");
+    }
+    // Made by the runner, beside the clone and not in it.
+    assert!(state.is_dir());
+    assert!(!state.starts_with(h.lane().join("clone")));
+}
+
+#[test]
+fn a_builder_whose_hook_fired_is_traced_in_run_json_and_the_capsule_and_leaves_the_clone_alone() {
+    if !sandbox_available() {
+        return;
+    }
+    let h = owned_packet(&hook_once_then_checks());
+    h.run_expecting(0);
+    assert_eq!(h.verdict()["verdict"], "proved");
+
+    let trace = &h.run_json()["trace"];
+    assert_eq!(trace["traced"], true, "{trace}");
+    assert!(trace.get("reason").is_none(), "{trace}");
+    let checks = trace["checks"].as_array().unwrap();
+    let fired = checks
+        .iter()
+        .find(|c| c["name"] == "hooks have fired")
+        .unwrap_or_else(|| panic!("{trace}"));
+    assert_eq!(fired["status"], "pass", "{trace}");
+    let registered = checks
+        .iter()
+        .find(|c| c["name"] == "hooks registered")
+        .unwrap_or_else(|| panic!("{trace}"));
+    assert_eq!(registered["status"], "pass", "{trace}");
+
+    // Sealed in the capsule, which still reads back with every hash verified.
+    let capsule_dir = h.lane().join("control/capsule");
+    assert!(Capsule::read(&capsule_dir).unwrap().traced);
+    let raw: Value = serde_json::from_str(&h.read("control/capsule/capsule.json")).unwrap();
+    assert_eq!(raw["traced"], true);
+
+    // The record is in the lane's state dir, named for the lane.
+    let traces = h.lane().join("portkit/traces");
+    let files: Vec<PathBuf> = fs::read_dir(&traces)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+    assert_eq!(files.len(), 1, "{files:?}");
+    let name = files[0].file_name().unwrap().to_str().unwrap().to_string();
+    assert!(name.ends_with(&format!("-{}.jsonl", h.id)), "{name}");
+    let record: Value =
+        serde_json::from_str(fs::read_to_string(&files[0]).unwrap().trim()).unwrap();
+    assert_eq!(record["tool"], "Read");
+    assert_eq!(record["surface"], "agent");
+
+    // Nothing of portkit's is in the clone or the patch: the clone holds only the
+    // fake's own edit and file (the runner has staged both to take the patch).
+    let clone = h.lane().join("clone");
+    assert!(!clone.join(".portkit").exists());
+    let status = git_out(&clone, &["status", "--porcelain", "--untracked-files=all"]);
+    let mut lines: Vec<&str> = status.lines().collect();
+    lines.sort_unstable();
+    assert_eq!(lines, ["A  created.txt", "M  README.md"], "{status}");
+    assert!(!h.read("control/lane.patch").contains("portkit"));
+}
+
+#[test]
+fn a_builder_that_ran_no_hook_is_untraced_in_both_files_and_still_proved() {
+    if !sandbox_available() {
+        return;
+    }
+    let h = owned_packet(&run_checks(&["edit", "made"]));
+    h.run_expecting(0);
+    assert_eq!(h.verdict()["verdict"], "proved");
+
+    let trace = &h.run_json()["trace"];
+    assert_eq!(trace["traced"], false, "{trace}");
+    // The settings were registered; only the evidence is missing.
+    let reason = trace["reason"].as_str().unwrap();
+    assert!(reason.starts_with("hooks have fired: "), "{reason}");
+    let raw: Value = serde_json::from_str(&h.read("control/capsule/capsule.json")).unwrap();
+    assert_eq!(raw["traced"], false);
+    assert!(
+        !Capsule::read(&h.lane().join("control/capsule"))
+            .unwrap()
+            .traced
+    );
+    // The state dir exists and holds no trace.
+    assert!(!h.lane().join("portkit/traces").exists());
+}
+
+#[test]
+fn with_no_pk_beside_cowproof_there_are_no_hooks_and_the_lane_is_untraced_but_proved() {
+    if !sandbox_available() {
+        return;
+    }
+    let h = owned_packet(&run_checks(&["edit", "made"]));
+    fs::remove_file(h.work.path().join("pk")).unwrap();
+    h.run_expecting(0);
+    assert_eq!(h.verdict()["verdict"], "proved");
+
+    let settings: Value = serde_json::from_str(&h.seg(1, "settings.json")).unwrap();
+    assert!(settings.get("hooks").is_none(), "{settings}");
+    assert!(settings["permissions"]["allow"].is_array(), "{settings}");
+
+    let trace = &h.run_json()["trace"];
+    assert_eq!(trace["traced"], false, "{trace}");
+    let reason = trace["reason"].as_str().unwrap();
+    assert!(reason.contains("pk was not found"), "{reason}");
+    let raw: Value = serde_json::from_str(&h.read("control/capsule/capsule.json")).unwrap();
+    assert_eq!(raw["traced"], false);
+}
+
+#[test]
+fn a_doctor_that_fails_makes_the_lane_untraced_and_never_changes_the_verdict() {
+    if !sandbox_available() {
+        return;
+    }
+    let h = owned_packet(&run_checks(&["edit", "made"]));
+    // A `pk` that exits non-zero with output that is not JSON, in place of the real one.
+    let pk = h.work.path().join("pk");
+    {
+        let _g = fork_lock();
+        fs::remove_file(&pk).unwrap();
+        fs::write(&pk, "#!/bin/sh\necho not json\nexit 3\n").unwrap();
+        fs::set_permissions(&pk, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    h.run_expecting(0);
+    assert_eq!(h.verdict()["verdict"], "proved");
+
+    let trace = &h.run_json()["trace"];
+    assert_eq!(trace["traced"], false, "{trace}");
+    let reason = trace["reason"].as_str().unwrap();
+    assert!(reason.contains("printed no JSON (exit 3)"), "{reason}");
+    let raw: Value = serde_json::from_str(&h.read("control/capsule/capsule.json")).unwrap();
+    assert_eq!(raw["traced"], false);
 }

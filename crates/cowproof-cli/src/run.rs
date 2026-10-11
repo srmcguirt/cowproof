@@ -18,8 +18,9 @@
 //!    director rules (the resume loop, [`Drive`], D9): `answer` resumes the
 //!    session, `redirect` and `reassign` start a fresh one, `stop` ends the
 //!    lane. Each launch is one segment in `run.json`;
-//! 6. stop the tools server and the proxy, capture `control/lane.patch` and
-//!    write `control/run.json`;
+//! 6. stop the tools server and the proxy, capture `control/lane.patch`, ask
+//!    `pk doctor --json` (outside the sandbox) whether the builder's portkit hooks
+//!    fired (D5), and write `control/run.json`, whose `trace` entry holds the answer;
 //! 7. prove the lane: seal a capsule from the builder's last recorded
 //!    `run_check` results, replay it in the verifier, run the gates and write
 //!    `control/verdict.json`. The exit code is the verdict (0 proved, or 0
@@ -592,6 +593,13 @@ struct Launcher {
     layout: LaneLayout,
     claude_bin: PathBuf,
     cowproof_exe: PathBuf,
+    /// The portkit CLI `pk`, the sibling of the running `cowproof` executable
+    /// (G8). Without it the builder gets no hooks and the lane is `untraced` (D5).
+    pk_exe: Option<PathBuf>,
+    /// The lane's portkit state dir, `<lane>/portkit`: the builder may write it
+    /// (hook traces land there), it is outside the clone and so outside the patch,
+    /// and the runner reads it back at lane end (D5).
+    portkit_dir: PathBuf,
     path: String,
     base_url: String,
     /// The bridge's port and its target, the proxy's socket (D24).
@@ -686,9 +694,7 @@ impl Launcher {
         let settings_file = layout.home.join("settings.json");
         fs::write(
             &settings_file,
-            serde_json::to_vec_pretty(&json!({
-                "permissions": {"allow": BUILDER_ALLOW, "deny": BUILDER_DENY}
-            }))?,
+            serde_json::to_vec_pretty(&builder_settings(self.pk_exe.as_deref()))?,
         )?;
         let mcp_config = layout.home.join("mcp.json");
         fs::write(
@@ -726,6 +732,9 @@ impl Launcher {
             self.socket.to_string_lossy().into_owned(),
         ));
         invocation.env.extend(port_block_env(self.port_base));
+        invocation
+            .env
+            .extend(portkit_env(&self.portkit_dir, &self.lane_id));
         invocation.program = self.claude_bin.to_string_lossy().into_owned();
         let claude: Vec<String> = std::iter::once(invocation.program.clone())
             .chain(invocation.args.iter().cloned())
@@ -736,11 +745,13 @@ impl Launcher {
             &self.proxy_socket,
             &claude,
         );
-        let policy = SandboxPolicy::builder_with_executables(
-            layout,
-            self.network.clone(),
-            &[self.claude_bin.clone(), self.cowproof_exe.clone()],
-        )?;
+        // The builder may execute claude, cowproof and, when there is one, `pk`
+        // (the hooks call it). It may write the lane's portkit state dir.
+        let mut executables = vec![self.claude_bin.clone(), self.cowproof_exe.clone()];
+        executables.extend(self.pk_exe.clone());
+        let mut policy =
+            SandboxPolicy::builder_with_executables(layout, self.network.clone(), &executables)?;
+        policy.rw_paths.push(self.portkit_dir.clone());
         // The first launch starts the lane's stream and stderr files; every
         // later one appends, so they hold the whole lane in order.
         let first = index == 0;
@@ -2067,6 +2078,8 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
     let cowproof_exe = std::env::current_exe()
         .and_then(|p| p.canonicalize())
         .context("locating the cowproof executable")?;
+    // The portkit companion `pk`, beside the running executable (G8).
+    let pk_exe = sibling_pk(&cowproof_exe);
 
     // 3. The lane.
     fs::create_dir_all(&lanes_root)
@@ -2085,6 +2098,10 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
     // scratch they are granted, because macOS denies every other write.
     fs::create_dir_all(lane_tmp(&layout.scratch)).context("creating the lane's temp directory")?;
     let lane = lane_dir(&layout)?;
+    // The portkit state dir: made by the runner, so the builder's hooks can write
+    // their traces without creating anything in the clone (D5).
+    let portkit_dir = lane.join("portkit");
+    fs::create_dir(&portkit_dir).context("creating the lane's portkit directory")?;
     eprintln!("[{}] lane {}", header.id, lane.display());
     if args.unsandboxed {
         eprintln!(
@@ -2259,6 +2276,8 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
         layout: layout.clone(),
         claude_bin: claude_bin.clone(),
         cowproof_exe: cowproof_exe.clone(),
+        pk_exe: pk_exe.clone(),
+        portkit_dir: portkit_dir.clone(),
         path: path.clone(),
         base_url: endpoint.base_url,
         bridge_port: endpoint.bridge_port,
@@ -2391,6 +2410,17 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
         .iter()
         .filter_map(|s| s["estimatedCostUsd"].as_f64())
         .sum();
+
+    // The builder is gone: ask `pk doctor` whether its hooks fired (D5). The
+    // verdict is information about the lane and never changes the proof's.
+    let trace = lane_trace_verdict(
+        launcher.pk_exe.as_deref(),
+        &layout,
+        &portkit_dir,
+        &header.id,
+    )
+    .await;
+
     let run = json!({
         "id": header.id,
         "bridgePort": launcher.bridge_port,
@@ -2445,6 +2475,7 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
         },
         "prefixVersion": &launcher.prefix_version,
         "projectInstructionsSha256": &launcher.project_instructions_sha256,
+        "trace": trace,
     });
     fs::write(
         layout.control.join("run.json"),
@@ -2505,6 +2536,7 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
             class_limit,
             port_base,
             unsandboxed: launcher.unsandboxed,
+            trace: trace.clone(),
         },
         results,
     )
@@ -2687,6 +2719,8 @@ struct ProofInput<'a> {
     port_base: u16,
     /// Whether the builder ran without the OS sandbox.
     unsandboxed: bool,
+    /// The portkit trace verdict: whether the lane was traced (D5).
+    trace: Value,
 }
 
 /// Find the lane's held-out checks (D5): the explicit `--heldout` path, which must exist,
@@ -2895,6 +2929,7 @@ async fn replay_and_gate(
     capsule.prefix_version = Some(input.prefix_version.clone());
     capsule.project_instructions_sha256 = input.project_instructions_sha256.clone();
     capsule.class = header.class_name.clone();
+    capsule.traced = input.trace["traced"].as_bool().unwrap_or(false);
 
     // Fetch the dependencies the checks need before verify runs (D6, D11, D14), on the
     // rebuilt tree, outside any builder. The capsule records the cache key and what the
@@ -3059,10 +3094,179 @@ async fn tool_version(tool: &str) -> Option<String> {
         .filter(|l| !l.is_empty())
 }
 
+/// The portkit companion `pk` beside the running `cowproof` executable (G8): a
+/// regular, executable file named `pk` with a path that is valid UTF-8, because the
+/// hook command strings in the settings file carry it. `exe` is canonical, so the
+/// result is absolute and never relies on the builder's `PATH`.
+fn sibling_pk(exe: &Path) -> Option<PathBuf> {
+    let pk = exe.parent()?.join("pk");
+    pk.to_str()?;
+    let meta = fs::metadata(&pk).ok()?;
+    (meta.is_file() && meta.permissions().mode() & 0o111 != 0).then_some(pk)
+}
+
+/// `word` as one shell word: unchanged when it holds only safe characters, else
+/// single-quoted. Claude Code runs a hook command through a shell, so a `pk`
+/// path with a space in it must not split. `pk doctor` reads both forms.
+fn shell_word(word: &str) -> String {
+    let safe = |c: char| c.is_ascii_alphanumeric() || "/._-+:@%,=".contains(c);
+    if !word.is_empty() && word.chars().all(safe) {
+        word.to_string()
+    } else {
+        format!("'{}'", word.replace('\'', "'\\''"))
+    }
+}
+
+/// The settings file the builder gets: its permissions, plus the portkit hooks
+/// when `pk` exists (D5). Each hook command starts with the absolute path of `pk`
+/// (G8). Without `pk` there is no `hooks` key at all.
+fn builder_settings(pk: Option<&Path>) -> Value {
+    let mut settings = json!({
+        "permissions": {"allow": BUILDER_ALLOW, "deny": BUILDER_DENY}
+    });
+    if let Some(pk) = pk.and_then(Path::to_str) {
+        let hook = |event: &str| {
+            json!([{"hooks": [{
+                "type": "command",
+                "command": format!("{} hook {event}", shell_word(pk)),
+            }]}])
+        };
+        settings["hooks"] = json!({
+            "PostToolUse": hook("post-tool-use"),
+            "UserPromptSubmit": hook("user-prompt-submit"),
+            "SessionEnd": hook("session-end"),
+        });
+    }
+    settings
+}
+
+/// The portkit variables of the builder's environment (D5). The state dir keeps
+/// traces out of the clone, the session names the trace file after the lane, and
+/// tracing is off in portkit unless asked for, so the hooks would record nothing.
+fn portkit_env(state_dir: &Path, lane_id: &str) -> Vec<(String, String)> {
+    vec![
+        (
+            "PORTKIT_STATE_DIR".to_string(),
+            state_dir.to_string_lossy().into_owned(),
+        ),
+        ("PORTKIT_SESSION".to_string(), lane_id.to_string()),
+        ("PK_TRACE__ENABLED".to_string(), "true".to_string()),
+    ]
+}
+
+/// How long `pk doctor` may take at lane end.
+const DOCTOR_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// `{traced: false, reason, checks}`.
+fn untraced(reason: String, checks: Value) -> Value {
+    json!({"traced": false, "reason": reason, "checks": checks})
+}
+
+/// Run `pk doctor --json --settings <the lane's settings file>` outside the
+/// sandbox, with the lane's state dir, and turn it into the lane's `trace` entry:
+/// `{traced, reason?, checks}` (D5).
+///
+/// `pk doctor` exits non-zero whenever any check misses, so the exit status says
+/// nothing; the JSON it prints is the verdict. Anything that stops the verdict
+/// from being read (no `pk`, a spawn error, a timeout, output that is not JSON)
+/// is `traced: false` with the reason. This never fails the lane: a lane's
+/// verdict does not depend on whether it was watched.
+async fn lane_trace_verdict(
+    pk: Option<&Path>,
+    layout: &LaneLayout,
+    state_dir: &Path,
+    session: &str,
+) -> Value {
+    let Some(pk) = pk else {
+        return untraced(
+            "pk was not found beside the cowproof executable, so the builder had no hooks"
+                .to_string(),
+            json!([]),
+        );
+    };
+    let mut cmd = Command::new(pk);
+    cmd.args(["doctor", "--json", "--settings"])
+        .arg(layout.home.join("settings.json"))
+        // An explicit environment, like every child the runner starts. The
+        // working directory is the control directory, which the builder cannot
+        // write: no file of the builder's clone can steer the doctor's config.
+        .env_clear()
+        .env("PATH", pk.parent().unwrap_or(Path::new("/")))
+        .env("HOME", &layout.home)
+        .envs(portkit_env(state_dir, session))
+        .current_dir(&layout.control)
+        .stdin(Stdio::null())
+        .kill_on_drop(true);
+    let out = match tokio::time::timeout(DOCTOR_TIMEOUT, cmd.output()).await {
+        Ok(Ok(out)) => out,
+        Ok(Err(e)) => return untraced(format!("pk doctor could not run: {e}"), json!([])),
+        Err(_) => {
+            return untraced(
+                format!("pk doctor did not finish in {} s", DOCTOR_TIMEOUT.as_secs()),
+                json!([]),
+            );
+        }
+    };
+    let Ok(doc) = serde_json::from_slice::<Value>(&out.stdout) else {
+        return untraced(
+            format!(
+                "pk doctor printed no JSON (exit {})",
+                out.status
+                    .code()
+                    .map_or("signal".to_string(), |c| c.to_string())
+            ),
+            json!([]),
+        );
+    };
+    let checks = doc["checks"].clone();
+    let checks = if checks.is_array() { checks } else { json!([]) };
+    match doc["traced"].as_bool() {
+        Some(true) => json!({"traced": true, "checks": checks}),
+        Some(false) => {
+            // The first missing check is the cause: registered hooks come before
+            // enabled tracing, which comes before the evidence.
+            let reason = checks
+                .as_array()
+                .and_then(|all| all.iter().find(|c| c["status"] == "miss"))
+                .map_or_else(
+                    || "no hook call was recorded".to_string(),
+                    |c| {
+                        format!(
+                            "{}: {}",
+                            c["name"].as_str().unwrap_or("check"),
+                            c["detail"].as_str().unwrap_or("missed")
+                        )
+                    },
+                );
+            untraced(reason, checks)
+        }
+        None => untraced("pk doctor gave no traced verdict".to_string(), checks),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::os::unix::fs::symlink;
+
+    #[test]
+    fn a_pk_path_is_one_shell_word_in_its_hook_command() {
+        assert_eq!(shell_word("/opt/cowproof/bin/pk"), "/opt/cowproof/bin/pk");
+        assert_eq!(shell_word("/my tools/pk"), "'/my tools/pk'");
+        assert_eq!(shell_word("/it's/pk"), "'/it'\\''s/pk'");
+        let settings = builder_settings(Some(Path::new("/my tools/pk")));
+        assert_eq!(
+            settings["hooks"]["SessionEnd"][0]["hooks"][0]["command"],
+            "'/my tools/pk' hook session-end"
+        );
+    }
+
+    #[test]
+    fn no_pk_means_no_hooks_key() {
+        let settings = builder_settings(None);
+        assert!(settings.get("hooks").is_none(), "{settings}");
+        assert!(settings["permissions"]["deny"].is_array());
+    }
 
     fn layout_in(dir: &Path) -> LaneLayout {
         LaneLayout {
