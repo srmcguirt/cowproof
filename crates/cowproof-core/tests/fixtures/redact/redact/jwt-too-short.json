@@ -1,0 +1,12 @@
+{
+  "tool": "redact",
+  "id": "jwt-too-short",
+  "input": {
+    "input": "short eyJ1234567890"
+  },
+  "expected": {
+    "output": "short eyJ1234567890"
+  },
+  "captured_at": "2026-10-11T09:14:59.201975Z",
+  "source": "node reference adapter (redactSecrets of the Node lane runner run-lane.mjs L214-220, run on probe strings; not distributed)"
+}

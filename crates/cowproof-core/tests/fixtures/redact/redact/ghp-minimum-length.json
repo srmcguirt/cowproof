@@ -1,0 +1,12 @@
+{
+  "tool": "redact",
+  "id": "ghp-minimum-length",
+  "input": {
+    "input": "token: ghp_0123456789"
+  },
+  "expected": {
+    "output": "token: [redacted]"
+  },
+  "captured_at": "2026-10-11T09:15:06.047701Z",
+  "source": "node reference adapter (redactSecrets of the Node lane runner run-lane.mjs L214-220, run on probe strings; not distributed)"
+}

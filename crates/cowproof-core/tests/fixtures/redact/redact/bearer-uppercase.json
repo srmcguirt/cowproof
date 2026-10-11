@@ -1,0 +1,12 @@
+{
+  "tool": "redact",
+  "id": "bearer-uppercase",
+  "input": {
+    "input": "auth: BEARER secrettoken"
+  },
+  "expected": {
+    "output": "auth: Bearer [redacted]"
+  },
+  "captured_at": "2026-10-11T09:15:03.06558Z",
+  "source": "node reference adapter (redactSecrets of the Node lane runner run-lane.mjs L214-220, run on probe strings; not distributed)"
+}

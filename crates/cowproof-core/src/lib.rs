@@ -11,10 +11,12 @@ use std::process::Stdio;
 pub mod git_show;
 pub mod heldout;
 pub mod patch;
+pub mod redact;
 pub mod status;
 
 pub use git_show::{LinkedFile, git_show_following_links, git_show_optional};
 pub use patch::{PatchDelta, parse_patch};
+pub use redact::redact;
 pub use status::{LaneStatus, StatusClass, StatusFacts, classify_opencode, classify_status};
 
 /// The first port of the lanes' port blocks.

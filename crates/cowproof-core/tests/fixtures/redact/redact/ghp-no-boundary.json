@@ -1,0 +1,12 @@
+{
+  "tool": "redact",
+  "id": "ghp-no-boundary",
+  "input": {
+    "input": "myghp_0123456789abc"
+  },
+  "expected": {
+    "output": "myghp_0123456789abc"
+  },
+  "captured_at": "2026-10-11T09:15:07.48866Z",
+  "source": "node reference adapter (redactSecrets of the Node lane runner run-lane.mjs L214-220, run on probe strings; not distributed)"
+}

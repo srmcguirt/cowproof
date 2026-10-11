@@ -1,0 +1,12 @@
+{
+  "tool": "redact",
+  "id": "sk-alone-too-short",
+  "input": {
+    "input": "sk- is too short"
+  },
+  "expected": {
+    "output": "sk- is too short"
+  },
+  "captured_at": "2026-10-11T09:15:20.100568Z",
+  "source": "node reference adapter (redactSecrets of the Node lane runner run-lane.mjs L214-220, run on probe strings; not distributed)"
+}

@@ -1,0 +1,12 @@
+{
+  "tool": "redact",
+  "id": "xox-invalid-type",
+  "input": {
+    "input": "xoxd-1234567890abc"
+  },
+  "expected": {
+    "output": "xoxd-1234567890abc"
+  },
+  "captured_at": "2026-10-11T09:15:12.067104Z",
+  "source": "node reference adapter (redactSecrets of the Node lane runner run-lane.mjs L214-220, run on probe strings; not distributed)"
+}

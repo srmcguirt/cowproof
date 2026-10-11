@@ -1,0 +1,12 @@
+{
+  "tool": "redact",
+  "id": "sk-uppercase",
+  "input": {
+    "input": "sk-UPPERCASE"
+  },
+  "expected": {
+    "output": "[redacted]"
+  },
+  "captured_at": "2026-10-11T09:14:56.889339Z",
+  "source": "node reference adapter (redactSecrets of the Node lane runner run-lane.mjs L214-220, run on probe strings; not distributed)"
+}

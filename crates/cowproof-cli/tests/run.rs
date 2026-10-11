@@ -3079,3 +3079,134 @@ fn run_help_documents_the_two_hard_limits_and_hides_the_test_flag() {
     }
     assert!(!help.contains("--timeout-secs"), "the test flag is hidden");
 }
+
+#[test]
+fn builder_stderr_with_tokens_is_redacted() {
+    if !sandbox_available() {
+        return;
+    }
+    // Fake builder writes synthetic tokens to stderr
+    let fake_body = r#"
+echo "Error with Bearer sk-synthtoken1234567 in stderr" >&2
+echo "Also xoxb-1234567890synthetic" >&2
+"#;
+    let h = Harness::new(fake_body);
+    h.run_ok();
+
+    let stderr = h.read("control/builder.stderr");
+    // Redacted tokens should be present
+    assert!(
+        stderr.contains("[redacted]"),
+        "stderr should contain redacted marker: {stderr}"
+    );
+    // Original tokens should NOT be present
+    assert!(
+        !stderr.contains("sk-synthtoken1234567"),
+        "sk- token should be redacted: {stderr}"
+    );
+    assert!(
+        !stderr.contains("xoxb-1234567890synthetic"),
+        "xox token should be redacted: {stderr}"
+    );
+    // Bearer text should still be there with redacted token
+    assert!(
+        stderr.contains("Bearer [redacted]"),
+        "Bearer header should be redacted: {stderr}"
+    );
+}
+
+// ---- builder stderr is redacted as it is written ----------------------------
+//
+// The builder's stderr is a pipe the runner reads: only redacted text reaches
+// `control/builder.stderr`, at the time it is written, not after the builder
+// exits.
+
+const STDERR_TOKEN: &str = "sk-synthtoken1234567";
+
+/// Wait until `control/builder.stderr` contains `needle`, at most 30 s; a run
+/// that never gets there is killed (by its pid) and fails the test.
+fn wait_for_stderr_file(run: &mut Watched, h: &Harness, needle: &str) -> String {
+    let path = h.lane().join("control/builder.stderr");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let text = fs::read_to_string(&path).unwrap_or_default();
+        if text.contains(needle) {
+            return text;
+        }
+        if Instant::now() > deadline {
+            let _ = run.child.kill();
+            let _ = run.child.wait();
+            panic!("{needle:?} never reached {}: {text:?}", path.display());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn builder_stderr_is_redacted_while_the_builder_is_still_running() {
+    if !sandbox_available() {
+        return;
+    }
+    let h = owned_packet(&format!(
+        "{}echo \"auth failed: Bearer {STDERR_TOKEN} and xoxb-1234567890synthetic\" >&2\necho up > \"$HOME/written\"\nsleep 120\n",
+        init_line()
+    ));
+    let mut run = start_watched(&h, &[]);
+    wait_for_file(&mut run, &h.lane().join("home/written"));
+    // The builder is still alive (asleep): an after-exit rewrite has not run.
+    let text = wait_for_stderr_file(&mut run, &h, "[redacted]");
+    assert!(
+        run.child.try_wait().unwrap().is_none(),
+        "the run ended early"
+    );
+    assert!(
+        !text.contains(STDERR_TOKEN) && !text.contains("xoxb-1234567890synthetic"),
+        "a raw token is on disk while the builder runs: {text:?}"
+    );
+    assert!(text.contains("Bearer [redacted]"), "{text:?}");
+    send_signal("INT", &run.child);
+    let status = exit_within(&mut run, INTERRUPT_EXIT_WITHIN);
+    assert_eq!(status.code(), Some(130), "{}", run.stderr());
+}
+
+#[test]
+fn a_token_split_across_two_stderr_writes_is_redacted() {
+    if !sandbox_available() {
+        return;
+    }
+    let h = Harness::new("printf 'leak sk-abcd' >&2\nsleep 0.3\nprintf 'efgh1234 tail\\n' >&2\n");
+    h.run_ok();
+    let text = h.read("control/builder.stderr");
+    assert!(text.contains("leak [redacted] tail"), "{text:?}");
+    assert!(
+        !text.contains("sk-abcd") && !text.contains("efgh1234"),
+        "a piece of the token reached the file: {text:?}"
+    );
+}
+
+#[test]
+fn sigint_leaves_no_raw_token_in_builder_stderr_even_for_an_unfinished_line() {
+    if !sandbox_available() {
+        return;
+    }
+    // One complete line, then a token with no newline after it.
+    let h = owned_packet(&format!(
+        "{}echo \"first {STDERR_TOKEN}\" >&2\nprintf 'second sk-partialtoken9999' >&2\necho up > \"$HOME/written\"\nsleep 120\n",
+        init_line()
+    ));
+    let mut run = start_watched(&h, &[]);
+    wait_for_file(&mut run, &h.lane().join("home/written"));
+    wait_for_stderr_file(&mut run, &h, "first [redacted]");
+    send_signal("INT", &run.child);
+    let status = exit_within(&mut run, INTERRUPT_EXIT_WITHIN);
+    assert_interrupted_cleanly(&h, status, &run);
+    let text = h.read("control/builder.stderr");
+    assert!(
+        !text.contains(STDERR_TOKEN) && !text.contains("sk-partialtoken9999"),
+        "a raw token is on disk after SIGINT: {text:?}"
+    );
+    assert!(
+        text.contains("first [redacted]") && text.contains("second [redacted]"),
+        "the unfinished line is written, redacted, when the stream ends: {text:?}"
+    );
+}

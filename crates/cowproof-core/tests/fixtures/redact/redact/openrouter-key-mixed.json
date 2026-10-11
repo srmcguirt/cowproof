@@ -1,0 +1,12 @@
+{
+  "tool": "redact",
+  "id": "openrouter-key-mixed",
+  "input": {
+    "input": "OpenRouter_API_Key=secret"
+  },
+  "expected": {
+    "output": "OpenRouter_API_Key=[redacted]"
+  },
+  "captured_at": "2026-10-11T09:15:14.946544Z",
+  "source": "node reference adapter (redactSecrets of the Node lane runner run-lane.mjs L214-220, run on probe strings; not distributed)"
+}

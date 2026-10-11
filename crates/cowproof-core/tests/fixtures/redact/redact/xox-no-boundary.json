@@ -1,0 +1,12 @@
+{
+  "tool": "redact",
+  "id": "xox-no-boundary",
+  "input": {
+    "input": "myxoxb-1234567890abc"
+  },
+  "expected": {
+    "output": "myxoxb-1234567890abc"
+  },
+  "captured_at": "2026-10-11T09:15:10.538728Z",
+  "source": "node reference adapter (redactSecrets of the Node lane runner run-lane.mjs L214-220, run on probe strings; not distributed)"
+}

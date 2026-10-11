@@ -1,0 +1,12 @@
+{
+  "tool": "redact",
+  "id": "jwt-full",
+  "input": {
+    "input": "token: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0"
+  },
+  "expected": {
+    "output": "token: [redacted JWT]"
+  },
+  "captured_at": "2026-10-11T09:14:57.65974Z",
+  "source": "node reference adapter (redactSecrets of the Node lane runner run-lane.mjs L214-220, run on probe strings; not distributed)"
+}

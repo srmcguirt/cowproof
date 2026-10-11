@@ -1,0 +1,12 @@
+{
+  "tool": "redact",
+  "id": "empty-after-label",
+  "input": {
+    "input": "empty string test: "
+  },
+  "expected": {
+    "output": "empty string test: "
+  },
+  "captured_at": "2026-10-11T09:15:18.693204Z",
+  "source": "node reference adapter (redactSecrets of the Node lane runner run-lane.mjs L214-220, run on probe strings; not distributed)"
+}

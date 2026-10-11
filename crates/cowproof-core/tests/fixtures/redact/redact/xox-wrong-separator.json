@@ -1,0 +1,12 @@
+{
+  "tool": "redact",
+  "id": "xox-wrong-separator",
+  "input": {
+    "input": "xox_b-1234567890abc"
+  },
+  "expected": {
+    "output": "xox_b-1234567890abc"
+  },
+  "captured_at": "2026-10-11T09:15:11.35086Z",
+  "source": "node reference adapter (redactSecrets of the Node lane runner run-lane.mjs L214-220, run on probe strings; not distributed)"
+}

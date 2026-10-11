@@ -1,0 +1,48 @@
+# Redaction parity cases. Capture from Node reference with:
+#   PORTKIT_CAPTURE=1 PORTKIT_ADAPTER_CMD="node <path>/redact-adapter.mjs" cargo test -p cowproof-core --test redact_parity -- --ignored
+{"tool": "redact", "id": "sk-minimum-8-chars", "input": {"input":"sk-aaaabbbb"}}
+{"tool": "redact", "id": "sk-too-short-7-chars", "input": {"input":"sk-aaabbb"}}
+{"tool": "redact", "id": "sk-with-special-chars", "input": {"input":"key is sk-abcd_efgh-ijkl"}}
+{"tool": "redact", "id": "sk-multiple-tokens", "input": {"input":"multiple: sk-aaaabbbb and sk-ccccdddd"}}
+{"tool": "redact", "id": "sk-uppercase", "input": {"input":"sk-UPPERCASE"}}
+{"tool": "redact", "id": "jwt-full", "input": {"input":"token: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0"}}
+{"tool": "redact", "id": "jwt-no-payload", "input": {"input":"just eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9"}}
+{"tool": "redact", "id": "jwt-too-short", "input": {"input":"short eyJ1234567890"}}
+{"tool": "redact", "id": "jwt-minimum-length", "input": {"input":"eyJ1234567890123456.part2"}}
+{"tool": "redact", "id": "jwt-inline", "input": {"input":"jwt with eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9 inside"}}
+{"tool": "redact", "id": "bearer-with-sk", "input": {"input":"auth: Bearer sk-secret123456"}}
+{"tool": "redact", "id": "bearer-lowercase", "input": {"input":"auth: bearer secrettoken"}}
+{"tool": "redact", "id": "bearer-uppercase", "input": {"input":"auth: BEARER secrettoken"}}
+{"tool": "redact", "id": "bearer-mixed-case", "input": {"input":"auth: BeArEr secrettoken"}}
+{"tool": "redact", "id": "bearer-single-token", "input": {"input":"header: Bearer token"}}
+{"tool": "redact", "id": "ghp-too-short-9", "input": {"input":"ghp_123456789"}}
+{"tool": "redact", "id": "ghp-minimum-length", "input": {"input":"token: ghp_0123456789"}}
+{"tool": "redact", "id": "ghp-long", "input": {"input":"github: ghp_0123456789abc"}}
+{"tool": "redact", "id": "ghp-no-boundary", "input": {"input":"myghp_0123456789abc"}}
+{"tool": "redact", "id": "xox-type-b", "input": {"input":"slack: xoxb-1234567890abc"}}
+{"tool": "redact", "id": "xox-type-p", "input": {"input":"xoxp-123456789012-abc"}}
+{"tool": "redact", "id": "xox-type-a", "input": {"input":"xoxa-secrettoken"}}
+{"tool": "redact", "id": "xox-no-boundary", "input": {"input":"myxoxb-1234567890abc"}}
+{"tool": "redact", "id": "xox-wrong-separator", "input": {"input":"xox_b-1234567890abc"}}
+{"tool": "redact", "id": "xox-invalid-type", "input": {"input":"xoxd-1234567890abc"}}
+{"tool": "redact", "id": "openrouter-key-equals", "input": {"input":"OPENROUTER_API_KEY=sk-123456789abcdef"}}
+{"tool": "redact", "id": "openrouter-key-spaced", "input": {"input":"export OPENROUTER_API_KEY = sk-123456789abcdef"}}
+{"tool": "redact", "id": "openrouter-key-lowercase", "input": {"input":"openrouter_api_key=secret"}}
+{"tool": "redact", "id": "openrouter-key-mixed", "input": {"input":"OpenRouter_API_Key=secret"}}
+{"tool": "redact", "id": "multiple-different-secrets", "input": {"input":"sk-aaaabbbb Bearer secret ghp_0123456789"}}
+{"tool": "redact", "id": "bearer-and-jwt", "input": {"input":"Auth: Bearer eyJ1234567890123456 and sk-aaaabbbb"}}
+{"tool": "redact", "id": "multiline", "input": {"input":"line1: sk-aaaabbbb\nline2: Bearer secret\nline3: ghp_0123456789"}}
+{"tool": "redact", "id": "no-secrets", "input": {"input":"This is just normal text with no secrets"}}
+{"tool": "redact", "id": "empty-after-label", "input": {"input":"empty string test: "}}
+{"tool": "redact", "id": "bearer-with-jwt", "input": {"input":"Authorization: Bearer eyJ1234567890123456.payload.sig"}}
+{"tool": "redact", "id": "sk-alone-too-short", "input": {"input":"sk- is too short"}}
+{"tool": "redact", "id": "bearer-no-token", "input": {"input":"Bearer "}}
+{"tool": "redact", "id": "bearer-with-tabs", "input": {"input":"Bearer\t\ttab"}}
+{"tool": "redact", "id": "multiple-sk-tokens", "input": {"input":"keys: sk-aaaabbbb and sk-ccccdddd and sk-eeeeffff"}}
+{"tool": "redact", "id": "error-message", "input": {"input":"error: Authentication failed with token Bearer sk-abc123456"}}
+{"tool": "redact", "id": "debug-openrouter", "input": {"input":"DEBUG: OPENROUTER_API_KEY=sk-abcdefgh12345678"}}
+{"tool": "redact", "id": "xoxb-multi", "input": {"input":"XOXB token found: xoxb-SYNTHtesta-SYNTHtestb-abcdefghijklmnop"}}
+{"tool": "redact", "id": "multiple-bearer", "input": {"input":"Bearer sk-secret123456 then Bearer sk-another123456"}}
+{"tool": "redact", "id": "ghp-incomplete", "input": {"input":"ghp_ incomplete"}}
+{"tool": "redact", "id": "xox-no-dash", "input": {"input":"xox[baprs] no dash"}}
+{"tool": "redact", "id": "realistic-mixed", "input": {"input":"real case: Bearer eyJhbGciOiJIUzI1NiJ9.eyJpZCI6MX0.sig followed by sk-realtoken12345678"}}

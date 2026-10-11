@@ -1,0 +1,12 @@
+{
+  "tool": "redact",
+  "id": "ghp-long",
+  "input": {
+    "input": "github: ghp_0123456789abc"
+  },
+  "expected": {
+    "output": "github: [redacted]"
+  },
+  "captured_at": "2026-10-11T09:15:06.785012Z",
+  "source": "node reference adapter (redactSecrets of the Node lane runner run-lane.mjs L214-220, run on probe strings; not distributed)"
+}

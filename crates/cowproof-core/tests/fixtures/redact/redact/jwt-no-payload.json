@@ -1,0 +1,12 @@
+{
+  "tool": "redact",
+  "id": "jwt-no-payload",
+  "input": {
+    "input": "just eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9"
+  },
+  "expected": {
+    "output": "just [redacted JWT]"
+  },
+  "captured_at": "2026-10-11T09:14:58.431117Z",
+  "source": "node reference adapter (redactSecrets of the Node lane runner run-lane.mjs L214-220, run on probe strings; not distributed)"
+}

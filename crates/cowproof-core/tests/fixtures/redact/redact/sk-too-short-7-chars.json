@@ -1,0 +1,12 @@
+{
+  "tool": "redact",
+  "id": "sk-too-short-7-chars",
+  "input": {
+    "input": "sk-aaabbb"
+  },
+  "expected": {
+    "output": "sk-aaabbb"
+  },
+  "captured_at": "2026-10-11T09:14:54.611118Z",
+  "source": "node reference adapter (redactSecrets of the Node lane runner run-lane.mjs L214-220, run on probe strings; not distributed)"
+}

@@ -40,7 +40,7 @@ use crate::verify::{Rebuild, fetch_dependencies, verifier_runner};
 use anyhow::{Context, Result, anyhow, bail};
 use cowproof_core::{
     LinkedFile, PORT_CLASS, class_limit_at_commit, get_slot_dir, git_show_following_links,
-    parse_header, port_base_for_slot, port_block_env, release_slot,
+    parse_header, port_base_for_slot, port_block_env, redact, release_slot,
 };
 use cowproof_prove::{
     capsule::HELDOUT_FILE,
@@ -109,6 +109,11 @@ const TERM_GRACE: Duration = Duration::from_secs(10);
 /// the stream pump may still wait for EOF. A process that escaped the group
 /// could hold the pipe open forever; the pump is abandoned after this.
 const PUMP_DRAIN: Duration = Duration::from_secs(5);
+
+/// The most builder stderr text held while it waits for a newline. A longer
+/// unterminated line is redacted and written in pieces (cut at whitespace where
+/// there is any), so memory stays bounded however the builder writes.
+const MAX_STDERR_LINE: usize = 64 * 1024;
 
 /// The exit code when the run is interrupted by a signal (SIGINT or SIGTERM).
 const INTERRUPTED_EXIT_CODE: i32 = 130;
@@ -760,13 +765,19 @@ impl Launcher {
         )?
         .process_group(0)
         .stdout(Stdio::piped())
-        .stderr(Stdio::from(stderr_file))
+        .stderr(Stdio::piped())
         .spawn()
         .context("launching the builder in its sandbox")?;
         // `process_group(0)` makes the child its own leader, so its pid is the pgid.
         let pgid = child.id().context("reading the builder's process id")?;
         let _group = GroupGuard::new(pgid, self.interrupt.clone());
         let stdout = child.stdout.take().context("taking the builder's stdout")?;
+        // The builder never writes to `builder.stderr` itself: the runner reads
+        // this pipe and writes the file, redacted, so a raw token is never on disk.
+        let stderr = child.stderr.take().context("taking the builder's stderr")?;
+        let mut stderr_sink = tokio::fs::File::from_std(stderr_file);
+        // Text read but not yet written (a line still waiting for its newline).
+        let mut stderr_pending: Vec<u8> = Vec::new();
 
         let mut meter = StreamMeter::new(launch.resume.is_some());
         let mut stream = tokio::fs::OpenOptions::new()
@@ -789,6 +800,7 @@ impl Launcher {
         };
 
         let mut pump_result: Option<io::Result<PumpStats>> = None;
+        let mut stderr_result: Option<io::Result<()>> = None;
         let mut status: Option<ExitStatus> = None;
         let mut session_end: Option<SessionEnd> = None;
         let mut signals_open = true;
@@ -798,6 +810,7 @@ impl Launcher {
         let mut kill_at: Option<TokioInstant> = None;
         let mut drain_until: Option<TokioInstant> = None;
         let mut abandoned = false;
+        let mut stderr_abandoned = false;
         let mut interrupted = false;
 
         // What is left of the lane's wall-clock limit after the earlier launches.
@@ -818,14 +831,27 @@ impl Launcher {
                 &mut observe,
             );
             tokio::pin!(pump);
-            // The three events race for as long as any of them can still
-            // matter: the pump reading the builder's stdout (never awaited to
-            // EOF before listening for the rest), the builder exiting, and a
-            // session-end signal.
-            while !(status.is_some() && (pump_result.is_some() || abandoned)) {
+            let stderr_pump = pump_stderr(
+                stderr,
+                &mut stderr_sink,
+                &mut stderr_pending,
+                MAX_STDERR_LINE,
+            );
+            tokio::pin!(stderr_pump);
+            // The events race for as long as any of them can still matter:
+            // the pumps reading the builder's stdout and stderr (never awaited
+            // to EOF before listening for the rest), the builder exiting, and
+            // a session-end signal.
+            while !(status.is_some()
+                && (pump_result.is_some() || abandoned)
+                && (stderr_result.is_some() || stderr_abandoned))
+            {
                 tokio::select! {
                     result = &mut pump, if pump_result.is_none() => {
                         pump_result = Some(result);
+                    }
+                    result = &mut stderr_pump, if stderr_result.is_none() => {
+                        stderr_result = Some(result);
                     }
                     waited = child.wait(), if status.is_none() => {
                         status = Some(waited.context("waiting for the builder")?);
@@ -903,8 +929,11 @@ impl Launcher {
                         kill_process_group(pgid);
                         kill_at = None;
                     }
-                    _ = sleep_until_opt(drain_until), if drain_until.is_some() && pump_result.is_none() => {
+                    _ = sleep_until_opt(drain_until), if drain_until.is_some() && pump_result.is_none() && !abandoned => {
                         abandoned = true;
+                    }
+                    _ = sleep_until_opt(drain_until), if drain_until.is_some() && stderr_result.is_none() && !stderr_abandoned => {
+                        stderr_abandoned = true;
                     }
                     _ = sleep_until_opt(timeout_at), if timeout_at.is_some() && status.is_none() => {
                         eprintln!(
@@ -921,6 +950,25 @@ impl Launcher {
                     }
                 }
             }
+        }
+        // A stderr pump that was abandoned (an escaped process held the pipe)
+        // still holds the text it had read; write it, redacted, before anything
+        // else, so an interrupted run leaves no raw token either.
+        if stderr_abandoned {
+            eprintln!(
+                "[{}] the builder's stderr stayed open {PUMP_DRAIN:?} after it exited; not waiting for it",
+                self.lane_id
+            );
+            let rest = redact_ready(&mut stderr_pending, MAX_STDERR_LINE, true);
+            if let Err(e) = stderr_sink.write_all(&rest).await {
+                eprintln!("[{}] warning: writing builder.stderr: {e}", self.lane_id);
+            }
+        }
+        if let Err(e) = stderr_sink.flush().await {
+            eprintln!("[{}] warning: writing builder.stderr: {e}", self.lane_id);
+        }
+        if let Some(Err(e)) = &stderr_result {
+            eprintln!("[{}] warning: builder.stderr: {e}", self.lane_id);
         }
         // The group is already ended; the guard's drop is a second, harmless kill.
         if interrupted || *interrupted_rx.borrow() {
@@ -1628,6 +1676,94 @@ where
     }
     sink.flush().await?;
     Ok(stats)
+}
+
+/// Take the text of `pending` that is ready to be written, redacted line by
+/// line with `cowproof_core::redact`, and leave the rest in `pending`.
+///
+/// Ready is everything through the last newline. A tail with no newline waits
+/// for one, until it reaches `max` bytes: then it is cut at its last whitespace
+/// byte (else at a character boundary near `max`) so memory stays bounded. A
+/// secret that straddles such a forced cut can escape redaction; that needs a
+/// single unterminated run of 64 KiB or more. With `eof` the whole buffer is
+/// ready. Invalid UTF-8 becomes U+FFFD.
+fn redact_ready(pending: &mut Vec<u8>, max: usize, eof: bool) -> Vec<u8> {
+    let mut out = Vec::new();
+    loop {
+        let mut cut = if eof {
+            pending.len()
+        } else {
+            pending
+                .iter()
+                .rposition(|&b| b == b'\n')
+                .map_or(0, |i| i + 1)
+        };
+        if !eof && pending.len() - cut >= max {
+            let tail = &pending[cut..];
+            let at = tail
+                .iter()
+                .rposition(|b| b.is_ascii_whitespace())
+                .map(|i| i + 1)
+                .unwrap_or_else(|| {
+                    let mut c = max;
+                    while c > 0 && tail.get(c).is_some_and(|b| b & 0xC0 == 0x80) {
+                        c -= 1;
+                    }
+                    if c == 0 { max } else { c }
+                });
+            cut += at;
+        }
+        if cut == 0 {
+            break;
+        }
+        let piece: Vec<u8> = pending.drain(..cut).collect();
+        for line in piece.split_inclusive(|&b| b == b'\n') {
+            out.extend_from_slice(redact(&String::from_utf8_lossy(line)).as_bytes());
+        }
+        if eof || pending.len() < max {
+            break;
+        }
+    }
+    out
+}
+
+/// Copy the builder's stderr to `sink`, redacted, as it arrives. Text is held
+/// in `pending` (owned by the caller, so an abandoned pump loses nothing) until
+/// its line is complete, so a token written in two pieces is still seen whole.
+/// Each batch is flushed before the next read, so the file never lags the
+/// builder by more than the line in progress. A write error stops writing but
+/// not reading: the builder must never block on a full pipe or get SIGPIPE.
+async fn pump_stderr<R, W>(
+    mut reader: R,
+    sink: &mut W,
+    pending: &mut Vec<u8>,
+    max_line: usize,
+) -> io::Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut chunk = vec![0u8; 8192];
+    let mut write_error: Option<io::Error> = None;
+    loop {
+        let n = reader.read(&mut chunk).await?;
+        let eof = n == 0;
+        pending.extend_from_slice(&chunk[..n]);
+        let ready = redact_ready(pending, max_line, eof);
+        if write_error.is_none() && !ready.is_empty() {
+            let wrote = async {
+                sink.write_all(&ready).await?;
+                sink.flush().await
+            }
+            .await;
+            if let Err(e) = wrote {
+                write_error = Some(e);
+            }
+        }
+        if eof {
+            return write_error.map_or(Ok(()), Err);
+        }
+    }
 }
 
 /// `control/lane.patch`: everything the builder changed since the launch
@@ -3024,6 +3160,60 @@ body"#;
         );
         // Only the short line after the long one was metered.
         assert_eq!(meter.summary().session_id.as_deref(), Some("after"));
+    }
+
+    #[test]
+    fn redact_ready_holds_an_unterminated_line_until_its_newline() {
+        let mut pending = b"first sk-aaaabbbb\nsecond sk-cccc".to_vec();
+        let out = redact_ready(&mut pending, 1024, false);
+        assert_eq!(out, b"first [redacted]\n");
+        assert_eq!(pending, b"second sk-cccc");
+        pending.extend_from_slice(b"dddd\n");
+        let out = redact_ready(&mut pending, 1024, false);
+        assert_eq!(out, b"second [redacted]\n");
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn redact_ready_cuts_a_full_unterminated_tail_at_whitespace_and_at_eof_writes_the_rest() {
+        let mut pending = b"aaaa bbbb cccc dddd".to_vec();
+        let out = redact_ready(&mut pending, 12, false);
+        assert_eq!(out, b"aaaa bbbb cccc ");
+        assert_eq!(pending, b"dddd");
+        let out = redact_ready(&mut pending, 12, true);
+        assert_eq!(out, b"dddd");
+        assert!(pending.is_empty());
+        // No whitespace at all: cut at a character boundary, never inside one.
+        let mut pending = "\u{e9}".repeat(10).into_bytes();
+        let out = redact_ready(&mut pending, 7, false);
+        assert!(String::from_utf8(out).is_ok());
+        assert!(String::from_utf8(pending).is_ok());
+    }
+
+    #[tokio::test]
+    async fn pump_stderr_redacts_a_token_split_across_reads() {
+        let (mut tx, rx) = tokio::io::duplex(64);
+        let writer = tokio::spawn(async move {
+            tx.write_all(b"leak sk-abcd").await.unwrap();
+            tx.flush().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            tx.write_all(b"efgh1234 end\nBearer tok").await.unwrap();
+            tx.flush().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            tx.write_all(b"en-no-newline").await.unwrap();
+        });
+        let mut sink: Vec<u8> = Vec::new();
+        let mut pending = Vec::new();
+        pump_stderr(rx, &mut sink, &mut pending, 1024)
+            .await
+            .unwrap();
+        writer.await.unwrap();
+        // The unterminated last line is redacted whole at EOF too.
+        assert_eq!(
+            String::from_utf8(sink).unwrap(),
+            "leak [redacted] end\nBearer [redacted]"
+        );
+        assert!(pending.is_empty());
     }
 
     #[tokio::test]

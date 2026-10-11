@@ -1,0 +1,12 @@
+{
+  "tool": "redact",
+  "id": "ghp-incomplete",
+  "input": {
+    "input": "ghp_ incomplete"
+  },
+  "expected": {
+    "output": "ghp_ incomplete"
+  },
+  "captured_at": "2026-10-11T09:15:25.913944Z",
+  "source": "node reference adapter (redactSecrets of the Node lane runner run-lane.mjs L214-220, run on probe strings; not distributed)"
+}

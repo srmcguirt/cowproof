@@ -1,0 +1,12 @@
+{
+  "tool": "redact",
+  "id": "multiline",
+  "input": {
+    "input": "line1: sk-aaaabbbb\nline2: Bearer secret\nline3: ghp_0123456789"
+  },
+  "expected": {
+    "output": "line1: [redacted]\nline2: Bearer [redacted]\nline3: [redacted]"
+  },
+  "captured_at": "2026-10-11T09:15:17.214621Z",
+  "source": "node reference adapter (redactSecrets of the Node lane runner run-lane.mjs L214-220, run on probe strings; not distributed)"
+}

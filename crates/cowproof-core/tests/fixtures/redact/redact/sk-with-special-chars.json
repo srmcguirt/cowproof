@@ -1,0 +1,12 @@
+{
+  "tool": "redact",
+  "id": "sk-with-special-chars",
+  "input": {
+    "input": "key is sk-abcd_efgh-ijkl"
+  },
+  "expected": {
+    "output": "key is [redacted]"
+  },
+  "captured_at": "2026-10-11T09:14:55.35903Z",
+  "source": "node reference adapter (redactSecrets of the Node lane runner run-lane.mjs L214-220, run on probe strings; not distributed)"
+}

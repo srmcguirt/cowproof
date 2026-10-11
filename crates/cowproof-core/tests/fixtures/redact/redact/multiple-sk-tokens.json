@@ -1,0 +1,12 @@
+{
+  "tool": "redact",
+  "id": "multiple-sk-tokens",
+  "input": {
+    "input": "keys: sk-aaaabbbb and sk-ccccdddd and sk-eeeeffff"
+  },
+  "expected": {
+    "output": "keys: [redacted] and [redacted] and [redacted]"
+  },
+  "captured_at": "2026-10-11T09:15:22.328669Z",
+  "source": "node reference adapter (redactSecrets of the Node lane runner run-lane.mjs L214-220, run on probe strings; not distributed)"
+}

@@ -1,0 +1,12 @@
+{
+  "tool": "redact",
+  "id": "xoxb-multi",
+  "input": {
+    "input": "XOXB token found: xoxb-SYNTHtesta-SYNTHtestb-abcdefghijklmnop"
+  },
+  "expected": {
+    "output": "XOXB token found: [redacted]"
+  },
+  "captured_at": "2026-10-11T09:15:24.44451Z",
+  "source": "node reference adapter (redactSecrets of the Node lane runner run-lane.mjs L214-220, run on probe strings; not distributed)"
+}

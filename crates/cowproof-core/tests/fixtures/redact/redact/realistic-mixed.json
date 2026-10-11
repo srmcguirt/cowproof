@@ -1,0 +1,12 @@
+{
+  "tool": "redact",
+  "id": "realistic-mixed",
+  "input": {
+    "input": "real case: Bearer eyJhbGciOiJIUzI1NiJ9.eyJpZCI6MX0.sig followed by sk-realtoken12345678"
+  },
+  "expected": {
+    "output": "real case: Bearer [redacted] JWT] followed by [redacted]"
+  },
+  "captured_at": "2026-10-11T09:15:27.416921Z",
+  "source": "node reference adapter (redactSecrets of the Node lane runner run-lane.mjs L214-220, run on probe strings; not distributed)"
+}

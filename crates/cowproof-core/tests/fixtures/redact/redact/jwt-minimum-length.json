@@ -1,0 +1,12 @@
+{
+  "tool": "redact",
+  "id": "jwt-minimum-length",
+  "input": {
+    "input": "eyJ1234567890123456.part2"
+  },
+  "expected": {
+    "output": "[redacted JWT]"
+  },
+  "captured_at": "2026-10-11T09:14:59.976387Z",
+  "source": "node reference adapter (redactSecrets of the Node lane runner run-lane.mjs L214-220, run on probe strings; not distributed)"
+}

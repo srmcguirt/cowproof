@@ -1,0 +1,12 @@
+{
+  "tool": "redact",
+  "id": "jwt-inline",
+  "input": {
+    "input": "jwt with eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9 inside"
+  },
+  "expected": {
+    "output": "jwt with [redacted JWT] inside"
+  },
+  "captured_at": "2026-10-11T09:15:00.778811Z",
+  "source": "node reference adapter (redactSecrets of the Node lane runner run-lane.mjs L214-220, run on probe strings; not distributed)"
+}

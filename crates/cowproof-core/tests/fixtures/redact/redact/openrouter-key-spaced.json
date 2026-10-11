@@ -1,0 +1,12 @@
+{
+  "tool": "redact",
+  "id": "openrouter-key-spaced",
+  "input": {
+    "input": "export OPENROUTER_API_KEY = sk-123456789abcdef"
+  },
+  "expected": {
+    "output": "export OPENROUTER_API_KEY = [redacted]"
+  },
+  "captured_at": "2026-10-11T09:15:13.481922Z",
+  "source": "node reference adapter (redactSecrets of the Node lane runner run-lane.mjs L214-220, run on probe strings; not distributed)"
+}
