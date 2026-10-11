@@ -7,7 +7,11 @@
 //! recorded requests must be equal. `lanes` is compared with what the real
 //! `cowproof watch` prints, `events` with `watch --events` and its own cursor,
 //! and one test drives the real `cowproof serve --director` process over stdio.
+//! `escalations` reads queue files that the queue itself wrote (`escalate::Queue`),
+//! so a change to what the queue records cannot leave the tool reading a format
+//! the tests made up.
 
+use cowproof_run::escalate::{Ask, AskKind, Clock, Opt, Origin, Queue, QueueEvent, Verdict};
 use serde_json::{Value, json};
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
@@ -16,7 +20,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const LANE: &str = "lane-a";
 const ESCALATION: &str = "lane-a:E1";
@@ -314,6 +318,7 @@ fn write_queue(root: &Root, lane: &str, events: &[Value]) {
 
 fn append_raw(root: &Root, lane: &str, text: &str) {
     let mut file = fs::OpenOptions::new()
+        .create(true)
         .append(true)
         .open(root.control(lane).join("escalations.jsonl"))
         .unwrap();
@@ -531,6 +536,18 @@ async fn events_refuses_a_cursor_it_did_not_issue() {
 fn serve_director_answers_over_stdio_and_a_rule_reaches_the_lane() {
     let root = Root::new();
     let seen = fake_director(&root, LANE);
+    // Twelve long asks: about 53 KB of escalations, over the server's default
+    // 16 KiB output budget and under the tool's own 64 KiB cap.
+    let question = "q".repeat(4000);
+    for n in 0..4 {
+        let lane = format!("big-{n}");
+        let clock = TestClock::at(now_ms_for_test());
+        let mut q = queue(&root, &lane, &clock);
+        for _ in 0..3 {
+            q.ask(&lane, &real_ask(&question, true), Origin::Builder)
+                .unwrap();
+        }
+    }
     let frames = [
         json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
             "protocolVersion": "2025-06-18", "capabilities": {},
@@ -541,6 +558,8 @@ fn serve_director_answers_over_stdio_and_a_rule_reaches_the_lane() {
             "name": "rule",
             "arguments": {"lanes_root": root.arg(), "lane": LANE,
                           "escalation": ESCALATION, "answer": "go with A"}}}),
+        json!({"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {
+            "name": "escalations", "arguments": {"lanes_root": root.arg()}}}),
     ];
     let mut child = Command::new(env!("CARGO_BIN_EXE_cowproof"))
         .args(["serve", "--director"])
@@ -582,7 +601,7 @@ fn serve_director_answers_over_stdio_and_a_rule_reaches_the_lane() {
         .map(|t| t["name"].as_str().unwrap())
         .collect();
     names.sort_unstable();
-    assert_eq!(names, ["events", "lanes", "note", "rule"]);
+    assert_eq!(names, ["escalations", "events", "lanes", "note", "rule"]);
 
     let call = reply(3);
     assert_eq!(call["result"]["isError"], false, "{call}");
@@ -594,6 +613,15 @@ fn serve_director_answers_over_stdio_and_a_rule_reaches_the_lane() {
         only_request(&seen),
         json!({"op": "rule", "id": ESCALATION, "verdict": {"answer": "go with A"}})
     );
+
+    // Every escalation arrives whole: the server's default output budget does not
+    // trim a reply that is inside the tool's own cap.
+    let escalations = reply(4);
+    assert_eq!(escalations["result"]["isError"], false, "{escalations}");
+    let out = &escalations["result"]["structuredContent"];
+    assert_eq!(out["escalations"].as_array().unwrap().len(), 12);
+    assert_eq!(out["truncated"], false);
+    assert!(out["escalations"].to_string().len() > 16 * 1024);
 }
 
 #[test]
@@ -606,4 +634,376 @@ fn serve_needs_director_and_its_help_names_the_mcp_use() {
     let help = stdout_of(&cowproof(&root, &["serve", "--help"]));
     assert!(help.contains(".mcp.json"), "{help}");
     assert!(help.contains("lanes"), "{help}");
+}
+
+/// A queue clock the test sets: milliseconds since the Unix epoch.
+#[derive(Clone)]
+struct TestClock(Arc<AtomicU64>);
+
+impl TestClock {
+    fn at(ms: u64) -> TestClock {
+        TestClock(Arc::new(AtomicU64::new(ms)))
+    }
+
+    fn set(&self, ms: u64) {
+        self.0.store(ms, Ordering::SeqCst);
+    }
+}
+
+impl Clock for TestClock {
+    fn now(&self) -> SystemTime {
+        UNIX_EPOCH + Duration::from_millis(self.0.load(Ordering::SeqCst))
+    }
+}
+
+/// The queue the runner would hold for `lane`, on the fixture's control directory.
+fn queue(root: &Root, lane: &str, clock: &TestClock) -> Queue {
+    Queue::new(&root.control(lane), Box::new(clock.clone())).unwrap()
+}
+
+fn real_ask(question: &str, blocking: bool) -> Ask {
+    Ask {
+        kind: AskKind::Design,
+        question: question.to_string(),
+        tried: vec!["read the docs".to_string(), "ran the check".to_string()],
+        options: vec![
+            Opt {
+                id: "a".to_string(),
+                summary: "the small change".to_string(),
+                cost: "an hour".to_string(),
+            },
+            Opt {
+                id: "b".to_string(),
+                summary: "the rewrite".to_string(),
+                cost: "a day".to_string(),
+            },
+        ],
+        recommend: "a".to_string(),
+        blocking,
+    }
+}
+
+fn now_ms_for_test() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+}
+
+/// The escalation ids in a tool reply, in order.
+fn ids(out: &Value) -> Vec<String> {
+    out["escalations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["id"].as_str().unwrap().to_string())
+        .collect()
+}
+
+/// Append one real queue event to a lane's queue file.
+fn append_event(root: &Root, lane: &str, event: &QueueEvent) {
+    append_raw(
+        root,
+        lane,
+        &format!("{}\n", serde_json::to_string(event).unwrap()),
+    );
+}
+
+/// An `asked` event for `ask`, serialized from the queue's own type, for the
+/// states `Queue::ask` refuses to produce (it validates, an old or hand-edited
+/// file need not).
+fn asked_event(lane: &str, n: u32, ask: Ask, at_ms: u64) -> QueueEvent {
+    QueueEvent::Asked {
+        lane: lane.to_string(),
+        id: format!("{lane}:E{n}"),
+        ask,
+        origin: Origin::Builder,
+        at_ms,
+    }
+}
+
+#[tokio::test]
+async fn escalations_returns_the_open_asks_and_the_ruled_one_only_on_request() {
+    let root = Root::new();
+    let clock = TestClock::at(now_ms_for_test() - 10 * 60 * 1000);
+    let mut q = queue(&root, LANE, &clock);
+    let blocking = real_ask("which way for the parser?", true);
+    let quiet = real_ask("may I rename the helper?", false);
+    let ruled = real_ask("is the retry loop in scope?", true);
+    let e1 = q.ask(LANE, &blocking, Origin::Builder).unwrap();
+    clock.set(now_ms_for_test() - 5 * 60 * 1000);
+    let e2 = q.ask(LANE, &quiet, Origin::Builder).unwrap();
+    let e3 = q.ask(LANE, &ruled, Origin::Builder).unwrap();
+    q.rule(
+        LANE,
+        &e3,
+        &Verdict::Answer {
+            text: "out of scope".to_string(),
+        },
+    )
+    .unwrap();
+    let file = root.control(LANE).join("escalations.jsonl");
+    let before = fs::read(&file).unwrap();
+
+    let out = tool("escalations", json!({"lanes_root": root.arg()})).await;
+
+    // Exactly the two open ones, oldest first, every ask field as it was asked.
+    assert_eq!(ids(&out), [e1.0.as_str(), e2.0.as_str()], "{out}");
+    assert_eq!(out["truncated"], false);
+    assert_eq!(out["omitted"], 0);
+    assert_eq!(out["skipped_lines"], 0);
+    assert_eq!(out["unreadable_lanes"], json!([]));
+    for (esc, ask) in out["escalations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .zip([&blocking, &quiet])
+    {
+        assert_eq!(esc["lane"], LANE);
+        assert_eq!(esc["status"], "open");
+        assert_eq!(esc["ruling"], Value::Null);
+        assert_eq!(esc["blocking"], json!(ask.blocking));
+        let mut expected = serde_json::to_value(ask).unwrap();
+        expected.as_object_mut().unwrap().remove("blocking");
+        expected["truncated_fields"] = json!([]);
+        assert_eq!(esc["builder_written"], expected);
+    }
+    // Ages come from the queue's own timestamps.
+    let age = |i: usize| out["escalations"][i]["age_ms"].as_u64().unwrap();
+    assert!((600_000..660_000).contains(&age(0)), "{}", age(0));
+    assert!((300_000..360_000).contains(&age(1)), "{}", age(1));
+    // The tool only read the queue.
+    assert_eq!(fs::read(&file).unwrap(), before);
+
+    let all = tool(
+        "escalations",
+        json!({"lanes_root": root.arg(), "include_ruled": true}),
+    )
+    .await;
+    assert_eq!(
+        ids(&all),
+        [e1.0.as_str(), e2.0.as_str(), e3.0.as_str()],
+        "{all}"
+    );
+    let all = all["escalations"].as_array().unwrap();
+    assert_eq!(all[2]["status"], "ruled");
+    assert_eq!(all[2]["ruling"], "answer");
+    assert_eq!(
+        all[2]["builder_written"]["question"],
+        "is the retry loop in scope?"
+    );
+    assert_eq!(all[0]["status"], "open");
+    assert_eq!(all[1]["ruling"], Value::Null);
+}
+
+#[tokio::test]
+async fn escalations_names_each_kind_of_ruling() {
+    let root = Root::new();
+    let clock = TestClock::at(now_ms_for_test());
+    let mut q = queue(&root, LANE, &clock);
+    let verdicts = [
+        (
+            Verdict::Redirect {
+                packet_path: "p.md".to_string(),
+            },
+            "redirect",
+        ),
+        (Verdict::Reassign { model: None }, "reassign"),
+        (Verdict::Stop, "stop"),
+    ];
+    for (i, (verdict, _)) in verdicts.iter().enumerate() {
+        let id = q
+            .ask(LANE, &real_ask(&format!("q{i}"), true), Origin::Builder)
+            .unwrap();
+        q.rule(LANE, &id, verdict).unwrap();
+    }
+    let out = tool(
+        "escalations",
+        json!({"lanes_root": root.arg(), "include_ruled": true}),
+    )
+    .await;
+    let kinds: Vec<&str> = out["escalations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["ruling"].as_str().unwrap())
+        .collect();
+    assert_eq!(kinds, ["redirect", "reassign", "stop"], "{out}");
+}
+
+#[tokio::test]
+async fn escalations_cuts_long_builder_fields_and_says_which() {
+    let root = Root::new();
+    let clock = TestClock::at(now_ms_for_test());
+    // A 3-byte character, so the cut at 4000 bytes falls inside one.
+    let long_question = "\u{20ac}".repeat(2000);
+    let mut ask = real_ask(&long_question, true);
+    ask.tried = vec!["t".repeat(3000), "u".repeat(2000)];
+    ask.options[0].summary = "s".repeat(3000);
+    ask.options[1].cost = "c".repeat(2001);
+    ask.recommend = "r".repeat(2500);
+    // `Queue::ask` refuses these lengths, so the file gets the real event instead.
+    queue(&root, LANE, &clock);
+    append_event(
+        &root,
+        LANE,
+        &asked_event(LANE, 1, ask, clock.0.load(Ordering::SeqCst)),
+    );
+
+    let out = tool("escalations", json!({"lanes_root": root.arg()})).await;
+    let written = &out["escalations"][0]["builder_written"];
+
+    let question = written["question"].as_str().unwrap();
+    assert_eq!(question.len(), 3999, "cut back to a character boundary");
+    assert!(long_question.starts_with(question));
+    assert_eq!(written["tried"][0].as_str().unwrap().len(), 2000);
+    assert_eq!(
+        written["tried"][1],
+        "u".repeat(2000),
+        "exactly at the cap is whole"
+    );
+    assert_eq!(
+        written["options"][0]["summary"].as_str().unwrap().len(),
+        2000
+    );
+    assert_eq!(written["options"][1]["cost"].as_str().unwrap().len(), 2000);
+    assert_eq!(written["recommend"].as_str().unwrap().len(), 2000);
+    assert_eq!(
+        written["truncated_fields"],
+        json!([
+            "tried[0]",
+            "options[0].summary",
+            "options[1].cost",
+            "question",
+            "recommend"
+        ])
+    );
+}
+
+#[tokio::test]
+async fn escalations_caps_the_whole_reply_and_counts_what_it_left_out() {
+    let root = Root::new();
+    // 24 asks of about 4.3 KB each is well past 64 KiB. A lane may ask three times.
+    let question = "q".repeat(4000);
+    let mut asked_ids = Vec::new();
+    for lane_n in 0..8u64 {
+        let lane = format!("lane-{lane_n}");
+        let clock = TestClock::at(1_000_000 + lane_n * 1000);
+        let mut q = queue(&root, &lane, &clock);
+        for _ in 0..3 {
+            let id = q
+                .ask(&lane, &real_ask(&question, true), Origin::Builder)
+                .unwrap();
+            asked_ids.push(id.0);
+        }
+    }
+
+    let out = tool("escalations", json!({"lanes_root": root.arg()})).await;
+    let kept = ids(&out);
+    let size: usize = out["escalations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e.to_string().len())
+        .sum();
+    assert!(size <= 64 * 1024, "{size} bytes of escalations");
+    assert!(!kept.is_empty());
+    assert_eq!(out["truncated"], true, "{} kept", kept.len());
+    let omitted = out["omitted"].as_u64().unwrap() as usize;
+    assert!(omitted > 0);
+    assert_eq!(
+        kept.len() + omitted,
+        asked_ids.len(),
+        "every ask is kept or counted"
+    );
+    assert_eq!(out["omitted_ids"].as_array().unwrap().len(), omitted);
+    // The oldest waits longest, so it is kept and the newest is what is left out.
+    assert_eq!(kept[0], "lane-0:E1");
+    assert!(
+        out["omitted_ids"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("lane-7:E3"))
+    );
+}
+
+#[tokio::test]
+async fn escalations_filters_to_one_lane() {
+    let root = Root::new();
+    let clock = TestClock::at(now_ms_for_test());
+    for lane in ["lane-a", "lane-b"] {
+        queue(&root, lane, &clock)
+            .ask(
+                lane,
+                &real_ask(&format!("question of {lane}"), true),
+                Origin::Builder,
+            )
+            .unwrap();
+    }
+    let all = tool("escalations", json!({"lanes_root": root.arg()})).await;
+    assert_eq!(ids(&all), ["lane-a:E1", "lane-b:E1"], "{all}");
+
+    let only_b = tool(
+        "escalations",
+        json!({"lanes_root": root.arg(), "lane": "lane-b"}),
+    )
+    .await;
+    assert_eq!(ids(&only_b), ["lane-b:E1"], "{only_b}");
+    assert_eq!(
+        only_b["escalations"][0]["builder_written"]["question"],
+        "question of lane-b"
+    );
+    let none = tool(
+        "escalations",
+        json!({"lanes_root": root.arg(), "lane": "lane-c"}),
+    )
+    .await;
+    assert_eq!(ids(&none), Vec::<String>::new());
+}
+
+#[tokio::test]
+async fn escalations_counts_lines_it_cannot_read_and_names_unreadable_lanes() {
+    let root = Root::new();
+    let clock = TestClock::at(now_ms_for_test());
+    queue(&root, LANE, &clock)
+        .ask(LANE, &real_ask("still readable?", true), Origin::Builder)
+        .unwrap();
+    // One garbage line and one half-written line.
+    append_raw(&root, LANE, "this is not an event\n");
+    append_raw(
+        &root,
+        LANE,
+        r#"{"event":"asked","lane":"lane-a","id":"lane-a:E2""#,
+    );
+    // Another lane whose queue path is a directory, so it cannot be read.
+    fs::create_dir(root.control("lane-b").join("escalations.jsonl")).unwrap();
+
+    let out = tool("escalations", json!({"lanes_root": root.arg()})).await;
+
+    assert_eq!(ids(&out), [ESCALATION], "{out}");
+    assert_eq!(out["skipped_lines"], 2, "{out}");
+    assert_eq!(out["unreadable_lanes"], json!(["lane-b"]), "{out}");
+}
+
+#[tokio::test]
+async fn escalations_says_in_its_description_that_the_fields_are_untrusted() {
+    let server = cowproof_cli::director_tools::server(None);
+    let description = server
+        .registry()
+        .get("escalations")
+        .unwrap()
+        .spec()
+        .description;
+    assert!(
+        description.contains("written by the builder"),
+        "{description}"
+    );
+    assert!(description.contains("untrusted"), "{description}");
+    // The reply says it too, next to the data.
+    let root = Root::new();
+    let out = tool("escalations", json!({"lanes_root": root.arg()})).await;
+    assert!(
+        out["notice"].as_str().unwrap().contains("untrusted"),
+        "{out}"
+    );
 }

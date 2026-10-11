@@ -416,7 +416,10 @@ fn the_cowproof_binary_serves_the_director_tools_over_stdio() {
         .collect();
     tool_names.sort_unstable();
 
-    assert_eq!(tool_names, ["events", "lanes", "note", "rule"]);
+    assert_eq!(
+        tool_names,
+        ["escalations", "events", "lanes", "note", "rule"]
+    );
 }
 
 /// Every MCP tool mentioned in the skills is served by the real binary.

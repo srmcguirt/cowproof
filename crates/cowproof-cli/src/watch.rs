@@ -195,7 +195,7 @@ pub async fn watch(args: WatchArgs) -> Result<()> {
 }
 
 /// Collect all lanes from the lanes root.
-fn collect_lanes(lanes_root: &Path) -> Result<Vec<PathBuf>> {
+pub(crate) fn collect_lanes(lanes_root: &Path) -> Result<Vec<PathBuf>> {
     if !lanes_root.is_dir() {
         return Ok(Vec::new());
     }

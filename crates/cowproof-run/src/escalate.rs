@@ -18,8 +18,8 @@
 //!   session with a carry-over summary built from the queue.
 
 use std::collections::{BTreeMap, HashMap};
-use std::fs::{File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
@@ -394,6 +394,19 @@ pub enum Verdict {
     Reassign { model: std::option::Option<String> },
     #[serde(rename = "stop")]
     Stop,
+}
+
+impl Verdict {
+    /// The verdict's kind as the queue file spells it: `answer`, `redirect`,
+    /// `reassign` or `stop`.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Verdict::Answer { .. } => "answer",
+            Verdict::Redirect { .. } => "redirect",
+            Verdict::Reassign { .. } => "reassign",
+            Verdict::Stop => "stop",
+        }
+    }
 }
 
 /// Delivery result from the Delivery trait.
@@ -805,19 +818,10 @@ impl Queue {
 
     /// Rebuild queue state from the file.
     fn rebuild_from_file(&mut self) -> std::io::Result<()> {
-        let file = File::open(self.queue_path())?;
-        let reader = BufReader::new(file);
+        // Malformed lines are skipped (the reader counts them).
+        let (events, _skipped) = read_queue_events(&self.queue_path())?;
 
-        for line in reader.lines() {
-            let line = line?;
-            if line.trim().is_empty() {
-                continue;
-            }
-
-            // Skip malformed lines
-            let Ok(event) = serde_json::from_str::<QueueEvent>(&line) else {
-                continue;
-            };
+        for event in events {
             match event {
                 QueueEvent::Asked {
                     lane,
@@ -1625,6 +1629,115 @@ impl Queue {
 
         Ok(())
     }
+}
+
+/// Read a queue file's events in file order, with the count of lines that are
+/// not events. The one parser of `escalations.jsonl`: [`Queue`] rebuilds from it
+/// and [`read_escalations`] reads through it, so both see the same events.
+///
+/// A blank line is ignored. A line that is not a [`QueueEvent`] is skipped and
+/// counted: a half-written last line, bytes that are not UTF-8, or a record of
+/// an unknown shape. The file is only read.
+pub fn read_queue_events(path: &Path) -> std::io::Result<(Vec<QueueEvent>, usize)> {
+    let bytes = std::fs::read(path)?;
+    let mut events = Vec::new();
+    let mut skipped = 0;
+    for line in bytes.split(|b| *b == b'\n') {
+        if line.iter().all(u8::is_ascii_whitespace) {
+            continue;
+        }
+        match serde_json::from_slice::<QueueEvent>(line) {
+            Ok(event) => events.push(event),
+            Err(_) => skipped += 1,
+        }
+    }
+    Ok((events, skipped))
+}
+
+/// One escalation as the queue file records it, with its ruling if it has one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EscalationRecord {
+    pub lane: String,
+    pub id: String,
+    pub ask: Ask,
+    pub origin: Origin,
+    /// When the lane parked, milliseconds since the Unix epoch; 0 = unknown.
+    pub asked_at_ms: u64,
+    /// The ruling, or `None` while the escalation is open.
+    pub ruling: StdOption<Verdict>,
+}
+
+impl EscalationRecord {
+    /// Open means no ruling has been recorded. This is [`Queue`]'s own test: a
+    /// second ruling for the id is refused once an entry has a verdict.
+    pub fn is_open(&self) -> bool {
+        self.ruling.is_none()
+    }
+}
+
+/// What [`read_escalations`] found in one queue file.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EscalationRead {
+    /// Every asked escalation, open and ruled, in the order it was asked.
+    pub escalations: Vec<EscalationRecord>,
+    /// Lines that were not queue events.
+    pub skipped_lines: usize,
+}
+
+/// Read a lane's escalations from `<control_dir>/escalations.jsonl`, read only:
+/// no [`Queue`] is opened, nothing is written or locked, so it is safe on a live
+/// lane. A missing file is an empty read.
+///
+/// The events replay the way [`Queue::new`] rebuilds its state: an `asked` event
+/// makes an entry (a repeated id replaces it), a `ruled` event sets the verdict
+/// of an entry that exists, and a `ruled` event for an id never asked is ignored.
+/// Everything in `ask` was written by the builder: untrusted data.
+pub fn read_escalations(control_dir: &Path) -> std::io::Result<EscalationRead> {
+    let path = control_dir.join("escalations.jsonl");
+    let (events, skipped_lines) = match read_queue_events(&path) {
+        Ok(read) => read,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(EscalationRead::default()),
+        Err(e) => return Err(e),
+    };
+    let mut escalations: Vec<EscalationRecord> = Vec::new();
+    let mut index: HashMap<String, usize> = HashMap::new();
+    for event in events {
+        match event {
+            QueueEvent::Asked {
+                lane,
+                id,
+                ask,
+                origin,
+                at_ms,
+            } => {
+                let record = EscalationRecord {
+                    lane,
+                    id: id.clone(),
+                    ask,
+                    origin,
+                    asked_at_ms: at_ms,
+                    ruling: StdOption::None,
+                };
+                match index.get(&id) {
+                    Some(&at) => escalations[at] = record,
+                    None => {
+                        index.insert(id, escalations.len());
+                        escalations.push(record);
+                    }
+                }
+            }
+            QueueEvent::Ruled { id, verdict, .. } => {
+                if let Some(&at) = index.get(&id) {
+                    escalations[at].ruling = StdOption::Some(verdict);
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(EscalationRead {
+        escalations,
+        skipped_lines,
+    })
 }
 
 #[cfg(test)]
@@ -3509,5 +3622,115 @@ mod tests {
         // A check never run has no entry, and neither has an unknown lane.
         assert!(!results.contains_key("never-run"));
         assert!(queue.check_results("unknown").is_empty());
+    }
+    #[test]
+    fn read_escalations_agrees_with_the_queue_on_open_and_ruled() {
+        let tmpdir = tempfile::TempDir::new().unwrap();
+        let mut queue = Queue::new(tmpdir.path(), Box::new(TestClock::new())).unwrap();
+        let mut quiet = new_ask("a non-blocking question");
+        quiet.blocking = false;
+        let e1 = queue
+            .ask("lane1", &new_ask("first, blocking"), Origin::Builder)
+            .unwrap();
+        let e2 = queue.ask("lane1", &quiet, Origin::Builder).unwrap();
+        let e3 = queue
+            .ask("lane1", &new_ask("third, blocking"), Origin::Builder)
+            .unwrap();
+        let answer = Verdict::Answer {
+            text: "go left".to_string(),
+        };
+        queue.rule("lane1", &e1, &answer).unwrap();
+        // A refused second ruling is logged as `rejected` and changes nothing.
+        queue.rule("lane1", &e1, &Verdict::Stop).unwrap_err();
+
+        let read = read_escalations(tmpdir.path()).unwrap();
+        assert_eq!(read.skipped_lines, 0);
+        let ids: Vec<&str> = read.escalations.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(ids, [e1.0.as_str(), e2.0.as_str(), e3.0.as_str()]);
+        let open: Vec<&str> = read
+            .escalations
+            .iter()
+            .filter(|e| e.is_open())
+            .map(|e| e.id.as_str())
+            .collect();
+        assert_eq!(open, [e2.0.as_str(), e3.0.as_str()]);
+        assert_eq!(read.escalations[0].ruling, Some(answer.clone()));
+        assert_eq!(read.escalations[0].ask, new_ask("first, blocking"));
+        assert_eq!(read.escalations[1].ask, quiet);
+
+        // The queue's own view, rebuilt from the same file, says the same: of the
+        // blocking asks, E1 has a verdict and E3 has none.
+        let rebuilt = Queue::new(tmpdir.path(), Box::new(TestClock::new())).unwrap();
+        let verdicts: Vec<(String, bool)> = rebuilt
+            .pending_blocking("lane1")
+            .into_iter()
+            .map(|p| (p.id.0, p.verdict.is_some()))
+            .collect();
+        assert_eq!(
+            verdicts,
+            [(e1.0.clone(), true), (e3.0.clone(), false)],
+            "the queue's view"
+        );
+        for (id, ruled) in verdicts {
+            let record = read.escalations.iter().find(|e| e.id == id).unwrap();
+            assert_eq!(!record.is_open(), ruled, "{id}");
+        }
+    }
+
+    #[test]
+    fn read_escalations_only_reads() {
+        let tmpdir = tempfile::TempDir::new().unwrap();
+        let mut queue = Queue::new(tmpdir.path(), Box::new(TestClock::new())).unwrap();
+        queue.ask("lane1", &new_ask("q"), Origin::Builder).unwrap();
+        let file = tmpdir.path().join("escalations.jsonl");
+        let before = std::fs::read(&file).unwrap();
+        read_escalations(tmpdir.path()).unwrap();
+        assert_eq!(std::fs::read(&file).unwrap(), before);
+        let names: Vec<_> = std::fs::read_dir(tmpdir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, ["escalations.jsonl"]);
+    }
+
+    #[test]
+    fn read_escalations_counts_lines_that_are_not_events() {
+        let tmpdir = tempfile::TempDir::new().unwrap();
+        let mut queue = Queue::new(tmpdir.path(), Box::new(TestClock::new())).unwrap();
+        queue.ask("lane1", &new_ask("q"), Origin::Builder).unwrap();
+        // Garbage, a record of an unknown shape, bytes that are not UTF-8, a
+        // ruling for an id never asked, and a half-written last line.
+        let mut raw = Vec::new();
+        raw.extend_from_slice(b"not json\n{\"event\":\"nope\"}\n\xff\xfe\n\n");
+        let stray = QueueEvent::Ruled {
+            lane: "lane1".to_string(),
+            id: "lane1:E9".to_string(),
+            verdict: Verdict::Stop,
+            at_ms: 1,
+        };
+        raw.extend_from_slice(serde_json::to_string(&stray).unwrap().as_bytes());
+        raw.extend_from_slice(b"\n{\"event\":\"asked\",\"lane\":\"lane1\"");
+        let mut file = OpenOptions::new()
+            .append(true)
+            .open(tmpdir.path().join("escalations.jsonl"))
+            .unwrap();
+        file.write_all(&raw).unwrap();
+
+        let read = read_escalations(tmpdir.path()).unwrap();
+        assert_eq!(read.skipped_lines, 4);
+        assert_eq!(read.escalations.len(), 1);
+        assert!(read.escalations[0].is_open());
+        // The queue rebuilds from the same lines the same way.
+        let rebuilt = Queue::new(tmpdir.path(), Box::new(TestClock::new())).unwrap();
+        assert_eq!(rebuilt.escalation_count("lane1"), 1);
+    }
+
+    #[test]
+    fn read_escalations_of_a_lane_with_no_queue_file_is_empty() {
+        let tmpdir = tempfile::TempDir::new().unwrap();
+        assert_eq!(
+            read_escalations(tmpdir.path()).unwrap(),
+            EscalationRead::default()
+        );
     }
 }

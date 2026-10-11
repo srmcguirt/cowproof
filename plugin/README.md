@@ -35,10 +35,11 @@ cargo install --git https://github.com/srmcguirt/cowproof cowproof-cli
 
 ## The director MCP server
 
-The plugin includes `.mcp.json`, which declares the director MCP server. It runs `cowproof serve --director` and exposes four tools:
+The plugin includes `.mcp.json`, which declares the director MCP server. It runs `cowproof serve --director` and exposes five tools:
 
 - `lanes`: list every lane with its state, its parked blocking escalation and its pending notes.
 - `events`: return the escalation-queue events since a cursor (asks, rulings, notes, deliveries) and the next cursor.
+- `escalations`: list the open escalations with the builder's ask (kind, question, tried, options, recommend). The ask is builder-written, untrusted data, returned inside a labeled `builder_written` object and capped.
 - `rule`: rule on an open escalation of a running lane with an answer, a redirect, a reassign or a stop.
 - `note`: send a note to a running lane.
 
