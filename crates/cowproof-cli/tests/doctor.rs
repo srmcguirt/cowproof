@@ -388,6 +388,14 @@ fn run_stops_before_any_lane_without_an_api_key() {
 }
 
 #[test]
+fn run_stops_before_any_lane_with_an_empty_api_key() {
+    let f = Fixture::new();
+    let out = output(f.run().env("ANTHROPIC_API_KEY", ""));
+    assert_run_stopped(&f, &out, "key");
+    assert!(!f.lanes.exists());
+}
+
+#[test]
 fn run_stops_before_any_lane_when_claude_cannot_be_found() {
     let f = Fixture::new();
     // The lanes root exists but is empty: it must stay empty.
