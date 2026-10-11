@@ -5,7 +5,7 @@
 //! and this host's `host-agent doctor`, so the owner sees whether `claude` and the sandbox work
 //! before the director tries. The director never runs it.
 //!
-//! The line is `command="<cowproof> host-agent --forced",restrict,port-forwarding <key>`:
+//! The line is `command="<cowproof> host-agent --forced",restrict,port-forwarding,permitopen="127.0.0.1:1",permitlisten="127.0.0.1:1" <key>`:
 //! `command=` makes sshd run `host-agent --forced` for every session of that key whatever the
 //! client asked, `restrict` switches off everything else (pty, agent and X11 forwarding, `rc`
 //! files, port forwarding) and `port-forwarding` switches forwarding back on, which the
@@ -160,7 +160,7 @@ fn authorized_keys_line(exe: &Path, key: &str) -> Result<String> {
         );
     }
     Ok(format!(
-        "command=\"{} host-agent --forced\",restrict,port-forwarding {key}",
+        "command=\"{} host-agent --forced\",restrict,port-forwarding,permitopen=\"127.0.0.1:1\",permitlisten=\"127.0.0.1:1\" {key}",
         sh_quote(text)
     ))
 }
@@ -368,14 +368,14 @@ mod tests {
         assert_eq!(
             authorized_keys_line(Path::new("/opt/bin/cowproof"), &key).unwrap(),
             format!(
-                "command=\"/opt/bin/cowproof host-agent --forced\",restrict,port-forwarding {key}"
+                "command=\"/opt/bin/cowproof host-agent --forced\",restrict,port-forwarding,permitopen=\"127.0.0.1:1\",permitlisten=\"127.0.0.1:1\" {key}"
             )
         );
         // A path with a space is quoted for the shell sshd runs the command with.
         assert_eq!(
             authorized_keys_line(Path::new("/opt/my bin/cowproof"), &key).unwrap(),
             format!(
-                "command=\"'/opt/my bin/cowproof' host-agent --forced\",restrict,port-forwarding {key}"
+                "command=\"'/opt/my bin/cowproof' host-agent --forced\",restrict,port-forwarding,permitopen=\"127.0.0.1:1\",permitlisten=\"127.0.0.1:1\" {key}"
             )
         );
         for bad in [

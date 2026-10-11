@@ -89,7 +89,7 @@ Owner steps, on the host, as the user the director logs in as:
 The line looks like this:
 
 ```
-command="/opt/cowproof/bin/cowproof host-agent --forced",restrict,port-forwarding ssh-ed25519 AAAA... director@laptop
+command="/opt/cowproof/bin/cowproof host-agent --forced",restrict,port-forwarding,permitopen="127.0.0.1:1",permitlisten="127.0.0.1:1" ssh-ed25519 AAAA... director@laptop
 ```
 
 `command=` makes `sshd` run `host-agent --forced` for every session of that key, whatever the client asked for, and put what it asked for in `SSH_ORIGINAL_COMMAND`. `host-agent --forced` accepts that text only if it is `<path>/cowproof host-agent <verb> <arguments>` in the form the director writes (words of letters, digits and `_./:=@%+,-`, or single-quoted words), with a verb from the closed set (`prepare`, `builder`, `check`, `patch`, `stderr`, `doctor`, `cleanup`), and then runs that verb itself. It never starts a shell and never runs the program named in the first word: the binary that runs is the one the key names. `$`, backticks, `;`, `|`, `&`, redirections, double quotes, globs, newlines and `--forced` inside the command are refused. A refusal, and an interactive login with no command, print one JSON error line (`{"ok":false,"error":"refused: ..."}`, which says what was wrong and never repeats the command) and exit 77. A verb that runs exits with its own code (0 or 1). `restrict` turns off the pty, agent and X11 forwarding, port forwarding and `~/.ssh/rc`; `port-forwarding` turns port forwarding back on, which the director needs for the two socket forwards.

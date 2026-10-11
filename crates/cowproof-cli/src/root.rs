@@ -39,7 +39,7 @@ pub fn resolve_executable(name: &str, path: &str, cwd: &Path) -> Result<PathBuf>
     candidates
         .into_iter()
         .find(|c| is_executable(c))
-        .ok_or_else(|| anyhow!("cannot find an executable {name:?} on the director's PATH"))
+        .ok_or_else(|| anyhow!("cannot find an executable {name:?} on this machine's PATH"))
 }
 
 /// [`lanes_root`] for this process: the working directory and `HOME` as they are now.

@@ -101,7 +101,7 @@ fn the_printed_line_is_exact_and_names_this_binary_and_the_directors_key() {
     let out = s.run(&key, &[]);
     let text = stdout(&out);
     let expected = format!(
-        "command=\"{} host-agent --forced\",restrict,port-forwarding {KEY}",
+        "command=\"{} host-agent --forced\",restrict,port-forwarding,permitopen=\"127.0.0.1:1\",permitlisten=\"127.0.0.1:1\" {KEY}",
         s.cowproof.display()
     );
     // The line, alone on its own line.
@@ -168,6 +168,10 @@ fn a_host_without_claude_is_not_ready_and_says_so() {
     assert!(text.contains("Not ready"), "{text}");
     // The line is still printed: the owner can fix claude later.
     assert!(text.contains("restrict,port-forwarding"), "{text}");
+    assert!(
+        text.contains("permitopen=\"127.0.0.1:1\",permitlisten=\"127.0.0.1:1\""),
+        "{text}"
+    );
 }
 
 #[test]
