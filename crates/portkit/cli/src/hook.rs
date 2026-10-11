@@ -151,7 +151,7 @@ fn is_hot(config: &Config, command: &str) -> bool {
         // is a guess.
         return false;
     }
-    let path = trace_dir(config).join(format!("{}.jsonl", today()));
+    let path = trace_path(config);
     let Ok(records) = trace::read_jsonl(&path) else {
         return false;
     };
@@ -202,7 +202,13 @@ fn split_command(command: &str) -> Option<(String, Vec<String>)> {
 }
 
 fn trace_dir(config: &Config) -> PathBuf {
-    PathBuf::from(&config.trace.dir)
+    config.trace.resolve_dir()
+}
+
+/// Today's trace file: under the state dir when `PORTKIT_STATE_DIR` is set,
+/// and named for `PORTKIT_SESSION` when that is set.
+fn trace_path(config: &Config) -> PathBuf {
+    trace_dir(config).join(portkit_core::config::TraceConfig::trace_filename(&today()))
 }
 
 fn today() -> String {
@@ -245,7 +251,7 @@ fn record(payload: &Payload, config: &Config) {
     if !config.trace.enabled || payload.tool_name.is_empty() {
         return;
     }
-    let path = trace_dir(config).join(format!("{}.jsonl", today()));
+    let path = trace_path(config);
     let Ok(recorder) = JsonlRecorder::create(&path) else {
         return;
     };
@@ -286,7 +292,7 @@ fn suggest(payload: &Payload, config: &Config) {
     if !config.trace.enabled {
         return;
     }
-    let path = trace_dir(config).join(format!("{}.jsonl", today()));
+    let path = trace_path(config);
     let Ok(all) = trace::read_jsonl(&path) else {
         return;
     };
@@ -319,7 +325,7 @@ fn summarize(payload: &Payload, config: &Config) {
     if !config.trace.enabled {
         return;
     }
-    let path = trace_dir(config).join(format!("{}.jsonl", today()));
+    let path = trace_path(config);
     let Ok(all) = trace::read_jsonl(&path) else {
         return;
     };

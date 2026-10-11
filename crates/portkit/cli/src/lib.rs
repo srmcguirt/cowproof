@@ -219,7 +219,15 @@ pub enum Command {
     },
 
     /// Check whether this session is actually being watched.
-    Doctor,
+    Doctor {
+        /// Emit JSON instead of a table.
+        #[arg(long)]
+        json: bool,
+
+        /// Settings file to check instead of searching the default locations.
+        #[arg(long, value_name = "FILE")]
+        settings: Option<PathBuf>,
+    },
 
     /// Show the effective configuration after all layers are applied.
     Config,
@@ -343,7 +351,7 @@ impl Command {
                 apply,
             } => verify::run(config, &manifest, window, apply),
             Command::Trace { dir, json } => commands::trace(config, dir, json),
-            Command::Doctor => doctor::run(config),
+            Command::Doctor { json, settings } => doctor::run(config, json, settings),
             Command::Config => commands::show_config(config),
             Command::Completion { shell } => {
                 commands::completion(shell);

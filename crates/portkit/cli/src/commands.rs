@@ -278,7 +278,10 @@ fn recorder(config: &Config) -> Option<Arc<dyn Recorder>> {
     if !config.trace.enabled {
         return None;
     }
-    let path = PathBuf::from(&config.trace.dir).join(format!("{}.jsonl", today()));
+    let path = config
+        .trace
+        .resolve_dir()
+        .join(portkit_core::config::TraceConfig::trace_filename(&today()));
     match JsonlRecorder::create(&path) {
         Ok(r) => Some(Arc::new(r)),
         Err(err) => {
@@ -292,7 +295,7 @@ fn recorder(config: &Config) -> Option<Arc<dyn Recorder>> {
 }
 
 pub fn trace(config: &Config, dir: Option<PathBuf>, json: bool) -> Result<ExitCode> {
-    let dir = dir.unwrap_or_else(|| PathBuf::from(&config.trace.dir));
+    let dir = dir.unwrap_or_else(|| config.trace.resolve_dir());
     if !dir.exists() {
         println!(
             "no traces at {} (set [trace] enabled = true)",

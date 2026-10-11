@@ -3,6 +3,8 @@
 //! Later layers win. The environment layer is prefixed `PK_` and uses `__`
 //! to descend, so `PK_PARITY__EPSILON=1e-6` sets `parity.epsilon`.
 
+use std::path::{Path, PathBuf};
+
 use serde::{Deserialize, Serialize};
 
 use crate::diff::DiffOptions;
@@ -88,7 +90,8 @@ pub struct TraceConfig {
     /// Record what each tool call cost in context. Off by default: writing a
     /// file per call is a side effect nobody asked for.
     pub enabled: bool,
-    /// Directory for daily JSONL files, relative to the working directory.
+    /// Directory for daily JSONL files, relative to the working directory, or
+    /// to `PORTKIT_STATE_DIR` when that is set (see `resolve_dir`).
     pub dir: String,
 }
 
@@ -97,6 +100,72 @@ impl Default for TraceConfig {
         Self {
             enabled: false,
             dir: ".portkit/traces".into(),
+        }
+    }
+}
+
+/// The shipped `[trace] dir`. Under `PORTKIT_STATE_DIR` it means `<state>/traces`.
+const DEFAULT_TRACE_DIR: &str = ".portkit/traces";
+
+/// Longest `PORTKIT_SESSION` kept in a trace file name, matching the hook's
+/// own session-id truncation.
+const MAX_SESSION_CHARS: usize = 48;
+
+impl TraceConfig {
+    /// Where trace files go, honouring `PORTKIT_STATE_DIR`.
+    ///
+    /// See [`TraceConfig::resolve_dir_in`] for the rules.
+    pub fn resolve_dir(&self) -> PathBuf {
+        let state = std::env::var_os("PORTKIT_STATE_DIR").filter(|v| !v.is_empty());
+        self.resolve_dir_in(state.as_deref().map(Path::new))
+    }
+
+    /// Resolve the trace directory against an optional state dir.
+    ///
+    /// - An absolute `dir` is used as it is.
+    /// - With a state dir, the shipped default (`.portkit/traces`) becomes
+    ///   `<state>/traces`, and any other relative `dir` resolves against the
+    ///   state dir, never the working directory. A lane's working directory is
+    ///   the builder's clone, so a cwd-relative trace dir would land in its
+    ///   patch.
+    /// - Without a state dir, a relative `dir` stays relative to the working
+    ///   directory, as before.
+    pub fn resolve_dir_in(&self, state_dir: Option<&Path>) -> PathBuf {
+        let dir = Path::new(&self.dir);
+        if dir.is_absolute() {
+            return dir.to_path_buf();
+        }
+        match state_dir {
+            Some(state) if self.dir == DEFAULT_TRACE_DIR => state.join("traces"),
+            Some(state) => state.join(dir),
+            None => dir.to_path_buf(),
+        }
+    }
+
+    /// Daily trace file name, with `PORTKIT_SESSION` in it when set.
+    ///
+    /// See [`TraceConfig::trace_filename_for`].
+    pub fn trace_filename(date: &str) -> String {
+        let session = std::env::var("PORTKIT_SESSION").ok();
+        Self::trace_filename_for(date, session.as_deref())
+    }
+
+    /// `<date>.jsonl`, or `<date>-<session>.jsonl` when a session is given.
+    ///
+    /// Two lanes that share a state dir on the same day then write different
+    /// files. The session is reduced to letters, digits, `-` and `_` and cut
+    /// at 48 characters, so it can never name another directory.
+    pub fn trace_filename_for(date: &str, session: Option<&str>) -> String {
+        let safe: String = session
+            .unwrap_or_default()
+            .chars()
+            .filter(|c| c.is_alphanumeric() || *c == '-' || *c == '_')
+            .take(MAX_SESSION_CHARS)
+            .collect();
+        if safe.is_empty() {
+            format!("{date}.jsonl")
+        } else {
+            format!("{date}-{safe}.jsonl")
         }
     }
 }
@@ -278,5 +347,84 @@ mod tests {
         let opts = cfg.diff_options();
         assert_eq!(opts.epsilon, 1e-3);
         assert_eq!(opts.ignore_paths, vec!["/meta".to_string()]);
+    }
+
+    #[test]
+    fn trace_filename_includes_the_session() {
+        assert_eq!(
+            TraceConfig::trace_filename_for("2026-10-11", Some("lane-a")),
+            "2026-10-11-lane-a.jsonl"
+        );
+    }
+
+    #[test]
+    fn trace_filename_without_a_session_is_the_plain_date() {
+        assert_eq!(
+            TraceConfig::trace_filename_for("2026-10-11", None),
+            "2026-10-11.jsonl"
+        );
+        assert_eq!(
+            TraceConfig::trace_filename_for("2026-10-11", Some("")),
+            "2026-10-11.jsonl"
+        );
+        assert_eq!(
+            TraceConfig::trace_filename_for("2026-10-11", Some("@#$/")),
+            "2026-10-11.jsonl"
+        );
+    }
+
+    #[test]
+    fn trace_filename_cannot_escape_the_directory() {
+        assert_eq!(
+            TraceConfig::trace_filename_for("2026-10-11", Some("../x/lane_1@#")),
+            "2026-10-11-xlane_1.jsonl"
+        );
+        let long = "a".repeat(200);
+        let name = TraceConfig::trace_filename_for("2026-10-11", Some(&long));
+        assert_eq!(name.len(), "2026-10-11-.jsonl".len() + 48);
+    }
+
+    #[test]
+    fn default_dir_becomes_traces_under_the_state_dir() {
+        let config = TraceConfig::default();
+        assert_eq!(
+            config.resolve_dir_in(Some(Path::new("/var/tmp/state"))),
+            Path::new("/var/tmp/state/traces")
+        );
+    }
+
+    #[test]
+    fn a_relative_dir_resolves_against_the_state_dir_not_the_cwd() {
+        let config = TraceConfig {
+            enabled: true,
+            dir: "my/traces".into(),
+        };
+        assert_eq!(
+            config.resolve_dir_in(Some(Path::new("/var/tmp/state"))),
+            Path::new("/var/tmp/state/my/traces")
+        );
+    }
+
+    #[test]
+    fn an_absolute_dir_ignores_the_state_dir() {
+        let config = TraceConfig {
+            enabled: true,
+            dir: "/var/tmp/elsewhere".into(),
+        };
+        assert_eq!(
+            config.resolve_dir_in(Some(Path::new("/var/tmp/state"))),
+            Path::new("/var/tmp/elsewhere")
+        );
+    }
+
+    #[test]
+    fn without_a_state_dir_a_relative_dir_stays_cwd_relative() {
+        let config = TraceConfig::default();
+        assert_eq!(config.resolve_dir_in(None), Path::new(".portkit/traces"));
+        let custom = TraceConfig {
+            enabled: true,
+            dir: "x/y".into(),
+        };
+        assert_eq!(custom.resolve_dir_in(None), Path::new("x/y"));
     }
 }
