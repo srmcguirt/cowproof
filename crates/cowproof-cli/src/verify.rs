@@ -11,7 +11,7 @@ use clap::Parser;
 use cowproof_prove::{
     Capsule, VerifyError,
     runner::{SandboxedRunner, host_platform, verifier_toolchain},
-    verify::{VerifyOptions, VerifyResult, verify},
+    verify::{VerifyOptions, VerifyResult, remove_launch_paths, verify},
 };
 use cowproof_run::{
     LaneLayout,
@@ -107,7 +107,7 @@ impl Rebuild {
         if let Some(patch) = &self.base_patch {
             apply(tree, patch).context("applying base.patch")?;
         }
-        remove_launch_paths(tree, &self.launch_removed)?;
+        remove_launch_paths(tree, &self.launch_removed).map_err(|e| anyhow!("{e}"))?;
         let config = deps::RegistryConfigSnapshot::take(tree)?;
         apply(tree, &self.lane_patch).context("applying lane.patch")?;
         config.restore(tree)
@@ -155,37 +155,6 @@ fn apply(tree: &Path, patch: &[u8]) -> Result<()> {
         return Ok(());
     }
     git(Some(tree), &["apply", "-"], &[], Some(patch))
-}
-
-/// Delete the launch baseline's paths (R15), refusing anything but a relative path to a
-/// file or symlink inside the tree that no symlink or `.git` component leads through. A
-/// symlink at the end is unlinked, never followed (a committed `CLAUDE.md -> AGENTS.md`
-/// is a launch-removed path).
-fn remove_launch_paths(tree: &Path, removed: &[String]) -> Result<()> {
-    for rel in removed {
-        let parts: Vec<&str> = rel.split('/').collect();
-        let bad = rel.is_empty()
-            || parts
-                .iter()
-                .any(|c| c.is_empty() || *c == "." || *c == ".." || c.eq_ignore_ascii_case(".git"));
-        if bad || rel.contains('\0') {
-            bail!("launch baseline: refused path {rel:?}");
-        }
-        let mut current = tree.to_path_buf();
-        for (i, c) in parts.iter().enumerate() {
-            current.push(c);
-            let last = i + 1 == parts.len();
-            match fs::symlink_metadata(&current) {
-                Ok(m) if last && (m.is_file() || m.file_type().is_symlink()) => {
-                    fs::remove_file(&current)?
-                }
-                Ok(m) if !last && m.is_dir() => {}
-                Ok(_) => bail!("launch baseline: {rel:?} is not a plain file path"),
-                Err(e) => bail!("launch baseline: cannot remove {rel:?}: {e}"),
-            }
-        }
-    }
-    Ok(())
 }
 
 /// Fetch (or find in the cache) the dependencies of the tree `rebuild` describes, before
@@ -378,36 +347,4 @@ fn quote_ids(ids: &[String]) -> String {
         .map(|id| format!("{id:?}"))
         .collect::<Vec<_>>()
         .join(", ")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_launch_removed_symlink_is_unlinked_and_its_target_is_left_alone() {
-        let dir = tempfile::TempDir::new().unwrap();
-        fs::write(dir.path().join("AGENTS.md"), "rules").unwrap();
-        std::os::unix::fs::symlink("AGENTS.md", dir.path().join("CLAUDE.md")).unwrap();
-        remove_launch_paths(dir.path(), &["CLAUDE.md".to_string()]).unwrap();
-        assert!(fs::symlink_metadata(dir.path().join("CLAUDE.md")).is_err());
-        assert_eq!(
-            fs::read_to_string(dir.path().join("AGENTS.md")).unwrap(),
-            "rules"
-        );
-    }
-
-    #[test]
-    fn a_path_through_a_symlinked_directory_is_still_refused() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let outside = tempfile::TempDir::new().unwrap();
-        fs::write(outside.path().join("CLAUDE.md"), "precious").unwrap();
-        std::os::unix::fs::symlink(outside.path(), dir.path().join("sub")).unwrap();
-        let err = remove_launch_paths(dir.path(), &["sub/CLAUDE.md".to_string()]).unwrap_err();
-        assert!(err.to_string().contains("not a plain file path"), "{err}");
-        assert_eq!(
-            fs::read_to_string(outside.path().join("CLAUDE.md")).unwrap(),
-            "precious"
-        );
-    }
 }

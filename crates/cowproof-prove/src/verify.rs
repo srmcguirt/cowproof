@@ -375,7 +375,15 @@ async fn replay_launch_baseline(tree: &Path, removed_paths: &[String]) -> Result
 }
 
 /// Validate every path, then delete them all. Never deletes anything unless all pass.
-fn remove_launch_paths(tree: &Path, removed_paths: &[String]) -> Result<(), VerifyError> {
+/// Remove the launch baseline paths: delete exactly the paths in `removed_paths` from the
+/// tree, validating each before any is deleted.
+///
+/// The list comes from the capsule (untrusted input), and this deletes files, so every
+/// path is validated first; one bad path means nothing is deleted. A path is accepted
+/// only when it is relative, has no empty, `.`, `..` or `.git` component, passes through
+/// no symlink, and ends in an existing file or symlink. Deletion unlinks; it never
+/// follows a symlink at the end of the path.
+pub fn remove_launch_paths(tree: &Path, removed_paths: &[String]) -> Result<(), VerifyError> {
     let mut seen = HashSet::new();
     let mut targets = Vec::new();
     for rel in removed_paths {
@@ -441,4 +449,39 @@ fn validate_launch_path(tree: &Path, rel: &str) -> Result<PathBuf, VerifyError> 
         }
     }
     Ok(current)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_launch_removed_symlink_is_unlinked_and_its_target_is_left_alone() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("AGENTS.md"), "rules").unwrap();
+        std::os::unix::fs::symlink("AGENTS.md", dir.path().join("CLAUDE.md")).unwrap();
+        remove_launch_paths(dir.path(), &["CLAUDE.md".to_string()]).unwrap();
+        assert!(std::fs::symlink_metadata(dir.path().join("CLAUDE.md")).is_err());
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("AGENTS.md")).unwrap(),
+            "rules"
+        );
+    }
+
+    #[test]
+    fn a_path_through_a_symlinked_directory_is_still_refused() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        std::fs::write(outside.path().join("CLAUDE.md"), "precious").unwrap();
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("sub")).unwrap();
+        let err = remove_launch_paths(dir.path(), &["sub/CLAUDE.md".to_string()]).unwrap_err();
+        assert!(
+            err.to_string().contains("path passes through a symlink"),
+            "{err}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(outside.path().join("CLAUDE.md")).unwrap(),
+            "precious"
+        );
+    }
 }

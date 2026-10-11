@@ -91,22 +91,16 @@ fn default_class() -> String {
 }
 
 impl Header {
-    pub fn model(&self) -> &str {
-        self.model.as_deref().unwrap_or(if self.runner == "codex" {
-            "gpt-6-luna"
-        } else {
-            "z-ai/glm-5.3-flash"
-        })
-    }
+    /// Default timeout in minutes (45 minutes). Legacy codex runner defaulted to 180 minutes,
+    /// which has been removed since only Claude Code builders are now supported.
     pub fn timeout(&self) -> u64 {
-        self.timeout_min
-            .unwrap_or(if self.runner == "codex" { 180 } else { 45 })
+        self.timeout_min.unwrap_or(45)
     }
     pub fn max_cost(&self) -> f64 {
         self.max_cost_usd.unwrap_or(2.0)
     }
     pub fn is_wide(&self) -> bool {
-        self.wide.unwrap_or(self.runner == "codex")
+        self.wide.unwrap_or(false)
     }
     pub fn effort(&self) -> &str {
         self.effort.as_deref().unwrap_or("high")
@@ -173,7 +167,7 @@ pub fn parse_header(text: &str) -> Result<Header> {
     }
     let h: Header = serde_json::from_value(v)?;
     if !["opencode", "codex"].contains(&h.runner.as_str()) {
-        bail!("lane {}: runner must be opencode or codex", h.id);
+        bail!("lane {}: runner must be opencode or codex (legacy)", h.id);
     }
     if !["rust", "crate", "pg", "light"].contains(&h.class_name.as_str()) {
         bail!(
@@ -181,23 +175,26 @@ pub fn parse_header(text: &str) -> Result<Header> {
             h.id
         );
     }
-    let model = h.model();
-    if (model.to_ascii_lowercase().contains("astra")
-        || model.to_ascii_lowercase().contains("terra"))
-        && !h.allow_heavy
-    {
-        bail!(
-            "lane {}: {} is a heavy model; set \"allowHeavy\": true to use it",
-            h.id,
-            model
-        );
-    }
-    if model.to_ascii_lowercase().contains("glm") && !model.to_ascii_lowercase().contains("flash") {
-        bail!(
-            "lane {}: {} is refused; only GLM flash models may run (user rule, 2026-09-23)",
-            h.id,
-            model
-        );
+    if let Some(model) = &h.model {
+        if (model.to_ascii_lowercase().contains("astra")
+            || model.to_ascii_lowercase().contains("terra"))
+            && !h.allow_heavy
+        {
+            bail!(
+                "lane {}: {} is a heavy model; set \"allowHeavy\": true to use it",
+                h.id,
+                model
+            );
+        }
+        if model.to_ascii_lowercase().contains("glm")
+            && !model.to_ascii_lowercase().contains("flash")
+        {
+            bail!(
+                "lane {}: {} is refused; only GLM flash models may run (user rule, 2026-09-23)",
+                h.id,
+                model
+            );
+        }
     }
     Ok(h)
 }
@@ -535,7 +532,6 @@ mod tests {
     fn header_defaults_and_refusals() {
         let h =
             parse_header("<!-- lane {\"id\":\"lane-a\",\"owns\":[\"scripts/x.mjs\"]} -->").unwrap();
-        assert_eq!(h.model(), "z-ai/glm-5.3-flash");
         assert_eq!(h.max_cost(), 2.0);
         assert!(
             parse_header("# no header")
@@ -570,12 +566,18 @@ mod tests {
                     .contains(m)
             );
         }
+        // Legacy codex runner is gone; runner field is kept for parsing tolerance only
         let c =
             parse_header("<!-- lane {\"id\":\"lane-c\",\"runner\":\"codex\",\"owns\":[\"a\"]} -->")
                 .unwrap();
-        assert_eq!(c.model(), "gpt-6-luna");
-        assert!(c.is_wide());
-        assert_eq!(parse_header("<!-- lane {\"id\":\"lane-f\",\"runner\":\"codex\",\"model\":\"gpt-6-terra\",\"allowHeavy\":true,\"owns\":[\"a\"]} -->").unwrap().model(),"gpt-6-terra");
+        assert_eq!(c.runner, "codex");
+        assert!(!c.is_wide()); // No longer defaults to true for codex
+        // Explicit model values are preserved even for legacy runners
+        let f = parse_header("<!-- lane {\"id\":\"lane-f\",\"runner\":\"codex\",\"model\":\"gpt-6-terra\",\"allowHeavy\":true,\"owns\":[\"a\"]} -->").unwrap();
+        assert_eq!(f.model, Some("gpt-6-terra".to_string()));
+        // Packet with no runner key defaults to "opencode" for parsing (legacy default)
+        let norunner = parse_header("<!-- lane {\"id\":\"lane-g\",\"owns\":[\"a\"]} -->").unwrap();
+        assert_eq!(norunner.runner, "opencode");
     }
 
     #[test]
@@ -752,7 +754,7 @@ mod tests {
             return;
         };
         let node_src = format!(
-            "import {{parseHeader,globToRegExp,outsideOwnership}} from {}; const h=parseHeader('<!-- lane {{\\\"id\\\":\\\"lane-a\\\",\\\"owns\\\":[\\\"src/**\\\"]}} -->'); console.log(JSON.stringify({{header:[h.runner,h.model,h.class,h.timeoutMin,h.maxCostUsd,h.wide],glob:globToRegExp('docs/**/x.md').source,owned:outsideOwnership(['src/a.rs','AGENTS.md'],['src/**'])}}));",
+            "import {{parseHeader,globToRegExp,outsideOwnership}} from {}; const h=parseHeader('<!-- lane {{\\\"id\\\":\\\"lane-a\\\",\\\"owns\\\":[\\\"src/**\\\"]}} -->'); console.log(JSON.stringify({{header:[h.runner,h.class,h.timeoutMin,h.maxCostUsd,h.wide],glob:globToRegExp('docs/**/x.md').source,owned:outsideOwnership(['src/a.rs','AGENTS.md'],['src/**'])}}));",
             serde_json::to_string(&runner.to_string_lossy()).unwrap()
         );
         let out = StdCommand::new("node")
@@ -770,7 +772,6 @@ mod tests {
             node["header"],
             json!([
                 h.runner,
-                h.model(),
                 h.class_name,
                 h.timeout(),
                 h.max_cost() as u64,

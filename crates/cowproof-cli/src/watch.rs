@@ -10,6 +10,7 @@
 //! `lanes` and `events` tools (`director_tools`) serialize the same data.
 
 use anyhow::{Result, anyhow, bail};
+use cowproof_run::escalate::{QueueEvent, read_queue_events};
 use cowproof_run::watch::{Parked, parked};
 use serde::Serialize;
 use serde_json::Value;
@@ -251,57 +252,50 @@ fn get_lane_state(lane_dir: &Path) -> String {
 fn get_last_event_time(lane_dir: &Path) -> Option<u64> {
     let control_dir = lane_dir.join("control");
     let queue_file = control_dir.join("escalations.jsonl");
-    if !queue_file.is_file() {
-        return None;
+
+    let (events, _) = read_queue_events(&queue_file).ok()?;
+    let mut max_ms = 0u64;
+
+    for event in events {
+        let at_ms = match event {
+            QueueEvent::Asked { at_ms, .. } => at_ms,
+            QueueEvent::Ruled { at_ms, .. } => at_ms,
+            QueueEvent::Delivered { at_ms, .. } => at_ms,
+            QueueEvent::ResumeFallback { at_ms, .. } => at_ms,
+            QueueEvent::LaneEscalationLimit { at_ms, .. } => at_ms,
+            QueueEvent::Note { at_ms, .. } => at_ms,
+            QueueEvent::NoteDelivered { at_ms, .. } => at_ms,
+            QueueEvent::Rejected { .. } => continue,
+        };
+        if at_ms > 0 {
+            max_ms = max_ms.max(at_ms);
+        }
     }
 
-    // Read the queue file and find the maximum at_ms
-    if let Ok(content) = fs::read_to_string(&queue_file) {
-        let mut max_ms = 0u64;
-        for line in content.lines() {
-            if let Ok(obj) = serde_json::from_str::<serde_json::Value>(line)
-                && let Some(at_ms) = obj.get("at_ms").and_then(|v| v.as_u64())
-                && at_ms > 0
-            {
-                max_ms = max_ms.max(at_ms);
-            }
-        }
-        if max_ms > 0 {
-            return Some(max_ms);
-        }
-    }
-    None
+    if max_ms > 0 { Some(max_ms) } else { None }
 }
 
 /// Count pending notes in a lane (notes without a delivered marker).
 fn count_pending_notes(control_dir: &Path, lane_name: &str) -> Result<usize> {
     let queue_file = control_dir.join("escalations.jsonl");
-    if !queue_file.exists() {
-        return Ok(0);
-    }
+
+    let (events, _) = match read_queue_events(&queue_file) {
+        Ok(read) => read,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(anyhow!("cannot read escalations: {e}")),
+    };
 
     let mut notes: HashMap<String, bool> = HashMap::new();
-    if let Ok(content) = fs::read_to_string(&queue_file) {
-        for line in content.lines() {
-            if let Ok(obj) = serde_json::from_str::<serde_json::Value>(line)
-                && let Some(event_type) = obj.get("event").and_then(|v| v.as_str())
-                && let Some(event_lane) = obj.get("lane").and_then(|v| v.as_str())
-                && event_lane == lane_name
-            {
-                match event_type {
-                    "note" => {
-                        if let Some(id) = obj.get("id").and_then(|v| v.as_str()) {
-                            notes.insert(id.to_string(), false);
-                        }
-                    }
-                    "note-delivered" => {
-                        if let Some(id) = obj.get("id").and_then(|v| v.as_str()) {
-                            notes.insert(id.to_string(), true);
-                        }
-                    }
-                    _ => {}
-                }
+
+    for event in events {
+        match event {
+            QueueEvent::Note { lane, id, .. } if lane == lane_name => {
+                notes.insert(id, false);
             }
+            QueueEvent::NoteDelivered { lane, id, .. } if lane == lane_name => {
+                notes.insert(id, true);
+            }
+            _ => {}
         }
     }
 
@@ -564,6 +558,22 @@ async fn watch_events(lanes_root: &Path, follow: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Notes written and delivered through the real queue: only the undelivered
+    /// one is pending, for this lane only.
+    #[test]
+    fn count_pending_notes_counts_only_undelivered_notes_of_the_lane() {
+        use cowproof_run::escalate::{Queue, SystemClock};
+        let dir = tempfile::tempdir().unwrap();
+        let mut queue = Queue::new(dir.path(), Box::new(SystemClock)).unwrap();
+        let first = queue.note("lane-a", "first").unwrap();
+        queue.note("lane-a", "second").unwrap();
+        queue.note("lane-b", "other lane").unwrap();
+        queue.mark_notes_delivered("lane-a", &[first]).unwrap();
+        drop(queue);
+        assert_eq!(count_pending_notes(dir.path(), "lane-a").unwrap(), 1);
+        assert_eq!(count_pending_notes(dir.path(), "lane-b").unwrap(), 1);
+    }
 
     #[test]
     fn test_parse_duration_hours() {
