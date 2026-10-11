@@ -13,9 +13,9 @@ an already-loaded index.
 | repo | symbols | index | cold load | warm query |
 | --- | ---: | ---: | ---: | ---: |
 | portkit | 270 | 43 KB | 0.24 ms | 0.05 µs |
-| magna | 1,446 | 237 KB | 0.91 ms | 0.05 µs |
+| service-a | 1,446 | 237 KB | 0.91 ms | 0.05 µs |
 | sample-app | 3,664 | 618 KB | 2.10 ms | 0.07 µs |
-| mlh | 4,068 | 704 KB | 2.23 ms | 0.06 µs |
+| service-b | 4,068 | 704 KB | 2.23 ms | 0.06 µs |
 
 Against the alternatives, 10 symbol lookups in sample-app:
 
