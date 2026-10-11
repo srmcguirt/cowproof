@@ -239,7 +239,7 @@ capability as real tools:
 
 ```toml
 [schema]
-snapshots = [".portkit/schema/fellwork.json"]
+snapshots = [".portkit/schema/app.json"]
 ```
 
 ```
@@ -249,9 +249,9 @@ $ pk tools
   schema_columns  Report the real columns of a table, with types and nullability
   schema_tables   List tables known to a schema snapshot
 
-$ pk run schema_check -a source=fellwork -a table=source.tokens -a column=verse_ref
-{"exists":false,"kind":"column","name":"verse_ref","suggestions":["verse_id"],
- "provenance":{"source":"fellwork","kind":"postgres_catalog",
+$ pk run schema_check -a source=app -a table=public.orders -a column=order_ref
+{"exists":false,"kind":"column","name":"order_ref","suggestions":["order_id"],
+ "provenance":{"source":"app","kind":"postgres_catalog",
                "captured_at":"2026-09-09T19:42:44Z","fingerprint":"37902a5df4df512c"}}
 ```
 

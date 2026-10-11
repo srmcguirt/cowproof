@@ -210,7 +210,7 @@ It reads lane files only; there is no daemon. Idle time past a class threshold i
 
 portkit (`pk`, the founder's Rust CLI, public at `srmcguirt/portkit`, MIT or Apache-2.0) ports scripts to Rust CLI tools with a parity harness and measures agent tool usage through hooks. **It moves into this workspace** (founder decision, 2026-10-09). The full plan, with line-level evidence, is [portkit-integration.md](portkit-integration.md). Its decisions, adopted here:
 
-- `git subtree add` of portkit (public history, one author, no Everydom material) under `crates/portkit/`, keeping the `portkit-*` crate names: `core`, `mcp`, `port`, `cli`, `plugin`, `read`, `index`. Dropped: `demo/`, `schema/` (Fellwork fixtures and vendored code), the Python example and the Python CI script.
+- `git subtree add` of portkit (public history, one author, no Everydom material) under `crates/portkit/`, keeping the `portkit-*` crate names: `core`, `mcp`, `port`, `cli`, `plugin`, `read`, `index`. Dropped: `demo/`, `schema/` (a private project's fixtures and vendored code), the Python example and the Python CI script.
 - One `cowproof` package installs three binaries: `cowproof`, plus `pk` and `pk-read`, which Claude Code hooks and builder shells call by name. `cowproof pk ...` is the same command tree.
 - The builder's `ask` / `check_ruling` / `run_check` and the director's `rule` / `watch` tools are portkit `Tool` implementations served by portkit's MCP server from the `cowproof` binary, which gives each one a CLI and MCP surface and a parity test.
 - portkit is code-neutral already (`pk port capture` runs any command through `sh -c`); what is Python-specific is documentation, examples and CI, listed for rewording (portkit-integration.md, section 6.5).

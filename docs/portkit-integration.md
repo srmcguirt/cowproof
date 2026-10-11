@@ -191,7 +191,7 @@ Founder decision 2026-10-09: portkit's code becomes part of cowproof. This secti
 | `plugin` | move, `portkit-plugin` | external tools by manifest; also the generic process adapter's spec flag (`--portkit-spec`, `plugin/src/tool.rs` L15) |
 | `read` | move, `portkit-read` (lib plus `pk-read` bin) | builder token saver (3c) |
 | `index` | move, `portkit-index`, feature `symbols` on by default, drop the `pkx` bin | `sym`/`outline` for builders; prototype status stays in its README; `ast-grep-core` is the heaviest dependency, so keep the feature gate |
-| `schema` | leave behind (delete from the import) | `publish = false`, Fellwork fixtures and README (`schema/tests/fixtures/fellwork.json`, `schema/README.md` L7-34), `src/pg/` vendored from another project (`schema/src/pg/mod.rs` L5), 247 dependencies with the `postgres` feature (`schema/Cargo.toml` comment); no cowproof use |
+| `schema` | leave behind (delete from the import) | `publish = false`, a private project's fixtures and README (`schema/tests/fixtures/`, `schema/README.md` L7-34), `src/pg/` vendored from another project (`schema/src/pg/mod.rs` L5), 247 dependencies with the `postgres` feature (`schema/Cargo.toml` comment); no cowproof use |
 | `demo` | delete | "delete this crate when you fork" (`demo/Cargo.toml` description); referenced only by `src/main.rs` L49 and `tests/parity.rs` L17, L27, both replaced by cowproof's registry and fixtures |
 | `examples/python`, `fixtures/`, `scripts/check_fixtures_fresh.py`, the `parity` CI job's Python setup | delete | demo-only; the freshness check is reimplemented in Rust as `pk port check-fresh` (section 6.5) so cowproof's CI needs no Python |
 | `src/main.rs` (the `pk` reference binary) | replace | becomes the `pk` companion bin in the cowproof package (4.5) |
@@ -202,7 +202,7 @@ Naming recommendation: keep `portkit-*`. The crates are a general tool-and-parit
 
 ### 4.2 Import with history
 
-`git subtree add --prefix=crates/portkit https://github.com/srmcguirt/portkit.git main` into the fresh cowproof history. Reasons: the 19 commits are public already under MIT/Apache, all by the founder (`git log` authors), and contain no Everydom material (the only "fellwork" mentions are in `schema/` and `index/README.md` benchmark rows); `git log --follow` and blame keep working; a `git subtree pull` can pick up anything that lands in the old repository during the transition. The cowproof-side scrub (design L25, L259) applies to the Everydom crates, not to this import. Delete `schema/`, `demo/` and the Python files in the first commit after the subtree add so the deletions are their own reviewable change.
+`git subtree add --prefix=crates/portkit https://github.com/srmcguirt/portkit.git main` into the fresh cowproof history. Reasons: the 19 commits are public already under MIT/Apache, all by the founder (`git log` authors), and contain no Everydom material (the only private-project mentions were in `schema/` and the `index/README.md` benchmark rows); `git log --follow` and blame keep working; a `git subtree pull` can pick up anything that lands in the old repository during the transition. The cowproof-side scrub (design L25, L259) applies to the Everydom crates, not to this import. Delete `schema/`, `demo/` and the Python files in the first commit after the subtree add so the deletions are their own reviewable change.
 
 ### 4.3 MSRV and edition
 
