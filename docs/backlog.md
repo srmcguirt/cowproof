@@ -2,6 +2,7 @@
 
 Work the crate port (2026-10-09) deferred or exposed. Newest first.
 
+- **The bridge READY wait is 5 s, and a freshly linked binary can miss it (2026-10-10).** `live_d24_bridge_alone_prints_ready_and_relays_inside_the_sandbox` failed in three lanes' gates under load and passed alone; its shell loop now waits 30 s. The same limit is `BRIDGE_READY_TIMEOUT` in `crates/cowproof-cli/src/main.rs`, which the wrapper applies before it runs the builder, so a slow first launch (macOS checks a new binary on first exec) would fail a real lane as infrastructure. Raise it to 30 s and say why, once no lane is editing `main.rs`.
 - **Director MCP server (`cowproof serve --director`): the Claude Code plugin's next step (2026-10-10).** The plugin (`plugin/`, marketplace at `.claude-plugin/marketplace.json`) ships three skills and a session-start hook, and drives `cowproof` through the shell. It has no `.mcp.json` because the server does not exist.
   - **Design.** `docs/portkit-integration.md` 3a and 4.5: the director tools (`rule`, `watch`, `lanes`) are `portkit_core::Tool` impls in a second registry, served over stdio by `portkit_mcp::serve_stdio`, so a director session can run `claude mcp add cowproof -- cowproof serve --director`. Once it exists, the plugin adds a `.mcp.json` and the skills prefer the tools to the shell commands.
   - **Open:**

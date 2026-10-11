@@ -1189,7 +1189,7 @@ fn live_d24_bridge_alone_prints_ready_and_relays_inside_the_sandbox() {
         r#"'{bin}' net-bridge --port {port} --target '{sock}' 2> '{ready}' &
 bridge=$!
 i=0
-while ! grep -q '^READY$' '{ready}' 2>/dev/null && [ $i -lt 50 ]; do sleep 0.1; i=$((i+1)); done
+while ! grep -q '^READY$' '{ready}' 2>/dev/null && [ $i -lt 300 ]; do sleep 0.1; i=$((i+1)); done
 echo "READY_LINE:$(cat '{ready}')"
 {probes}
 kill $bridge
