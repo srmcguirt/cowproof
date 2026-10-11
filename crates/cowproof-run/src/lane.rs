@@ -356,9 +356,22 @@ fn capture_base_patch(repo: &Path, scratch: &Path) -> Result<Vec<u8>> {
 /// fallback. The method used is returned. No remotes, alternates or hooks
 /// from the source; HEAD points to base_commit; the checkout is verified clean.
 fn clone_isolated(repo: &Path, clone: &Path, base_commit: &str) -> Result<String> {
+    // Resolve the source's git dir and objects path. Works for worktrees (where .git
+    // is a file) and separate git directories.
+    let git_objects_path = git_text(&git_source(
+        repo,
+        &[
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-path",
+            "objects",
+        ],
+    )?)?;
+    let objects_src = PathBuf::from(git_objects_path);
+
     // A source that borrows objects from another repository would leave the
     // clone borrowing them too; refuse rather than share.
-    if repo.join(".git/objects/info/alternates").exists() {
+    if objects_src.join("info/alternates").exists() {
         bail!(
             "the source repository borrows objects (has alternates); the lane would share storage"
         );
@@ -380,8 +393,7 @@ fn clone_isolated(repo: &Path, clone: &Path, base_commit: &str) -> Result<String
         &["rev-parse", "--verify", "--end-of-options", base_commit],
     )?)?;
 
-    // Copy the source's .git/objects using copy-on-write. Detect which method succeeded.
-    let objects_src = repo.join(".git/objects");
+    // Copy the source's objects using copy-on-write. Detect which method succeeded.
     let objects_dst = clone.join(".git/objects");
     // Remove the placeholder objects directory created by git init so cp can copy directly.
     if objects_dst.exists() {
@@ -446,6 +458,7 @@ fn clone_isolated(repo: &Path, clone: &Path, base_commit: &str) -> Result<String
 
 /// Copy the source's object store using copy-on-write where available.
 /// Returns the method used: "clonefile" on macOS, "reflink" on Linux, or "copy" as fallback.
+/// The method label is honest: "reflink" means reflink was actually used, not just attempted.
 fn copy_objects_cow(src: &Path, dst: &Path) -> Result<String> {
     // Try copy-on-write methods in order.
     if cfg!(target_os = "macos") {
@@ -460,25 +473,35 @@ fn copy_objects_cow(src: &Path, dst: &Path) -> Result<String> {
         if out.status.success() {
             return Ok("clonefile".to_string());
         }
-        // clonefile not supported on this filesystem; fall through to plain copy
+        // clonefile failed or not supported; clean up partial copy and fall through
+        if dst.exists() {
+            fs::remove_dir_all(dst).ok();
+        }
     }
 
     if cfg!(target_os = "linux") {
-        // Linux: try reflink with cp --reflink=auto
+        // Linux: try reflink with cp --reflink=always (fails if reflink unavailable)
         let out = Command::new("cp")
-            .arg("--reflink=auto")
+            .arg("--reflink=always")
             .arg("-R")
             .arg(src)
             .arg(dst)
             .output()
-            .context("running cp --reflink=auto")?;
+            .context("running cp --reflink=always")?;
         if out.status.success() {
             return Ok("reflink".to_string());
         }
-        // reflink not supported; fall through to plain copy
+        // reflink not available; clean up partial copy and fall through
+        if dst.exists() {
+            fs::remove_dir_all(dst).ok();
+        }
     }
 
     // Fallback: plain recursive copy.
+    // Ensure no partial destination exists before copying.
+    if dst.exists() {
+        fs::remove_dir_all(dst).context("removing partial destination")?;
+    }
     let out = Command::new("cp")
         .arg("-R")
         .arg(src)
@@ -882,6 +905,45 @@ mod tests {
         let clone_inodes = object_inodes(clone);
         let shared: Vec<_> = source_inodes.intersection(&clone_inodes).copied().collect();
         assert!(shared.is_empty(), "shared inodes: {shared:?}");
+    }
+
+    #[test]
+    fn clone_works_from_a_git_worktree() {
+        let tmp = TempDir::new().unwrap();
+        let origin = tmp.path().join("origin");
+        fs::create_dir_all(&origin).unwrap();
+        git(&origin, &["init", "-q", "-b", "main"]);
+        write(&origin, "a.txt", "a");
+        git(&origin, &["add", "-A"]);
+        git(&origin, &["commit", "-q", "-m", "initial"]);
+
+        // Create a worktree from the origin.
+        let worktree = tmp.path().join("worktree");
+        git(
+            &origin,
+            &[
+                "worktree",
+                "add",
+                worktree.to_str().unwrap(),
+                "-b",
+                "feature",
+            ],
+        );
+        assert!(worktree.join(".git").exists());
+
+        // Prepare a lane from the worktree.
+        let lane = prepare_lane(&worktree, &tmp.path().join("lanes"), "l1", clean_opts()).unwrap();
+
+        // The clone should work fine, and clone_method should be recorded.
+        let control: LaneControl =
+            serde_json::from_slice(&fs::read(lane.layout.control.join("lane.json")).unwrap())
+                .unwrap();
+        assert!(
+            ["clonefile", "reflink", "copy"].contains(&control.clone_method.as_str()),
+            "invalid clone_method: {}",
+            control.clone_method
+        );
+        assert!(lane.layout.clone.join("a.txt").exists());
     }
 
     #[test]
