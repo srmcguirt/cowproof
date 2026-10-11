@@ -11,6 +11,7 @@
 //! therefore resolved by [`canonicalize_for_sandbox`] at render time, after
 //! any caller edits to the policy, and only the resolved path is emitted.
 
+pub mod bridge;
 pub mod claude;
 pub mod director;
 pub mod lane;
@@ -34,8 +35,13 @@ pub mod watch;
 pub enum NetworkMode {
     /// No network access.
     None,
-    /// Access to a local egress proxy (macOS localhost port, Linux Unix socket).
-    /// The socket path is used for Linux bind-mount; port is used for macOS localhost.
+    /// Access to the lane's egress proxy through the in-sandbox bridge (D24).
+    /// `socket` is the proxy's Unix socket: granted by exact path on macOS
+    /// (connect) and bound in by itself on Linux (`--ro-bind`). `port` is the
+    /// bridge's `127.0.0.1` port inside the sandbox: on macOS it is the only
+    /// local port the sandbox may bind or connect to; on Linux the sandbox has
+    /// its own empty network namespace (`--unshare-net`) and the port is only
+    /// the bridge's address in it.
     Proxy { port: u16, socket: PathBuf },
     /// Registry-only access through the proxy.
     RegistryReadOnly { port: u16, socket: PathBuf },
@@ -770,10 +776,24 @@ pub fn render_macos_profile(policy: &SandboxPolicy) -> Result<String> {
 
     match &policy.network {
         NetworkMode::None => out.push_str("(deny network*)\n"),
-        NetworkMode::Proxy { port, .. } | NetworkMode::RegistryReadOnly { port, .. } => {
+        NetworkMode::Proxy { port, socket } | NetworkMode::RegistryReadOnly { port, socket } => {
             out.push_str("(deny network*)\n");
+            // The in-sandbox bridge (D24): it binds `localhost:<port>` and its
+            // client connects to it, so bind, inbound and outbound on that one
+            // port, and nothing on any other. It reaches the proxy through the
+            // exact socket path, never the bare `(remote unix-socket)`.
+            out.push_str(&format!(
+                "(allow network-bind (local ip \"localhost:{port}\"))\n"
+            ));
+            out.push_str(&format!(
+                "(allow network-inbound (local ip \"localhost:{port}\"))\n"
+            ));
             out.push_str(&format!(
                 "(allow network-outbound (remote ip \"localhost:{port}\"))\n"
+            ));
+            out.push_str(&format!(
+                "(allow network-outbound (remote unix-socket (path-literal {})))\n",
+                sbpl(&canonicalize_for_sandbox(socket)?)?
             ));
         }
         // Legacy: no network rules.
@@ -1015,6 +1035,96 @@ mod tests {
             .unwrap();
         // Seatbelt applies the last matching rule: the allow must follow the deny.
         assert!(deny < allow, "{profile}");
+    }
+
+    /// Every `(allow network...)` line of a profile.
+    fn network_allows(profile: &str) -> Vec<&str> {
+        profile
+            .lines()
+            .filter(|l| l.starts_with("(allow network"))
+            .collect()
+    }
+
+    #[test]
+    fn the_macos_proxy_profile_allows_the_bridge_port_and_the_two_sockets_and_no_other_network() {
+        let lane = test_lane();
+        let proxy_sock = "/nonexistent-cp/lanes/l1/proxy.sock";
+        let policy = SandboxPolicy::builder(
+            &lane,
+            NetworkMode::Proxy {
+                port: 41_003,
+                socket: PathBuf::from(proxy_sock),
+            },
+        );
+        let profile = render_macos_profile(&policy).unwrap();
+        // Exactly these allows, nothing else: the bridge binds, accepts and
+        // is dialled on one local port, and the two Unix sockets are exact
+        // paths (the runner's and the proxy's).
+        let expected = vec![
+            "(allow network-bind (local ip \"localhost:41003\"))".to_string(),
+            "(allow network-inbound (local ip \"localhost:41003\"))".to_string(),
+            "(allow network-outbound (remote ip \"localhost:41003\"))".to_string(),
+            format!("(allow network-outbound (remote unix-socket (path-literal \"{proxy_sock}\")))"),
+            "(allow network-outbound (remote unix-socket (path-literal \"/nonexistent-cp/lanes/l1/sock/runner.sock\")))".to_string(),
+        ];
+        assert_eq!(network_allows(&profile), expected, "{profile}");
+        // No wildcard port, no host other than localhost, no bare socket rule.
+        assert!(!profile.contains("localhost:*"), "{profile}");
+        assert!(!profile.contains("(remote unix-socket)"), "{profile}");
+        assert!(!profile.contains("(remote ip \"*"), "{profile}");
+        // Every allow follows the deny.
+        let deny = profile.find("(deny network*)").unwrap();
+        assert!(
+            profile
+                .match_indices("(allow network")
+                .all(|(i, _)| i > deny),
+            "{profile}"
+        );
+    }
+
+    #[test]
+    fn the_linux_proxy_args_keep_the_empty_network_namespace_and_bind_only_the_proxy_socket_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        for d in ["lanes/l1/clone", "lanes/l1/control", "lanes/l1/sock"] {
+            std::fs::create_dir_all(root.join(d)).unwrap();
+        }
+        let lane = LaneLayout {
+            clone: root.join("lanes/l1/clone"),
+            home: root.join("lanes/l1/home"),
+            scratch: root.join("lanes/l1/scratch"),
+            control: root.join("lanes/l1/control"),
+            real_home: root.join("realhome"),
+            sock: root.join("lanes/l1/sock/runner.sock"),
+            lanes_root: root.join("lanes"),
+        };
+        let proxy_sock = root.join("lanes/l1/proxy.sock");
+        // The file stands in for the socket: bwrap's bind only needs a path.
+        std::fs::write(&proxy_sock, b"").unwrap();
+        let policy = SandboxPolicy::builder(
+            &lane,
+            NetworkMode::Proxy {
+                port: 41_003,
+                socket: proxy_sock.clone(),
+            },
+        );
+        let args = render_bwrap_args(&policy, &["cmd".into()]).unwrap();
+        assert!(args.iter().any(|a| a == "--unshare-net"), "{args:?}");
+        assert!(!args.iter().any(|a| a == "--share-net"), "{args:?}");
+        let sock = proxy_sock.to_str().unwrap();
+        let bound = args
+            .windows(3)
+            .any(|w| w[0] == "--ro-bind" && w[1] == sock && w[2] == sock);
+        assert!(bound, "proxy.sock is not bound by itself: {args:?}");
+        // The file alone: its directory (the lane directory) is never bound
+        // as a whole.
+        let lane_dir = root.join("lanes/l1");
+        assert!(
+            !args.windows(3).any(|w| w[0].starts_with("--")
+                && w[0].contains("bind")
+                && w[1] == lane_dir.to_str().unwrap()),
+            "{args:?}"
+        );
     }
 
     #[test]

@@ -981,3 +981,230 @@ echo END
     assert!(!out.contains("TOOL_RAN"), "ungrantedexecutable ran\n{why}");
     assert!(out.contains("EXEC_FAIL:"), "execution did not fail\n{why}");
 }
+
+// ---------------------------------------------------------------- D24 bridge
+
+/// The real `cowproof` binary, built from this workspace. The test binary of
+/// this crate does not depend on the cli crate, so Cargo has not necessarily
+/// built it: build it once (a no-op when it is current) into the same target
+/// directory and return its path. The sandbox policy grants that one file.
+fn cowproof_bin() -> PathBuf {
+    static BIN: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    BIN.get_or_init(|| {
+        let exe = std::env::current_exe().unwrap();
+        // <target>/<profile>/deps/live-<hash>
+        let profile_dir = exe.parent().unwrap().parent().unwrap().to_path_buf();
+        let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+        let mut build = Command::new(cargo);
+        build.args([
+            "build",
+            "-p",
+            "cowproof-cli",
+            "--bin",
+            "cowproof",
+            "--locked",
+        ]);
+        if !cfg!(debug_assertions) {
+            build.arg("--release");
+        }
+        let status = build.status().expect("running cargo build for cowproof");
+        assert!(status.success(), "cargo build -p cowproof-cli failed");
+        let bin = profile_dir.join("cowproof");
+        assert!(bin.is_file(), "{} was not built", bin.display());
+        bin
+    })
+    .clone()
+}
+
+/// A port nothing listens on right now.
+fn free_port() -> u16 {
+    TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+/// A Unix server that answers each line `x` with `proxy-saw:x`.
+fn serve_echo(path: &Path) {
+    let listener = UnixListener::bind(path).unwrap();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { return };
+            std::thread::spawn(move || {
+                let mut line = String::new();
+                let _ = BufReader::new(&stream).read_line(&mut line);
+                let _ = write!(stream, "proxy-saw:{line}");
+            });
+        }
+    });
+}
+
+/// perl probe: connect to `host:port`, send a line, and print `<tag>_OK:<reply>`
+/// when the connection opens (the reply is empty if nothing answers within 3
+/// seconds, so a port that accepts and stays silent is still reported as
+/// reachable, never as a hang) or `<tag>_BLOCKED` when it fails.
+fn tcp_probe(tag: &str, host: &str, port: u16) -> String {
+    format!(
+        r#"perl -MIO::Socket::INET -MIO::Select -e 'alarm 20; $s = IO::Socket::INET->new(PeerAddr => "{host}", PeerPort => {port}, Proto => "tcp", Timeout => 3); if ($s) {{ $s->autoflush(1); print $s "hello-{tag}\n"; $l = ""; $l = <$s> if IO::Select->new($s)->can_read(3); chomp $l; print "{tag}_OK:$l\n" }} else {{ print "{tag}_BLOCKED\n" }}'"#
+    )
+}
+
+fn proxy_policy(f: &Fixture, port: u16, sock: &Path, bin: &Path) -> SandboxPolicy {
+    SandboxPolicy::builder_with_executables(
+        &f.lane,
+        NetworkMode::Proxy {
+            port,
+            socket: sock.to_path_buf(),
+        },
+        std::slice::from_ref(&bin.to_path_buf()),
+    )
+    .unwrap()
+}
+
+/// The probes every D24 live test runs inside the sandbox: the bridge port
+/// answers from the proxy socket; a different local port and 1.1.1.1:443 do
+/// not connect.
+fn bridge_probes(port: u16, other: u16) -> String {
+    format!(
+        "echo STARTED\n{}\n{}\n{}\necho END\n",
+        tcp_probe("BRIDGE", "127.0.0.1", port),
+        tcp_probe("OTHER", "127.0.0.1", other),
+        tcp_probe("EXTERNAL", "1.1.1.1", 443),
+    )
+}
+
+fn assert_bridge_outcome(out: &str, why: &str) {
+    assert!(out.contains("STARTED"), "the command never started\n{why}");
+    assert!(
+        out.contains("BRIDGE_OK:proxy-saw:hello-BRIDGE"),
+        "127.0.0.1:<port> did not reach the proxy socket\n{why}"
+    );
+    assert!(
+        out.contains("OTHER_BLOCKED") && !out.contains("OTHER_OK"),
+        "another local port was reachable\n{why}"
+    );
+    assert!(
+        out.contains("EXTERNAL_BLOCKED") && !out.contains("EXTERNAL_OK"),
+        "1.1.1.1:443 was reachable\n{why}"
+    );
+    assert!(out.contains("END"), "the script did not finish\n{why}");
+}
+
+#[test]
+fn live_d24_wrapper_starts_the_bridge_then_the_command_reaches_the_proxy_socket_only() {
+    if !sandbox_available() {
+        return;
+    }
+    let bin = cowproof_bin();
+    let f = Fixture::new();
+    let sock = f.lane_root.join("proxy.sock");
+    serve_echo(&sock);
+    let port = free_port();
+    // Listening on the host, so "blocked" is the sandbox's doing, not a
+    // closed port.
+    let other_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let other = other_listener.local_addr().unwrap().port();
+    let policy = proxy_policy(&f, port, &sock, &bin);
+
+    // The command runs behind `net-bridge ... --`, exactly as the builder does.
+    let probe = f.lane.clone.join("probe.sh");
+    std::fs::write(&probe, bridge_probes(port, other)).unwrap();
+    let script = format!(
+        "exec '{}' net-bridge --port {port} --target '{}' -- /bin/sh '{}'",
+        bin.display(),
+        sock.display(),
+        probe.display()
+    );
+    let o = run(&policy, &f.lane_root, &script);
+    assert_bridge_outcome(&stdout(&o), &describe(&o));
+    assert_eq!(o.status.code(), Some(0), "{}", describe(&o));
+}
+
+#[test]
+fn live_d24_wrapper_forwards_the_commands_exit_status_and_never_starts_it_if_the_bridge_cannot_bind()
+ {
+    if !sandbox_available() {
+        return;
+    }
+    let bin = cowproof_bin();
+    let f = Fixture::new();
+    let sock = f.lane_root.join("proxy.sock");
+    serve_echo(&sock);
+    let port = free_port();
+    let policy = proxy_policy(&f, port, &sock, &bin);
+    let net_bridge = format!(
+        "'{}' net-bridge --port {port} --target '{}'",
+        bin.display(),
+        sock.display()
+    );
+
+    let o = run(
+        &policy,
+        &f.lane_root,
+        &format!("{net_bridge} -- /bin/sh -c 'exit 7'"),
+    );
+    assert_eq!(o.status.code(), Some(7), "{}", describe(&o));
+
+    // A host process already holds the port: on macOS the sandbox shares the
+    // host's loopback, so the bridge cannot bind it and the command must not run.
+    if cfg!(target_os = "macos") {
+        let held = TcpListener::bind("127.0.0.1:0").unwrap();
+        let busy = held.local_addr().unwrap().port();
+        let busy_policy = proxy_policy(&f, busy, &sock, &bin);
+        let o = run(
+            &busy_policy,
+            &f.lane_root,
+            &format!(
+                "'{}' net-bridge --port {busy} --target '{}' -- /bin/sh -c 'echo COMMAND_RAN'",
+                bin.display(),
+                sock.display()
+            ),
+        );
+        assert!(
+            !stdout(&o).contains("COMMAND_RAN"),
+            "the command ran without its bridge\n{}",
+            describe(&o)
+        );
+        assert!(!o.status.success(), "{}", describe(&o));
+    }
+}
+
+#[test]
+fn live_d24_bridge_alone_prints_ready_and_relays_inside_the_sandbox() {
+    if !sandbox_available() {
+        return;
+    }
+    let bin = cowproof_bin();
+    let f = Fixture::new();
+    let sock = f.lane_root.join("proxy.sock");
+    serve_echo(&sock);
+    let port = free_port();
+    let other_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let other = other_listener.local_addr().unwrap().port();
+    let policy = proxy_policy(&f, port, &sock, &bin);
+
+    let ready = f.lane.clone.join("bridge.err");
+    let script = format!(
+        r#"'{bin}' net-bridge --port {port} --target '{sock}' 2> '{ready}' &
+bridge=$!
+i=0
+while ! grep -q '^READY$' '{ready}' 2>/dev/null && [ $i -lt 50 ]; do sleep 0.1; i=$((i+1)); done
+echo "READY_LINE:$(cat '{ready}')"
+{probes}
+kill $bridge
+"#,
+        bin = bin.display(),
+        sock = sock.display(),
+        ready = ready.display(),
+        probes = bridge_probes(port, other),
+    );
+    let o = run(&policy, &f.lane_root, &script);
+    let out = stdout(&o);
+    assert!(
+        out.contains("READY_LINE:READY"),
+        "no READY\n{}",
+        describe(&o)
+    );
+    assert_bridge_outcome(&out, &describe(&o));
+}

@@ -119,7 +119,33 @@ fn git(repo: &Path, args: &[&str]) {
     );
 }
 
+/// Gives every harness its own lane id, and its own bridge port.
+///
+/// The builder's bridge port is a hash of the lane id and, on macOS, the
+/// sandbox shares the host's loopback, so two harnesses running in parallel
+/// would fight over a port if their ids shared one or merely hashed alike (with
+/// about 40 harnesses and 20000 ports, a birthday collision is not rare). The
+/// id is therefore searched for: its port must be unused by every other
+/// harness in this process and free on the host right now.
+static HARNESS_COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static HARNESS_PORTS: Mutex<Vec<u16>> = Mutex::new(Vec::new());
+
+fn unique_lane_id() -> String {
+    let mut used = HARNESS_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    loop {
+        let n = HARNESS_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let id = format!("t-run-{}-{n}", std::process::id());
+        let port = cowproof_run::bridge::bridge_port(&id);
+        if !used.contains(&port) && std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
+            used.push(port);
+            return id;
+        }
+    }
+}
+
 struct Harness {
+    /// The lane id (lowercase letters, digits and dashes), unique per harness.
+    id: String,
     /// Holds the repository, the packet, the fake and the cowproof copy.
     work: TempDir,
     /// Holds the lanes, nothing else.
@@ -173,10 +199,11 @@ impl Harness {
         git(&repo, &["add", "."]);
         git(&repo, &["commit", "-q", "-m", "base"]);
 
+        let id = unique_lane_id();
         let packet_text = format!(
             "# Task\n\n<!-- lane {} -->\n\nChange the README.\n",
             json!({
-                "id": "t-run",
+                "id": id,
                 "owns": owns,
                 "class": "light",
                 "checks": checks,
@@ -239,6 +266,7 @@ exit 0
         }
 
         Harness {
+            id,
             work,
             lanes,
             repo,
@@ -304,7 +332,7 @@ exit 0
     }
 
     fn lane(&self) -> PathBuf {
-        self.lanes.path().canonicalize().unwrap().join("t-run")
+        self.lanes.path().canonicalize().unwrap().join(&self.id)
     }
 
     fn read(&self, rel: &str) -> String {
@@ -397,10 +425,13 @@ fn run_json_records_exit_status_turns_and_the_session_id() {
     let lines: Vec<&str> = stdout.lines().collect();
     assert_eq!(lines.len(), 2, "{stdout:?}");
     assert!(
-        lines[0].starts_with("t-run: finished, exit 0, 2 turns"),
+        lines[0].starts_with(&format!("{}: finished, exit 0, 2 turns", h.id)),
         "{stdout}"
     );
-    assert!(lines[1].starts_with("t-run: refuted: "), "{stdout}");
+    assert!(
+        lines[1].starts_with(&format!("{}: refuted: ", h.id)),
+        "{stdout}"
+    );
     assert!(lines[1].contains("gate ownership failed"), "{stdout}");
     for id in ["ok", "denied", "slow"] {
         assert!(
@@ -494,6 +525,72 @@ fn the_real_key_never_reaches_the_builder_or_any_file_in_the_lane() {
     }
     // The scan saw the lane's real files (control, home, the clone and its .git).
     assert!(scanned > 20, "only {scanned} files scanned");
+}
+
+/// The builder POSTs to `$ANTHROPIC_BASE_URL` with perl (on every macOS and
+/// Linux host) and records the whole HTTP answer. The path is one the proxy
+/// refuses, so the REAL egress proxy answers from its own policy and nothing
+/// is sent upstream: no network, no stub, and no race over which socket the
+/// sandbox sees (a replaced `proxy.sock` would be bound in at launch on
+/// Linux). Only the real `ProxyServer` produces this answer, and only the
+/// bridge can carry the request to it from inside the sandbox.
+const POST_THROUGH_THE_BRIDGE: &str = r#"
+host_port="${ANTHROPIC_BASE_URL#http://}"
+perl -MIO::Socket::INET -e '
+  $s = IO::Socket::INET->new(PeerAddr => $ARGV[0], Proto => "tcp", Timeout => 10)
+      or die "connect: $!\n";
+  $b = "{}";
+  print $s "POST /v1/refused-by-the-proxy HTTP/1.1\r\nHost: $ARGV[0]\r\n"
+      . "x-api-key: $ENV{ANTHROPIC_API_KEY}\r\ncontent-type: application/json\r\n"
+      . "connection: close\r\ncontent-length: " . length($b) . "\r\n\r\n$b";
+  local $/; print <$s>;' "$host_port" > "$rec/answer" 2> "$rec/answer.err"
+echo "$?" > "$rec/answer.status"
+"#;
+
+#[test]
+fn the_builder_reaches_the_real_egress_proxy_through_the_bridge_and_the_bridge_ends_with_it() {
+    if !sandbox_available() {
+        return;
+    }
+    let h = Harness::new(POST_THROUGH_THE_BRIDGE);
+    h.run_ok();
+
+    // The builder was pointed at its lane's bridge port, recorded in run.json.
+    let port = cowproof_run::bridge::bridge_port(&h.id);
+    assert!((40_000..60_000).contains(&port), "{port}");
+    let env = h.read("home/fake/env.txt");
+    assert!(
+        env.lines()
+            .any(|l| l == format!("ANTHROPIC_BASE_URL=http://127.0.0.1:{port}")),
+        "{env}"
+    );
+    assert_eq!(h.run_json()["bridgePort"], port, "{}", h.run_json());
+
+    // builder -> bridge -> proxy.sock -> the real ProxyServer: its own
+    // refusal came back through both hops.
+    let answer = h.read("home/fake/answer");
+    let err = h.read("home/fake/answer.err");
+    assert_eq!(h.read("home/fake/answer.status").trim(), "0", "{err}");
+    assert!(
+        answer.starts_with("HTTP/1.1 403"),
+        "no answer from the proxy through the bridge: {answer:?} {err}"
+    );
+    assert!(answer.ends_with("forbidden\n"), "{answer:?}");
+
+    // The bridge lived only as long as the builder: its port is free again.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match std::net::TcpListener::bind(("127.0.0.1", port)) {
+            Ok(_) => break,
+            Err(e) => {
+                assert!(
+                    Instant::now() < deadline,
+                    "the bridge outlived the builder: {e}"
+                );
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+    }
 }
 
 #[test]
@@ -614,7 +711,7 @@ fn a_builder_ask_over_the_tools_socket_lands_in_the_escalation_queue() {
     assert_eq!(frame(&out, 3)["result"]["isError"], false, "{out:?}");
     let queue = h.read("control/escalations.jsonl");
     assert!(queue.contains("which way through the fake?"), "{queue}");
-    assert!(queue.contains("t-run"), "{queue}");
+    assert!(queue.contains(&h.id), "{queue}");
 }
 
 #[test]
@@ -760,7 +857,11 @@ fn every_check_run_and_reproduced_with_owned_edits_is_proved_and_sealed_in_a_cap
     assert_eq!(verdict["exitCode"], 0);
     assert!(reasons(&verdict).is_empty(), "{verdict}");
     let stdout = String::from_utf8(out.stdout).unwrap();
-    assert_eq!(stdout.lines().last().unwrap(), "t-run: proved", "{stdout}");
+    assert_eq!(
+        stdout.lines().last().unwrap(),
+        format!("{}: proved", h.id),
+        "{stdout}"
+    );
 
     // The capsule reads back with every recorded hash verified, and holds what
     // the lane was, not just that a file exists.
@@ -904,7 +1005,7 @@ fn a_declared_check_the_builder_never_ran_is_incomplete_and_named() {
             .lines()
             .last()
             .unwrap()
-            .starts_with("t-run: incomplete: ")
+            .starts_with(&format!("{}: incomplete: ", h.id))
             && stdout.contains("\"made\""),
         "{stdout}"
     );
@@ -948,7 +1049,7 @@ fn a_check_that_fails_when_the_builder_runs_it_is_refuted_and_named() {
             .lines()
             .last()
             .unwrap()
-            .starts_with("t-run: refuted: "),
+            .starts_with(&format!("{}: refuted: ", h.id)),
         "{stdout}"
     );
     // A failing recorded result is sealed as a failure.
@@ -1125,11 +1226,11 @@ fn wait_for_ask(h: &Harness, child: &mut Child, nth: usize) -> String {
     }
 }
 
-/// `cowproof rule t-run <id> <verdict args>`, which must succeed.
+/// `cowproof rule <lane> <id> <verdict args>`, which must succeed.
 fn rule(h: &Harness, id: &str, verdict: &[&str]) {
     let out = output(
         Command::new(&h.cowproof)
-            .args(["rule", "t-run", id])
+            .args(["rule", &h.id, id])
             .args(verdict)
             .arg("--lanes-root")
             .arg(h.lanes.path()),
@@ -1206,7 +1307,10 @@ fn an_answer_resumes_the_parked_session_with_the_ruling_and_the_lane_is_proved()
     rule(&h, &id, &["--answer", "use option B"]);
     let out = finish(child);
     assert_eq!(out.status.code(), Some(0), "{}", stdout_of(&out));
-    assert_eq!(stdout_of(&out).lines().last().unwrap(), "t-run: proved");
+    assert_eq!(
+        stdout_of(&out).lines().last().unwrap(),
+        format!("{}: proved", h.id)
+    );
 
     // Two launches; the second resumed the first one's session.
     assert_eq!(h.launches(), 2);
@@ -1389,7 +1493,7 @@ fn a_redirect_with_another_lanes_id_is_refused_and_nothing_launches() {
     }
     let h = owned_packet(&asks_first("Right task?", true, &then_checks()));
     let packet = h.work.path().join("redirect.md");
-    fs::write(&packet, h.packet_text.replace("t-run", "someone-else")).unwrap();
+    fs::write(&packet, h.packet_text.replace(&h.id, "someone-else")).unwrap();
     let mut child = start(&h);
     let id = wait_for_ask(&h, &mut child, 1);
     rule(&h, &id, &["--redirect", packet.to_str().unwrap()]);
@@ -1657,7 +1761,10 @@ fn a_parked_blocking_ask_ends_a_builder_that_keeps_running_and_the_answer_resume
     rule(&h, &id, &["--answer", "use option B"]);
     let out = finish(run.child);
     assert_eq!(out.status.code(), Some(0), "{}", stdout_of(&out));
-    assert_eq!(stdout_of(&out).lines().last().unwrap(), "t-run: proved");
+    assert_eq!(
+        stdout_of(&out).lines().last().unwrap(),
+        format!("{}: proved", h.id)
+    );
 
     let segs = segments(&h);
     assert_eq!(segs.len(), 2, "{segs:?}");
@@ -1840,4 +1947,151 @@ fn run_help_documents_the_turn_budget_and_the_cost_cap_defaults() {
     ] {
         assert!(help.contains(needle), "{needle} missing from:\n{help}");
     }
+}
+
+// ---------------------------------------------------------------- net-bridge (D24)
+
+/// A free loopback port.
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+/// Spawn `cowproof net-bridge <args>` with stderr piped. No sandbox: these
+/// tests are about the subcommand's own contract.
+fn spawn_net_bridge(args: &[&str]) -> Child {
+    let _g = fork_lock();
+    Command::new(env!("CARGO_BIN_EXE_cowproof"))
+        .arg("net-bridge")
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap()
+}
+
+#[test]
+fn net_bridge_prints_ready_on_stderr_once_bound_and_relays_to_the_socket() {
+    use std::io::{BufRead, BufReader, Read, Write};
+    let dir = var_tmp("cp-bridge-");
+    let sock = dir.path().join("p.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { return };
+            let mut buf = [0u8; 4];
+            if stream.read_exact(&mut buf).is_ok() {
+                let _ = stream.write_all(&buf.map(|b| b.to_ascii_uppercase()));
+            }
+        }
+    });
+    let port = free_port();
+    let mut child = spawn_net_bridge(&[
+        "--port",
+        &port.to_string(),
+        "--target",
+        sock.to_str().unwrap(),
+    ]);
+    let mut stderr = BufReader::new(child.stderr.take().unwrap());
+    let mut line = String::new();
+    stderr.read_line(&mut line).unwrap();
+    assert_eq!(line, "READY\n");
+
+    let mut c = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    c.write_all(b"abcd").unwrap();
+    let mut got = [0u8; 4];
+    c.read_exact(&mut got).unwrap();
+    assert_eq!(&got, b"ABCD");
+    child.kill().unwrap();
+    child.wait().unwrap();
+}
+
+#[test]
+fn net_bridge_waits_briefly_for_a_busy_port_and_gives_up_when_it_stays_busy() {
+    use std::io::{BufRead, BufReader};
+    let dir = var_tmp("cp-bridge-");
+    let sock = dir.path().join("p.sock");
+
+    // Busy for 400 ms (a previous launch's bridge still exiting): READY follows.
+    let held = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = held.local_addr().unwrap().port();
+    let mut child = spawn_net_bridge(&[
+        "--port",
+        &port.to_string(),
+        "--target",
+        sock.to_str().unwrap(),
+    ]);
+    std::thread::sleep(Duration::from_millis(400));
+    drop(held);
+    let mut stderr = BufReader::new(child.stderr.take().unwrap());
+    let mut line = String::new();
+    stderr.read_line(&mut line).unwrap();
+    assert_eq!(line, "READY\n", "the bridge did not retry the busy port");
+    child.kill().unwrap();
+    child.wait().unwrap();
+
+    // Busy for good: no READY, a failure exit, and the wrapper never runs its command.
+    let held = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let busy = held.local_addr().unwrap().port();
+    let marker = dir.path().join("ran");
+    let out = output(Command::new(env!("CARGO_BIN_EXE_cowproof")).args([
+        "net-bridge",
+        "--port",
+        &busy.to_string(),
+        "--target",
+        sock.to_str().unwrap(),
+        "--",
+        "/bin/sh",
+        "-c",
+        &format!("touch {}", marker.display()),
+    ]));
+    assert!(!out.status.success(), "{:?}", out.status);
+    assert!(!marker.exists(), "the command ran without its bridge");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("not ready"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    drop(held);
+}
+
+#[test]
+fn net_bridge_wrapper_passes_argv_whole_and_forwards_the_exit_status() {
+    let dir = var_tmp("cp-bridge-");
+    let sock = dir.path().join("p.sock");
+    let port = free_port();
+    let out_file = dir.path().join("argv");
+    // A hostile-looking argument stays one argument: there is no shell.
+    let hostile = "a b; touch PWNED $(id) 'q'";
+    let out = output(
+        Command::new(env!("CARGO_BIN_EXE_cowproof"))
+            .current_dir(dir.path())
+            .args([
+                "net-bridge",
+                "--port",
+                &port.to_string(),
+                "--target",
+                sock.to_str().unwrap(),
+                "--",
+                "/bin/sh",
+                "-c",
+                "printf '%s' \"$1\" > \"$2\"; exit 7",
+                "sh",
+                hostile,
+                out_file.to_str().unwrap(),
+            ]),
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(7),
+        "{:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(fs::read_to_string(&out_file).unwrap(), hostile);
+    assert!(!dir.path().join("PWNED").exists());
 }

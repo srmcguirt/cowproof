@@ -15,6 +15,7 @@ use cowproof_plan::{
     HostCapacity, LaneStateUpdate, PlanHostRunner, check_plans, choose_host, collect_running,
     duplicate_running_id, lanes as plan_lanes, load_plans, ready_next, set_lane_state,
 };
+use cowproof_run::bridge::{bind_bridge, serve_bridge};
 use cowproof_run::{LaneLayout, NetworkMode, SandboxPolicy, render_macos_profile, sandbox_command};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -74,6 +75,14 @@ enum Action {
     /// runner socket; the builder runtime launches it, people do not.
     #[command(hide = true)]
     LaneTools(LaneToolsArgs),
+    /// The in-sandbox bridge from `127.0.0.1:<port>` to the lane's proxy
+    /// socket (D24). Without a command it serves and prints `READY` on stderr
+    /// once bound. With `-- <command>` it starts that bridge first, waits up to
+    /// five seconds for `READY`, then replaces itself with the command, so the
+    /// command's exit status is the process's own. The runtime launches it;
+    /// people do not.
+    #[command(hide = true)]
+    NetBridge(NetBridgeArgs),
 }
 #[derive(Parser)]
 struct RuleArgs {
@@ -117,6 +126,23 @@ struct LaneToolsArgs {
     /// The lane's runner socket, `<lane>/sock/runner.sock`.
     #[arg(long)]
     socket: PathBuf,
+}
+
+#[derive(Parser)]
+struct NetBridgeArgs {
+    /// Port to bind on `127.0.0.1`.
+    #[arg(long)]
+    port: u16,
+    /// Unix socket path to relay to.
+    #[arg(long)]
+    target: PathBuf,
+    /// Exit when this process is no longer the parent (set by the wrapper, so
+    /// the bridge never outlives the command it serves).
+    #[arg(long, hide = true)]
+    watch_parent: Option<u32>,
+    /// The command to run once the bridge is ready, as argv (no shell).
+    #[arg(last = true)]
+    command: Vec<String>,
 }
 #[derive(Parser)]
 struct PlanArgs {
@@ -270,7 +296,103 @@ async fn main() -> Result<()> {
         Action::Rule(args) => rule_command(args).await,
         Action::Note(args) => note_command(args).await,
         Action::LaneTools(args) => lane_tools::run(args.socket).await,
+        Action::NetBridge(args) => net_bridge_command(args).await,
     }
+}
+
+/// How long the wrapper waits for its bridge to report `READY`.
+const BRIDGE_READY_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long a bridge retries a busy port before it gives up. Shorter than
+/// [`BRIDGE_READY_TIMEOUT`], so the wrapper sees the failure, not a timeout.
+const BRIDGE_BIND_RETRY: Duration = Duration::from_secs(3);
+
+async fn net_bridge_command(args: NetBridgeArgs) -> Result<()> {
+    if args.command.is_empty() {
+        return serve_net_bridge(args).await;
+    }
+    exec_behind_bridge(args)
+}
+
+/// Bind, print `READY`, and serve until killed (or until the watched parent
+/// is gone).
+async fn serve_net_bridge(args: NetBridgeArgs) -> Result<()> {
+    // A resumed builder reuses its lane's port while the previous launch's
+    // bridge is still noticing that its parent is gone (a few tens of
+    // milliseconds), so a busy port is retried briefly. A port held by
+    // something else stays busy, and the bridge then fails: its command is
+    // never started.
+    let deadline = Instant::now() + BRIDGE_BIND_RETRY;
+    let listener = loop {
+        match bind_bridge(args.port).await {
+            Ok(listener) => break listener,
+            Err(e) if Instant::now() >= deadline => return Err(e),
+            Err(_) => tokio::time::sleep(Duration::from_millis(25)).await,
+        }
+    };
+    if let Some(parent) = args.watch_parent {
+        std::thread::spawn(move || {
+            while std::os::unix::process::parent_id() == parent {
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            std::process::exit(0);
+        });
+    }
+    eprintln!("READY");
+    serve_bridge(listener, args.target).await
+}
+
+/// Start the bridge as a child, wait for it to be ready, then exec the
+/// command in this process. The command is argv, never a shell string.
+fn exec_behind_bridge(args: NetBridgeArgs) -> Result<()> {
+    use std::io::{BufRead, BufReader};
+    use std::os::unix::process::CommandExt;
+    use std::process::{Command, Stdio};
+
+    let exe = std::env::current_exe().context("locating the cowproof executable")?;
+    let mut bridge = Command::new(exe)
+        .arg("net-bridge")
+        .arg("--port")
+        .arg(args.port.to_string())
+        .arg("--target")
+        .arg(&args.target)
+        .arg("--watch-parent")
+        .arg(std::process::id().to_string())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("starting the bridge")?;
+    let stderr = bridge
+        .stderr
+        .take()
+        .context("reading the bridge's stderr")?;
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut line = String::new();
+        let _ = BufReader::new(stderr).read_line(&mut line);
+        let _ = ready_tx.send(line);
+    });
+    match ready_rx.recv_timeout(BRIDGE_READY_TIMEOUT) {
+        Ok(line) if line.trim() == "READY" => {}
+        other => {
+            let _ = bridge.kill();
+            let _ = bridge.wait();
+            let seen = other.map(|l| l.trim().to_string()).unwrap_or_default();
+            bail!(
+                "the bridge on 127.0.0.1:{} was not ready within {}s (saw {:?}); not starting the command",
+                args.port,
+                BRIDGE_READY_TIMEOUT.as_secs(),
+                seen
+            );
+        }
+    }
+    // The bridge now outlives this call only while its parent (this process,
+    // then the exec'd command, which keeps the pid) is alive.
+    let error = Command::new(&args.command[0])
+        .args(&args.command[1..])
+        .exec();
+    let _ = bridge.kill();
+    bail!("cannot execute {}: {error}", args.command[0])
 }
 
 fn lint_command(args: LintArgs) -> Result<()> {

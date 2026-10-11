@@ -41,6 +41,7 @@ use cowproof_prove::{
 };
 use cowproof_run::{
     LaneLayout, NetworkMode, SandboxPolicy,
+    bridge::bridge_port,
     claude::{ClaudeSpec, claude_command},
     director::{self, VerdictEvent},
     escalate::{
@@ -66,7 +67,6 @@ use std::process::{ExitStatus, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
-use tokio::net::TcpListener;
 use tokio::process::Command;
 use tokio::sync::{Semaphore, mpsc::UnboundedReceiver};
 use tokio::task::JoinHandle;
@@ -74,11 +74,6 @@ use tokio::time::Instant as TokioInstant;
 
 /// The provider the proxy forwards to.
 const UPSTREAM: &str = "https://api.anthropic.com";
-
-/// Where the builder is pointed on Linux until the D24 bridge exists. Nothing
-/// listens here (port 0 is never connectable), so a Linux builder fails fast
-/// instead of reaching some other local service.
-const LINUX_UNBRIDGED_URL: &str = "http://127.0.0.1:0";
 
 /// The longest one `run_check` may run before it is killed.
 const CHECK_TIMEOUT: Duration = Duration::from_secs(20 * 60);
@@ -118,8 +113,13 @@ const BUILDER_DENY: [&str; 2] = ["WebFetch", "WebSearch"];
 
 /// A running egress proxy and what the builder needs to reach it.
 pub struct ProxyEndpoint {
-    /// `ANTHROPIC_BASE_URL` for the builder.
+    /// `ANTHROPIC_BASE_URL` for the builder: the in-sandbox bridge's
+    /// `127.0.0.1` port.
     pub base_url: String,
+    /// The bridge's port, recorded in `run.json`.
+    pub bridge_port: u16,
+    /// The proxy's Unix socket, `<lane>/proxy.sock`, the bridge's target.
+    pub socket: PathBuf,
     /// The network mode for the builder's sandbox policy.
     pub network: NetworkMode,
     /// The key the builder presents; the proxy swaps in the real one.
@@ -128,26 +128,19 @@ pub struct ProxyEndpoint {
     pub task: JoinHandle<()>,
 }
 
-/// Start the egress proxy for one lane.
+/// Start the egress proxy for one lane (D24).
 ///
-/// This is the only place that decides how the builder reaches the proxy, so
-/// the D24 in-sandbox bridge replaces exactly this function.
-///
-/// - macOS: a `127.0.0.1` TCP port chosen by the OS (the sandbox allows that
-///   one port).
-/// - Linux: a Unix socket at `<lane>/proxy.sock`. The builder's network
-///   namespace is empty and no bridge exists yet, so a real builder cannot
-///   reach it; a warning says so.
+/// This is the only place that decides how the builder reaches the proxy. The
+/// proxy listens on a Unix socket, `<lane>/proxy.sock` (mode 0600), on macOS
+/// and Linux alike. The builder reaches it through a bridge that
+/// [`builder_argv`] starts inside the sandbox, listening on `127.0.0.1:<port>`
+/// where the port is [`bridge_port`] of the lane id.
 ///
 /// The real key goes only into the proxy's memory.
-pub async fn start_proxy(layout: &LaneLayout, real_api_key: String) -> Result<ProxyEndpoint> {
-    start_proxy_on(layout, real_api_key, cfg!(target_os = "macos")).await
-}
-
-async fn start_proxy_on(
+pub async fn start_proxy(
     layout: &LaneLayout,
+    lane_id: &str,
     real_api_key: String,
-    tcp: bool,
 ) -> Result<ProxyEndpoint> {
     let config =
         ProxyConfig::new(real_api_key, UPSTREAM).context("configuring the egress proxy")?;
@@ -155,42 +148,52 @@ async fn start_proxy_on(
     let server = ProxyServer::new(config);
     let socket = lane_dir(layout)?.join("proxy.sock");
 
-    if tcp {
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .await
-            .context("binding the egress proxy port")?;
-        let port = listener.local_addr()?.port();
-        let task = tokio::spawn(async move {
-            if let Err(e) = server.serve_tcp(listener).await {
-                eprintln!("egress proxy stopped: {e:#}");
-            }
-        });
-        Ok(ProxyEndpoint {
-            base_url: format!("http://127.0.0.1:{port}"),
-            network: NetworkMode::Proxy { port, socket },
-            placeholder_key,
-            task,
-        })
-    } else {
-        let listener = tools::bind(&socket).context("binding the egress proxy socket")?;
-        fs::set_permissions(&socket, fs::Permissions::from_mode(0o600))
-            .context("restricting the egress proxy socket")?;
-        eprintln!(
-            "warning: no in-sandbox bridge yet (D24): the Linux builder cannot reach the egress proxy at {}",
-            socket.display()
-        );
-        let task = tokio::spawn(async move {
-            if let Err(e) = server.serve_unix(listener).await {
-                eprintln!("egress proxy stopped: {e:#}");
-            }
-        });
-        Ok(ProxyEndpoint {
-            base_url: LINUX_UNBRIDGED_URL.to_string(),
-            network: NetworkMode::Proxy { port: 0, socket },
-            placeholder_key,
-            task,
-        })
-    }
+    let listener = tools::bind(&socket).context("binding the egress proxy socket")?;
+    fs::set_permissions(&socket, fs::Permissions::from_mode(0o600))
+        .context("restricting the egress proxy socket")?;
+    let task = tokio::spawn(async move {
+        if let Err(e) = server.serve_unix(listener).await {
+            eprintln!("egress proxy stopped: {e:#}");
+        }
+    });
+
+    let port = bridge_port(lane_id);
+    Ok(ProxyEndpoint {
+        base_url: format!("http://127.0.0.1:{port}"),
+        bridge_port: port,
+        network: NetworkMode::Proxy {
+            port,
+            socket: socket.clone(),
+        },
+        socket,
+        placeholder_key,
+        task,
+    })
+}
+
+/// The builder's argv: the bridge wrapper first, then `claude`.
+///
+/// `cowproof net-bridge --port <P> --target <proxy.sock> -- <claude> <args>`
+/// starts the bridge inside the sandbox, waits for it to be ready, and then
+/// replaces itself with `claude`. It is argv end to end: no shell, no
+/// interpolation. If the bridge cannot start, `claude` never does.
+fn builder_argv(
+    cowproof_exe: &Path,
+    bridge_port: u16,
+    proxy_socket: &Path,
+    claude: &[String],
+) -> Vec<String> {
+    let mut argv = vec![
+        cowproof_exe.to_string_lossy().into_owned(),
+        "net-bridge".to_string(),
+        "--port".to_string(),
+        bridge_port.to_string(),
+        "--target".to_string(),
+        proxy_socket.to_string_lossy().into_owned(),
+        "--".to_string(),
+    ];
+    argv.extend(claude.iter().cloned());
+    argv
 }
 
 /// Aborts a task when dropped, so no exit path leaves a server running.
@@ -479,6 +482,9 @@ struct Launcher {
     cowproof_exe: PathBuf,
     path: String,
     base_url: String,
+    /// The bridge's port and its target, the proxy's socket (D24).
+    bridge_port: u16,
+    proxy_socket: PathBuf,
     placeholder_key: String,
     network: NetworkMode,
     max_turns: u32,
@@ -559,9 +565,15 @@ impl Launcher {
             path: self.path.clone(),
         })?;
         invocation.program = self.claude_bin.to_string_lossy().into_owned();
-        let argv: Vec<String> = std::iter::once(invocation.program.clone())
+        let claude: Vec<String> = std::iter::once(invocation.program.clone())
             .chain(invocation.args.iter().cloned())
             .collect();
+        let argv = builder_argv(
+            &self.cowproof_exe,
+            self.bridge_port,
+            &self.proxy_socket,
+            &claude,
+        );
         let policy = SandboxPolicy::builder_with_executables(
             layout,
             self.network.clone(),
@@ -1509,7 +1521,7 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
     eprintln!("[{}] lane {}", header.id, lane.display());
 
     // 4. Proxy and tools, both live before the builder starts.
-    let endpoint = start_proxy(&layout, api_key).await?;
+    let endpoint = start_proxy(&layout, &header.id, api_key).await?;
     let _proxy = AbortOnDrop(endpoint.task);
     // The session-end channel exists before the tools server and the builder
     // do, so no signal can be missed (D9: the runner ends the session).
@@ -1593,6 +1605,8 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
         cowproof_exe: cowproof_exe.clone(),
         path: path.clone(),
         base_url: endpoint.base_url,
+        bridge_port: endpoint.bridge_port,
+        proxy_socket: endpoint.socket,
         placeholder_key: endpoint.placeholder_key,
         network: endpoint.network,
         max_turns: args.max_turns,
@@ -1663,6 +1677,7 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
         .sum();
     let run = json!({
         "id": header.id,
+        "bridgePort": launcher.bridge_port,
         "status": status_name,
         "estimatedCostUsd": estimated_cost_usd,
         "costIsEstimate": true,
@@ -2360,46 +2375,68 @@ body"#;
     }
 
     #[tokio::test]
-    async fn start_proxy_tcp_listens_and_unix_binds_a_private_socket() {
+    async fn start_proxy_binds_a_private_unix_socket_and_names_the_lanes_bridge_port() {
         let tmp = tempfile::tempdir().unwrap();
         let layout = layout_in(tmp.path());
         fs::create_dir_all(&layout.clone).unwrap();
 
-        let tcp = start_proxy_on(&layout, "sk-unit-real".into(), true)
-            .await
-            .unwrap();
-        let NetworkMode::Proxy { port, socket } = &tcp.network else {
-            panic!("expected a proxy network mode");
-        };
-        assert_eq!(tcp.base_url, format!("http://127.0.0.1:{port}"));
-        assert_eq!(socket, &tmp.path().join("lane/proxy.sock"));
-        assert!(!socket.exists(), "the TCP proxy creates no socket");
-        tokio::net::TcpStream::connect(("127.0.0.1", *port))
-            .await
-            .expect("the proxy accepts connections");
-        assert!(tcp.placeholder_key.starts_with("placeholder-"));
-        assert!(!tcp.placeholder_key.contains("sk-unit-real"));
-        tcp.task.abort();
-
-        let unix = start_proxy_on(&layout, "sk-unit-real".into(), false)
+        let proxy = start_proxy(&layout, "t-run", "sk-unit-real".into())
             .await
             .unwrap();
         let socket = tmp.path().join("lane/proxy.sock");
+        // The stable hash of the id, never the OS's choice.
+        assert_eq!(proxy.bridge_port, 41_003);
+        assert_eq!(proxy.base_url, "http://127.0.0.1:41003");
+        assert_eq!(proxy.socket, socket);
         assert_eq!(
-            unix.network,
+            proxy.network,
             NetworkMode::Proxy {
-                port: 0,
+                port: 41_003,
                 socket: socket.clone()
             }
         );
-        assert_eq!(unix.base_url, LINUX_UNBRIDGED_URL);
+        // The proxy is a Unix socket on every OS, mode 0600, and nothing
+        // listens on the bridge port from the host's side.
         let meta = fs::metadata(&socket).unwrap();
         assert!(std::os::unix::fs::FileTypeExt::is_socket(&meta.file_type()));
         assert_eq!(meta.permissions().mode() & 0o777, 0o600);
         tokio::net::UnixStream::connect(&socket)
             .await
             .expect("the proxy accepts connections on its socket");
-        unix.task.abort();
+        assert!(proxy.placeholder_key.starts_with("placeholder-"));
+        assert!(!proxy.placeholder_key.contains("sk-unit-real"));
+        proxy.task.abort();
+    }
+
+    #[test]
+    fn the_builder_argv_is_the_bridge_wrapper_then_claude_with_every_value_a_single_argument() {
+        // A prompt with spaces, quotes and a leading dash stays one argument.
+        let claude = vec![
+            "/bin/claude".to_string(),
+            "-p".to_string(),
+            "--x; rm -rf /".to_string(),
+        ];
+        let argv = builder_argv(
+            Path::new("/opt/cowproof"),
+            41_003,
+            Path::new("/lanes/l1/proxy.sock"),
+            &claude,
+        );
+        assert_eq!(
+            argv,
+            [
+                "/opt/cowproof",
+                "net-bridge",
+                "--port",
+                "41003",
+                "--target",
+                "/lanes/l1/proxy.sock",
+                "--",
+                "/bin/claude",
+                "-p",
+                "--x; rm -rf /",
+            ]
+        );
     }
 
     fn reasons_of(e: &Evidence) -> (Outcome, Vec<String>) {

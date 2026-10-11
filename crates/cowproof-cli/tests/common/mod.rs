@@ -132,6 +132,8 @@ pub fn run_checks(ids: &[&str]) -> String {
 /// the home and a `HOME` of its own for every child (so no test touches the real one).
 pub struct Lane {
     /// Holds the repository, the packet, the fake and the cowproof copy.
+    /// The lane id, unique per lane (see [`unique_lane_id`]).
+    pub id: String,
     _work: TempDir,
     /// Holds the lanes, nothing else.
     pub lanes: TempDir,
@@ -143,13 +145,34 @@ pub struct Lane {
     pub cowproof: PathBuf,
 }
 
-pub const LANE_ID: &str = "t-ver";
+static LANE_COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static LANE_PORTS: Mutex<Vec<u16>> = Mutex::new(Vec::new());
+
+/// A lane id of its own, with a bridge port of its own (D24).
+///
+/// The builder's bridge port is a hash of the lane id and, on macOS, the sandbox shares
+/// the host's loopback, so lanes that run in parallel with one id (or with ids that merely
+/// hash alike) would fight over a port. The id is searched for: its port must be unused by
+/// every other lane of this process and free on the host right now.
+pub fn unique_lane_id() -> String {
+    let mut used = LANE_PORTS.lock().unwrap_or_else(|e| e.into_inner());
+    loop {
+        let n = LANE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let id = format!("t-ver-{}-{n}", std::process::id());
+        let port = cowproof_run::bridge::bridge_port(&id);
+        if !used.contains(&port) && std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
+            used.push(port);
+            return id;
+        }
+    }
+}
 
 impl Lane {
     /// A committed repository with a README, and a packet that owns `README.md` and
     /// `created.txt` and declares `checks`. The fake edits README.md, creates
     /// created.txt, then runs `fake_body`.
     pub fn new(fake_body: &str, checks: Value) -> Self {
+        let id = unique_lane_id();
         let work = var_tmp("cp-ver-work-");
         let lanes = var_tmp("cp-ver-lanes-");
         let home = var_tmp("cp-ver-home-");
@@ -168,7 +191,7 @@ impl Lane {
             format!(
                 "# Task\n\n<!-- lane {} -->\n\nChange the README.\n",
                 json!({
-                    "id": LANE_ID,
+                    "id": id,
                     "owns": ["README.md", "created.txt"],
                     "class": "light",
                     "checks": checks,
@@ -206,6 +229,7 @@ exit 0
             fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
         }
         Lane {
+            id,
             _work: work,
             lanes,
             home,
@@ -241,7 +265,7 @@ exit 0
     }
 
     pub fn lane_dir(&self) -> PathBuf {
-        self.lanes.path().canonicalize().unwrap().join(LANE_ID)
+        self.lanes.path().canonicalize().unwrap().join(&self.id)
     }
 
     pub fn capsule_dir(&self) -> PathBuf {

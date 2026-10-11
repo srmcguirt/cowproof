@@ -5,7 +5,7 @@
 
 mod common;
 
-use common::{LANE_ID, Lane, output, run_checks, sandbox_available, text, var_tmp};
+use common::{Lane, output, run_checks, sandbox_available, text, var_tmp};
 use cowproof_prove::{Capsule, HELDOUT_FILE};
 use serde_json::{Value, json};
 use std::fs;
@@ -335,7 +335,7 @@ fn without_the_flag_the_director_store_supplies_the_held_out_checks() {
     }
     let lane = lane();
     let id = cowproof_core::heldout::repo_id(&lane.repo).unwrap();
-    let store = cowproof_core::heldout::default_store(lane.home.path(), &id, LANE_ID).unwrap();
+    let store = cowproof_core::heldout::default_store(lane.home.path(), &id, &lane.id).unwrap();
     fs::create_dir_all(store.parent().unwrap()).unwrap();
     heldout_file(store.parent().unwrap(), "grep -q no-such-line README.md");
     fs::rename(store.parent().unwrap().join("h.toml"), &store).unwrap();
