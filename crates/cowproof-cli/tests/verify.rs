@@ -183,6 +183,45 @@ fn a_tampered_capsule_is_refused_naming_the_tamper() {
     assert_eq!(out.status.code(), Some(0), "{}", text(&out));
 }
 
+/// The seal covers what `verify` runs: a `checks/injected.json` added to a sealed capsule
+/// is refused (exit 4, naming the file) and its command never runs, and the capsule
+/// reproduces again once the file is removed.
+#[test]
+fn an_unsealed_check_added_to_a_capsule_is_refused_and_never_run() {
+    if !sandbox_available() {
+        return;
+    }
+    let lane = lane();
+    run_expecting(&lane, &[], 0);
+    let capsule = lane.capsule_dir();
+
+    let markers = var_tmp("cp-ver-marker-");
+    let marker = markers.path().join("injected-ran");
+    let injected = capsule.join("checks/injected.json");
+    fs::write(
+        &injected,
+        serde_json::to_vec(&json!({
+            "command": format!("touch '{}'", marker.display()),
+            "exit_status": 0,
+            "attempts": 1,
+            "duration_ms": 1,
+            "output_sha256": "ignored",
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let out = replay(&lane);
+    assert_eq!(out.status.code(), Some(4), "{}", text(&out));
+    let err = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(err.contains("checks/injected.json"), "{err}");
+    assert!(!marker.exists(), "the unsealed check ran");
+
+    fs::remove_file(&injected).unwrap();
+    let out = replay(&lane);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    assert!(!marker.exists(), "the unsealed check ran");
+}
+
 /// A capsule from a builder that ran unconfined is not a proof to hand to someone else:
 /// standalone `cowproof verify` refuses it with exit 4, naming `unsandboxed`, before it
 /// rebuilds anything. The run that made it checked it (and ended `finished`).

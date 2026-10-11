@@ -43,6 +43,13 @@ pub enum CapsuleError {
     #[error("Hash mismatch for file {0}: expected {1}, got {2}")]
     HashMismatch(String, String, String),
 
+    /// A file is on disk in the capsule but is not among `capsule.json`'s `file_hashes`,
+    /// so the seal does not cover it. The seal covers exactly the listed files, and
+    /// `verify` acts only on those, so an extra file is refused rather than skipped:
+    /// skipping it would hide that someone added to a sealed capsule.
+    #[error("{}", unsealed_message(.0))]
+    UnsealedFile(String),
+
     #[error("Invalid capsule.json format: {0}")]
     InvalidFormat(String),
 
@@ -51,6 +58,68 @@ pub enum CapsuleError {
 
     #[error("JSON error: {0}")]
     JsonError(#[from] serde_json::error::Error),
+}
+
+/// The message for a file the seal does not cover. macOS `tar` stores extended
+/// attributes as AppleDouble `._<name>` siblings, the usual way an unsealed file
+/// reaches a capsule that was archived and unpacked, so those get a hint.
+fn unsealed_message(path: &str) -> String {
+    let base = path.rsplit('/').next().unwrap_or(path);
+    let mut msg = format!("File in the capsule is not sealed (not listed in capsule.json): {path}");
+    if base.starts_with("._") {
+        msg.push_str(
+            "; macOS tar adds ._ files when it archives, so recreate the archive with COPYFILE_DISABLE=1",
+        );
+    }
+    msg
+}
+
+/// Fail closed on anything `verify` could read that the seal does not list: an entry
+/// of a sealed subdirectory (`packets`, `checks`, `applied`) that is not in
+/// `file_hashes`, and a top-level capsule file (`base.patch` and the rest) that is
+/// present but unlisted. `write` hashes every file it finds, so a file that is not
+/// listed was added afterwards. A directory or symlink counts as an entry: `write`
+/// never leaves one in a sealed subdirectory.
+fn refuse_unsealed(dir: &Path, hashes: &HashMap<String, String>) -> Result<(), CapsuleError> {
+    for name in CAPSULE_TOP_FILES {
+        if !hashes.contains_key(*name) && fs::symlink_metadata(dir.join(name)).is_ok() {
+            return Err(CapsuleError::UnsealedFile((*name).to_string()));
+        }
+    }
+    for sub in CAPSULE_SUBDIRS {
+        let sub_dir = dir.join(sub);
+        match fs::symlink_metadata(&sub_dir) {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(CapsuleError::IoError(e)),
+        }
+        for entry in fs::read_dir(&sub_dir)? {
+            check_entry_is_sealed(sub, &entry?.file_name(), hashes)?;
+        }
+    }
+    Ok(())
+}
+
+/// One entry of the sealed subdirectory `sub`: its name must be UTF-8 (it is a key in
+/// `file_hashes`, so one that is not cannot be listed) and the key `<sub>/<name>` must be
+/// listed.
+pub(crate) fn check_entry_is_sealed(
+    sub: &str,
+    file_name: &std::ffi::OsStr,
+    hashes: &HashMap<String, String>,
+) -> Result<(), CapsuleError> {
+    let Some(name) = file_name.to_str() else {
+        return Err(CapsuleError::InvalidFormat(format!(
+            "{sub}/ holds a file whose name is not UTF-8: {}",
+            file_name.to_string_lossy()
+        )));
+    };
+    let key = format!("{sub}/{name}");
+    if hashes.contains_key(&key) {
+        Ok(())
+    } else {
+        Err(CapsuleError::UnsealedFile(key))
+    }
 }
 
 /// Environment fingerprint: OS, architecture, and tool versions.
@@ -268,6 +337,8 @@ impl Capsule {
                 ));
             }
         }
+
+        refuse_unsealed(dir, &capsule.file_hashes)?;
 
         // The launch baseline must be present and hashed: a capsule without it would
         // replay as "nothing was removed".

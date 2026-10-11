@@ -112,7 +112,9 @@ const FLAKY_ATTEMPTS: u32 = 3;
 /// 2. Apply `base.patch` (when present and non-empty).
 /// 3. Replay the launch baseline by deleting the paths in `capsule.launch_removed` (D13/R10).
 /// 4. Apply `lane.patch`.
-/// 5. Run each recorded check's command through the `CheckRunner`.
+/// 5. Run each recorded check's command through the `CheckRunner`. The checks are the
+///    sealed `checks/<id>.json` files named in `capsule.json`; a file the seal does not
+///    list is refused by `Capsule::read` before this point, never run.
 /// 6. Compare pass or fail per check id; durations and output hashes are never compared.
 /// 7. Run the held-out checks in `packets/heldout.toml` (when the capsule has one) on the
 ///    same tree, after the recorded checks. They have no recorded result: one that fails
@@ -157,7 +159,7 @@ pub async fn verify(
         ),
     };
 
-    let recorded = load_checks(capsule_dir)?;
+    let recorded = load_checks(capsule_dir, &capsule)?;
 
     let tree = workdir.join("tree");
     if tree.exists() {
@@ -260,28 +262,31 @@ fn infra(msg: String) -> VerifyError {
     VerifyError::Infrastructure(msg)
 }
 
-fn load_checks(capsule_dir: &Path) -> Result<BTreeMap<String, CheckResult>, VerifyError> {
+/// The recorded checks, taken from the sealed list and never from the directory: a
+/// check is `checks/<id>.json` for each such key of `capsule.file_hashes`. `Capsule::read`
+/// has already hashed every one of those files and refused any other file in `checks/`, so
+/// a check that is loaded here is a check that was sealed. A key that would name a path
+/// outside `checks/` is refused.
+pub(crate) fn load_checks(
+    capsule_dir: &Path,
+    capsule: &Capsule,
+) -> Result<BTreeMap<String, CheckResult>, VerifyError> {
     let mut checks = BTreeMap::new();
-    let checks_dir = capsule_dir.join("checks");
-    if !checks_dir.exists() {
-        return Ok(checks);
-    }
-    let entries = std::fs::read_dir(&checks_dir).map_err(|e| infra(format!("checks/: {e}")))?;
-    for entry in entries {
-        let path = entry.map_err(|e| infra(format!("checks/: {e}")))?.path();
-        if path.extension().is_none_or(|ext| ext != "json") {
+    for key in capsule.file_hashes.keys() {
+        let Some(file) = key.strip_prefix("checks/") else {
             continue;
+        };
+        let Some(id) = file.strip_suffix(".json") else {
+            continue;
+        };
+        if id.is_empty() || id.contains('/') {
+            return Err(infra(format!("{key}: not a valid check file name")));
         }
-        let id = path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .ok_or_else(|| infra("check file name is not UTF-8".to_string()))?
-            .to_string();
-        let content =
-            std::fs::read_to_string(&path).map_err(|e| infra(format!("checks/{id}.json: {e}")))?;
+        let content = std::fs::read_to_string(capsule_dir.join(key))
+            .map_err(|e| infra(format!("checks/{id}.json: {e}")))?;
         let check: CheckResult =
             serde_json::from_str(&content).map_err(|e| infra(format!("checks/{id}.json: {e}")))?;
-        checks.insert(id, check);
+        checks.insert(id.to_string(), check);
     }
     Ok(checks)
 }

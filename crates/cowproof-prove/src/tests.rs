@@ -2042,3 +2042,253 @@ async fn test_a_held_out_file_that_does_not_parse_is_infrastructure() {
         other => panic!("expected Infrastructure, got {other:?}"),
     }
 }
+
+// ============================================================================
+// The seal covers what verify acts on: a file in a sealed subdirectory that
+// `capsule.json` does not list is refused, never read and never run.
+// ============================================================================
+
+fn shell_quote(path: &Path) -> String {
+    format!("'{}'", path.display())
+}
+
+/// An unsealed `checks/injected.json` carries a command that writes a marker file.
+/// `verify` must refuse the capsule, naming the file, and must never run the command.
+#[tokio::test]
+async fn an_unsealed_check_file_is_refused_and_never_run() {
+    let c = chain();
+    let (_, work) = dirs();
+    let capsule_dir = passing_capsule(&c);
+    let markers = TempDir::new().unwrap();
+    let marker = markers.path().join("injected-ran");
+    let injected = CheckResult {
+        command: format!("touch {}", shell_quote(&marker)),
+        exit_status: 0,
+        attempts: 1,
+        duration_ms: 1,
+        output_sha256: "ignored".to_string(),
+    };
+    std::fs::write(
+        capsule_dir.path().join("checks/injected.json"),
+        serde_json::to_string(&injected).unwrap(),
+    )
+    .unwrap();
+
+    let result = verify(
+        capsule_dir.path(),
+        c.repo.path(),
+        work.path(),
+        &ProcessRunner::new(),
+        test_opts(work.path()),
+    )
+    .await;
+
+    assert!(
+        !marker.exists(),
+        "the unsealed check ran: its marker file exists"
+    );
+    let err = result.expect_err("an unsealed check file must make verify fail");
+    assert!(
+        err.to_string().contains("checks/injected.json"),
+        "the error must name the file: {err}"
+    );
+    assert!(!work.path().join("tree").exists());
+}
+
+/// `._has-world.json` is what macOS `tar` adds next to `has-world.json`. It is refused by
+/// name, with the hint for the archive, instead of failing later on its bytes.
+#[tokio::test]
+async fn an_appledouble_file_is_refused_with_the_copyfile_hint() {
+    let c = chain();
+    let (_, work) = dirs();
+    let capsule_dir = passing_capsule(&c);
+    // AppleDouble bytes are binary, not JSON, and not UTF-8.
+    std::fs::write(
+        capsule_dir.path().join("checks/._slow.json"),
+        [0x00, 0x05, 0x16, 0x07, 0x00, 0x02, 0x00, 0x00, 0xff, 0xfe],
+    )
+    .unwrap();
+    let runner = ScriptedRunner::new(&[("true", &[0])]);
+
+    let result = verify(
+        capsule_dir.path(),
+        c.repo.path(),
+        work.path(),
+        &runner,
+        test_opts(work.path()),
+    )
+    .await;
+
+    match result {
+        Err(VerifyError::Capsule(CapsuleError::UnsealedFile(name))) => {
+            assert_eq!(name, "checks/._slow.json")
+        }
+        other => panic!("expected Capsule(UnsealedFile), got {other:?}"),
+    }
+    let message = Capsule::read(capsule_dir.path()).unwrap_err().to_string();
+    assert!(message.contains("checks/._slow.json"), "{message}");
+    assert!(message.contains("COPYFILE_DISABLE=1"), "{message}");
+    assert_eq!(runner.call_count(), 0);
+    assert!(!work.path().join("tree").exists());
+}
+
+/// An ordinary unsealed name gets no tar hint.
+#[test]
+fn an_unsealed_file_that_is_not_appledouble_gets_no_tar_hint() {
+    let dir = TempDir::new().unwrap();
+    sealed_capsule(dir.path());
+    std::fs::write(dir.path().join("checks/extra.json"), "{}").unwrap();
+    let message = Capsule::read(dir.path()).unwrap_err().to_string();
+    assert!(message.contains("checks/extra.json"), "{message}");
+    assert!(!message.contains("COPYFILE_DISABLE"), "{message}");
+}
+
+/// `packets/` and `applied/` are sealed subdirectories too: an extra file in either is
+/// refused by name. So is a subdirectory, since `write` hashes only flat files.
+#[test]
+fn an_unsealed_file_in_packets_or_applied_is_refused() {
+    for (sub, name) in [
+        ("packets", "extra.toml"),
+        ("packets", "heldout.toml"),
+        ("applied", "extra.json"),
+        ("checks", "extra.txt"),
+    ] {
+        let dir = TempDir::new().unwrap();
+        sealed_capsule(dir.path());
+        std::fs::write(dir.path().join(sub).join(name), "x").unwrap();
+        match Capsule::read(dir.path()) {
+            Err(CapsuleError::UnsealedFile(file)) => assert_eq!(file, format!("{sub}/{name}")),
+            other => panic!("{sub}/{name}: expected UnsealedFile, got {other:?}"),
+        }
+    }
+    for sub in ["packets", "checks", "applied"] {
+        let dir = TempDir::new().unwrap();
+        sealed_capsule(dir.path());
+        std::fs::create_dir(dir.path().join(sub).join("nested")).unwrap();
+        match Capsule::read(dir.path()) {
+            Err(CapsuleError::UnsealedFile(file)) => assert_eq!(file, format!("{sub}/nested")),
+            other => panic!("{sub}/nested: expected UnsealedFile, got {other:?}"),
+        }
+    }
+}
+
+/// A top-level capsule file the seal does not list is refused as well: `verify` applies
+/// `base.patch` whenever it is present, so adding one to a capsule written without it
+/// would change the rebuilt tree under an intact seal.
+#[tokio::test]
+async fn an_unsealed_top_level_patch_is_refused_and_never_applied() {
+    let c = chain();
+    let (_, work) = dirs();
+    let capsule_dir = passing_capsule(&c);
+    std::fs::write(capsule_dir.path().join("base.patch"), "not a patch\n").unwrap();
+    let runner = ScriptedRunner::new(&[("true", &[0])]);
+
+    let result = verify(
+        capsule_dir.path(),
+        c.repo.path(),
+        work.path(),
+        &runner,
+        test_opts(work.path()),
+    )
+    .await;
+
+    match result {
+        Err(VerifyError::Capsule(CapsuleError::UnsealedFile(name))) => {
+            assert_eq!(name, "base.patch")
+        }
+        other => panic!("expected Capsule(UnsealedFile), got {other:?}"),
+    }
+    assert_eq!(runner.call_count(), 0);
+    assert!(!work.path().join("tree").exists());
+}
+
+/// A file name that is not UTF-8 in a sealed subdirectory is refused, naming the
+/// directory, never skipped. Checked on the entry check itself, because macOS refuses to
+/// create such a name on disk.
+#[cfg(unix)]
+#[test]
+fn a_non_utf8_file_name_in_a_sealed_subdirectory_is_refused() {
+    use std::os::unix::ffi::OsStrExt;
+    let odd = std::ffi::OsStr::from_bytes(b"bad-\xff.json");
+    match crate::capsule::check_entry_is_sealed("checks", odd, &HashMap::new()) {
+        Err(CapsuleError::InvalidFormat(msg)) => assert!(msg.contains("checks/"), "{msg}"),
+        other => panic!("expected InvalidFormat naming checks/, got {other:?}"),
+    }
+}
+
+/// `load_checks` takes its ids from the sealed list. With a capsule whose `file_hashes`
+/// lists `a` only, a `b.json` on disk is not loaded, whether or not `Capsule::read` would
+/// have refused the directory first.
+#[test]
+fn load_checks_takes_its_ids_from_file_hashes_not_the_directory() {
+    let dir = TempDir::new().unwrap();
+    std::fs::create_dir_all(dir.path().join("checks")).unwrap();
+    let check = |command: &str| {
+        serde_json::to_string(&CheckResult {
+            command: command.to_string(),
+            exit_status: 0,
+            attempts: 1,
+            duration_ms: 1,
+            output_sha256: "ignored".to_string(),
+        })
+        .unwrap()
+    };
+    std::fs::write(dir.path().join("checks/a.json"), check("true")).unwrap();
+    std::fs::write(dir.path().join("checks/b.json"), check("touch pwned")).unwrap();
+    std::fs::write(dir.path().join("checks/c.txt"), "not a check").unwrap();
+    let mut capsule = Capsule::new(
+        "abc123".to_string(),
+        "tree_hash_123".to_string(),
+        fingerprint(),
+        "claude:haiku".to_string(),
+        "api-key".to_string(),
+    );
+    capsule
+        .file_hashes
+        .insert("checks/a.json".to_string(), "unused".to_string());
+    capsule
+        .file_hashes
+        .insert("checks/c.txt".to_string(), "unused".to_string());
+
+    let loaded = crate::verify::load_checks(dir.path(), &capsule).unwrap();
+    assert_eq!(loaded.keys().collect::<Vec<_>>(), vec!["a"]);
+    assert_eq!(loaded["a"].command, "true");
+
+    // A listed key that climbs out of checks/ is refused, not read.
+    capsule
+        .file_hashes
+        .insert("checks/x/y.json".to_string(), "unused".to_string());
+    match crate::verify::load_checks(dir.path(), &capsule) {
+        Err(VerifyError::Infrastructure(msg)) => assert!(msg.contains("checks/x/y.json"), "{msg}"),
+        other => panic!("expected Infrastructure, got {other:?}"),
+    }
+}
+
+/// A capsule `write` sealed, with its check and held-out file, still reads and verifies:
+/// the unsealed-file check refuses nothing `write` produced.
+#[tokio::test]
+async fn a_sealed_capsule_still_verifies() {
+    let c = chain();
+    let (_, work) = dirs();
+    let capsule_dir = capsule_with_heldout(&c, HELDOUT_PASSING);
+    // Rewriting reseals it (as `cowproof run` does for the verdict) and still reads.
+    let mut again = Capsule::read(capsule_dir.path()).unwrap();
+    again.write(capsule_dir.path()).unwrap();
+
+    let report = verify(
+        capsule_dir.path(),
+        c.repo.path(),
+        work.path(),
+        &ProcessRunner::new(),
+        test_opts(work.path()),
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        matches!(report.result, VerifyResult::Reproduced),
+        "{report:?}"
+    );
+    assert_eq!(report.checks.len(), 1);
+    assert_eq!(report.checks[0].check_id, "visible");
+}
