@@ -989,7 +989,7 @@ impl Queue {
         }
 
         // Unknown, wrong lane or already ruled
-        match self.escalations.get(id) {
+        let entry = match self.escalations.get(id) {
             None => return Err(format!("escalation {} unknown", id)),
             Some(entry) if entry.lane != lane => {
                 return Err(format!(
@@ -1003,21 +1003,25 @@ impl Queue {
             }) => {
                 return Err(format!("escalation {} already ruled: {:?}", id, existing));
             }
-            Some(_) => {}
-        }
+            Some(entry) => entry,
+        };
 
-        // Park limit: past it the lane ends as escalation-limit.
-        let over = self
-            .park_times
-            .get(id)
-            .and_then(|parked_at| self.clock.now().duration_since(*parked_at).ok())
-            .filter(|elapsed| *elapsed > self.park_limit);
-        if let StdOption::Some(elapsed) = over {
-            self.end_lane_escalation_limit(lane, StdOption::Some(id))?;
-            return Err(format!(
-                "ruling for {} rejected: parked over limit ({:?} > {:?}); lane in terminal state escalation-limit",
-                id, elapsed, self.park_limit
-            ));
+        // Park limit: applies only to BLOCKING asks. Past the limit, the lane ends
+        // as escalation-limit. Non-blocking asks are accepted anytime, as long as
+        // the lane is still running.
+        if entry.ask.blocking {
+            let over = self
+                .park_times
+                .get(id)
+                .and_then(|parked_at| self.clock.now().duration_since(*parked_at).ok())
+                .filter(|elapsed| *elapsed > self.park_limit);
+            if let StdOption::Some(elapsed) = over {
+                self.end_lane_escalation_limit(lane, StdOption::Some(id))?;
+                return Err(format!(
+                    "ruling for {} rejected: parked over limit ({:?} > {:?}); lane in terminal state escalation-limit",
+                    id, elapsed, self.park_limit
+                ));
+            }
         }
 
         Ok(())
@@ -2111,6 +2115,118 @@ mod tests {
         assert!(err.contains("escalation-limit"), "{err}");
         assert_eq!(queue.lane_state("lane1"), Some(LaneState::EscalationLimit));
         assert!(queue.get(&late).unwrap().2.is_none());
+    }
+
+    #[test]
+    fn test_park_limit_only_applies_to_blocking_asks_stop() {
+        let tmpdir = tempfile::TempDir::new().unwrap();
+        let clock = Arc::new(TestClock::new());
+        let mut queue = Queue::with_limits(
+            tmpdir.path(),
+            Box::new(clock.clone()),
+            Duration::from_secs(30 * 60),
+            3,
+        )
+        .unwrap();
+
+        let mut ask = new_ask("should I continue?");
+        ask.blocking = false; // Non-blocking
+        let non_blocking_id = queue.ask("lane1", &ask, Origin::Builder).unwrap();
+
+        // Advance past the park limit
+        clock.advance(Duration::from_secs(30 * 60 + 1));
+
+        // A stop ruling on a non-blocking ask past the limit should be accepted
+        let verdict = Verdict::Stop;
+        queue.rule("lane1", &non_blocking_id, &verdict).unwrap();
+
+        // The directive should be returned by pending_directive, proving the ruling was accepted
+        let directive = queue.pending_directive("lane1");
+        assert!(directive.is_some());
+        assert_eq!(directive.unwrap().0, non_blocking_id);
+    }
+
+    #[test]
+    fn test_park_limit_only_applies_to_blocking_asks_answer() {
+        let tmpdir = tempfile::TempDir::new().unwrap();
+        let clock = Arc::new(TestClock::new());
+        let mut queue = Queue::with_limits(
+            tmpdir.path(),
+            Box::new(clock.clone()),
+            Duration::from_secs(30 * 60),
+            3,
+        )
+        .unwrap();
+
+        let mut ask = new_ask("should I continue?");
+        ask.blocking = false; // Non-blocking
+        let non_blocking_id = queue.ask("lane1", &ask, Origin::Builder).unwrap();
+
+        // Advance past the park limit
+        clock.advance(Duration::from_secs(30 * 60 + 1));
+
+        // An answer ruling on a non-blocking ask past the limit should be accepted
+        let verdict = Verdict::Answer {
+            text: "here is the answer".to_string(),
+        };
+        queue.rule("lane1", &non_blocking_id, &verdict).unwrap();
+
+        // pending_directive should return nothing (answer is not a directive), but the
+        // ruling should be in the queue and readable
+        assert!(queue.pending_directive("lane1").is_none());
+        assert_eq!(queue.get(&non_blocking_id).unwrap().2, Some(&verdict));
+    }
+
+    #[test]
+    fn test_park_limit_still_applies_to_blocking_asks_past_limit() {
+        let tmpdir = tempfile::TempDir::new().unwrap();
+        let clock = Arc::new(TestClock::new());
+        let mut queue = Queue::with_limits(
+            tmpdir.path(),
+            Box::new(clock.clone()),
+            Duration::from_secs(30 * 60),
+            3,
+        )
+        .unwrap();
+
+        let blocking_ask = new_ask("must block?");
+        let blocking_id = queue.ask("lane1", &blocking_ask, Origin::Builder).unwrap();
+
+        // Advance past the park limit
+        clock.advance(Duration::from_secs(30 * 60 + 1));
+
+        // A ruling on a blocking ask past the limit should be rejected
+        let verdict = Verdict::Stop;
+        let err = queue.rule("lane1", &blocking_id, &verdict).unwrap_err();
+        assert!(err.contains("parked over limit"), "{err}");
+        assert!(err.contains("escalation-limit"), "{err}");
+        assert_eq!(queue.lane_state("lane1"), Some(LaneState::EscalationLimit));
+    }
+
+    #[test]
+    fn test_park_limit_blocking_ask_at_boundary() {
+        let tmpdir = tempfile::TempDir::new().unwrap();
+        let clock = Arc::new(TestClock::new());
+        let mut queue = Queue::with_limits(
+            tmpdir.path(),
+            Box::new(clock.clone()),
+            Duration::from_secs(30 * 60),
+            3,
+        )
+        .unwrap();
+
+        let blocking_ask = new_ask("must block?");
+        let blocking_id = queue.ask("lane1", &blocking_ask, Origin::Builder).unwrap();
+
+        // Advance exactly to the park limit (not past)
+        clock.advance(Duration::from_secs(30 * 60));
+
+        // A ruling on a blocking ask exactly at the limit should be accepted
+        let verdict = Verdict::Stop;
+        queue.rule("lane1", &blocking_id, &verdict).unwrap();
+
+        // Verify the ruling was accepted by checking it's in the queue
+        assert_eq!(queue.get(&blocking_id).unwrap().2, Some(&verdict));
     }
 
     #[test]
