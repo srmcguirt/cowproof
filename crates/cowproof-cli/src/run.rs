@@ -5,7 +5,9 @@
 //! 1. lint the packet (errors stop the run before any lane exists);
 //! 2. read the real key from the director's `ANTHROPIC_API_KEY` and resolve
 //!    the Claude Code executable once on the director's `PATH`;
-//! 3. prepare the lane (isolated clone, launch baseline);
+//! 3. prepare the lane (isolated clone, launch baseline) and take a slot of the
+//!    packet's class (D12), waiting while the class is full. The slot is held to the
+//!    end of the run, on every exit, and the verifier reuses it;
 //! 4. start the egress proxy ([`start_proxy`], the one place the builder's
 //!    endpoint is decided) and bind the builder tools socket, both BEFORE the
 //!    builder starts (the Linux policy binds a socket only when the file
@@ -36,12 +38,15 @@ use crate::preflight::{CheckStatus, PreflightOptions, preflight};
 use crate::root::resolve_executable;
 use crate::verify::{Rebuild, fetch_dependencies, verifier_runner};
 use anyhow::{Context, Result, anyhow, bail};
-use cowproof_core::{LinkedFile, git_show_following_links, parse_header};
+use cowproof_core::{
+    LinkedFile, PORT_CLASS, class_limit_at_commit, get_slot_dir, git_show_following_links,
+    parse_header, port_base_for_slot, port_block_env, release_slot,
+};
 use cowproof_prove::{
     capsule::HELDOUT_FILE,
     capsule::{Capsule, CheckResult, EnvironmentFingerprint},
     gates::{GatePacket, base_requires_heldout, run_gates},
-    runner::{kill_process_group, terminate_process_group},
+    runner::{acquire_slot_notifying, kill_process_group, terminate_process_group},
     verify::{VerifyOptions, verify},
 };
 use cowproof_run::{
@@ -620,6 +625,9 @@ struct Launcher {
     /// the time between launches (parked, waiting for the director's ruling) is
     /// never counted.
     active: Mutex<Duration>,
+    /// The first port of the lane's block, from the `port` slot it holds
+    /// (`COWPROOF_PORT_BASE`). Not the D24 bridge port, which is `bridge_port` above.
+    port_base: u16,
 }
 
 impl Launcher {
@@ -709,6 +717,7 @@ impl Launcher {
             "COWPROOF_RUNNER_SOCKET".to_string(),
             self.socket.to_string_lossy().into_owned(),
         ));
+        invocation.env.extend(port_block_env(self.port_base));
         invocation.program = self.claude_bin.to_string_lossy().into_owned();
         let claude: Vec<String> = std::iter::once(invocation.program.clone())
             .chain(invocation.args.iter().cloned())
@@ -1492,6 +1501,8 @@ struct CheckContext {
     commands: BTreeMap<String, String>,
     /// One check at a time per lane (a builder can open several connections).
     slot: Semaphore,
+    /// The first port of the lane's block (`COWPROOF_PORT_BASE`), the same one the builder gets.
+    port_base: u16,
 }
 
 fn refused(output: impl Into<String>) -> CheckOutcome {
@@ -1512,13 +1523,14 @@ async fn run_declared_check(ctx: Arc<CheckContext>, id: String) -> CheckOutcome 
     };
     let policy = SandboxPolicy::run_check(&ctx.layout);
     let argv = ["/bin/sh".to_string(), "-c".to_string(), command.clone()];
-    let env = vec![
+    let mut env = vec![
         ("PATH".to_string(), ctx.path.clone()),
         (
             "HOME".to_string(),
             ctx.layout.home.to_string_lossy().into_owned(),
         ),
     ];
+    env.extend(port_block_env(ctx.port_base));
     let mut child = match sandboxed_command(
         &policy,
         &ctx.layout.control.join("run_check.sb"),
@@ -1858,6 +1870,53 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
     let lane = lane_dir(&layout)?;
     eprintln!("[{}] lane {}", header.id, lane.display());
 
+    // The builder's slots (D12), before anything runs. First one of the packet's resource
+    // class: this machine's `rust` lanes (or `pg`, `light`, `crate`) are capped, and the cap
+    // is the base commit's, so a patch cannot raise it. Then one `port` slot, whose number
+    // fixes the lane's port block, so blocks are unique across classes. Both are held to the
+    // end of the run. The verifier of this same run reuses them (see
+    // `ProofInput::builder_slot`) and never waits on its own run. SIGINT and SIGTERM are
+    // caught from here on: a wait can last as long as the lanes ahead.
+    let mut sigint = signal(SignalKind::interrupt()).context("installing the SIGINT handler")?;
+    let mut sigterm = signal(SignalKind::terminate()).context("installing the SIGTERM handler")?;
+    let class = header.class_name.as_str();
+    let class_limit = class_limit_at_commit(&repo, &prepared.base_commit, class)?;
+    let port_limit = class_limit_at_commit(&repo, &prepared.base_commit, PORT_CLASS)?;
+    let slot_dir = args.slot_dir.clone().unwrap_or_else(get_slot_dir);
+    let mut taken = Vec::new();
+    for (slot_class, limit) in [(class, class_limit), (PORT_CLASS, port_limit)] {
+        let wait_started = Instant::now();
+        let slot = tokio::select! {
+            slot = acquire_slot_notifying(slot_class, limit, &slot_dir, || {
+                eprintln!("[{}] waiting for a {slot_class} slot (limit {limit})", header.id);
+            }) => slot.with_context(|| {
+                format!("taking a {slot_class} slot in {}", slot_dir.display())
+            })?,
+            name = next_signal(&mut sigint, &mut sigterm) => {
+                eprintln!(
+                    "[{}] {name} while waiting for a {slot_class} slot: ending the run",
+                    header.id
+                );
+                // `taken` drops here and gives back the class slot, if it was held.
+                record_interrupted(
+                    &layout,
+                    &header.id,
+                    name,
+                    None,
+                    &layout.control.join("proxy.sock"),
+                    started,
+                );
+                return Ok(INTERRUPTED_EXIT_CODE);
+            }
+        };
+        taken.push((slot, wait_started.elapsed()));
+    }
+    let (port_slot, port_wait) = taken.pop().context("the port slot")?;
+    let (slot, slot_wait) = taken.pop().context("the class slot")?;
+    let slot_paths = [slot.path().to_path_buf(), port_slot.path().to_path_buf()];
+    let port_base = port_base_for_slot(port_slot.path())
+        .with_context(|| format!("the slot {} has no number", port_slot.path().display()))?;
+
     // 4. Proxy and tools, both live before the builder starts.
     let endpoint = start_proxy(&layout, &header.id, api_key).await?;
     let _proxy = AbortOnDrop(endpoint.task);
@@ -1897,6 +1956,7 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
             .map(|c| (c.id.clone(), c.command.clone()))
             .collect(),
         slot: Semaphore::new(1),
+        port_base,
     });
     let run_check: RunCheck =
         Arc::new(move |id: &str| Box::pin(run_declared_check(context.clone(), id.to_string())));
@@ -1993,6 +2053,7 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
         project_instructions_sha256: project_instructions_hash.clone(),
         timeout,
         active: Mutex::new(Duration::ZERO),
+        port_base,
     };
     let drive = Drive {
         launcher: &launcher,
@@ -2003,15 +2064,14 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
         plans: &plans,
     };
 
-    // 5b. SIGINT and SIGTERM. The builder is not in the terminal's foreground
-    // group, so the default action would end the runner and leave it running.
+    // 5b. SIGINT and SIGTERM (caught since the slot wait). The builder is not in the
+    // terminal's foreground group, so the default action would end the runner and leave
+    // it running.
     // On the first signal: end the builder's group (the launcher sends SIGTERM,
     // then SIGKILL after TERM_GRACE, and gives up the launch), stop the tools,
     // director and proxy tasks, remove the three sockets, write `run.json` as
     // `interrupted`, skip the proof and exit 130. A second signal while that
     // waits skips the wait.
-    let mut sigint = signal(SignalKind::interrupt()).context("installing the SIGINT handler")?;
-    let mut sigterm = signal(SignalKind::terminate()).context("installing the SIGTERM handler")?;
     let drive_run = drive.run(&mut verdict_rx, &args.model, &packet_text);
     tokio::pin!(drive_run);
     let first = tokio::select! {
@@ -2052,6 +2112,10 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
     // the handlers existed (the tokio handlers would otherwise swallow it).
     tokio::spawn(async move {
         next_signal(&mut sigint, &mut sigterm).await;
+        // `exit` runs no destructors: give both slots back first.
+        for slot_path in &slot_paths {
+            release_slot(Some(slot_path));
+        }
         std::process::exit(INTERRUPTED_EXIT_CODE);
     });
     let status = lane_run.status;
@@ -2133,6 +2197,16 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
         "patchBytes": patch_bytes,
         "patchError": patch.as_ref().err().map(|e| format!("{e:#}")),
         "durationMs": started.elapsed().as_millis() as u64,
+        "classSlot": {
+            "class": class,
+            "limit": class_limit,
+            "waitMs": slot_wait.as_millis() as u64,
+        },
+        "portSlot": {
+            "limit": port_limit,
+            "portBase": port_base,
+            "waitMs": port_wait.as_millis() as u64,
+        },
         "lane": {
             "dir": lane,
             "clone": layout.clone,
@@ -2198,6 +2272,10 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
             heldout_path: heldout.as_deref(),
             prefix_version: launcher.prefix_version.clone(),
             project_instructions_sha256: launcher.project_instructions_sha256.clone(),
+            builder_slot: slot.path(),
+            slot_dir: &slot_dir,
+            class_limit,
+            port_base,
         },
         results,
     )
@@ -2357,6 +2435,17 @@ struct ProofInput<'a> {
     /// The SHA256 hash of the project instructions from the base commit,
     /// or None if there were no project instructions.
     project_instructions_sha256: Option<String>,
+    /// The class slot this run holds (D12). The verifier reuses it and never takes a
+    /// second: at a class limit of one it would wait for the slot its own run holds. The
+    /// run keeps holding it until the verdict is written.
+    builder_slot: &'a Path,
+    /// The slot directory and the class limit the slot came from: what the verifier would
+    /// use if it ever had to take a slot itself.
+    slot_dir: &'a Path,
+    class_limit: usize,
+    /// The first port of the run's `port` slot's block, which the verifier's checks get as
+    /// well. The verifier takes no `port` slot of its own.
+    port_base: u16,
 }
 
 /// Find the lane's held-out checks (D5): the explicit `--heldout` path, which must exist,
@@ -2563,6 +2652,7 @@ async fn replay_and_gate(
     capsule.launch_removed = input.prepared.launch_removed.clone();
     capsule.prefix_version = Some(input.prefix_version.clone());
     capsule.project_instructions_sha256 = input.project_instructions_sha256.clone();
+    capsule.class = header.class_name.clone();
 
     // Fetch the dependencies the checks need before verify runs (D6, D11, D14), on the
     // rebuilt tree, outside any builder. The capsule records the cache key and what the
@@ -2645,11 +2735,15 @@ async fn replay_and_gate(
         return Ok(());
     }
     let verify_dir = layout.scratch.join("verify");
-    let runner = verifier_runner(layout, &verify_dir, deps_dir.as_deref())?;
-    // The builder's class slot (D12) is not held in this flow, so the
-    // verifier takes the lane's class slot without waiting on itself.
+    let runner =
+        verifier_runner(layout, &verify_dir, deps_dir.as_deref())?.with_port_block(input.port_base);
+    // The verifier holds the lane's class slot (D12) by reusing the one this run holds:
+    // `verify` takes none of its own.
     let options = VerifyOptions {
+        slot_dir: input.slot_dir.to_path_buf(),
         slot_class: header.class_name.clone(),
+        slot_limit: input.class_limit,
+        held_slot_path: Some(input.builder_slot.to_path_buf()),
         ..VerifyOptions::default()
     };
     match verify(&capsule_dir, input.repo, &verify_dir, &runner, options).await {
@@ -2943,13 +3037,13 @@ body"#;
             .unwrap();
         let socket = tmp.path().join("lane/proxy.sock");
         // The stable hash of the id, never the OS's choice.
-        assert_eq!(proxy.bridge_port, 41_003);
-        assert_eq!(proxy.base_url, "http://127.0.0.1:41003");
+        assert_eq!(proxy.bridge_port, 51_003);
+        assert_eq!(proxy.base_url, "http://127.0.0.1:51003");
         assert_eq!(proxy.socket, socket);
         assert_eq!(
             proxy.network,
             NetworkMode::Proxy {
-                port: 41_003,
+                port: 51_003,
                 socket: socket.clone()
             }
         );

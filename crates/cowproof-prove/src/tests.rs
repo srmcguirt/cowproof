@@ -394,6 +394,7 @@ fn test_opts(work: &Path) -> VerifyOptions {
         slot_class: "rust".to_string(),
         slot_limit: 2,
         default_timeout: Duration::from_secs(60),
+        held_slot_path: None,
     }
 }
 
@@ -1475,6 +1476,7 @@ async fn test_class_slot_caps_concurrent_verifications() {
         slot_class: "rust".to_string(),
         slot_limit: 2,
         default_timeout: Duration::from_secs(60),
+        held_slot_path: None,
     };
 
     let (a, b, d) = tokio::join!(
@@ -1618,6 +1620,67 @@ async fn test_slot_is_released_when_verification_errors() {
     );
 }
 
+/// A caller that holds the class's only slot passes it as `held_slot_path`: `verify`
+/// takes no second one (it would wait forever on a limit of one), finishes, and leaves the
+/// caller's slot where it was.
+#[tokio::test]
+async fn test_verify_reuses_a_held_slot_instead_of_taking_another() {
+    let c = chain();
+    let capsule_dir = passing_capsule(&c);
+    let (_unused, work) = dirs();
+    let mut opts = test_opts(work.path());
+    opts.slot_limit = 1;
+    let held = cowproof_core::try_acquire_slot("rust", 1, &opts.slot_dir)
+        .unwrap()
+        .expect("the one slot is free");
+    opts.held_slot_path = Some(held.clone());
+
+    let report = tokio::time::timeout(
+        Duration::from_secs(30),
+        verify(
+            capsule_dir.path(),
+            c.repo.path(),
+            work.path(),
+            &ProcessRunner::new(),
+            opts,
+        ),
+    )
+    .await
+    .expect("verify waited for a slot the caller holds")
+    .unwrap();
+
+    assert!(
+        matches!(report.result, VerifyResult::Reproduced),
+        "{report:?}"
+    );
+    assert!(held.is_dir(), "verify released a slot it did not take");
+}
+
+/// A held slot that is no longer there is a caller bug and an infrastructure error, not
+/// a quiet pass through.
+#[tokio::test]
+async fn test_verify_refuses_a_held_slot_that_is_gone() {
+    let c = chain();
+    let capsule_dir = passing_capsule(&c);
+    let (_unused, work) = dirs();
+    let mut opts = test_opts(work.path());
+    opts.held_slot_path = Some(work.path().join("no-such-slot"));
+
+    let result = verify(
+        capsule_dir.path(),
+        c.repo.path(),
+        work.path(),
+        &ProcessRunner::new(),
+        opts,
+    )
+    .await;
+
+    assert!(
+        matches!(&result, Err(VerifyError::Infrastructure(m)) if m.contains("slot")),
+        "{result:?}"
+    );
+}
+
 // ============================================================================
 // The seal on capsule.json: the hash of its raw bytes, in capsule.sha256.
 // ============================================================================
@@ -1631,6 +1694,31 @@ fn sealed_capsule(dir: &Path) {
         "api-key".to_string(),
     );
     capsule.write(dir).unwrap();
+}
+
+/// The lane's class is written to `capsule.json` and read back; a capsule from before the
+/// field existed reads as `light`, the packet default.
+#[test]
+fn test_capsule_records_the_class_and_defaults_to_light() {
+    let dir = TempDir::new().unwrap();
+    let mut capsule = Capsule::new(
+        "abc123".to_string(),
+        "tree_hash_123".to_string(),
+        fingerprint(),
+        "claude:haiku".to_string(),
+        "api-key".to_string(),
+    );
+    assert_eq!(capsule.class, "light");
+    capsule.class = "rust".to_string();
+    capsule.write(dir.path()).unwrap();
+    assert_eq!(Capsule::read(dir.path()).unwrap().class, "rust");
+
+    let text = std::fs::read_to_string(dir.path().join("capsule.json")).unwrap();
+    let mut value: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(value["class"], "rust");
+    value.as_object_mut().unwrap().remove("class");
+    let old: Capsule = serde_json::from_value(value).unwrap();
+    assert_eq!(old.class, "light");
 }
 
 /// Replace `from` with `to` in capsule.json, as a hand edit would, leaving the seal alone.

@@ -174,7 +174,14 @@ impl Lane {
     /// A committed repository with a README, and a packet that owns `README.md` and
     /// `created.txt` and declares `checks`. The fake edits README.md, creates
     /// created.txt, then runs `fake_body`.
+    #[allow(dead_code)] // `tests/slots.rs` builds every lane with a class
     pub fn new(fake_body: &str, checks: Value) -> Self {
+        Self::with_class(fake_body, checks, "light")
+    }
+
+    /// [`Lane::new`] with the packet's resource `class` (`light`, `crate`, `rust`, `pg`).
+    #[allow(dead_code)] // `tests/slots.rs` uses it; the other test crates that share this module do not
+    pub fn with_class(fake_body: &str, checks: Value, class: &str) -> Self {
         let id = unique_lane_id();
         let work = var_tmp("cp-ver-work-");
         let lanes = var_tmp("cp-ver-lanes-");
@@ -196,7 +203,7 @@ impl Lane {
                 json!({
                     "id": id,
                     "owns": ["README.md", "created.txt"],
-                    "class": "light",
+                    "class": class,
                     "checks": checks,
                 })
             ),
@@ -277,8 +284,9 @@ exit 0
         c
     }
 
-    /// `cowproof run` with the real key set, plus `extra` arguments.
-    pub fn run(&self, extra: &[&Path]) -> Output {
+    /// The `cowproof run` command with the real key set, plus `extra` arguments, not yet
+    /// started.
+    pub fn run_command(&self, extra: &[&Path]) -> Command {
         let mut c = self.cowproof_cmd();
         c.arg("run")
             .arg(&self.packet)
@@ -290,7 +298,13 @@ exit 0
             .arg(&self.fake)
             .args(extra)
             .env("ANTHROPIC_API_KEY", REAL_KEY);
-        output(&mut c)
+        c
+    }
+
+    /// `cowproof run` with the real key set, plus `extra` arguments.
+    #[allow(dead_code)] // `tests/slots.rs` starts its runs without waiting
+    pub fn run(&self, extra: &[&Path]) -> Output {
+        output(&mut self.run_command(extra))
     }
 
     pub fn lane_dir(&self) -> PathBuf {
@@ -308,6 +322,19 @@ exit 0
         )
         .unwrap()
     }
+}
+
+/// Start `cmd` without waiting, its stdout dropped and its stderr written to the file
+/// `stderr` (read it while the process runs). The spawn is under `FORK_LOCK`.
+#[allow(dead_code)] // `tests/slots.rs` uses it; the other test crates that share this module do not
+pub fn spawn_to_file(cmd: &mut Command, stderr: &Path) -> std::process::Child {
+    let file = fs::File::create(stderr).unwrap();
+    let _g = fork_lock();
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(file))
+        .spawn()
+        .unwrap()
 }
 
 /// `out`'s stdout and stderr, for assertion messages.

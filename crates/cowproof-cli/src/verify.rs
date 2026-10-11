@@ -8,9 +8,12 @@
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::Parser;
+use cowproof_core::{PORT_CLASS, class_limit_at_commit, get_slot_dir, port_base_for_slot};
 use cowproof_prove::{
     Capsule, VerifyError,
-    runner::{SandboxedRunner, host_platform, verifier_toolchain},
+    runner::{
+        SandboxedRunner, SlotGuard, acquire_slot_notifying, host_platform, verifier_toolchain,
+    },
     verify::{VerifyOptions, VerifyResult, remove_launch_paths, verify},
 };
 use cowproof_run::{
@@ -46,6 +49,12 @@ pub struct VerifyArgs {
     /// removed when the capsule reproduces
     #[arg(long)]
     workdir: Option<PathBuf>,
+    /// Directory of the machine-wide class slots (D12). Default: `$COWPROOF_SLOT_DIR`, else
+    /// `~/.cache/cowproof/slots`. The verifier holds one slot of the class the capsule
+    /// records and one `port` slot while it replays, waiting when none is free; the limits
+    /// are the capsule's base commit's `cowproof.toml` `[classes]`
+    #[arg(long)]
+    slot_dir: Option<PathBuf>,
 }
 
 /// The sandboxed check runner the verifier uses, for both `cowproof run` and
@@ -296,17 +305,47 @@ pub async fn verify_capsule(args: VerifyArgs) -> Result<i32> {
             return Ok(4);
         }
     };
-    let runner = verifier_runner(&layout, &verify_dir, deps_dir.as_deref())?;
+    // The verifier holds one slot of the lane's class for the replay (D12), and one `port`
+    // slot whose number is the checks' port block. Both are taken here, class first, and not
+    // inside `verify`, because the port slot decides the environment the runner is built
+    // with. A capsule that cannot be read is refused by `verify` below, as it always was,
+    // without a slot.
+    let capsule = Capsule::read(&capsule_dir).ok();
+    let mut options = VerifyOptions::default();
+    let mut runner = verifier_runner(&layout, &verify_dir, deps_dir.as_deref())?;
+    let _slot = match &capsule {
+        Some(capsule) => {
+            let slot_dir = args.slot_dir.clone().unwrap_or_else(get_slot_dir);
+            let held = async {
+                let (class_slot, class_limit) =
+                    hold_slot(&repo, capsule, &capsule.class, &slot_dir).await?;
+                let (port_slot, _) = hold_slot(&repo, capsule, PORT_CLASS, &slot_dir).await?;
+                Ok::<_, String>((class_slot, class_limit, port_slot))
+            };
+            match held.await {
+                Ok((class_slot, class_limit, port_slot)) => {
+                    options.slot_dir = slot_dir;
+                    options.slot_limit = class_limit;
+                    options.slot_class = capsule.class.clone();
+                    options.held_slot_path = Some(class_slot.path().to_path_buf());
+                    if let Some(base) = port_base_for_slot(port_slot.path()) {
+                        runner = runner.with_port_block(base);
+                    }
+                    Some((class_slot, port_slot))
+                }
+                Err(why) => {
+                    eprintln!("infrastructure: {why}");
+                    if ours {
+                        let _ = fs::remove_dir_all(&root);
+                    }
+                    return Ok(4);
+                }
+            }
+        }
+        None => None,
+    };
 
-    let code = match verify(
-        &capsule_dir,
-        &repo,
-        &verify_dir,
-        &runner,
-        VerifyOptions::default(),
-    )
-    .await
-    {
+    let code = match verify(&capsule_dir, &repo, &verify_dir, &runner, options).await {
         Ok(report) => match report.result {
             VerifyResult::Reproduced => {
                 println!("reproduced");
@@ -340,6 +379,25 @@ pub async fn verify_capsule(args: VerifyArgs) -> Result<i32> {
         eprintln!("rebuilt tree kept in {}", verify_dir.join("tree").display());
     }
     Ok(code)
+}
+
+/// One slot of `class`, held by the caller until the replay ends (D12): the capsule's own
+/// class, or `port`. The limit is the class limit in the `cowproof.toml` of the capsule's
+/// base commit; when none is free it says so once and waits.
+async fn hold_slot(
+    repo: &Path,
+    capsule: &Capsule,
+    class: &str,
+    slot_dir: &Path,
+) -> std::result::Result<(SlotGuard, usize), String> {
+    let limit =
+        class_limit_at_commit(repo, &capsule.base_commit, class).map_err(|e| format!("{e:#}"))?;
+    let slot = acquire_slot_notifying(class, limit, slot_dir, || {
+        eprintln!("waiting for a {class} slot (limit {limit})");
+    })
+    .await
+    .map_err(|e| format!("could not take a {class} slot: {e:#}"))?;
+    Ok((slot, limit))
 }
 
 fn quote_ids(ids: &[String]) -> String {

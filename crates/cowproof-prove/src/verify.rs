@@ -1,5 +1,6 @@
 use crate::capsule::{Capsule, CapsuleError, CheckResult, HELDOUT_FILE};
 use crate::runner::{CheckRunner, acquire_slot};
+use cowproof_core::get_slot_dir;
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -10,25 +11,30 @@ use tokio::process::Command;
 pub struct VerifyOptions {
     /// Directory holding the machine-wide slots, shared with the builders.
     pub slot_dir: PathBuf,
-    /// The class of the lane being verified (`rust`, `pg`, `light`). The verifier takes a
-    /// slot of this class after the builder has released its own (D12).
+    /// The class of the lane being verified (`rust`, `pg`, `light`). The verifier holds a
+    /// slot of this class while it runs (D12): its own, or the one in `held_slot_path`.
     pub slot_class: String,
     /// The class's limit.
     pub slot_limit: usize,
     /// Per-check time limit. A recorded check carries no limit of its own yet, so this
     /// applies to every check.
     pub default_timeout: Duration,
+    /// The directory of a slot of `slot_class` the caller already holds and keeps holding
+    /// until `verify` returns. The verifier then acquires none. `cowproof run` sets it to
+    /// the builder's slot, so the verifier never waits on a slot its own run holds.
+    pub held_slot_path: Option<PathBuf>,
 }
 
 impl Default for VerifyOptions {
     /// The machine-wide slot directory, the `rust` class at its usual limit of two, and
-    /// a 20 minute limit per check.
+    /// a 20 minute limit per check. No held slot is assumed (standalone verify).
     fn default() -> Self {
         Self {
-            slot_dir: PathBuf::from(cowproof_core::SLOT_DIR),
+            slot_dir: get_slot_dir(),
             slot_class: "rust".to_string(),
             slot_limit: 2,
             default_timeout: Duration::from_secs(20 * 60),
+            held_slot_path: None,
         }
     }
 }
@@ -85,8 +91,9 @@ const FLAKY_ATTEMPTS: u32 = 3;
 
 /// Verify a capsule by rebuilding the tree from `source_repo` and re-running checks.
 ///
-/// Before it builds anything, `verify` waits for a slot of `opts.slot_class` and holds it
-/// until it returns, on every path: success, divergence, error or check timeout (D12).
+/// Before it builds anything, `verify` holds a slot of `opts.slot_class` until it returns,
+/// on every path: success, divergence, error or check timeout (D12). It waits for one, unless
+/// `opts.held_slot_path` names a slot the caller already holds.
 /// Every check runs under `opts.default_timeout`; one that overruns is an
 /// infrastructure error naming the check, never a divergence.
 ///
@@ -119,9 +126,27 @@ pub async fn verify(
         return Err(VerifyError::UnsandboxedNotProved);
     }
 
-    let _slot = acquire_slot(&opts.slot_class, opts.slot_limit, &opts.slot_dir)
-        .await
-        .map_err(|e| infra(format!("could not acquire a {} slot: {e}", opts.slot_class)))?;
+    // A caller that already holds a slot of the lane's class (`cowproof run` holds the
+    // builder's; `cowproof verify` takes its own before it builds the runner, which needs
+    // the slot's port block) says so in `held_slot_path`, and the verifier takes no
+    // second one: at a limit of one it would wait forever on itself. Otherwise it waits
+    // for a slot here and holds it until it returns (D12).
+    let _slot = match &opts.held_slot_path {
+        Some(held) => {
+            if !held.is_dir() {
+                return Err(infra(format!(
+                    "the slot the caller says it holds is gone: {}",
+                    held.display()
+                )));
+            }
+            None
+        }
+        None => Some(
+            acquire_slot(&opts.slot_class, opts.slot_limit, &opts.slot_dir)
+                .await
+                .map_err(|e| infra(format!("could not acquire a {} slot: {e}", opts.slot_class)))?,
+        ),
+    };
 
     let recorded = load_checks(capsule_dir)?;
 

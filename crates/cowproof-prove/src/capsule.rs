@@ -113,12 +113,20 @@ pub struct Capsule {
     /// the builder saw.
     #[serde(default)]
     pub project_instructions_sha256: Option<String>,
+    /// The class of the lane (rust, crate, pg, light, port), recorded so that
+    /// `cowproof verify` uses the same class slot. Defaults to "light".
+    #[serde(default = "default_class")]
+    pub class: String,
     /// Paths removed during the launch baseline, relative and sorted. Verify replays
     /// them by deleting these exact paths from the rebuilt tree. Stored in the hashed
     /// `launch_removed.json`, not in `capsule.json`, so editing it after `write`
     /// makes `read` fail.
     #[serde(skip)]
     pub launch_removed: Vec<String>,
+}
+
+fn default_class() -> String {
+    "light".to_string()
 }
 
 impl Capsule {
@@ -150,6 +158,7 @@ impl Capsule {
             dependency_fetch_outcome: None,
             prefix_version: None,
             project_instructions_sha256: None,
+            class: "light".to_string(),
             launch_removed: Vec::new(),
         }
     }

@@ -25,15 +25,17 @@ pub const MAX_CONNECTIONS: usize = 64;
 
 /// The first port of the bridge range.
 const PORT_BASE: u16 = 40_000;
-/// The number of ports in the range: 40000 to 59999.
-const PORT_SPAN: u64 = 20_000;
+/// The number of ports in the range: 40000 up to, not including, the first port of the
+/// lanes' port blocks (`cowproof_core::PORT_BASE`, 57000), so a bridge port is never inside
+/// a lane's block. That is 40000 to 56999.
+const PORT_SPAN: u64 = (cowproof_core::PORT_BASE - PORT_BASE) as u64;
 
-/// The bridge port for a lane: `40000 + FNV-1a(lane id) % 20000`.
+/// The bridge port for a lane: `40000 + FNV-1a(lane id) % 17000`.
 ///
 /// The hash is FNV-1a over the id's UTF-8 bytes, written out here rather than
 /// taken from `DefaultHasher`, whose output may change between Rust versions:
 /// a port recorded in `run.json` must still be the port the id maps to.
-/// Distinct lanes can collide (about one pair in 20000); the second bridge
+/// Distinct lanes can collide (about one pair in 17000); the second bridge
 /// then fails to bind and its builder never starts, which is a safe failure.
 pub fn bridge_port(lane_id: &str) -> u16 {
     const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
@@ -247,9 +249,9 @@ mod tests {
         // Known values from FNV-1a 64 (checked against an independent
         // implementation). A change of hash would fail here, which is the
         // point: ports recorded in earlier run.json files must stay valid.
-        assert_eq!(bridge_port("t-run"), 41_003);
-        assert_eq!(bridge_port("lane-1"), 43_765);
-        assert_eq!(bridge_port(""), 56_037);
+        assert_eq!(bridge_port("t-run"), 51_003);
+        assert_eq!(bridge_port("lane-1"), 46_765);
+        assert_eq!(bridge_port(""), 48_037);
         for id in [
             "a",
             "b",
@@ -257,8 +259,28 @@ mod tests {
             "a-much-longer-lane-identifier-0123456789",
         ] {
             let p = bridge_port(id);
-            assert!((40_000..60_000).contains(&p), "{id}: {p}");
+            assert!((40_000..57_000).contains(&p), "{id}: {p}");
             assert_eq!(p, bridge_port(id));
         }
+    }
+
+    /// The bridge port never falls in the lanes' port blocks: the default 50 `port` slots
+    /// are 57000 to 57999, and the bridge range ends below 57000 whatever the limit.
+    #[test]
+    fn the_bridge_port_is_never_in_a_port_block() {
+        let (mut lowest, mut highest) = (u16::MAX, 0);
+        for n in 0..10_000u32 {
+            for id in [format!("lane-{n}"), format!("t-ver-{n}-{}", n * 7919)] {
+                let p = bridge_port(&id);
+                assert!(
+                    !(57_000..58_000).contains(&p) && p < cowproof_core::PORT_BASE,
+                    "{id}: {p}"
+                );
+                lowest = lowest.min(p);
+                highest = highest.max(p);
+            }
+        }
+        // The ids do spread over the range (the check above is not vacuous).
+        assert!(lowest < 40_100 && highest > 56_900, "{lowest}..{highest}");
     }
 }

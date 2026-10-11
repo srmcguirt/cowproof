@@ -253,6 +253,9 @@ pub struct SandboxedRunner {
     /// The trusted dependency cache (D6): its `cargo/registry` and `cargo/git` are
     /// mounted read-only into every check. `None` for a lane with nothing fetched.
     deps_cache: Option<PathBuf>,
+    /// The first port of the lane's block (`COWPROOF_PORT_BASE`, with
+    /// `COWPROOF_PORT_COUNT`), when the lane holds a class slot. `None` sets neither.
+    port_base: Option<u16>,
     /// Resolved once, here, in the caller's environment and outside any sandbox. An
     /// unusable `PATH` is reported when the first check runs.
     path: Result<String, InfraError>,
@@ -276,6 +279,7 @@ impl SandboxedRunner {
             cache_dir,
             platform,
             deps_cache: None,
+            port_base: None,
             path: compose_path(cargo_dir.as_deref()),
         }
     }
@@ -285,6 +289,14 @@ impl SandboxedRunner {
     /// (`cowproof_run::link_dependency_cache`).
     pub fn with_dependency_cache(mut self, deps_dir: PathBuf) -> Self {
         self.deps_cache = Some(deps_dir);
+        self
+    }
+
+    /// Give every check the lane's port block: `COWPROOF_PORT_BASE=<port_base>` and
+    /// `COWPROOF_PORT_COUNT=20`, the same two variables the builder and its `run_check`
+    /// get. Without it the checks see neither.
+    pub fn with_port_block(mut self, port_base: u16) -> Self {
+        self.port_base = Some(port_base);
         self
     }
 }
@@ -336,6 +348,9 @@ impl CheckRunner for SandboxedRunner {
         // the caller's environment, which may carry API keys.
         let mut env = vec![("PATH".to_string(), path)];
         policy.apply_env(&mut env);
+        if let Some(port_base) = self.port_base {
+            env.extend(cowproof_core::port_block_env(port_base));
+        }
 
         let mut cmd = Command::new(&sandbox_bin);
         cmd.args(&sandbox_args)
@@ -365,6 +380,12 @@ impl SlotGuard {
     fn new(slot_path: PathBuf) -> Self {
         Self { slot_path }
     }
+
+    /// The slot's directory, `<slot dir>/<class>-<n>`. The guard still owns the slot and
+    /// releases it on drop.
+    pub fn path(&self) -> &Path {
+        &self.slot_path
+    }
 }
 
 impl Drop for SlotGuard {
@@ -380,8 +401,24 @@ impl Drop for SlotGuard {
 /// it runs on the same executor thread) keep running. The slot probe itself touches the
 /// filesystem and spawns `kill -0`, so it runs on the blocking pool.
 pub async fn acquire_slot(class: &str, limit: usize, dir: &Path) -> Result<SlotGuard> {
+    acquire_slot_notifying(class, limit, dir, || {}).await
+}
+
+/// [`acquire_slot`], calling `on_wait` once, the first time no slot is free (so a caller
+/// can say it is waiting without saying it for every retry).
+///
+/// Dropping the future gives up the wait. A probe already running on the blocking pool can
+/// still take a slot after that; it carries this process's pid, so it is reclaimed as a
+/// dead holder once the process ends.
+pub async fn acquire_slot_notifying(
+    class: &str,
+    limit: usize,
+    dir: &Path,
+    on_wait: impl FnOnce(),
+) -> Result<SlotGuard> {
     const MAX_BACKOFF_MS: u64 = 1000;
     let mut backoff_ms = 10u64;
+    let mut on_wait = Some(on_wait);
 
     loop {
         let (class, dir) = (class.to_string(), dir.to_path_buf());
@@ -393,6 +430,9 @@ pub async fn acquire_slot(class: &str, limit: usize, dir: &Path) -> Result<SlotG
         match probe {
             Some(slot) => return Ok(SlotGuard::new(slot)),
             None => {
+                if let Some(notify) = on_wait.take() {
+                    notify();
+                }
                 tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
                 backoff_ms = std::cmp::min(backoff_ms * 2, MAX_BACKOFF_MS);
             }
@@ -607,6 +647,44 @@ pub(crate) mod tests {
         assert!(slot_dir.join("light-0").exists());
         drop(guard2);
         assert!(!slot_dir.join("light-0").exists());
+    }
+
+    /// `on_wait` runs once when the class is full, however long the wait, and never when a
+    /// slot is free at once.
+    #[tokio::test]
+    async fn acquire_slot_notifying_says_so_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let tmp = tempfile::tempdir().unwrap();
+        let slot_dir = tmp.path().to_path_buf();
+        let calls = AtomicUsize::new(0);
+
+        let first = acquire_slot_notifying("light", 1, &slot_dir, || {
+            calls.fetch_add(1, Ordering::SeqCst);
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "a free slot needs no notice"
+        );
+
+        let holder = std::sync::Mutex::new(Some(first));
+        let release = async {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            drop(holder.lock().unwrap().take());
+        };
+        let wait = acquire_slot_notifying("light", 1, &slot_dir, || {
+            calls.fetch_add(1, Ordering::SeqCst);
+        });
+        let (second, ()) = tokio::join!(wait, release);
+        let second = second.unwrap();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "one notice for the whole wait"
+        );
+        assert!(second.path().ends_with("light-0"));
     }
 
     #[tokio::test]

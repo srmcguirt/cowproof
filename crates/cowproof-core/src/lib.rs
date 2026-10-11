@@ -17,10 +17,48 @@ pub use git_show::{LinkedFile, git_show_following_links, git_show_optional};
 pub use patch::{PatchDelta, parse_patch};
 pub use status::{LaneStatus, StatusClass, StatusFacts, classify_opencode, classify_status};
 
+/// The first port of the lanes' port blocks.
+///
+/// Every lane holds one slot of the machine-wide `port` class ([`PORT_CLASS`]) for its
+/// whole life, beside its resource-class slot, and owns the block
+/// `PORT_BASE + n * PORT_BLOCK_SIZE` for `PORT_BLOCK_SIZE` ports (see
+/// [`port_base_for_slot`]), `n` being the number of that `port` slot. Blocks are therefore
+/// unique across classes on the machine. It is a separate thing from the D24 bridge port,
+/// a hash of the lane id in `cowproof_run::bridge`, which carries the builder's API
+/// traffic: the block is for the servers a lane's own checks start. The bridge's range
+/// ends below `PORT_BASE`, so the two never overlap.
 pub const PORT_BASE: u16 = 57000;
-pub const SLOT_DIR: &str = "/tmp/cowproof-lanes/.slots";
+/// The number of ports in each lane's block.
+pub const PORT_BLOCK_SIZE: u16 = 20;
+/// The slot class that numbers the port blocks. It is not a packet class: the runner takes
+/// one slot of it per lane, after the lane's own class slot.
+pub const PORT_CLASS: &str = "port";
+/// The most `port` slots a base may configure: `[classes] port = N` above this would push
+/// the blocks past port 65535.
+pub const MAX_PORT_SLOTS: usize = 400;
+/// The environment variable that holds the first port of the lane's block.
+pub const PORT_BASE_ENV: &str = "COWPROOF_PORT_BASE";
+/// The environment variable that holds the number of ports in the lane's block.
+pub const PORT_COUNT_ENV: &str = "COWPROOF_PORT_COUNT";
+/// The environment variable that overrides the slot directory.
+pub const SLOT_DIR_ENV: &str = "COWPROOF_SLOT_DIR";
 pub const DEFAULT_HANDOFF_DIR: &str = "docs/handoffs";
 pub const ALWAYS_PROTECTED: [&str; 4] = [".env", ".env.*", "**/.env", "**/.env.*"];
+
+/// The machine-wide slot directory: `$COWPROOF_SLOT_DIR` when set and not empty, else
+/// `~/.cache/cowproof/slots`. A `--slot-dir` flag, where a command has one, wins over both.
+pub fn get_slot_dir() -> PathBuf {
+    match std::env::var_os(SLOT_DIR_ENV) {
+        Some(dir) if !dir.is_empty() => PathBuf::from(dir),
+        _ => {
+            let home = std::env::var_os("HOME")
+                .filter(|h| !h.is_empty())
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("/tmp"));
+            home.join(".cache/cowproof/slots")
+        }
+    }
+}
 
 /// Marker strings that identify preamble protocol text.
 /// Used by lint to detect when a packet restates the preamble protocol (D20 constraint).
@@ -445,7 +483,7 @@ pub fn remove_build_output(root: &Path) -> Vec<String> {
 pub fn try_acquire_slot(class: &str, limit: usize, dir: &Path) -> Result<Option<PathBuf>> {
     fs::create_dir_all(dir)?;
     for n in 0..limit {
-        if class == "port" && scratch_busy(PORT_BASE + (n as u16) * 20) {
+        if class == "port" && scratch_busy(PORT_BASE + (n as u16) * PORT_BLOCK_SIZE) {
             continue;
         }
         let slot = dir.join(format!("{class}-{n}"));
@@ -508,6 +546,86 @@ pub fn release_slot(slot: Option<&Path>) {
     if let Some(p) = slot {
         let _ = fs::remove_dir_all(p);
     }
+}
+
+/// The first port of the block that goes with a held `port` slot. The slot directory is
+/// named `<class>-<n>` (see [`try_acquire_slot`]); the block is
+/// `PORT_BASE + n * PORT_BLOCK_SIZE`. `None` when the name does not end in a slot number.
+///
+/// Only a slot of [`PORT_CLASS`] should be passed: its number is machine-wide, so no two
+/// lanes share a block. (The number of a resource-class slot counts within its class and
+/// would give `rust-0` and `light-0` the same block.)
+pub fn port_base_for_slot(slot: &Path) -> Option<u16> {
+    let name = slot.file_name()?.to_str()?;
+    let (_, n) = name.rsplit_once('-')?;
+    let n: u16 = n.parse().ok()?;
+    PORT_BASE.checked_add(n.checked_mul(PORT_BLOCK_SIZE)?)
+}
+
+/// The environment a lane's processes get for its port block: [`PORT_BASE_ENV`] and
+/// [`PORT_COUNT_ENV`].
+pub fn port_block_env(port_base: u16) -> [(String, String); 2] {
+    [
+        (PORT_BASE_ENV.to_string(), port_base.to_string()),
+        (PORT_COUNT_ENV.to_string(), PORT_BLOCK_SIZE.to_string()),
+    ]
+}
+
+/// The class limits when `cowproof.toml` says nothing: `light` 6, `crate` 4, `rust` 2,
+/// `pg` 3, and `port` 50 (ports 57000 to 57999).
+pub const DEFAULT_CLASS_LIMITS: [(&str, usize); 5] = [
+    ("light", 6),
+    ("crate", 4),
+    ("rust", 2),
+    ("pg", 3),
+    (PORT_CLASS, 50),
+];
+
+/// The limit of a class that is in neither the defaults nor `cowproof.toml`.
+pub const OTHER_CLASS_LIMIT: usize = 2;
+
+/// The class limits in a `cowproof.toml`: the defaults, overridden by its `[classes]`
+/// table. A limit must be a whole number of at least 1 (a class with no slots could never
+/// run a lane), and a file that does not parse is an error. `None` is a repository with
+/// no `cowproof.toml`.
+pub fn parse_class_limits(text: Option<&str>) -> Result<BTreeMap<String, usize>> {
+    let mut limits: BTreeMap<String, usize> = DEFAULT_CLASS_LIMITS
+        .iter()
+        .map(|(class, limit)| (class.to_string(), *limit))
+        .collect();
+    let Some(text) = text else {
+        return Ok(limits);
+    };
+    let config: toml::Table = toml::from_str(text).context("cowproof.toml does not parse")?;
+    let Some(classes) = config.get("classes") else {
+        return Ok(limits);
+    };
+    let classes = classes
+        .as_table()
+        .context("cowproof.toml: [classes] must be a table")?;
+    for (class, value) in classes {
+        let limit = value
+            .as_integer()
+            .and_then(|n| usize::try_from(n).ok())
+            .filter(|n| *n >= 1)
+            .with_context(|| {
+                format!("cowproof.toml: [classes] {class} must be a whole number of at least 1")
+            })?;
+        if class == PORT_CLASS && limit > MAX_PORT_SLOTS {
+            bail!("cowproof.toml: [classes] port must be at most {MAX_PORT_SLOTS}");
+        }
+        limits.insert(class.clone(), limit);
+    }
+    Ok(limits)
+}
+
+/// The limit of `class` in the `cowproof.toml` of `commit` (the lane's base commit, so a
+/// patch cannot raise it).
+pub fn class_limit_at_commit(repo: &Path, commit: &str, class: &str) -> Result<usize> {
+    let text = git_show_optional(repo, commit, "cowproof.toml")?;
+    let limits = parse_class_limits(text.as_deref())
+        .with_context(|| format!("reading the class limits at {commit}"))?;
+    Ok(limits.get(class).copied().unwrap_or(OTHER_CLASS_LIMIT))
 }
 
 #[cfg(test)]
@@ -786,6 +904,64 @@ mod tests {
                 &["src/**".into()],
                 &["AGENTS.md".into()]
             ))
+        );
+    }
+
+    #[test]
+    fn class_limits_default_and_override() {
+        let defaults = parse_class_limits(None).unwrap();
+        assert_eq!(
+            defaults.into_iter().collect::<Vec<_>>(),
+            vec![
+                ("crate".to_string(), 4),
+                ("light".to_string(), 6),
+                ("pg".to_string(), 3),
+                ("port".to_string(), 50),
+                ("rust".to_string(), 2),
+            ]
+        );
+        let none_set = parse_class_limits(Some("[proof]\npacks = []\n")).unwrap();
+        assert_eq!(none_set["light"], 6);
+
+        let limits = parse_class_limits(Some("[classes]\nlight = 1\nrust = 5\ngpu = 7\n")).unwrap();
+        assert_eq!(limits["light"], 1);
+        assert_eq!(limits["rust"], 5);
+        assert_eq!(
+            limits["crate"], 4,
+            "a class the file leaves out keeps its default"
+        );
+        assert_eq!(limits["gpu"], 7);
+    }
+
+    #[test]
+    fn class_limits_refuse_a_limit_no_lane_could_use() {
+        for bad in [
+            "[classes]\nlight = 0\n",
+            "[classes]\nlight = -1\n",
+            "[classes]\nlight = \"two\"\n",
+            "[classes]\nlight = 1.5\n",
+            "classes = 3\n",
+            "[classes]\nport = 401\n",
+            "[classes\n",
+        ] {
+            assert!(parse_class_limits(Some(bad)).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn port_blocks_follow_the_slot_number() {
+        let block = |name: &str| port_base_for_slot(&PathBuf::from("/s").join(name));
+        assert_eq!(block("port-0"), Some(57000));
+        assert_eq!(block("port-1"), Some(57020));
+        assert_eq!(block("port-49"), Some(57980));
+        assert_eq!(block("no-number"), None);
+        assert_eq!(block("plain"), None);
+        assert_eq!(
+            port_block_env(57020),
+            [
+                ("COWPROOF_PORT_BASE".to_string(), "57020".to_string()),
+                ("COWPROOF_PORT_COUNT".to_string(), "20".to_string())
+            ]
         );
     }
 }

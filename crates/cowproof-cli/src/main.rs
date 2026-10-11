@@ -304,6 +304,15 @@ struct RunOneArgs {
     /// `~/.cowproof/heldout/<repo-id>/<lane-id>.toml`, used when that file exists
     #[arg(long)]
     heldout: Option<PathBuf>,
+    /// Directory of the machine-wide class slots (D12), shared by every `cowproof run` and
+    /// `cowproof verify` on this machine. Default: `$COWPROOF_SLOT_DIR`, else
+    /// `~/.cache/cowproof/slots`. The run takes a slot of its packet's class before it starts
+    /// the builder and waits when none is free (the wait counts toward neither the time limit
+    /// nor the cost). The run also holds one `port` slot, whose number is its port block
+    /// (`COWPROOF_PORT_BASE`). The limits are the base commit's `cowproof.toml` `[classes]`,
+    /// else `light` 6, `crate` 4, `rust` 2, `pg` 3, `port` 50
+    #[arg(long)]
+    slot_dir: Option<PathBuf>,
 }
 
 #[derive(Parser)]
