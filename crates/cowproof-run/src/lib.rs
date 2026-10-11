@@ -328,6 +328,27 @@ pub struct LaneLayout {
     pub lanes_root: PathBuf,
 }
 
+impl LaneLayout {
+    /// The layout of the lane at `lane_dir` (`<lanes_root>/<id>`): the one place the
+    /// lane's subdirectories are named, shared by `prepare_lane` and the remote
+    /// `host-agent` verbs.
+    pub fn for_lane_dir(lane_dir: &Path, real_home: PathBuf) -> anyhow::Result<LaneLayout> {
+        let lanes_root = lane_dir
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("lane_dir has no parent"))?
+            .to_path_buf();
+        Ok(LaneLayout {
+            clone: lane_dir.join("clone"),
+            home: lane_dir.join("home"),
+            scratch: lane_dir.join("scratch"),
+            control: lane_dir.join("control"),
+            real_home,
+            sock: lane_dir.join("sock").join("runner.sock"),
+            lanes_root,
+        })
+    }
+}
+
 /// Lockfiles, at the tree root only, that determine the dependencies (D11).
 const LOCKFILES: &[&str] = &[
     "Cargo.lock",

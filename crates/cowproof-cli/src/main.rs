@@ -23,6 +23,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 mod director_tools;
 mod doctor;
+mod host_agent;
 mod lane_tools;
 mod preflight;
 mod root;
@@ -101,6 +102,9 @@ enum Action {
     /// people do not.
     #[command(hide = true)]
     NetBridge(NetBridgeArgs),
+    /// The remote host's verbs for a remote lane: prepare, patch, doctor, cleanup (D27).
+    #[command(hide = true)]
+    HostAgent(host_agent::HostAgentArgs),
     /// Run portkit commands.
     #[command(disable_help_flag = true, disable_version_flag = true)]
     Pk {
@@ -413,6 +417,13 @@ async fn dispatch(command: Action) -> Result<()> {
         Action::LaneTools(args) => lane_tools::run(args.socket).await,
         Action::Serve(args) => director_tools::run(args.lanes_root).await,
         Action::NetBridge(args) => net_bridge_command(args).await,
+        Action::HostAgent(args) => {
+            let code = host_agent::run(args).await?;
+            if code != 0 {
+                std::process::exit(code);
+            }
+            Ok(())
+        }
         Action::Pk { .. } | Action::Read { .. } => {
             unreachable!("pk and read return their own exit code from main")
         }

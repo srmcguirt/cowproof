@@ -1863,7 +1863,11 @@ where
 /// programs named there (`core.fsmonitor`, clean filters), so both git
 /// commands run inside the `run_check` sandbox, never in the runner's own
 /// privileges.
-async fn capture_patch(layout: &LaneLayout, launch_commit: &str, path: &str) -> Result<Vec<u8>> {
+pub(crate) async fn capture_patch(
+    layout: &LaneLayout,
+    launch_commit: &str,
+    path: &str,
+) -> Result<Vec<u8>> {
     let policy = SandboxPolicy::run_check(layout);
     let profile = layout.control.join("capture.sb");
     let env = vec![

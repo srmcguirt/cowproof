@@ -154,21 +154,12 @@ fn build_lane(
     base_commit: &str,
     dirty: bool,
 ) -> Result<PreparedLane> {
-    let lanes_root = lane_dir
-        .parent()
-        .ok_or_else(|| anyhow!("lane_dir has no parent"))?
-        .to_path_buf();
-    let layout = LaneLayout {
-        clone: lane_dir.join("clone"),
-        home: lane_dir.join("home"),
-        scratch: lane_dir.join("scratch"),
-        control: lane_dir.join("control"),
-        real_home: std::env::var_os("HOME")
+    let layout = LaneLayout::for_lane_dir(
+        lane_dir,
+        std::env::var_os("HOME")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("/")),
-        sock: lane_dir.join("sock").join("runner.sock"),
-        lanes_root,
-    };
+    )?;
     for dir in [&layout.home, &layout.scratch, &layout.control] {
         fs::create_dir(dir).with_context(|| format!("creating {}", dir.display()))?;
     }
@@ -220,7 +211,7 @@ fn build_lane(
 }
 
 /// A lane id is `[A-Za-z0-9._-]{1,64}` and is never `.` or `..`.
-fn validate_lane_id(lane_id: &str) -> Result<()> {
+pub fn validate_lane_id(lane_id: &str) -> Result<()> {
     if lane_id.is_empty() || lane_id.len() > 64 {
         bail!("lane id must be 1 to 64 characters");
     }
