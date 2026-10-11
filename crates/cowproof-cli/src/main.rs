@@ -331,7 +331,7 @@ struct RunOneArgs {
     /// the held-out checks; the host runs only the sandboxed processes, over SSH. The entry
     /// gives `ssh` (the destination), `cowproof` and `claude` (their absolute paths on the host)
     /// and optionally `remoteRoot`. The config is `$COWPROOF_HOSTS_FILE`, else
-    /// `~/.config/cowproof/hosts.json`. Not combined with `--allow-dirty` or `--unsandboxed`
+    /// `~/.config/cowproof/hosts.json`. Not combined with `--unsandboxed`
     #[arg(long, value_name = "ALIAS")]
     host: Option<String>,
 }
