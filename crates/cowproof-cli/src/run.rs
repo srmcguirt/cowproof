@@ -37,6 +37,7 @@
 //! the builder sees only the proxy's placeholder key.
 
 use crate::preflight::{CheckStatus, PreflightOptions, preflight};
+use crate::remote::{self, BuilderSpecParts, LocalSide, RemoteHost, RemoteLane};
 use crate::root::resolve_executable;
 use crate::verify::{Rebuild, fetch_dependencies, verifier_runner};
 use anyhow::{Context, Result, anyhow, bail};
@@ -781,6 +782,9 @@ struct Launcher {
     port_base: u16,
     /// Launch the builder without the OS sandbox (trusted local experiments only).
     unsandboxed: bool,
+    /// The host that runs the builder, for `--host` (D27). The launch decisions stay here; the
+    /// host gets them as a spec and runs `host-agent builder`.
+    remote: Option<Arc<RemoteLane>>,
 }
 
 impl Launcher {
@@ -829,35 +833,59 @@ impl Launcher {
         }
         let layout = &self.layout;
         let assembled = assemble_prompt(self.project_instructions.as_deref(), &launch.packet);
-        let files = write_lane_files(
-            layout,
-            &builder_settings(self.pk_exe.as_deref()),
-            &self.cowproof_exe,
-            &self.socket,
-            &assembled.system_append,
-        )?;
-        let mut child_cmd = builder_command(&BuilderLaunch {
-            layout,
-            files,
-            claude_bin: &self.claude_bin,
-            cowproof_exe: &self.cowproof_exe,
-            pk_exe: self.pk_exe.as_deref(),
-            portkit_dir: &self.portkit_dir,
-            path: &self.path,
-            base_url: &self.base_url,
-            bridge_port: self.bridge_port,
-            proxy_socket: &self.proxy_socket,
-            placeholder_key: &self.placeholder_key,
-            network: self.network.clone(),
-            max_turns: self.max_turns,
-            runner_socket: &self.socket,
-            lane_id: &self.lane_id,
-            port_base: self.port_base,
-            model: &launch.model,
-            prompt: &launch.prompt,
-            resume: launch.resume.as_deref(),
-            unsandboxed: self.unsandboxed,
-        })?;
+        let (mut child_cmd, spec) = match &self.remote {
+            Some(remote) => {
+                // Everything the local branch decides, as a spec for `host-agent builder`; it
+                // holds the lane's placeholder key and never the real one. No portkit hooks:
+                // `pk` is not installed on the host (`builder_settings(None)`).
+                let settings = builder_settings(None);
+                let spec = remote::builder_spec(&BuilderSpecParts {
+                    model: &launch.model,
+                    prompt: &launch.prompt,
+                    system_prompt: &assembled.system_append,
+                    settings: &settings,
+                    resume_session_id: launch.resume.as_deref(),
+                    placeholder_key: &self.placeholder_key,
+                    bridge_port: self.bridge_port,
+                    port_base: self.port_base,
+                    max_turns: self.max_turns,
+                    claude_bin: remote.claude(),
+                });
+                (remote.builder_command(), Some(serde_json::to_vec(&spec)?))
+            }
+            None => {
+                let files = write_lane_files(
+                    layout,
+                    &builder_settings(self.pk_exe.as_deref()),
+                    &self.cowproof_exe,
+                    &self.socket,
+                    &assembled.system_append,
+                )?;
+                let command = builder_command(&BuilderLaunch {
+                    layout,
+                    files,
+                    claude_bin: &self.claude_bin,
+                    cowproof_exe: &self.cowproof_exe,
+                    pk_exe: self.pk_exe.as_deref(),
+                    portkit_dir: &self.portkit_dir,
+                    path: &self.path,
+                    base_url: &self.base_url,
+                    bridge_port: self.bridge_port,
+                    proxy_socket: &self.proxy_socket,
+                    placeholder_key: &self.placeholder_key,
+                    network: self.network.clone(),
+                    max_turns: self.max_turns,
+                    runner_socket: &self.socket,
+                    lane_id: &self.lane_id,
+                    port_base: self.port_base,
+                    model: &launch.model,
+                    prompt: &launch.prompt,
+                    resume: launch.resume.as_deref(),
+                    unsandboxed: self.unsandboxed,
+                })?;
+                (command, None)
+            }
+        };
         // The first launch starts the lane's stream and stderr files; every
         // later one appends, so they hold the whole lane in order.
         let first = index == 0;
@@ -884,6 +912,14 @@ impl Launcher {
         // `process_group(0)` makes the child its own leader, so its pid is the pgid.
         let pgid = child.id().context("reading the builder's process id")?;
         let _group = GroupGuard::new(pgid, self.interrupt.clone());
+        if let (Some(spec), Some(mut stdin)) = (spec, child.stdin.take()) {
+            // The spec, then end of input: `host-agent builder` reads it to the end. Written
+            // on its own task so a spec larger than the pipe cannot stall the stream pump.
+            tokio::spawn(async move {
+                let _ = stdin.write_all(&spec).await;
+                let _ = stdin.shutdown().await;
+            });
+        }
         let stdout = child.stdout.take().context("taking the builder's stdout")?;
         // The builder never writes to `builder.stderr` itself: the runner reads
         // this pipe and writes the file, redacted, so a raw token is never on disk.
@@ -1664,6 +1700,9 @@ struct CheckContext {
     slot: Semaphore,
     /// The first port of the lane's block (`COWPROOF_PORT_BASE`), the same one the builder gets.
     port_base: u16,
+    /// For a remote lane the checks run on the host, in the clone the builder works in
+    /// (`host-agent check`), not here.
+    remote: Option<Arc<RemoteLane>>,
 }
 
 fn refused(output: impl Into<String>) -> CheckOutcome {
@@ -1682,6 +1721,11 @@ async fn run_declared_check(ctx: Arc<CheckContext>, id: String) -> CheckOutcome 
     let Ok(_slot) = ctx.slot.acquire().await else {
         return refused("the check queue is closed");
     };
+    if let Some(remote) = &ctx.remote {
+        return remote
+            .run_check(&id, command, Some(ctx.port_base), CHECK_TIMEOUT)
+            .await;
+    }
     run_check_command(
         &ctx.layout,
         &ctx.path,
@@ -2059,6 +2103,14 @@ async fn next_signal(sigint: &mut Signal, sigterm: &mut Signal) -> &'static str 
     }
 }
 
+/// How a run was set up, for the record an interrupted run leaves.
+#[derive(Clone, Copy)]
+struct RunKind<'a> {
+    unsandboxed: bool,
+    /// The remote host that ran the builder, if any.
+    host: Option<&'a str>,
+}
+
 /// What an interrupted run leaves behind, after the servers are stopped: the
 /// builder's group ended for good (a no-op when the launcher already did it),
 /// the three sockets removed and `run.json` saying `interrupted`. Nothing here
@@ -2070,7 +2122,7 @@ fn record_interrupted(
     builder_pgid: Option<u32>,
     proxy_socket: &Path,
     started: Instant,
-    unsandboxed: bool,
+    kind: RunKind<'_>,
 ) {
     if let Some(pgid) = builder_pgid {
         kill_process_group(pgid);
@@ -2080,12 +2132,43 @@ fn record_interrupted(
     let _ = fs::remove_file(proxy_socket);
     let run = json!({
         "id": lane_id,
+        "host": kind.host,
         "status": "interrupted",
-        "unsandboxed": unsandboxed,
+        "unsandboxed": kind.unsandboxed,
         "signal": signal_name,
         "exitCode": INTERRUPTED_EXIT_CODE,
         "durationMs": started.elapsed().as_millis() as u64,
     });
+    if let Err(e) = fs::write(
+        layout.control.join("run.json"),
+        serde_json::to_vec_pretty(&run).unwrap_or_default(),
+    ) {
+        eprintln!("[{lane_id}] writing run.json: {e}");
+    }
+}
+
+/// What a run that stopped before the builder started leaves behind: the sockets removed and
+/// `run.json` holding `fields` (status, error, exit code) beside the id, the host and the
+/// duration.
+fn record_stopped(
+    layout: &LaneLayout,
+    lane_id: &str,
+    fields: Value,
+    proxy_socket: &Path,
+    started: Instant,
+    host: &str,
+) {
+    let _ = fs::remove_file(&layout.sock);
+    let _ = fs::remove_file(layout.control.join("director.sock"));
+    let _ = fs::remove_file(proxy_socket);
+    let mut run = json!({
+        "id": lane_id,
+        "host": host,
+        "durationMs": started.elapsed().as_millis() as u64,
+    });
+    if let (Some(run), Some(fields)) = (run.as_object_mut(), fields.as_object()) {
+        run.extend(fields.clone());
+    }
     if let Err(e) = fs::write(
         layout.control.join("run.json"),
         serde_json::to_vec_pretty(&run).unwrap_or_default(),
@@ -2116,6 +2199,25 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
         bail!("--timeout-min must be at least 1");
     }
     let cwd = std::env::current_dir().context("reading the current directory")?;
+    // The host entry, read and checked before anything else (`--host`, D27).
+    let remote_host = match args.host.as_deref() {
+        None => None,
+        Some(alias) => {
+            if args.allow_dirty {
+                bail!(
+                    "--allow-dirty cannot be combined with --host: a remote lane starts from a \
+                     commit (the base patch would have to be copied to the host); commit the \
+                     changes first"
+                );
+            }
+            if args.unsandboxed {
+                bail!(
+                    "--unsandboxed cannot be combined with --host: a remote builder is always sandboxed"
+                );
+            }
+            Some(RemoteHost::from_config(alias, &super::host_entry(alias)?)?)
+        }
+    };
 
     // 1. Lint first: errors stop the run before any lane exists.
     let packet_path = cwd.join(&args.packet);
@@ -2170,16 +2272,25 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
         for_run: true,
     })
     .await;
+    // A remote lane's `claude` runs on the host, whose own `doctor` checks it: a missing local
+    // `claude` is no reason to stop.
+    let needed = |c: &crate::preflight::Check| !(remote_host.is_some() && c.name == "claude");
     for check in &preflight_checks {
         match check.status {
             CheckStatus::Ok => {}
             CheckStatus::Warn => eprintln!("preflight warning: {}: {}", check.name, check.detail),
+            CheckStatus::Fail if !needed(check) => {
+                eprintln!(
+                    "preflight note: {}: {} (not needed: the builder runs on the host)",
+                    check.name, check.detail
+                );
+            }
             CheckStatus::Fail => eprintln!("preflight failed: {}: {}", check.name, check.detail),
         }
     }
     if preflight_checks
         .iter()
-        .any(|c| c.status == CheckStatus::Fail)
+        .any(|c| c.status == CheckStatus::Fail && needed(c))
     {
         eprintln!("nothing was started; `cowproof doctor` shows every check");
         return Ok(INFRASTRUCTURE_EXIT_CODE);
@@ -2192,19 +2303,31 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
             .map_err(|_| anyhow!("ANTHROPIC_API_KEY is not valid UTF-8"))?,
         _ => bail!("ANTHROPIC_API_KEY is not set; the proxy needs the real key"),
     };
-    let claude_bin = resolve_executable(&args.claude_bin, &director_path, &cwd)?;
+    let claude_bin = match &remote_host {
+        Some(host) => PathBuf::from(&host.claude),
+        None => resolve_executable(&args.claude_bin, &director_path, &cwd)?,
+    };
     // The held-out checks (D5) are found before any lane exists: a path inside the
     // repository, or one that is unreadable, stops the run here.
     let heldout = resolve_heldout(args.heldout.as_deref(), &repo, &real_home, &header.id)?;
     let path = builder_path(&director_path, &real_home);
-    let claude_bin = claude_bin
-        .canonicalize()
-        .context("resolving the claude executable")?;
+    let claude_bin = if remote_host.is_some() {
+        claude_bin
+    } else {
+        claude_bin
+            .canonicalize()
+            .context("resolving the claude executable")?
+    };
     let cowproof_exe = std::env::current_exe()
         .and_then(|p| p.canonicalize())
         .context("locating the cowproof executable")?;
     // The portkit companion `pk`, beside the running executable (G8).
-    let pk_exe = sibling_pk(&cowproof_exe);
+    // A remote builder has no `pk`: its hooks are not installed on the host.
+    let pk_exe = if remote_host.is_some() {
+        None
+    } else {
+        sibling_pk(&cowproof_exe)
+    };
 
     // 3. The lane.
     fs::create_dir_all(&lanes_root)
@@ -2271,7 +2394,10 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
                     None,
                     &layout.control.join("proxy.sock"),
                     started,
-                    args.unsandboxed,
+                    RunKind {
+                        unsandboxed: args.unsandboxed,
+                        host: None,
+                    },
                 );
                 return Ok(INTERRUPTED_EXIT_CODE);
             }
@@ -2313,6 +2439,11 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
     let permissions = std::fs::Permissions::from_mode(0o600);
     std::fs::set_permissions(&director_sock_path, permissions)
         .context("setting director socket permissions")?;
+    // The connection to the host (nothing is started yet): the checks and the launcher both
+    // need it, and every exit path from here on stops it (`Drop`).
+    let remote: Option<Arc<RemoteLane>> = remote_host
+        .map(|host| RemoteLane::new(host, &header.id, &layout.control))
+        .transpose()?;
     let tools_queue = queue.clone();
     let table: CheckTable = checks.iter().map(|c| c.id.clone()).collect();
     let context = Arc::new(CheckContext {
@@ -2324,6 +2455,7 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
             .collect(),
         slot: Semaphore::new(1),
         port_base,
+        remote: remote.clone(),
     });
     let run_check: RunCheck =
         Arc::new(move |id: &str| Box::pin(run_declared_check(context.clone(), id.to_string())));
@@ -2361,6 +2493,69 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
             }
         }
     }));
+
+    // 4b. A remote lane (D27): the host's setup, in the order that matters. Master, doctor
+    // (a failing one stops here, before any lane exists on the host), prepare, then the two
+    // socket forwards, which need the lane directory prepare made. A signal during it ends
+    // the run like any other: the host's lane is removed and the master stopped.
+    if let Some(remote) = &remote {
+        eprintln!("[{}] remote lane on {}", header.id, remote.alias());
+        let side = LocalSide {
+            repo: &repo,
+            base_commit: &prepared.base_commit,
+            launch_removed: &prepared.launch_removed,
+            proxy_socket: &endpoint.socket,
+            runner_socket: &socket,
+        };
+        let opened = tokio::select! {
+            result = remote.open(&side) => Ok(result),
+            name = next_signal(&mut sigint, &mut sigterm) => Err(name),
+        };
+        match opened {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                eprintln!("[{}] the remote lane could not be set up: {e:#}", header.id);
+                eprintln!("nothing was started");
+                remote.finish().await;
+                drop(_tools);
+                drop(_director);
+                drop(_proxy);
+                record_stopped(
+                    &layout,
+                    &header.id,
+                    json!({
+                        "status": "infrastructure",
+                        "error": format!("{e:#}"),
+                        "exitCode": INFRASTRUCTURE_EXIT_CODE,
+                    }),
+                    &endpoint.socket,
+                    started,
+                    remote.alias(),
+                );
+                return Ok(INFRASTRUCTURE_EXIT_CODE);
+            }
+            Err(signal_name) => {
+                eprintln!("[{}] {signal_name}: ending the run", header.id);
+                remote.finish().await;
+                drop(_tools);
+                drop(_director);
+                drop(_proxy);
+                record_interrupted(
+                    &layout,
+                    &header.id,
+                    signal_name,
+                    None,
+                    &endpoint.socket,
+                    started,
+                    RunKind {
+                        unsandboxed: args.unsandboxed,
+                        host: Some(remote.alias()),
+                    },
+                );
+                return Ok(INTERRUPTED_EXIT_CODE);
+            }
+        }
+    }
 
     // 5. Launch inside the builder sandbox, and relaunch on the director's
     // rulings while a blocking escalation is parked.
@@ -2424,6 +2619,7 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
         active: Mutex::new(Duration::ZERO),
         port_base,
         unsandboxed: args.unsandboxed,
+        remote: remote.clone(),
     };
     let drive = Drive {
         launcher: &launcher,
@@ -2467,6 +2663,9 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
             drop(_tools);
             drop(_director);
             drop(_proxy);
+            if let Some(remote) = &remote {
+                remote.finish().await;
+            }
             record_interrupted(
                 &layout,
                 &header.id,
@@ -2474,18 +2673,25 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
                 interrupt.builder_pgid(),
                 &proxy_sock,
                 started,
-                args.unsandboxed,
+                RunKind {
+                    unsandboxed: args.unsandboxed,
+                    host: remote.as_ref().map(|r| r.alias()),
+                },
             );
             return Ok(INTERRUPTED_EXIT_CODE);
         }
     };
     // Past the builder, a signal ends the process at once, as it did before
     // the handlers existed (the tokio handlers would otherwise swallow it).
+    let exit_remote = remote.clone();
     tokio::spawn(async move {
         next_signal(&mut sigint, &mut sigterm).await;
-        // `exit` runs no destructors: give both slots back first.
+        // `exit` runs no destructors: give both slots back first, and remove the host's lane.
         for slot_path in &slot_paths {
             release_slot(Some(slot_path));
+        }
+        if let Some(remote) = exit_remote {
+            remote.finish_blocking();
         }
         std::process::exit(INTERRUPTED_EXIT_CODE);
     });
@@ -2497,7 +2703,16 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
     // 6. The lane is over: stop serving, then capture.
     drop(_tools);
     drop(_proxy);
-    let patch = capture_patch(&layout, &prepared.launch_commit, &path).await;
+    // A remote lane's patch comes from the host (`host-agent patch`, the very same
+    // `capture_patch` there), and the host is done with once it has it.
+    let patch = match &remote {
+        Some(remote) => remote.fetch_patch().await,
+        None => capture_patch(&layout, &prepared.launch_commit, &path).await,
+    };
+    let remote_dir = remote.as_ref().and_then(|r| r.remote_dir());
+    if let Some(remote) = &remote {
+        remote.finish().await;
+    }
     let patch_path = layout.control.join("lane.patch");
     let patch_bytes = match &patch {
         Ok(bytes) => {
@@ -2538,16 +2753,25 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
 
     // The builder is gone: ask `pk doctor` whether its hooks fired (D5). The
     // verdict is information about the lane and never changes the proof's.
-    let trace = lane_trace_verdict(
-        launcher.pk_exe.as_deref(),
-        &layout,
-        &portkit_dir,
-        &header.id,
-    )
-    .await;
+    let trace = if remote.is_some() {
+        untraced(
+            "the builder ran on a remote host, which has no portkit hooks".to_string(),
+            json!([]),
+        )
+    } else {
+        lane_trace_verdict(
+            launcher.pk_exe.as_deref(),
+            &layout,
+            &portkit_dir,
+            &header.id,
+        )
+        .await
+    };
 
     let run = json!({
         "id": header.id,
+        "host": remote.as_ref().map(|r| r.alias()),
+        "remoteLaneDir": remote_dir,
         "bridgePort": launcher.bridge_port,
         "status": status_name,
         "unsandboxed": launcher.unsandboxed,
@@ -2662,6 +2886,7 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
             port_base,
             unsandboxed: launcher.unsandboxed,
             trace: trace.clone(),
+            host: remote.as_ref().map(|r| r.alias()),
         },
         results,
     )
@@ -2846,6 +3071,8 @@ struct ProofInput<'a> {
     unsandboxed: bool,
     /// The portkit trace verdict: whether the lane was traced (D5).
     trace: Value,
+    /// The remote host that ran the builder (D27); the proof itself is always local.
+    host: Option<&'a str>,
 }
 
 /// Find the lane's held-out checks (D5): the explicit `--heldout` path, which must exist,
@@ -3055,6 +3282,7 @@ async fn replay_and_gate(
     capsule.project_instructions_sha256 = input.project_instructions_sha256.clone();
     capsule.class = header.class_name.clone();
     capsule.traced = input.trace["traced"].as_bool().unwrap_or(false);
+    capsule.host = input.host.map(str::to_string);
 
     // Fetch the dependencies the checks need before verify runs (D6, D11, D14), on the
     // rebuilt tree, outside any builder. The capsule records the cache key and what the

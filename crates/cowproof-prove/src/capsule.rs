@@ -125,6 +125,12 @@ pub struct Capsule {
     /// read as false.
     #[serde(default)]
     pub traced: bool,
+    /// The alias of the remote host that ran the builder (D27), or null for a lane run on the
+    /// director's own machine. The proof is always local: the director rebuilt the tree from
+    /// the base and the patch the host returned, so this says where the work was done and
+    /// nothing else. Sealed in `capsule.json`; absent in older capsules, which read as null.
+    #[serde(default)]
+    pub host: Option<String>,
     /// Paths removed during the launch baseline, relative and sorted. Verify replays
     /// them by deleting these exact paths from the rebuilt tree. Stored in the hashed
     /// `launch_removed.json`, not in `capsule.json`, so editing it after `write`
@@ -168,6 +174,7 @@ impl Capsule {
             project_instructions_sha256: None,
             class: "light".to_string(),
             traced: false,
+            host: None,
             launch_removed: Vec::new(),
         }
     }

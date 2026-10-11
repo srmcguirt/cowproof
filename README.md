@@ -24,6 +24,34 @@ Status: design stage. Nothing here is ready to use yet. See [docs/design.md](doc
 
 `cowproof run --unsandboxed` launches the builder without the OS sandbox, for trusted local experiments only: the builder can then touch anything you can, the lane and its capsule are marked `unsandboxed`, and the lane can end `finished` (checked by the gates and the sandboxed verifier) but never `proved`; `cowproof verify` refuses its capsule.
 
+## Run a lane on another machine
+
+`cowproof run packet.md --host buildbox` runs the builder, and the checks it asks for, on another machine over SSH. Your machine stays the director: it keeps the escalation queue and your rulings, the egress proxy and so the API key, the held-out checks, the proof and the capsule. The host runs only what runs sandboxed. The key never leaves the director: no argument, spec, bundle or environment sent to the host holds it, and the builder on the host presents the lane's own `placeholder-...` key, which only your proxy accepts, through two sockets that SSH forwards from the host back to you.
+
+Add the host to `~/.config/cowproof/hosts.json` (or the file named by `$COWPROOF_HOSTS_FILE`; the older `$LANES_HOSTS_FILE` is still read). The user-level file is read before a `hosts.json` in the working directory, which `cowproof plan` and `cowproof hosts` also read, so a file that arrives with a repository cannot choose where a lane runs.
+
+```json
+{
+  "buildbox": {
+    "ssh": "builder@buildbox.example",
+    "cowproof": "/opt/cowproof/bin/cowproof",
+    "claude": "/usr/local/bin/claude",
+    "remoteRoot": "~/.cache/cowproof/remote-lanes"
+  }
+}
+```
+
+- `ssh` is the destination, as `ssh` takes it: a `Host` from your `~/.ssh/config` or `user@host`. Default: the alias. It may not start with `-`.
+- `cowproof` is the absolute path of `cowproof` on the host. Required. It must be built from the same version as yours; `prepare` refuses a different one.
+- `claude` is the absolute path of `claude` on the host. Required.
+- `remoteRoot` is where the host keeps its lanes: absolute, or `~/...` (relative to the host's home directory). Default: `~/.cache/cowproof/remote-lanes`.
+
+What the host needs: `cowproof` and `claude` installed, `git`, and a sandbox that works (`bwrap` on Linux, or macOS). `cowproof doctor` on the host shows it; `cowproof run --host` runs the host's `doctor` first and stops with exit 4, before a lane exists there, if it fails. Your SSH login must work without a prompt (a key or an agent; the connection runs with `BatchMode=yes`), and the host's `sshd` must allow Unix socket forwarding (`AllowStreamLocalForwarding`, on by default). Sign in to `claude` on the host yourself if you use a subscription; an API key lane needs no login there at all.
+
+How a lane runs: one SSH control master per lane, stopped when the lane ends however it ends; the repository's history at the base commit goes over as a git bundle, and the host clones it into its own lane directory; `proxy.sock` and `sock/runner.sock` are forwarded into that directory before the builder starts; the builder's stream comes back on the SSH channel to the same meter and `stream.jsonl` as a local lane; each `run_check` runs on the host, in the clone the builder works in; when the builder is done the lane patch comes back, the host's lane directory is removed, and the proof runs on your machine from the base commit and that patch. The capsule and `run.json` record the alias as `host`.
+
+Limits of this first version: the base must be a commit (`--allow-dirty` and `--unsandboxed` are refused with `--host`); the lane is `untraced`, because the portkit hooks are not installed on the host; the builder's own stderr stays on the host and is removed with the lane; the whole history is bundled for every lane.
+
 ## What a builder trusts
 
 A builder trusts what its repository tells it, and that can be hostile.

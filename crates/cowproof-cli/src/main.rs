@@ -26,6 +26,7 @@ mod doctor;
 mod host_agent;
 mod lane_tools;
 mod preflight;
+mod remote;
 mod root;
 mod run;
 mod verify;
@@ -325,6 +326,14 @@ struct RunOneArgs {
     /// else `light` 6, `crate` 4, `rust` 2, `pg` 3, `port` 50
     #[arg(long)]
     slot_dir: Option<PathBuf>,
+    /// Run the builder and its checks on another machine, the alias of an entry in the hosts
+    /// config (D27). The director keeps the queue, the proxy and so the API key, the proof and
+    /// the held-out checks; the host runs only the sandboxed processes, over SSH. The entry
+    /// gives `ssh` (the destination), `cowproof` and `claude` (their absolute paths on the host)
+    /// and optionally `remoteRoot`. The config is `$COWPROOF_HOSTS_FILE`, else
+    /// `~/.config/cowproof/hosts.json`. Not combined with `--allow-dirty` or `--unsandboxed`
+    #[arg(long, value_name = "ALIAS")]
+    host: Option<String>,
 }
 
 #[derive(Parser)]
@@ -611,17 +620,44 @@ fn format_age(seconds: u64) -> String {
     }
 }
 
-fn configured_hosts() -> Result<serde_json::Map<String, Value>> {
-    let explicit = std::env::var_os("LANES_HOSTS_FILE").map(PathBuf::from);
-    let path = explicit.unwrap_or_else(|| {
-        let private = PathBuf::from("hosts.json");
-        if private.exists() {
-            private
-        } else {
-            PathBuf::from("hosts.example.json")
+/// Where the hosts config is read from, in this order: `COWPROOF_HOSTS_FILE`, then the older
+/// `LANES_HOSTS_FILE`, then the user's `~/.config/cowproof/hosts.json` when it exists, then a
+/// `hosts.json` in the working directory (what `cowproof plan` and `cowproof hosts` read before
+/// the user-level file existed, kept so those keep working), then `hosts.example.json`. A file
+/// named by a variable is read or it is an error. The user-level file comes before the one in
+/// the working directory so that a `hosts.json` that arrives with a checked-out repository
+/// cannot choose the machine a remote lane runs on.
+fn hosts_file() -> PathBuf {
+    for name in ["COWPROOF_HOSTS_FILE", "LANES_HOSTS_FILE"] {
+        if let Some(path) = std::env::var_os(name).filter(|v| !v.is_empty()) {
+            return PathBuf::from(path);
         }
-    });
-    read_host_config(&path)
+    }
+    let user = home().join(".config/cowproof/hosts.json");
+    if user.is_file() {
+        return user;
+    }
+    let private = PathBuf::from("hosts.json");
+    if private.exists() {
+        private
+    } else {
+        PathBuf::from("hosts.example.json")
+    }
+}
+fn configured_hosts() -> Result<serde_json::Map<String, Value>> {
+    read_host_config(&hosts_file())
+}
+/// The config entry of one host alias, for the remote path of `cowproof run --host`.
+fn host_entry(alias: &str) -> Result<Value> {
+    let hosts = configured_hosts().context(
+        "--host reads its hosts config from $COWPROOF_HOSTS_FILE, else ~/.config/cowproof/hosts.json",
+    )?;
+    hosts.get(alias).cloned().ok_or_else(|| {
+        anyhow!(
+            "host alias {alias:?} is not in the hosts config ({})",
+            hosts_file().display()
+        )
+    })
 }
 fn host_settings(alias: &str) -> Result<(PathBuf, f64, String)> {
     let hosts = configured_hosts()?;

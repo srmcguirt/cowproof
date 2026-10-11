@@ -253,6 +253,12 @@ exit 0
         }
     }
 
+    /// The fake `claude`, for a hosts config that names it as the host's `claude`.
+    #[allow(dead_code)] // `tests/remote.rs` uses it; the other test crates that share this module do not
+    pub fn fake_claude(&self) -> &Path {
+        &self.fake
+    }
+
     /// Set an environment variable for every later `cowproof` child of this lane.
     #[allow(dead_code)] // `tests/deps.rs` uses it; the other test crates that share this module do not
     pub fn set_env(&mut self, key: &str, value: impl Into<OsString>) {
