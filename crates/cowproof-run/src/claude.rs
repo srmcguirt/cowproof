@@ -19,6 +19,11 @@ use std::path::PathBuf;
 /// it with `--disallowedTools` for defence in depth.
 const BUILDER_BUILTIN_TOOLS: &str = "Bash,Read,Edit,Write,Glob,Grep";
 
+/// Built-in tools denied outright, in case a future Claude Code version adds
+/// them back to the default set.
+const BUILDER_DISALLOWED_TOOLS: &str =
+    "Task,Workflow,SendMessage,ScheduleWakeup,CronCreate,Skill,EnterWorktree";
+
 /// Complete specification for a Claude Code invocation.
 ///
 /// Contains lane configuration, model selection, credentials, paths to configuration files,
@@ -191,10 +196,12 @@ pub fn claude_command(spec: &ClaudeSpec) -> Result<ClaudeInvocation> {
             .into_owned(),
         "--max-turns".to_string(),
         spec.max_turns.to_string(),
-        "--tools".to_string(),
-        BUILDER_BUILTIN_TOOLS.to_string(),
-        "--disallowedTools".to_string(),
-        "Task,Workflow,SendMessage,ScheduleWakeup,CronCreate,Skill,EnterWorktree".to_string(),
+        // `--tools` and `--disallowedTools` take a variable number of values,
+        // so the separate-argument form would swallow the prompt that follows
+        // (a live run failed with "Input must be provided"). The `=` form
+        // binds exactly one value.
+        format!("--tools={BUILDER_BUILTIN_TOOLS}"),
+        format!("--disallowedTools={BUILDER_DISALLOWED_TOOLS}"),
     ];
 
     // Add resume session ID only when given
@@ -308,10 +315,8 @@ mod tests {
             "/nonexistent-cp/system-prompt.txt",
             "--max-turns",
             "5",
-            "--tools",
-            "Bash,Read,Edit,Write,Glob,Grep",
-            "--disallowedTools",
-            "Task,Workflow,SendMessage,ScheduleWakeup,CronCreate,Skill,EnterWorktree",
+            "--tools=Bash,Read,Edit,Write,Glob,Grep",
+            "--disallowedTools=Task,Workflow,SendMessage,ScheduleWakeup,CronCreate,Skill,EnterWorktree",
             "Test prompt",
         ];
 
@@ -349,10 +354,8 @@ mod tests {
             "/nonexistent-cp/system-prompt.txt",
             "--max-turns",
             "5",
-            "--tools",
-            "Bash,Read,Edit,Write,Glob,Grep",
-            "--disallowedTools",
-            "Task,Workflow,SendMessage,ScheduleWakeup,CronCreate,Skill,EnterWorktree",
+            "--tools=Bash,Read,Edit,Write,Glob,Grep",
+            "--disallowedTools=Task,Workflow,SendMessage,ScheduleWakeup,CronCreate,Skill,EnterWorktree",
             "--resume",
             "abc123def456",
             "Test prompt",
@@ -658,16 +661,8 @@ mod tests {
         let spec = test_spec();
         let inv = claude_command(&spec).unwrap();
 
-        let idx = inv
-            .args
-            .iter()
-            .position(|a| a == "--tools")
-            .expect("--tools not found in args");
-        assert_eq!(
-            inv.args[idx + 1],
-            BUILDER_BUILTIN_TOOLS,
-            "tool list mismatch"
-        );
+        let tools = format!("--tools={BUILDER_BUILTIN_TOOLS}");
+        assert!(inv.args.contains(&tools), "{:?}", inv.args);
     }
 
     #[test]
@@ -675,12 +670,11 @@ mod tests {
         let spec = test_spec();
         let inv = claude_command(&spec).unwrap();
 
-        let idx = inv
+        let disallowed = inv
             .args
             .iter()
-            .position(|a| a == "--disallowedTools")
-            .expect("--disallowedTools not found in args");
-        let disallowed = &inv.args[idx + 1];
+            .find_map(|a| a.strip_prefix("--disallowedTools="))
+            .expect("--disallowedTools= not found in args");
         assert!(disallowed.contains("Task"), "Task must be disallowed");
         assert!(
             disallowed.contains("Workflow"),
@@ -691,6 +685,29 @@ mod tests {
             disallowed.contains("EnterWorktree"),
             "EnterWorktree must be disallowed"
         );
+    }
+
+    #[test]
+    fn no_variadic_flag_can_swallow_the_prompt() {
+        // Claude Code's `--tools`, `--disallowedTools` and `--allowedTools`
+        // accept several values: given as a separate argument they consume the
+        // arguments after them, the prompt included. (`--mcp-config` is
+        // variadic too, but `--strict-mcp-config` always follows it.)
+        for spec in [test_spec(), {
+            let mut s = test_spec();
+            s.resume_session_id = Some("abc123def456".into());
+            s
+        }] {
+            let inv = claude_command(&spec).unwrap();
+            for flag in ["--tools", "--disallowedTools", "--allowedTools"] {
+                assert!(
+                    !inv.args.iter().any(|a| a == flag),
+                    "{flag} must use the = form: {:?}",
+                    inv.args
+                );
+            }
+            assert_eq!(inv.args.last().unwrap(), &spec.prompt, "prompt is last");
+        }
     }
 
     #[test]

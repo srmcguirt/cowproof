@@ -516,11 +516,11 @@ fn the_fakes_argv_has_the_r15_flags_and_an_mcp_config_naming_the_cowproof_tools(
     assert_eq!(value_of("--output-format"), "stream-json");
     assert_eq!(value_of("--setting-sources"), "");
     assert_eq!(value_of("--max-turns"), "60");
-    assert_eq!(value_of("--tools"), "Bash,Read,Edit,Write,Glob,Grep");
-    assert_eq!(
-        value_of("--disallowedTools"),
-        "Task,Workflow,SendMessage,ScheduleWakeup,CronCreate,Skill,EnterWorktree"
-    );
+    assert!(argv.contains(&"--tools=Bash,Read,Edit,Write,Glob,Grep".to_string()));
+    assert!(argv.contains(
+        &"--disallowedTools=Task,Workflow,SendMessage,ScheduleWakeup,CronCreate,Skill,EnterWorktree"
+            .to_string()
+    ));
     assert!(argv.contains(&"--verbose".to_string()));
     assert!(argv.contains(&"--strict-mcp-config".to_string()));
     assert!(!argv.contains(&"--bare".to_string()), "R15: no --bare");
