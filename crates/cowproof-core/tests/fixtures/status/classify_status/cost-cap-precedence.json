@@ -1,0 +1,12 @@
+{
+  "tool": "classify_status",
+  "id": "cost-cap-precedence",
+  "input": {
+    "costCap": true
+  },
+  "expected": {
+    "status": "cost-cap",
+    "statusClass": "runner"
+  },
+  "source": "node reference adapter (classifyStatus and the opencode branch of the Node lane runner; not distributed)"
+}

@@ -1,0 +1,43 @@
+# Status taxonomy cases. Capture against the Node reference with:
+#   PORTKIT_CAPTURE=1 PORTKIT_ADAPTER_CMD="node <adapter>" cargo test -p cowproof-core --test status_parity -- --ignored
+{"tool": "classify_opencode", "id": "opencode-finished-no-handoff", "input": {"handoff": false, "exitCode": 0}}
+{"tool": "classify_opencode", "id": "opencode-finished", "input": {"handoff": true, "exitCode": 0}}
+{"tool": "classify_opencode", "id": "opencode-provider-refused", "input": {"providerRefusal": true}}
+{"tool": "classify_opencode", "id": "opencode-truncated", "input": {"truncated": true}}
+{"tool": "classify_opencode", "id": "opencode-worker-failed-exit-127", "input": {"exitCode": 127}}
+{"tool": "classify_opencode", "id": "opencode-worker-failed", "input": {"exitCode": 1}}
+{"tool": "classify_status", "id": "append-only-before-provider", "input": {"appendOnlyBreaches": ["line1"], "providerRefusal": true}}
+{"tool": "classify_status", "id": "append-only-breach-multiple", "input": {"appendOnlyBreaches": [1, 2]}}
+{"tool": "classify_status", "id": "append-only-breach-single", "input": {"appendOnlyBreaches": []}}
+{"tool": "classify_status", "id": "cost-cap-before-violations", "input": {"costCap": true, "violations": ["file1"]}}
+{"tool": "classify_status", "id": "cost-cap-precedence", "input": {"costCap": true}}
+{"tool": "classify_status", "id": "cost-cap-with-signal", "input": {"costCap": true, "signal": "SIGTERM"}}
+{"tool": "classify_status", "id": "finished-no-handoff-no-handoff-flag", "input": {"lastType": "turn.completed", "exitCode": 0}}
+{"tool": "classify_status", "id": "finished-no-handoff", "input": {"lastType": "turn.completed", "exitCode": 0, "handoff": false}}
+{"tool": "classify_status", "id": "finished-with-handoff", "input": {"lastType": "turn.completed", "exitCode": 0, "handoff": true}}
+{"tool": "classify_status", "id": "finished-with-missing-exit-and-handoff", "input": {"lastType": "turn.completed", "exitCode": null, "handoff": true}}
+{"tool": "classify_status", "id": "multiple-flags-timeout-wins", "input": {"timeout": true, "costCap": true, "violations": []}}
+{"tool": "classify_status", "id": "outside-ownership-multiple", "input": {"violations": ["file1", "file2", "file3"]}}
+{"tool": "classify_status", "id": "outside-ownership-single", "input": {"violations": ["file1"]}}
+{"tool": "classify_status", "id": "provider-refusal-with-signal", "input": {"providerRefusal": true, "signal": "SIGKILL"}}
+{"tool": "classify_status", "id": "provider-refusal", "input": {"providerRefusal": true}}
+{"tool": "classify_status", "id": "runner-error-empty", "input": {}}
+{"tool": "classify_status", "id": "sandbox-denied-no-terminal", "input": {"sandboxDenied": true, "terminalEvent": false}}
+{"tool": "classify_status", "id": "sandbox-denied-with-terminal-event", "input": {"sandboxDenied": true, "terminalEvent": true}}
+{"tool": "classify_status", "id": "timeout-precedence-over-violations", "input": {"timeout": true}}
+{"tool": "classify_status", "id": "timeout-with-violations", "input": {"timeout": true, "violations": []}}
+{"tool": "classify_status", "id": "truncated-with-signal", "input": {"truncated": true, "signal": "SIGTERM"}}
+{"tool": "classify_status", "id": "truncated", "input": {"truncated": true}}
+{"tool": "classify_status", "id": "violations-before-append", "input": {"violations": ["file1"], "appendOnlyBreaches": []}}
+{"tool": "classify_status", "id": "violations-before-sandbox", "input": {"violations": ["file1"], "sandboxDenied": true}}
+{"tool": "classify_status", "id": "worker-crashed-exit-1", "input": {"lastType": "turn.completed", "exitCode": 1, "handoff": false}}
+{"tool": "classify_status", "id": "worker-crashed-exit-127", "input": {"lastType": "turn.completed", "exitCode": 127, "handoff": false}}
+{"tool": "classify_status", "id": "worker-crashed-exit-2", "input": {"terminalEvent": false, "exitCode": 2}}
+{"tool": "classify_status", "id": "worker-crashed-exit-255", "input": {"terminalEvent": false, "exitCode": 255}}
+{"tool": "classify_status", "id": "worker-crashed-missing-exit", "input": {"lastType": "turn.completed", "exitCode": null, "handoff": false}}
+{"tool": "classify_status", "id": "worker-failed-error", "input": {"lastType": "error"}}
+{"tool": "classify_status", "id": "worker-failed-turn-failed", "input": {"lastType": "turn.failed"}}
+{"tool": "classify_status", "id": "worker-killed-sigkill", "input": {"signal": "SIGKILL"}}
+{"tool": "classify_status", "id": "worker-killed-sigterm", "input": {"signal": "SIGTERM"}}
+{"tool": "classify_status", "id": "worker-stopped-exit-0", "input": {"terminalEvent": false, "exitCode": 0}}
+{"tool": "classify_status", "id": "worker-stopped-exit-1", "input": {"terminalEvent": false, "exitCode": 1}}

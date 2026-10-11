@@ -378,6 +378,15 @@ pub fn running_lanes(root: &Path) -> Vec<RunningLane> {
         .collect()
 }
 
+/// Whether a recorded status means the lane finished with a handoff.
+///
+/// Only `finished` does. `finished-no-handoff` is a worker failure in the status
+/// taxonomy, and the legacy runner's statuses carry an ` (exit N)` suffix only when
+/// the exit code was nonzero, so `finished (exit 1)` is not finished either.
+fn is_finished_status(status: &str) -> bool {
+    status == "finished"
+}
+
 /// List lane-root directories using the same summary-less detection as host facts.
 pub fn host_lane_statuses(root: &Path) -> Vec<HostLaneStatus> {
     let running: std::collections::HashMap<String, String> = running_lanes(root)
@@ -403,7 +412,7 @@ pub fn host_lane_statuses(root: &Path) -> Vec<HostLaneStatus> {
                 if parsed
                     .get("status")
                     .and_then(Value::as_str)
-                    .is_some_and(|s| s.starts_with("finished") && !s.contains("(exit "))
+                    .is_some_and(is_finished_status)
                 {
                     "finished"
                 } else {
@@ -501,7 +510,7 @@ pub fn lane_status(dir: &Path, runner: &impl CommandRunner) -> Result<LaneStatus
             if summary
                 .get("status")
                 .and_then(Value::as_str)
-                .is_some_and(|s| s.starts_with("finished") && !s.contains("(exit "))
+                .is_some_and(is_finished_status)
             {
                 LaneStatus::Finished
             } else {
@@ -585,6 +594,21 @@ pub fn compact_facts(f: &HostFacts) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn only_a_plain_finished_status_counts_as_finished() {
+        assert!(super::is_finished_status("finished"));
+        for s in [
+            "finished-no-handoff",
+            "finished (exit 1)",
+            "finished (exit null)",
+            "worker-stopped",
+            "failed: no handoff",
+        ] {
+            assert!(!super::is_finished_status(s), "{s} counted as finished");
+        }
+    }
+
     use super::*;
     use std::cell::RefCell;
     struct Fake {

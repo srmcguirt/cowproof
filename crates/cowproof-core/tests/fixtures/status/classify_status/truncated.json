@@ -1,0 +1,12 @@
+{
+  "tool": "classify_status",
+  "id": "truncated",
+  "input": {
+    "truncated": true
+  },
+  "expected": {
+    "status": "truncated",
+    "statusClass": "worker"
+  },
+  "source": "node reference adapter (classifyStatus and the opencode branch of the Node lane runner; not distributed)"
+}

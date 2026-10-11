@@ -1,0 +1,13 @@
+{
+  "tool": "classify_status",
+  "id": "provider-refusal-with-signal",
+  "input": {
+    "providerRefusal": true,
+    "signal": "SIGKILL"
+  },
+  "expected": {
+    "status": "provider-refused",
+    "statusClass": "provider"
+  },
+  "source": "node reference adapter (classifyStatus and the opencode branch of the Node lane runner; not distributed)"
+}

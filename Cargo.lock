@@ -457,6 +457,9 @@ name = "cowproof-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
+ "portkit-core",
+ "portkit-port",
  "serde",
  "serde_json",
  "tempfile",
@@ -469,6 +472,7 @@ name = "cowproof-host"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "cowproof-core",
  "serde",
  "serde_json",
 ]

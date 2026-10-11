@@ -1,0 +1,13 @@
+{
+  "tool": "classify_status",
+  "id": "truncated-with-signal",
+  "input": {
+    "truncated": true,
+    "signal": "SIGTERM"
+  },
+  "expected": {
+    "status": "worker-killed",
+    "statusClass": "worker"
+  },
+  "source": "node reference adapter (classifyStatus and the opencode branch of the Node lane runner; not distributed)"
+}

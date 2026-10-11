@@ -1,0 +1,15 @@
+{
+  "tool": "classify_status",
+  "id": "cost-cap-before-violations",
+  "input": {
+    "costCap": true,
+    "violations": [
+      "file1"
+    ]
+  },
+  "expected": {
+    "status": "cost-cap",
+    "statusClass": "runner"
+  },
+  "source": "node reference adapter (classifyStatus and the opencode branch of the Node lane runner; not distributed)"
+}

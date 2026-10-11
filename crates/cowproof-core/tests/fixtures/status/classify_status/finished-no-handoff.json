@@ -1,0 +1,14 @@
+{
+  "tool": "classify_status",
+  "id": "finished-no-handoff",
+  "input": {
+    "lastType": "turn.completed",
+    "exitCode": 0,
+    "handoff": false
+  },
+  "expected": {
+    "status": "finished-no-handoff",
+    "statusClass": "worker"
+  },
+  "source": "node reference adapter (classifyStatus and the opencode branch of the Node lane runner; not distributed)"
+}

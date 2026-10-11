@@ -1,0 +1,13 @@
+{
+  "tool": "classify_status",
+  "id": "sandbox-denied-no-terminal",
+  "input": {
+    "sandboxDenied": true,
+    "terminalEvent": false
+  },
+  "expected": {
+    "status": "sandbox-denied",
+    "statusClass": "host"
+  },
+  "source": "node reference adapter (classifyStatus and the opencode branch of the Node lane runner; not distributed)"
+}

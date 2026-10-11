@@ -1,0 +1,12 @@
+{
+  "tool": "classify_status",
+  "id": "timeout-precedence-over-violations",
+  "input": {
+    "timeout": true
+  },
+  "expected": {
+    "status": "timeout",
+    "statusClass": "runner"
+  },
+  "source": "node reference adapter (classifyStatus and the opencode branch of the Node lane runner; not distributed)"
+}

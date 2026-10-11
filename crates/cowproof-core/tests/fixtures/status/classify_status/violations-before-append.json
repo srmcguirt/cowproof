@@ -1,0 +1,15 @@
+{
+  "tool": "classify_status",
+  "id": "violations-before-append",
+  "input": {
+    "violations": [
+      "file1"
+    ],
+    "appendOnlyBreaches": []
+  },
+  "expected": {
+    "status": "outside-ownership",
+    "statusClass": "runner"
+  },
+  "source": "node reference adapter (classifyStatus and the opencode branch of the Node lane runner; not distributed)"
+}

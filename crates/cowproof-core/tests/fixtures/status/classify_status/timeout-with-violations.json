@@ -1,0 +1,13 @@
+{
+  "tool": "classify_status",
+  "id": "timeout-with-violations",
+  "input": {
+    "timeout": true,
+    "violations": []
+  },
+  "expected": {
+    "status": "timeout",
+    "statusClass": "runner"
+  },
+  "source": "node reference adapter (classifyStatus and the opencode branch of the Node lane runner; not distributed)"
+}

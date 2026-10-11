@@ -1,0 +1,13 @@
+{
+  "tool": "classify_status",
+  "id": "worker-crashed-exit-2",
+  "input": {
+    "terminalEvent": false,
+    "exitCode": 2
+  },
+  "expected": {
+    "status": "worker-crashed",
+    "statusClass": "worker"
+  },
+  "source": "node reference adapter (classifyStatus and the opencode branch of the Node lane runner; not distributed)"
+}

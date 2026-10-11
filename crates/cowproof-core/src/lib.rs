@@ -10,8 +10,10 @@ use std::process::Stdio;
 
 pub mod heldout;
 pub mod patch;
+pub mod status;
 
 pub use patch::{PatchDelta, parse_patch};
+pub use status::{LaneStatus, StatusClass, StatusFacts, classify_opencode, classify_status};
 
 pub const PORT_BASE: u16 = 57000;
 pub const SLOT_DIR: &str = "/tmp/cowproof-lanes/.slots";

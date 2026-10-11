@@ -1,0 +1,13 @@
+{
+  "tool": "classify_status",
+  "id": "sandbox-denied-with-terminal-event",
+  "input": {
+    "sandboxDenied": true,
+    "terminalEvent": true
+  },
+  "expected": {
+    "status": "runner-error",
+    "statusClass": "runner"
+  },
+  "source": "node reference adapter (classifyStatus and the opencode branch of the Node lane runner; not distributed)"
+}

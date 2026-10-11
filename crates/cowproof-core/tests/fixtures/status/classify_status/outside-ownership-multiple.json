@@ -1,0 +1,16 @@
+{
+  "tool": "classify_status",
+  "id": "outside-ownership-multiple",
+  "input": {
+    "violations": [
+      "file1",
+      "file2",
+      "file3"
+    ]
+  },
+  "expected": {
+    "status": "outside-ownership",
+    "statusClass": "runner"
+  },
+  "source": "node reference adapter (classifyStatus and the opencode branch of the Node lane runner; not distributed)"
+}

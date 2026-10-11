@@ -1,0 +1,13 @@
+{
+  "tool": "classify_status",
+  "id": "cost-cap-with-signal",
+  "input": {
+    "costCap": true,
+    "signal": "SIGTERM"
+  },
+  "expected": {
+    "status": "cost-cap",
+    "statusClass": "runner"
+  },
+  "source": "node reference adapter (classifyStatus and the opencode branch of the Node lane runner; not distributed)"
+}

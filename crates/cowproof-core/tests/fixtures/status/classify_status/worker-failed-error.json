@@ -1,0 +1,12 @@
+{
+  "tool": "classify_status",
+  "id": "worker-failed-error",
+  "input": {
+    "lastType": "error"
+  },
+  "expected": {
+    "status": "worker-failed",
+    "statusClass": "worker"
+  },
+  "source": "node reference adapter (classifyStatus and the opencode branch of the Node lane runner; not distributed)"
+}

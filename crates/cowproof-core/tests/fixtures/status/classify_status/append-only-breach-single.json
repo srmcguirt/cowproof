@@ -1,0 +1,12 @@
+{
+  "tool": "classify_status",
+  "id": "append-only-breach-single",
+  "input": {
+    "appendOnlyBreaches": []
+  },
+  "expected": {
+    "status": "worker-crashed",
+    "statusClass": "worker"
+  },
+  "source": "node reference adapter (classifyStatus and the opencode branch of the Node lane runner; not distributed)"
+}

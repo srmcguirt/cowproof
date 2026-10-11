@@ -1,0 +1,12 @@
+{
+  "tool": "classify_opencode",
+  "id": "opencode-worker-failed-exit-127",
+  "input": {
+    "exitCode": 127
+  },
+  "expected": {
+    "status": "worker-failed",
+    "statusClass": "worker"
+  },
+  "source": "node reference adapter (classifyStatus and the opencode branch of the Node lane runner; not distributed)"
+}

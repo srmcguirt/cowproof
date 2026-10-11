@@ -1,0 +1,14 @@
+{
+  "tool": "classify_status",
+  "id": "finished-with-missing-exit-and-handoff",
+  "input": {
+    "lastType": "turn.completed",
+    "exitCode": null,
+    "handoff": true
+  },
+  "expected": {
+    "status": "worker-crashed",
+    "statusClass": "worker"
+  },
+  "source": "node reference adapter (classifyStatus and the opencode branch of the Node lane runner; not distributed)"
+}

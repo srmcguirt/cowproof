@@ -1,0 +1,13 @@
+{
+  "tool": "classify_opencode",
+  "id": "opencode-finished",
+  "input": {
+    "handoff": true,
+    "exitCode": 0
+  },
+  "expected": {
+    "status": "finished",
+    "statusClass": "finished"
+  },
+  "source": "node reference adapter (classifyStatus and the opencode branch of the Node lane runner; not distributed)"
+}
