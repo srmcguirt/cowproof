@@ -151,9 +151,19 @@ struct RunOneArgs {
     /// The Claude Code executable, resolved once on the director's PATH
     #[arg(long, default_value = "claude")]
     claude_bin: String,
-    /// Maximum builder turns
+    /// Hard cap on builder turns per session, passed to the builder (`--max-turns`)
     #[arg(long, default_value_t = 60)]
     max_turns: u32,
+    /// Escalate early when the builder reaches this many assistant turns (counted from the
+    /// stream; once per segment, which restarts at a reassign). The runner then ends the session
+    /// and parks the lane for a ruling, exactly like a blocking ask
+    #[arg(long, default_value_t = 40)]
+    turn_budget: u32,
+    /// The lane's cost cap in US dollars. Escalate early when the running cost ESTIMATE (per-turn
+    /// usage times a built-in price table for haiku, sonnet and opus; unknown models are priced
+    /// as opus) reaches 40% of it, once per segment. It is a trigger, not a hard stop
+    #[arg(long, default_value_t = 5.0)]
+    cost_cap_usd: f64,
 }
 
 #[derive(Parser)]

@@ -40,6 +40,79 @@ pub struct TurnUsage {
     pub cache_creation_5m_input_tokens: u64,
 }
 
+/// Token prices in USD per million tokens, for ESTIMATING a lane's running
+/// cost from per-message usage. This is the one price table in the runner.
+///
+/// These are estimates, never a bill: the table is matched by model-family name
+/// (`haiku`, `sonnet`, `opus`), list prices change, per-turn `output_tokens`
+/// is a streaming snapshot that can undercount, and discounts are ignored.
+/// A model that matches no family is priced as the dearest one, so an unknown
+/// model escalates early rather than late. Prices as of 2026-10-10.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Price {
+    pub input: f64,
+    pub output: f64,
+    pub cache_read: f64,
+}
+
+/// Prompt-cache write multipliers on the input price (5-minute and 1-hour).
+const CACHE_WRITE_5M: f64 = 1.25;
+const CACHE_WRITE_1H: f64 = 2.0;
+
+const PRICES: [(&str, Price); 3] = [
+    (
+        "haiku",
+        Price {
+            input: 1.0,
+            output: 5.0,
+            cache_read: 0.10,
+        },
+    ),
+    (
+        "sonnet",
+        Price {
+            input: 2.0,
+            output: 10.0,
+            cache_read: 0.20,
+        },
+    ),
+    (
+        "opus",
+        Price {
+            input: 4.0,
+            output: 20.0,
+            cache_read: 0.20,
+        },
+    ),
+];
+
+/// The price for `model` (a name or full id, matched case-insensitively), or
+/// the dearest family's when the name matches none.
+pub fn price_for(model: &str) -> Price {
+    let lower = model.to_ascii_lowercase();
+    PRICES
+        .iter()
+        .find(|(family, _)| lower.contains(family))
+        .map(|(_, price)| *price)
+        .unwrap_or(PRICES[PRICES.len() - 1].1)
+}
+
+/// Estimated cost in USD of one turn's usage on `model`. Cache-creation tokens
+/// with no 5-minute/1-hour split are priced as 1-hour writes (the runner sets
+/// the 1-hour cache, D19), the dearer reading.
+pub fn estimate_turn_cost_usd(model: &str, usage: &TurnUsage) -> f64 {
+    let price = price_for(model);
+    let split = usage.cache_creation_1h_input_tokens + usage.cache_creation_5m_input_tokens;
+    let unsplit = usage.cache_creation_input_tokens.saturating_sub(split);
+    let writes_1h = usage.cache_creation_1h_input_tokens + unsplit;
+    let per_million = usage.input_tokens as f64 * price.input
+        + usage.output_tokens as f64 * price.output
+        + usage.cache_read_input_tokens as f64 * price.cache_read
+        + usage.cache_creation_5m_input_tokens as f64 * price.input * CACHE_WRITE_5M
+        + writes_1h as f64 * price.input * CACHE_WRITE_1H;
+    per_million / 1_000_000.0
+}
+
 /// Summary of a tool call paired with its result.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolCall {
@@ -370,6 +443,21 @@ impl StreamMeter {
         }
     }
 
+    /// How many distinct assistant turns the meter has seen so far.
+    pub fn turn_count(&self) -> usize {
+        self.turns.len()
+    }
+
+    /// The running cost ESTIMATE in USD of the turns seen so far on `model`
+    /// (see [`price_for`]). The `result` event's own cost arrives only when the
+    /// session ends, too late for escalate-early.
+    pub fn estimated_cost_usd(&self, model: &str) -> f64 {
+        // A fold, not `sum`: the sum of nothing is -0.0, which prints as "-0.0".
+        self.turns.iter().fold(0.0, |total, turn| {
+            total + estimate_turn_cost_usd(model, turn)
+        })
+    }
+
     /// The Bash commands that ran so far and whether each succeeded.
     pub fn bash_commands(&self) -> Vec<BashCommand> {
         self.summary().bash_commands()
@@ -441,6 +529,54 @@ mod tests {
             cache_creation_1h_input_tokens: h1,
             cache_creation_5m_input_tokens: 0,
         }
+    }
+
+    #[test]
+    fn price_table_matches_families_by_name_and_prices_unknown_models_dearest() {
+        assert_eq!(price_for("haiku").input, 1.0);
+        assert_eq!(price_for("claude-haiku-5-5").output, 5.0);
+        assert_eq!(price_for("Claude-SONNET-5-5").input, 2.0);
+        assert_eq!(price_for("opus").output, 20.0);
+        assert_eq!(price_for("some-other-model"), price_for("opus"));
+    }
+
+    #[test]
+    fn a_turn_is_priced_from_each_token_class() {
+        // One million of each class on haiku: 1 (in) + 5 (out) + 0.10 (read)
+        // + 2 (1h write at 2x) + 1.25 (5m write).
+        let usage = TurnUsage {
+            input_tokens: 1_000_000,
+            output_tokens: 1_000_000,
+            cache_read_input_tokens: 1_000_000,
+            cache_creation_input_tokens: 2_000_000,
+            cache_creation_1h_input_tokens: 1_000_000,
+            cache_creation_5m_input_tokens: 1_000_000,
+        };
+        let cost = estimate_turn_cost_usd("haiku", &usage);
+        assert!((cost - 9.35).abs() < 1e-9, "{cost}");
+        // Writes with no split are priced as 1-hour writes.
+        let unsplit = turn(0, 0, 0, 1_000_000, 0);
+        assert!((estimate_turn_cost_usd("haiku", &unsplit) - 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn the_meter_estimates_cost_from_distinct_turns_only() {
+        let mut meter = StreamMeter::new(false);
+        let line = |id: &str, out: u64| {
+            format!(
+                r#"{{"type":"assistant","message":{{"id":"{id}","usage":{{"input_tokens":1000000,"output_tokens":{out}}}}}}}"#
+            )
+        };
+        meter.feed(&line("m1", 10)).unwrap();
+        assert_eq!(meter.turn_count(), 1);
+        // The same message id again is a snapshot, not a new turn.
+        meter.feed(&line("m1", 20)).unwrap();
+        assert_eq!(meter.turn_count(), 1);
+        meter.feed(&line("m2", 0)).unwrap();
+        assert_eq!(meter.turn_count(), 2);
+        // m1: $1 in + 20 out tokens at $5/M; m2: $1 in.
+        let cost = meter.estimated_cost_usd("haiku");
+        assert!((cost - (2.0 + 20.0 * 5.0 / 1e6)).abs() < 1e-9, "{cost}");
     }
 
     #[test]

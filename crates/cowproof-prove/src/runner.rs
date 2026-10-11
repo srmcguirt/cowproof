@@ -125,10 +125,23 @@ async fn run_with_timeout(
 }
 
 /// SIGKILL every process in the group `pgid` (a negative pid addresses the group).
-fn kill_process_group(pgid: u32) {
+///
+/// Public so `cowproof run` ends a builder's group with the same code the verifier
+/// uses for a timed-out check, not a second copy.
+pub fn kill_process_group(pgid: u32) {
+    signal_process_group(pgid, libc::SIGKILL);
+}
+
+/// SIGTERM every process in the group `pgid`: the polite first step before
+/// [`kill_process_group`].
+pub fn terminate_process_group(pgid: u32) {
+    signal_process_group(pgid, libc::SIGTERM);
+}
+
+fn signal_process_group(pgid: u32, signal: libc::c_int) {
     // SAFETY: `kill(2)` takes two integers and touches no memory.
     unsafe {
-        libc::kill(-(pgid as libc::pid_t), libc::SIGKILL);
+        libc::kill(-(pgid as libc::pid_t), signal);
     }
 }
 

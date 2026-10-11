@@ -132,7 +132,7 @@ After you ask, the runner will tell you it is parked. You keep working on other 
 }
 ```
 
-After you ask with `blocking: true`, the runner ends your session. You cannot make more tool calls. The director reads your ask and rules on it. When the director provides a ruling, the runner resumes your session with the ruling as the next message, and you can continue from where you left off.
+After you ask with `blocking: true`, the runner ends your session about two seconds later (SIGTERM to your process group, then SIGKILL after ten more seconds), even if you keep working. Whatever you have not saved to disk is lost, and you cannot make more tool calls. The director reads your ask and rules on it. When the director provides a ruling, the runner resumes your session with the ruling as the next message, and you can continue from where you left off.
 
 ## Check Results
 
@@ -148,13 +148,13 @@ Report every check result you run. Do not claim a check passed unless `run_check
 
 ## Escalate Early
 
-The runner tracks two triggers:
+The runner watches three triggers. You do not have to ask: when one fires, the runner opens a blocking escalation itself.
 
-1. **Same check failed twice in a row.** If the same check id fails twice with no pass in between, the runner forces an escalation. A pass resets the count. You do not have to ask: the runner opens an escalation with the check's output and your attempt history.
-2. **Cost share reached.** If your estimated cost reaches 40% of the lane's cost cap before any check has passed, the runner forces an escalation.
-3. **Turn budget reached.** If you reach the lane's turn budget before any check has passed, the runner forces an escalation.
+1. **Same check failed twice in a row.** If the same check id fails twice with no pass in between, the runner forces an escalation. A pass resets the count. Once it has fired for a check, that check does not fire again until it passes.
+2. **Cost share reached.** The runner estimates your cost from the token usage of each of your turns (an estimate, not a bill). When the estimate reaches 40% of the lane's cost cap, the runner forces an escalation. This fires once. The cap is set by the director and is not shown to you.
+3. **Turn budget reached.** The runner counts your assistant turns. When you reach the lane's turn budget, the runner forces an escalation. This fires once. The budget is set by the director and is not shown to you.
 
-When a forced escalation happens, your session ends. The runner records what you tried and opens the escalation for the director.
+A forced escalation is blocking, like a blocking `ask`: about two seconds after it opens, the runner ends your session (SIGTERM to your process group, then SIGKILL after ten more seconds), so anything you have not saved to disk is lost. The escalation names the check and how many times it failed, or the estimated cost, or the turn count. It does not carry the check's output. The director's ruling resumes your session. If the session cannot be resumed, the runner starts a fresh one with a summary.
 
 Escalation is the safety net. If you hit a forced escalation, it means the lane is worth the director's time. Use escalate early: ask the director after one failed check attempt if the failure looks fundamental, rather than thrashing on it twice.
 

@@ -36,7 +36,7 @@
 //! - **Notes are delivered once.** `check_ruling` returns the lane's pending
 //!   notes and marks them delivered in the same call.
 
-use crate::escalate::{Ask, EscalationId, NoteId, Origin, Queue};
+use crate::escalate::{Ask, EscalationId, LaneState, NoteId, Origin, Queue};
 use crate::wire::{self, Read};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -89,11 +89,51 @@ pub fn bind(path: &Path) -> io::Result<UnixListener> {
     UnixListener::bind(path)
 }
 
+/// Why the runner should end the builder's session (D9: "the runner ends the
+/// session"). The tools server sends one when a call leaves the lane parked, so
+/// the run loop does not depend on the builder exiting by itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionEnd {
+    /// A blocking `ask` parked the lane.
+    Parked(EscalationId),
+    /// The runner forced an escalation (escalate-early).
+    Forced(EscalationId),
+    /// A call hit the escalation limit and the lane ended as
+    /// `escalation-limit`; nothing is parked, but nothing more may run.
+    LimitReached,
+}
+
+/// Where [`serve_signalling`] sends a [`SessionEnd`]. Create the channel
+/// BEFORE the builder is spawned so no signal can be missed.
+pub type SessionEndSignal = tokio::sync::mpsc::UnboundedSender<SessionEnd>;
+
 struct Context {
     lane: String,
     queue: Arc<Mutex<Queue>>,
     checks: CheckTable,
     run: RunCheck,
+    end: Option<SessionEndSignal>,
+}
+
+impl Context {
+    fn signal(&self, end: SessionEnd) {
+        if let Some(tx) = &self.end {
+            // A closed receiver means the run loop is gone; nothing to end.
+            let _ = tx.send(end);
+        }
+    }
+
+    /// After a refused queue call: did the lane end at the escalation limit?
+    fn signal_if_limit_reached(&self) {
+        let ended = self
+            .queue
+            .lock()
+            .map(|q| q.lane_state(&self.lane) == Some(LaneState::EscalationLimit))
+            .unwrap_or(false);
+        if ended {
+            self.signal(SessionEnd::LimitReached);
+        }
+    }
 }
 
 /// Serve the builder tools for one lane until the listener fails.
@@ -107,11 +147,27 @@ pub async fn serve(
     checks: CheckTable,
     run: RunCheck,
 ) -> io::Result<()> {
+    serve_signalling(listener, lane, queue, checks, run, None).await
+}
+
+/// [`serve`], and a call that parks the lane (a blocking `ask`, or a
+/// `run_check` that forces an escalation) or ends it at the escalation limit
+/// also sends a [`SessionEnd`] to `end`. The signal is sent as soon as the
+/// queue has recorded the escalation, before the reply reaches the builder.
+pub async fn serve_signalling(
+    listener: UnixListener,
+    lane: String,
+    queue: Arc<Mutex<Queue>>,
+    checks: CheckTable,
+    run: RunCheck,
+    end: Option<SessionEndSignal>,
+) -> io::Result<()> {
     let ctx = Arc::new(Context {
         lane,
         queue,
         checks,
         run,
+        end,
     });
     loop {
         let stream = match listener.accept().await {
@@ -206,7 +262,17 @@ fn lock(queue: &Mutex<Queue>) -> Result<std::sync::MutexGuard<'_, Queue>, String
 fn ask(ctx: &Context, ask: Option<Value>) -> Result<Value, String> {
     let ask: Ask = serde_json::from_value(ask.ok_or("missing ask")?)
         .map_err(|e| format!("invalid ask: {e}"))?;
-    let id = lock(&ctx.queue)?.ask(&ctx.lane, &ask, Origin::Builder)?;
+    let asked = lock(&ctx.queue)?.ask(&ctx.lane, &ask, Origin::Builder);
+    let id = match asked {
+        Ok(id) => id,
+        Err(e) => {
+            ctx.signal_if_limit_reached();
+            return Err(e);
+        }
+    };
+    if ask.blocking {
+        ctx.signal(SessionEnd::Parked(id.clone()));
+    }
     Ok(json!({
         "ok": true,
         "id": id.0,
@@ -285,7 +351,17 @@ async fn run_check(ctx: &Context, id: Option<String>) -> Result<Value, String> {
     }
     let outcome = (ctx.run)(&id).await;
     let passed = outcome.exit_status == 0;
-    let escalation = lock(&ctx.queue)?.record_check(&ctx.lane, &id, passed)?;
+    let recorded = lock(&ctx.queue)?.record_check(&ctx.lane, &id, passed);
+    let escalation = match recorded {
+        Ok(escalation) => escalation,
+        Err(e) => {
+            ctx.signal_if_limit_reached();
+            return Err(e);
+        }
+    };
+    if let Some(forced) = &escalation {
+        ctx.signal(SessionEnd::Forced(forced.clone()));
+    }
     Ok(json!({
         "ok": true,
         "id": id,
@@ -335,6 +411,11 @@ mod tests {
     /// A server on a real socket. Checks `c1` and `c2` are declared; `c1`
     /// exits with `exit_status`, and every call is counted.
     fn harness(exit_status: i32) -> Harness {
+        harness_with(exit_status, None)
+    }
+
+    /// [`harness`] with a session-end signal.
+    fn harness_with(exit_status: i32, end: Option<SessionEndSignal>) -> Harness {
         let tmp = TempDir::new().unwrap();
         let sock_dir = tmp.path().join("sock");
         std::fs::create_dir(&sock_dir).unwrap();
@@ -355,12 +436,13 @@ mod tests {
             })
         });
         let checks: CheckTable = ["c1", "c2"].iter().map(|s| s.to_string()).collect();
-        let task = tokio::spawn(serve(
+        let task = tokio::spawn(serve_signalling(
             bind(&sock).unwrap(),
             LANE.to_string(),
             queue.clone(),
             checks,
             run,
+            end,
         ));
         Harness {
             _tmp: tmp,
@@ -761,6 +843,55 @@ mod tests {
         let r = c.call(json!({"op": "rule", "id": "l1:E1"})).await;
         assert_eq!(r["ok"], false, "{r}");
         assert_eq!(h.queue.lock().unwrap().escalation_count(LANE), 0);
+    }
+
+    #[tokio::test]
+    async fn a_blocking_ask_signals_the_session_end_and_a_non_blocking_one_does_not() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let h = harness_with(0, Some(tx));
+        let mut c = Client::connect(&h).await;
+        let r = c.call(json!({"op": "ask", "ask": sample_ask(false)})).await;
+        assert_eq!(r["status"], "asked", "{r}");
+        assert!(rx.try_recv().is_err(), "a non-blocking ask parks nothing");
+        let r = c.call(json!({"op": "ask", "ask": sample_ask(true)})).await;
+        assert_eq!(r["status"], "parked", "{r}");
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            SessionEnd::Parked(EscalationId::from_string("l1:E2".into()))
+        );
+        assert!(rx.try_recv().is_err(), "one signal per park");
+    }
+
+    #[tokio::test]
+    async fn a_run_check_that_forces_an_escalation_signals_the_session_end_once() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let h = harness_with(1, Some(tx));
+        let mut c = Client::connect(&h).await;
+        for _ in 0..4 {
+            c.call(json!({"op": "run_check", "id": "c1"})).await;
+        }
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            SessionEnd::Forced(EscalationId::from_string("l1:E1".into()))
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "four failures, one forced session end"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_ask_past_the_escalation_limit_signals_the_lane_ended() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let h = harness_with(0, Some(tx));
+        let mut c = Client::connect(&h).await;
+        for _ in 0..3 {
+            c.call(json!({"op": "ask", "ask": sample_ask(false)})).await;
+        }
+        assert!(rx.try_recv().is_err());
+        let r = c.call(json!({"op": "ask", "ask": sample_ask(false)})).await;
+        assert_eq!(r["ok"], false, "{r}");
+        assert_eq!(rx.try_recv().unwrap(), SessionEnd::LimitReached);
     }
 
     #[test]

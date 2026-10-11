@@ -1523,3 +1523,321 @@ fn the_fourth_ask_ends_the_lane_as_escalation_limit_without_a_proof() {
     assert_eq!(queue_events(&h, "lane-escalation-limit").len(), 1);
     assert!(!h.lane().join("control/verdict.json").exists());
 }
+
+// ---- The runner ends the session (D9) and escalates early -------------------
+//
+// A fake that asks blocking and then keeps running (`sleep 120`) is a builder
+// that ignores "parked". The runner must end its session itself: SIGTERM to the
+// builder's process group two seconds after the park, SIGKILL to the group
+// after ten more. Every wait below is bounded; the longest is the 20 s budget.
+
+/// How long after a park the segment must be over (design: 2 s grace plus the
+/// group kill, with a wide margin for a loaded CI machine).
+const SESSION_END_WITHIN: Duration = Duration::from_secs(20);
+
+/// The runner's own line saying a segment is over and it is waiting for a ruling.
+const WAITING: &str = "waiting for the director";
+
+/// A `cowproof run` in flight whose stderr is collected by a thread, so a test
+/// can see when the runner reaches a state.
+struct Watched {
+    child: Child,
+    stderr: std::sync::Arc<Mutex<String>>,
+}
+
+fn start_watched(h: &Harness, extra: &[&str]) -> Watched {
+    let mut child = {
+        let _g = fork_lock();
+        h.command(h.lanes.path())
+            .args(extra)
+            .env("ANTHROPIC_API_KEY", REAL_KEY)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap()
+    };
+    let pipe = child.stderr.take().unwrap();
+    let stderr = std::sync::Arc::new(Mutex::new(String::new()));
+    let sink = stderr.clone();
+    std::thread::spawn(move || {
+        use std::io::BufRead;
+        for line in std::io::BufReader::new(pipe).lines().map_while(Result::ok) {
+            let mut text = sink.lock().unwrap_or_else(|e| e.into_inner());
+            text.push_str(&line);
+            text.push('\n');
+        }
+    });
+    Watched { child, stderr }
+}
+
+impl Watched {
+    fn stderr(&self) -> String {
+        self.stderr
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Wait until the runner's stderr contains `needle`, at most `within`. A
+    /// run that never gets there is killed (by its pid) and fails the test.
+    fn wait_for_stderr(&mut self, needle: &str, within: Duration) {
+        let deadline = Instant::now() + within;
+        while !self.stderr().contains(needle) {
+            if Instant::now() > deadline {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+                panic!(
+                    "no {needle:?} on stderr within {within:?}:\n{}",
+                    self.stderr()
+                );
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+}
+
+/// The fake's stdout line for an assistant turn: distinct id, `input` input tokens.
+fn turn_line(id: &str, input: u64) -> String {
+    format!(
+        "printf '%s\\n' '{}'\n",
+        json!({"type":"assistant","message":{"id":id,"usage":{"input_tokens":input,"output_tokens":1}}})
+    )
+}
+
+/// The stream line that gives the session its id (so a resume has something to resume).
+fn init_line() -> String {
+    format!(
+        "printf '%s\\n' '{}'\n",
+        json!({"type":"system","subtype":"init","session_id":SESSION})
+    )
+}
+
+/// `first` on the first launch, `later` on every other one.
+fn first_then(first: &str, later: &str) -> String {
+    format!("if [ \"$n\" = 1 ]; then\n{first}else\n{later}fi\n")
+}
+
+/// Poll `kill -0 <pid>` until the process is gone (ESRCH), at most 5 s.
+fn assert_pid_gone(pid: &str) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let alive = output(Command::new("kill").args(["-0", pid]))
+            .status
+            .success();
+        if !alive {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "process {pid} is still alive 5 s after the lane ended"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+#[test]
+fn a_parked_blocking_ask_ends_a_builder_that_keeps_running_and_the_answer_resumes_it() {
+    if !sandbox_available() {
+        return;
+    }
+    // The first session asks, then ignores "parked" and sleeps for two minutes.
+    let ask = mcp_session("ask.out", &[(3, "ask", blocking_ask("Choose A or B?"))]);
+    let first = format!("{}{ask}sleep 120\n", init_line());
+    let h = owned_packet(&first_then(&first, &then_checks()));
+    let mut run = start_watched(&h, &[]);
+    let id = wait_for_ask(&h, &mut run.child, 1);
+    let asked_at = Instant::now();
+
+    // The segment is over (the runner is waiting for a ruling) well before the
+    // sleep would have ended.
+    run.wait_for_stderr(WAITING, SESSION_END_WITHIN);
+    assert!(asked_at.elapsed() < SESSION_END_WITHIN);
+
+    rule(&h, &id, &["--answer", "use option B"]);
+    let out = finish(run.child);
+    assert_eq!(out.status.code(), Some(0), "{}", stdout_of(&out));
+    assert_eq!(stdout_of(&out).lines().last().unwrap(), "t-run: proved");
+
+    let segs = segments(&h);
+    assert_eq!(segs.len(), 2, "{segs:?}");
+    assert_eq!(segs[0]["sessionEnd"], "parked", "{segs:?}");
+    assert_eq!(segs[0]["killedByRunner"], true);
+    assert_eq!(segs[0]["status"], "ended-by-runner");
+    assert_eq!(segs[0]["signal"], 15, "SIGTERM ended the group: {segs:?}");
+    assert_eq!(segs[0]["endedBy"], id.as_str());
+    assert_eq!(segs[1]["start"], "resumed");
+    assert_eq!(segs[1]["resumedSession"], SESSION);
+    assert_eq!(segs[1]["killedByRunner"], false);
+    assert_eq!(h.verdict()["verdict"], "proved");
+}
+
+#[test]
+fn the_runner_ends_the_whole_process_group_so_no_background_child_survives() {
+    if !sandbox_available() {
+        return;
+    }
+    // After asking, the fake starts a background child that ignores SIGTERM
+    // (so only the group SIGKILL can end it), would write a marker six seconds
+    // later; a second one (whose pid it records) lives for a minute; then the
+    // fake sleeps.
+    let ask = mcp_session("ask.out", &[(3, "ask", blocking_ask("Stuck?"))]);
+    let first = format!(
+        "{}{ask}( trap '' TERM; sleep 6; echo alive > \"$HOME/survived\" ) &\n( trap '' TERM; sleep 60 ) &\necho $! > \"$HOME/bgpid\"\nsleep 120\n",
+        init_line()
+    );
+    let h = owned_packet(&first_then(&first, &then_checks()));
+    let mut run = start_watched(&h, &[]);
+    let id = wait_for_ask(&h, &mut run.child, 1);
+    let asked_at = Instant::now();
+    run.wait_for_stderr(WAITING, SESSION_END_WITHIN);
+    rule(&h, &id, &["--stop"]);
+    let out = finish(run.child);
+    assert_eq!(out.status.code(), Some(1), "{}", stdout_of(&out));
+    assert_eq!(h.run_json()["status"], "stopped");
+
+    // By pid where the sandbox shares the host's pid space (macOS). bwrap runs
+    // with --unshare-pid, so on Linux the recorded pid means nothing outside.
+    if cfg!(target_os = "macos") {
+        let pid = h.read("home/bgpid");
+        assert_pid_gone(pid.trim());
+    }
+    // By effect everywhere: a surviving child writes its marker at six seconds.
+    let wait = Duration::from_secs(9).saturating_sub(asked_at.elapsed());
+    std::thread::sleep(wait);
+    assert!(
+        !h.lane().join("home/survived").exists(),
+        "a background child outlived the session end and wrote its marker"
+    );
+}
+
+#[test]
+fn a_non_blocking_ask_never_ends_the_session_and_the_builders_own_exit_is_recorded() {
+    if !sandbox_available() {
+        return;
+    }
+    // Longer than the 2 s park grace: a runner that ended sessions on any ask
+    // would kill this one.
+    let ask = mcp_session(
+        "ask.out",
+        &[(3, "ask", {
+            let mut a = blocking_ask("Design choice?");
+            a["blocking"] = json!(false);
+            a
+        })],
+    );
+    let h = owned_packet(&format!("{ask}sleep 3\nexit 7\n"));
+    let out = finish(start(&h));
+    assert_eq!(out.status.code(), Some(1), "{}", stdout_of(&out));
+    assert_eq!(h.launches(), 1);
+    let segs = segments(&h);
+    assert_eq!(segs.len(), 1, "{segs:?}");
+    assert_eq!(segs[0]["exitCode"], 7, "its own exit status: {segs:?}");
+    assert_eq!(segs[0]["signal"], Value::Null);
+    assert_eq!(segs[0]["killedByRunner"], false);
+    assert_eq!(segs[0]["sessionEnd"], Value::Null);
+    assert_eq!(segs[0]["status"], "failed");
+    assert_eq!(queue_events(&h, "asked").len(), 1);
+}
+
+/// The one forced escalation in the queue: its id, after checking it is forced.
+fn forced_escalation(h: &Harness) -> Value {
+    let asked = queue_events(h, "asked");
+    assert_eq!(asked.len(), 1, "exactly one escalation: {asked:?}");
+    assert!(
+        asked[0]["origin"]["forced"].is_object(),
+        "origin forced: {asked:?}"
+    );
+    asked[0].clone()
+}
+
+#[test]
+fn a_turn_budget_forces_one_escalation_ends_the_session_and_a_stop_ends_the_lane() {
+    if !sandbox_available() {
+        return;
+    }
+    // Five turns against a budget of three, then the fake keeps running.
+    let turns: String = (1..=5).map(|i| turn_line(&format!("m{i}"), 10)).collect();
+    let first = format!("{}{turns}sleep 120\n", init_line());
+    let h = owned_packet(&first_then(&first, &then_checks()));
+    let mut run = start_watched(&h, &["--turn-budget", "3"]);
+    let id = wait_for_ask(&h, &mut run.child, 1);
+    run.wait_for_stderr(WAITING, SESSION_END_WITHIN);
+
+    let forced = forced_escalation(&h);
+    assert_eq!(forced["id"], id.as_str());
+    let reason = forced["origin"]["forced"]["reason"].as_str().unwrap();
+    assert!(reason.contains("turn budget 3"), "{reason}");
+    assert_eq!(forced["ask"]["blocking"], true);
+
+    rule(&h, &id, &["--stop"]);
+    let out = finish(run.child);
+    assert_eq!(out.status.code(), Some(1), "{}", stdout_of(&out));
+    assert_eq!(h.run_json()["status"], "stopped");
+    assert_eq!(
+        h.launches(),
+        1,
+        "the lane waited for the ruling, then stopped"
+    );
+    let segs = segments(&h);
+    assert_eq!(segs[0]["sessionEnd"], "forced", "{segs:?}");
+    assert_eq!(segs[0]["killedByRunner"], true);
+    assert_eq!(segs[0]["endedBy"], id.as_str());
+    // Five turns went by and the budget fired once.
+    assert_eq!(queue_events(&h, "asked").len(), 1);
+}
+
+#[test]
+fn a_cost_estimate_past_the_share_forces_one_escalation_and_ends_the_session() {
+    if !sandbox_available() {
+        return;
+    }
+    // Haiku input is $1 per million tokens: each turn is an estimated $0.30,
+    // so against a $1.00 cap the second turn crosses the 40% share ($0.60).
+    let turns: String = (1..=4)
+        .map(|i| turn_line(&format!("m{i}"), 300_000))
+        .collect();
+    let first = format!("{}{turns}sleep 120\n", init_line());
+    let h = owned_packet(&first_then(&first, &then_checks()));
+    let mut run = start_watched(&h, &["--cost-cap-usd", "1.0"]);
+    let id = wait_for_ask(&h, &mut run.child, 1);
+    run.wait_for_stderr(WAITING, SESSION_END_WITHIN);
+
+    let forced = forced_escalation(&h);
+    assert_eq!(forced["id"], id.as_str());
+    let reason = forced["origin"]["forced"]["reason"].as_str().unwrap();
+    assert!(reason.contains("estimated cost"), "{reason}");
+    assert!(
+        forced["ask"]["question"]
+            .as_str()
+            .unwrap()
+            .contains("estimate"),
+        "{forced}"
+    );
+
+    rule(&h, &id, &["--stop"]);
+    let out = finish(run.child);
+    assert_eq!(out.status.code(), Some(1), "{}", stdout_of(&out));
+    assert_eq!(h.run_json()["status"], "stopped");
+    let segs = segments(&h);
+    assert_eq!(segs[0]["sessionEnd"], "forced", "{segs:?}");
+    assert_eq!(segs[0]["killedByRunner"], true);
+    assert_eq!(segs[0]["costIsEstimate"], true);
+    let spent = segs[0]["estimatedCostUsd"].as_f64().unwrap();
+    assert!(spent >= 0.6, "estimated {spent}");
+    assert_eq!(queue_events(&h, "asked").len(), 1);
+}
+
+#[test]
+fn run_help_documents_the_turn_budget_and_the_cost_cap_defaults() {
+    let out = output(Command::new(env!("CARGO_BIN_EXE_cowproof")).args(["run", "--help"]));
+    let help = String::from_utf8_lossy(&out.stdout).into_owned();
+    for needle in [
+        "--turn-budget",
+        "[default: 40]",
+        "--cost-cap-usd",
+        "[default: 5]",
+    ] {
+        assert!(help.contains(needle), "{needle} missing from:\n{help}");
+    }
+}

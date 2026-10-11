@@ -34,7 +34,7 @@ use cowproof_core::parse_header;
 use cowproof_prove::{
     capsule::{Capsule, CheckResult, EnvironmentFingerprint},
     gates::{GatePacket, run_gates},
-    runner::SandboxedRunner,
+    runner::{SandboxedRunner, kill_process_group, terminate_process_group},
     verify::{VerifyOptions, verify},
 };
 use cowproof_run::{
@@ -42,15 +42,16 @@ use cowproof_run::{
     claude::{ClaudeSpec, claude_command},
     director::{self, VerdictEvent},
     escalate::{
-        Ask, Delivery, DeliveryError, DeliveryOutcome, DeliveryResult, EscalationId, LaneState,
-        Queue, SystemClock, Verdict as EscalationVerdict,
+        Ask, DEFAULT_COST_FRACTION, DEFAULT_MAX_ESCALATIONS, DEFAULT_PARK_LIMIT, Delivery,
+        DeliveryError, DeliveryOutcome, DeliveryResult, EscalationId, LaneState, Queue,
+        SystemClock, Verdict as EscalationVerdict,
     },
     lane::{PrepareOptions, prepare_lane},
     prefix::assemble_prompt,
     proxy::{ProxyConfig, ProxyServer},
     render_macos_profile, sandbox_command,
     stream::{MeterSummary, StreamMeter},
-    tools::{self, CheckOutcome, CheckTable, RunCheck},
+    tools::{self, CheckOutcome, CheckTable, RunCheck, SessionEnd, SessionEndSignal},
 };
 use serde_json::json;
 use std::collections::{BTreeMap, HashMap};
@@ -67,6 +68,7 @@ use tokio::net::TcpListener;
 use tokio::process::Command;
 use tokio::sync::{Semaphore, mpsc::UnboundedReceiver};
 use tokio::task::JoinHandle;
+use tokio::time::Instant as TokioInstant;
 
 /// The provider the proxy forwards to.
 const UPSTREAM: &str = "https://api.anthropic.com";
@@ -82,6 +84,21 @@ const CHECK_TIMEOUT: Duration = Duration::from_secs(20 * 60);
 /// The longest builder stdout line the meter will parse, in bytes. A longer
 /// line is still written to `stream.jsonl`, whole, but is not metered.
 const MAX_STREAM_LINE: usize = 64 * 1024 * 1024;
+
+/// After the tools server reports a parked (or forced) escalation, how long the
+/// builder gets before the runner ends its session: enough for the tool reply to
+/// reach it and for `claude` to flush its session to disk. A builder that exits
+/// by itself in this time is not touched.
+const PARK_GRACE: Duration = Duration::from_secs(2);
+
+/// After SIGTERM to the builder's process group, how long the leader gets to
+/// exit before the group is SIGKILLed.
+const TERM_GRACE: Duration = Duration::from_secs(10);
+
+/// Once the builder's leader has exited and its group has been killed, how long
+/// the stream pump may still wait for EOF. A process that escaped the group
+/// could hold the pipe open forever; the pump is abandoned after this.
+const PUMP_DRAIN: Duration = Duration::from_secs(5);
 
 /// What the builder is allowed to use, per R15 ("tool permissions are set
 /// explicitly per policy; the OS sandbox is the boundary"). Web tools are
@@ -348,6 +365,109 @@ struct SegmentRun {
     stats: PumpStats,
     summary: MeterSummary,
     elapsed: Duration,
+    /// Why the tools server or the escalate-early observer asked the runner to
+    /// end the session, if it did. The builder may still have exited first.
+    session_end: Option<SessionEnd>,
+    /// The runner sent SIGTERM to the builder's process group: the builder had
+    /// not exited by itself within [`PARK_GRACE`] of the signal.
+    killed: bool,
+    /// The running cost ESTIMATE of this launch (per-message usage times the
+    /// price table in `cowproof_run::stream`), never the bill.
+    estimated_cost_usd: f64,
+}
+
+/// SIGKILLs a process group when dropped, so no early return leaves a builder's
+/// background children running. The group is also ended explicitly after every
+/// launch; this is the safety net for the error paths between spawn and that.
+struct GroupGuard(u32);
+
+impl Drop for GroupGuard {
+    fn drop(&mut self) {
+        kill_process_group(self.0);
+    }
+}
+
+/// Escalate-early on the live stream (design D9): each new assistant turn is a
+/// `Queue::record_turn`, and the running cost estimate feeds
+/// `Queue::record_cost`. A trigger forces a blocking escalation and signals the
+/// run loop to end the session, exactly like a blocking `ask`.
+struct LiveEscalation {
+    queue: Arc<Mutex<Queue>>,
+    lane: String,
+    model: String,
+    /// The estimate for earlier launches of this queue segment (a segment ends
+    /// at `reassign`), so the share is the lane's, not one launch's.
+    spent_before_usd: f64,
+    cost_cap_usd: f64,
+    seen_turns: usize,
+    /// A trigger fired (or the lane ended): nothing more is recorded this launch.
+    done: bool,
+    end: SessionEndSignal,
+}
+
+impl LiveEscalation {
+    fn observe(&mut self, meter: &StreamMeter) {
+        if self.done {
+            return;
+        }
+        let shared = self.queue.clone();
+        let Ok(mut queue) = shared.lock() else {
+            return;
+        };
+        // An unruled blocking escalation is already parked and this session is
+        // ending: do not open a second one. (A ruled one does not count: it is
+        // the answer this very session was resumed with.)
+        if queue
+            .pending_blocking(&self.lane)
+            .iter()
+            .any(|p| p.verdict.is_none())
+        {
+            self.done = true;
+            return;
+        }
+        let turns = meter.turn_count();
+        while self.seen_turns < turns {
+            self.seen_turns += 1;
+            let fired = queue.record_turn(&self.lane);
+            if self.finish(&queue, fired) {
+                return;
+            }
+        }
+        let spent = self.spent_before_usd + meter.estimated_cost_usd(&self.model);
+        let fired = queue.record_cost(&self.lane, spent, self.cost_cap_usd);
+        self.finish(&queue, fired);
+    }
+
+    /// Act on one `record_*` result; true when the session is ending.
+    fn finish(&mut self, queue: &Queue, fired: Result<Option<EscalationId>, String>) -> bool {
+        let end = match fired {
+            Ok(Some(id)) => SessionEnd::Forced(id),
+            Ok(None) => return false,
+            Err(why) => {
+                eprintln!(
+                    "[{}] escalate-early could not open an escalation: {why}",
+                    self.lane
+                );
+                if queue.lane_state(&self.lane) != Some(LaneState::EscalationLimit) {
+                    return false;
+                }
+                SessionEnd::LimitReached
+            }
+        };
+        self.done = true;
+        // A closed receiver means the run loop is gone; nothing to end.
+        let _ = self.end.send(end);
+        true
+    }
+}
+
+/// Sleep until `deadline`, or forever when there is none (for a `select!`
+/// branch that is switched off by its precondition, whose future is still built).
+async fn sleep_until_opt(deadline: Option<TokioInstant>) {
+    match deadline {
+        Some(at) => tokio::time::sleep_until(at).await,
+        None => std::future::pending().await,
+    }
 }
 
 /// Everything a launch needs that does not change between launches.
@@ -364,6 +484,15 @@ struct Launcher {
     socket: PathBuf,
     /// Where `CLAUDE.md` is read from.
     repo: PathBuf,
+    queue: Arc<Mutex<Queue>>,
+    lane_id: String,
+    /// The lane's cost cap in USD; escalate-early fires at the queue's share of it.
+    cost_cap_usd: f64,
+    /// Session-end signals from the tools server and the live observer. The
+    /// receiver is created BEFORE the tools server and the builder start, so
+    /// no signal can be missed; the sender is cloned into the observer.
+    end_tx: SessionEndSignal,
+    end_rx: tokio::sync::Mutex<UnboundedReceiver<SessionEnd>>,
 }
 
 impl Launcher {
@@ -372,7 +501,20 @@ impl Launcher {
     /// The lane home is writable by the builder, so `settings.json`,
     /// `mcp.json` and `system-prompt.md` are rewritten before EVERY launch
     /// (a resume must never trust what the previous session left there).
-    async fn launch(&self, index: usize, launch: &Launch) -> Result<SegmentRun> {
+    ///
+    /// The builder runs as the leader of its own process group, and the runner
+    /// ends that group, never only the leader. The stream pump, the child wait
+    /// and the session-end signal are listened to together: a blocking `ask`
+    /// (or a forced escalation) parks the lane, and [`PARK_GRACE`] later the
+    /// runner sends SIGTERM to the group, waits up to [`TERM_GRACE`] for the
+    /// leader, then SIGKILLs the group whether or not the leader has gone.
+    /// `spent_before_usd` is the estimated cost of this queue segment so far.
+    async fn launch(
+        &self,
+        index: usize,
+        launch: &Launch,
+        spent_before_usd: f64,
+    ) -> Result<SegmentRun> {
         let started = Instant::now();
         let layout = &self.layout;
         let settings_file = layout.home.join("settings.json");
@@ -432,6 +574,15 @@ impl Launcher {
             .append(!first)
             .truncate(first)
             .open(layout.control.join("builder.stderr"))?;
+        // Signals left over from an earlier launch (a second parked ask, say)
+        // must not end this one. Drained before the builder exists, so nothing
+        // this launch sends can be lost.
+        let mut end_rx = self.end_rx.lock().await;
+        while end_rx.try_recv().is_ok() {}
+
+        // Only the builder gets its own process group (so the runner can end
+        // it whole); `run_check` and the git steps keep the runner's group, so
+        // a terminal Ctrl-C still reaches them.
         let mut child = sandboxed_command(
             &policy,
             &layout.control.join("builder.sb"),
@@ -439,10 +590,14 @@ impl Launcher {
             invocation.env,
             &invocation.cwd,
         )?
+        .process_group(0)
         .stdout(Stdio::piped())
         .stderr(Stdio::from(stderr_file))
         .spawn()
         .context("launching the builder in its sandbox")?;
+        // `process_group(0)` makes the child its own leader, so its pid is the pgid.
+        let pgid = child.id().context("reading the builder's process id")?;
+        let _group = GroupGuard(pgid);
         let stdout = child.stdout.take().context("taking the builder's stdout")?;
 
         let mut meter = StreamMeter::new(launch.resume.is_some());
@@ -453,14 +608,105 @@ impl Launcher {
             .truncate(first)
             .open(layout.control.join("stream.jsonl"))
             .await?;
-        let pumped = pump_stream(stdout, &mut stream, &mut meter, MAX_STREAM_LINE).await;
-        let status = child.wait().await.context("waiting for the builder")?;
-        let stats = pumped.context("reading the builder's stream")?;
+        let mut live = LiveEscalation {
+            queue: self.queue.clone(),
+            lane: self.lane_id.clone(),
+            model: launch.model.clone(),
+            spent_before_usd,
+            cost_cap_usd: self.cost_cap_usd,
+            seen_turns: 0,
+            done: false,
+            end: self.end_tx.clone(),
+        };
+
+        let mut pump_result: Option<io::Result<PumpStats>> = None;
+        let mut status: Option<ExitStatus> = None;
+        let mut session_end: Option<SessionEnd> = None;
+        let mut signals_open = true;
+        let mut killed = false;
+        let mut term_at: Option<TokioInstant> = None;
+        let mut kill_at: Option<TokioInstant> = None;
+        let mut drain_until: Option<TokioInstant> = None;
+        let mut abandoned = false;
+        {
+            let mut observe = |m: &StreamMeter| live.observe(m);
+            let pump = pump_stream(
+                stdout,
+                &mut stream,
+                &mut meter,
+                MAX_STREAM_LINE,
+                &mut observe,
+            );
+            tokio::pin!(pump);
+            // The three events race for as long as any of them can still
+            // matter: the pump reading the builder's stdout (never awaited to
+            // EOF before listening for the rest), the builder exiting, and a
+            // session-end signal.
+            while !(status.is_some() && (pump_result.is_some() || abandoned)) {
+                tokio::select! {
+                    result = &mut pump, if pump_result.is_none() => {
+                        pump_result = Some(result);
+                    }
+                    waited = child.wait(), if status.is_none() => {
+                        status = Some(waited.context("waiting for the builder")?);
+                        // The leader is gone: end whatever it left running, so
+                        // no background child survives or holds the stream open.
+                        kill_process_group(pgid);
+                        term_at = None;
+                        kill_at = None;
+                        drain_until = Some(TokioInstant::now() + PUMP_DRAIN);
+                    }
+                    signal = end_rx.recv(), if session_end.is_none() && signals_open && status.is_none() => {
+                        match signal {
+                            Some(end) => {
+                                eprintln!(
+                                    "[{}] session ends in {:?}: {end:?}",
+                                    self.lane_id, PARK_GRACE
+                                );
+                                session_end = Some(end);
+                                term_at = Some(TokioInstant::now() + PARK_GRACE);
+                            }
+                            None => signals_open = false,
+                        }
+                    }
+                    _ = sleep_until_opt(term_at), if term_at.is_some() => {
+                        terminate_process_group(pgid);
+                        killed = true;
+                        term_at = None;
+                        kill_at = Some(TokioInstant::now() + TERM_GRACE);
+                    }
+                    _ = sleep_until_opt(kill_at), if kill_at.is_some() => {
+                        kill_process_group(pgid);
+                        kill_at = None;
+                    }
+                    _ = sleep_until_opt(drain_until), if drain_until.is_some() && pump_result.is_none() => {
+                        abandoned = true;
+                    }
+                }
+            }
+        }
+        // The group is already ended; the guard's drop is a second, harmless kill.
+        let status = status.context("the builder's exit status was never read")?;
+        let stats = if abandoned {
+            eprintln!(
+                "[{}] the builder's stream stayed open {PUMP_DRAIN:?} after it exited; not waiting for it",
+                self.lane_id
+            );
+            PumpStats::default()
+        } else {
+            pump_result
+                .context("the stream pump never finished")?
+                .context("reading the builder's stream")?
+        };
+        let estimated_cost_usd = meter.estimated_cost_usd(&launch.model);
         Ok(SegmentRun {
             status,
             stats,
             summary: meter.summary(),
             elapsed: started.elapsed(),
+            session_end,
+            killed,
+            estimated_cost_usd,
         })
     }
 }
@@ -653,10 +899,24 @@ impl Drive<'_> {
             "resumedSession": launch.resume,
             "startedBy": launch.started_by.as_ref().map(|id| id.0.clone()),
             "sessionId": seg.summary.session_id,
-            "status": if seg.status.success() { "finished" } else { "failed" },
+            "status": if seg.killed {
+                "ended-by-runner"
+            } else if seg.status.success() {
+                "finished"
+            } else {
+                "failed"
+            },
             "exitCode": seg.status.code(),
             "signal": seg.status.signal(),
+            "sessionEnd": seg.session_end.as_ref().map(|end| match end {
+                SessionEnd::Parked(_) => "parked",
+                SessionEnd::Forced(_) => "forced",
+                SessionEnd::LimitReached => "escalation-limit",
+            }),
+            "killedByRunner": seg.killed,
             "turns": seg.summary.turns.len(),
+            "estimatedCostUsd": seg.estimated_cost_usd,
+            "costIsEstimate": true,
             "durationMs": seg.elapsed.as_millis() as u64,
             "endedBy": serde_json::Value::Null,
         })
@@ -686,9 +946,16 @@ impl Drive<'_> {
         let mut segments = Vec::new();
         let mut summaries = Vec::new();
         let mut stats = PumpStats::default();
+        // The estimated cost of the queue's current segment (it restarts at
+        // `reassign`, as the queue's own counters do).
+        let mut segment_cost_usd = 0.0_f64;
 
         let (end, status) = loop {
-            let seg = self.launcher.launch(segments.len(), &launch).await?;
+            let seg = self
+                .launcher
+                .launch(segments.len(), &launch, segment_cost_usd)
+                .await?;
+            segment_cost_usd += seg.estimated_cost_usd;
             stats.add(&seg.stats);
             if let Some(id) = &seg.summary.session_id {
                 session_id = Some(id.clone());
@@ -831,6 +1098,7 @@ impl Drive<'_> {
                         summary
                     };
                     self.mark_delivered(&id)?;
+                    segment_cost_usd = 0.0;
                     model = to;
                     launch = Launch {
                         model: model.clone(),
@@ -1033,16 +1301,20 @@ impl PumpStats {
 }
 
 /// Copy `reader` to `sink` byte for byte and feed each complete line to the
-/// meter. Memory per line is bounded by `max_line`.
-async fn pump_stream<R, W>(
+/// meter. Memory per line is bounded by `max_line`. After every line the meter
+/// accepts, `on_line` sees the meter, which is where escalate-early reads the
+/// new turns and the running cost estimate.
+async fn pump_stream<R, W, F>(
     reader: R,
     sink: &mut W,
     meter: &mut StreamMeter,
     max_line: usize,
+    on_line: &mut F,
 ) -> io::Result<PumpStats>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
+    F: FnMut(&StreamMeter),
 {
     let mut reader = BufReader::new(reader);
     let mut stats = PumpStats::default();
@@ -1073,7 +1345,10 @@ where
             continue;
         }
         match meter.feed(line) {
-            Ok(_) => stats.metered += 1,
+            Ok(_) => {
+                stats.metered += 1;
+                on_line(meter);
+            }
             Err(_) => stats.unparsed += 1,
         }
     }
@@ -1159,6 +1434,12 @@ pub(crate) fn lanes_root(arg: Option<&Path>, cwd: &Path, home: &Path) -> PathBuf
 
 pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
     let started = Instant::now();
+    if args.turn_budget == 0 {
+        bail!("--turn-budget must be at least 1");
+    }
+    if !args.cost_cap_usd.is_finite() || args.cost_cap_usd <= 0.0 {
+        bail!("--cost-cap-usd must be a positive number of US dollars");
+    }
     let cwd = std::env::current_dir().context("reading the current directory")?;
 
     // 1. Lint first: errors stop the run before any lane exists.
@@ -1225,9 +1506,19 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
     // 4. Proxy and tools, both live before the builder starts.
     let endpoint = start_proxy(&layout, api_key).await?;
     let _proxy = AbortOnDrop(endpoint.task);
+    // The session-end channel exists before the tools server and the builder
+    // do, so no signal can be missed (D9: the runner ends the session).
+    let (end_tx, end_rx) = tokio::sync::mpsc::unbounded_channel();
     let queue = Arc::new(Mutex::new(
-        Queue::new(&layout.control, Box::new(SystemClock))
-            .context("opening the escalation queue")?,
+        Queue::with_all_limits(
+            &layout.control,
+            Box::new(SystemClock),
+            DEFAULT_PARK_LIMIT,
+            DEFAULT_MAX_ESCALATIONS,
+            args.turn_budget as usize,
+            DEFAULT_COST_FRACTION,
+        )
+        .context("opening the escalation queue")?,
     ));
     let tools_listener = tools::bind(&layout.sock).context("binding the builder tools socket")?;
     let socket = layout
@@ -1256,9 +1547,17 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
         Arc::new(move |id: &str| Box::pin(run_declared_check(context.clone(), id.to_string())));
     let _tools = AbortOnDrop(tokio::spawn({
         let lane_id = header.id.clone();
+        let end_tx = end_tx.clone();
         async move {
-            if let Err(e) =
-                tools::serve(tools_listener, lane_id, tools_queue, table, run_check).await
+            if let Err(e) = tools::serve_signalling(
+                tools_listener,
+                lane_id,
+                tools_queue,
+                table,
+                run_check,
+                Some(end_tx),
+            )
+            .await
             {
                 eprintln!("builder tools stopped: {e}");
             }
@@ -1294,6 +1593,11 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
         max_turns: args.max_turns,
         socket,
         repo: repo.clone(),
+        queue: queue.clone(),
+        lane_id: header.id.clone(),
+        cost_cap_usd: args.cost_cap_usd,
+        end_tx,
+        end_rx: tokio::sync::Mutex::new(end_rx),
     };
     let drive = Drive {
         launcher: &launcher,
@@ -1347,9 +1651,16 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
         .iter()
         .filter_map(|s| s.total_cost_usd)
         .sum();
+    let estimated_cost_usd: f64 = lane_run
+        .segments
+        .iter()
+        .filter_map(|s| s["estimatedCostUsd"].as_f64())
+        .sum();
     let run = json!({
         "id": header.id,
         "status": status_name,
+        "estimatedCostUsd": estimated_cost_usd,
+        "costIsEstimate": true,
         "error": match end {
             LaneEnd::Refused(why) => json!(why),
             _ => serde_json::Value::Null,
@@ -1956,9 +2267,15 @@ body"#;
         let input: &[u8] = b"{\"type\":\"system\",\"session_id\":\"s1\"}\r\n\nnot json\n{\"type\":\"result\",\"subtype\":\"success\",\"result\":\"ok\"}";
         let mut sink: Vec<u8> = Vec::new();
         let mut meter = StreamMeter::new(false);
-        let stats = pump_stream(input, &mut sink, &mut meter, 1024)
-            .await
-            .unwrap();
+        let stats = pump_stream(
+            input,
+            &mut sink,
+            &mut meter,
+            1024,
+            &mut |_: &StreamMeter| {},
+        )
+        .await
+        .unwrap();
         assert_eq!(sink, input);
         assert_eq!(
             stats,
@@ -1980,9 +2297,15 @@ body"#;
         let input = format!("{long}\n{{\"type\":\"system\",\"session_id\":\"after\"}}\n");
         let mut sink: Vec<u8> = Vec::new();
         let mut meter = StreamMeter::new(false);
-        let stats = pump_stream(input.as_bytes(), &mut sink, &mut meter, 64)
-            .await
-            .unwrap();
+        let stats = pump_stream(
+            input.as_bytes(),
+            &mut sink,
+            &mut meter,
+            64,
+            &mut |_: &StreamMeter| {},
+        )
+        .await
+        .unwrap();
         assert_eq!(sink, input.as_bytes());
         assert_eq!(
             stats,
@@ -2143,6 +2466,9 @@ body"#;
             },
             summary: meter.summary(),
             elapsed: Duration::from_secs(elapsed_secs),
+            session_end: None,
+            killed: false,
+            estimated_cost_usd: 0.0,
         }
     }
 
