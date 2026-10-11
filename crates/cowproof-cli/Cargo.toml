@@ -33,6 +33,7 @@ cowproof-plan = { path = "../cowproof-plan" }
 cowproof-lint = { path = "../cowproof-lint" }
 cowproof-run = { path = "../cowproof-run" }
 cowproof-prove = { path = "../cowproof-prove" }
+cowproof-report = { path = "../cowproof-report" }
 portkit-core.workspace = true
 portkit-cli.workspace = true
 portkit-mcp.workspace = true

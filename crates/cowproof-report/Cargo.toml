@@ -5,6 +5,10 @@ rust-version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[lib]
+name = "cowproof_report"
+path = "src/lib.rs"
+
 [[bin]]
 name = "cowproof-report"
 path = "src/main.rs"
@@ -18,3 +22,4 @@ serde_json = "1"
 
 [dev-dependencies]
 cowproof-core = { version = "0.1.0", path = "../cowproof-core" }
+tempfile = "3"

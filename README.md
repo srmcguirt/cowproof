@@ -45,6 +45,60 @@ classes = { rust = "claude:sonnet", pg = "claude:sonnet" }
 
 Only the `claude` runtime has an adapter so far. The ladder may list `openrouter` and `codex` rungs, but a lane that would start on one is refused with exit 4 ("runtime `codex` has no adapter yet (D28 step 1)"), and a `reassign` that would land on one ends the lane the way the top of the ladder does.
 
+## Tune the ladder from data: `cowproof report rollup`
+
+Routing should come from measurement (D28 clause 4). `cowproof report rollup <lanes-root>...` reads every lane one level under each root and prints, for each starting rung and packet class, how the lanes did: first-try pass rate, proved rate, median and total cost, cost per proved lane, median turns and mean reassigns, then where the lanes that started on each rung ended. The numbers below come from synthetic lanes made by hand, not from real runs:
+
+```text
+Lane rollup: 12 counted of 14 lanes in 1 root
+
+claude:haiku *
+  class        lanes    1st-try     proved  med $ total $  $/prov turns reasg
+  light            2   2/2 100%   2/2 100%  0.055   0.110   0.055   3.5  0.00
+  rust             7    5/7 71%    6/7 86%  0.080   1.250   0.208     6  0.14
+
+claude:sonnet
+  class        lanes    1st-try     proved  med $ total $  $/prov turns reasg
+  pg               1     0/1 0%   1/1 100%  2.400   2.400   2.400    21  1.00
+  rust             1   1/1 100%   1/1 100%  0.500   0.500   0.500     8  0.00
+
+openrouter:glm-5.3-flash
+  class        lanes    1st-try     proved  med $ total $  $/prov turns reasg
+  light            1     0/1 0%   1/1 100%  0.210   0.210   0.210    13  1.00
+
+Climbed to (lanes by the rung they started on)
+claude:haiku: 9 lanes, 1 climbed
+  stayed on claude:haiku    8
+  -> claude:sonnet          1
+claude:sonnet: 2 lanes, 1 climbed
+  stayed on claude:sonnet    1
+  -> claude:opus             1
+openrouter:glm-5.3-flash: 1 lane, 1 climbed
+  -> claude:haiku    1
+
+1st-try is proved with no reassign; proved is proved at all; $/prov is the
+  group's cost over its proved lanes; reasg is the mean reassigns per lane.
+Left out of every rate: running 1.
+1 unsandboxed lane left out; --include-unsandboxed counts them (a finished
+  unsandboxed lane then counts as proved).
+* 1 lane from before D28 step 1 (no runtime field) counts as claude:<model>.
+Cost is the runner's estimate, not a bill.
+Starting rung came from: class 10, header 1, unknown 1.
+```
+
+What it reads and how it counts:
+
+- **Only two files per lane:** `control/run.json` and `control/verdict.json`, one level under each root. No symlink is followed: a lane directory, its `control` directory or either file that is a link is skipped and counted as `symlink`. A lane with neither file (or an empty `control`) is `unreadable`, a malformed file is `malformed`, and neither stops the rollup. Text from the files is stripped of control characters before it is printed.
+- **A lane before D28 step 1** has no `runtime`; it counts as `claude:<model>` and the table says so (the `*`).
+- **A lane whose builder has not exited** has no `run.json` yet (a lane that exited and is being proved has one and no verdict), and is counted as `running`. It is in no rate. A lane that ended without a verdict (`timeout`, `cost-cap`, `failed`, `stopped`, `escalation-limit`) is counted as not proved. A `run.json` from a run that never started a builder is `never started` and is in no rate.
+- **Start rung and final rung:** the start rung is the first segment's `runtime:model` and the final rung is the top-level `runtime:model`. A **reassign** is a segment on a different rung than the one before it, so a resume or a redirect on the same rung is not one.
+- **First-try pass** means the lane is proved, has zero reassigns, and ended on the rung it started on. **Proved** means the verdict is `proved`. Lanes are grouped by the rung they started on, so a lane that climbed from haiku to sonnet counts against haiku.
+- **Unsandboxed lanes** (they can end `finished`, never `proved`) are left out of the rates and counted. `--include-unsandboxed` counts them, and a `finished` verdict from an unsandboxed lane then counts as proved.
+- **Cost** is the runner's estimate (`estimatedCostUsd`), not a bill. `$/prov` is the group's whole cost, failures included, over its proved lanes.
+- **Remote lanes** are counted in the rates like any other and noted in the footer; `rungSource` shows how many starting rungs came from a flag, a header, a class route or the default.
+
+`--json` prints the same numbers as one document (`counts`, `groups`, `climbed`, and one `lanes` row per counted lane with its first and final rung, class, cost, turns, reassigns, `host` and `unsandboxed`). Exit 0 when it prints; exit 1 when a root is not a directory. The plain table is at most 80 columns wide.
+
 ## Run a lane on another machine
 
 `cowproof run packet.md --host buildbox` runs the builder, and the checks it asks for, on another machine over SSH. Your machine stays the director: it keeps the escalation queue and your rulings, the egress proxy and so the API key, the held-out checks, the proof and the capsule. The host runs only what runs sandboxed. The key never leaves the director: no argument, spec, bundle or environment sent to the host holds it, and the builder on the host presents the lane's own `placeholder-...` key, which only your proxy accepts, through two sockets that SSH forwards from the host back to you.

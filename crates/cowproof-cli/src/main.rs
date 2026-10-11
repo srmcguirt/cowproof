@@ -28,6 +28,7 @@ mod host_setup;
 mod lane_tools;
 mod preflight;
 mod remote;
+mod report;
 mod root;
 mod run;
 mod verify;
@@ -68,6 +69,8 @@ enum Action {
     /// when a lane could start. Exit codes: 0 no check failed (warnings do not count; a
     /// missing API key is a warning here and a failure for `run`); 1 a check failed.
     Doctor(doctor::DoctorArgs),
+    /// Aggregate reports over lanes: `cowproof report rollup <lanes-root>...` (D23, D28).
+    Report(report::ReportArgs),
     Lint(LintArgs),
     Host(HostArgs),
     Hosts,
@@ -417,6 +420,7 @@ async fn dispatch(command: Action) -> Result<()> {
             }
             Ok(())
         }
+        Action::Report(args) => report::run(args),
         Action::Lint(args) => lint_command(args),
         Action::Host(HostArgs {
             command: HostAction::Setup(args),

@@ -443,6 +443,7 @@ dependencies = [
  "cowproof-lint",
  "cowproof-plan",
  "cowproof-prove",
+ "cowproof-report",
  "cowproof-run",
  "portkit-cli",
  "portkit-core",
@@ -539,6 +540,7 @@ dependencies = [
  "regex",
  "serde",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]
