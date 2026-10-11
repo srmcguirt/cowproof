@@ -9,7 +9,9 @@
 #[allow(dead_code)] // this file needs only a few of the shared helpers
 mod common;
 
-use common::{REAL_KEY, fork_lock, git, output, sandbox_available, unique_lane_id, var_tmp};
+use common::{
+    REAL_KEY, fork_lock, git, group_gone, output, sandbox_available, unique_lane_id, var_tmp,
+};
 use cowproof_run::bridge::bridge_port;
 use serde_json::{Value, json};
 use std::fs;
@@ -22,6 +24,8 @@ use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+/// The host-agent protocol this build speaks (`HOST_PROTOCOL` in `src/host_agent.rs`).
+const PROTOCOL: &str = "2";
 
 /// A source repository with two commits, a bundle of it, a lanes root that does not exist
 /// yet, and a `HOME`.
@@ -31,7 +35,19 @@ struct Fx {
     repo: PathBuf,
     sha: String,
     bundle: PathBuf,
+    /// Holds the framed stdin files for `prepare`, beside nothing else.
+    inputs: TempDir,
+    /// `prepare`'s stdin for the bundle with no base patch.
+    framed: PathBuf,
     root: PathBuf,
+}
+
+/// `prepare`'s stdin: the header line, the base patch, the bundle.
+fn frame(patch: &[u8], bundle: &Path) -> Vec<u8> {
+    let mut bytes = format!("{}\n", json!({"patch_bytes": patch.len()})).into_bytes();
+    bytes.extend_from_slice(patch);
+    bytes.extend_from_slice(&fs::read(bundle).unwrap());
+    bytes
 }
 
 fn git_out(repo: &Path, args: &[&str]) -> Vec<u8> {
@@ -79,14 +95,26 @@ impl Fx {
             &["bundle", "create", bundle.to_str().unwrap(), "HEAD"],
         );
         let root = work.path().join("lanes");
+        let inputs = var_tmp("cp-hostagent-inputs-");
+        let framed = inputs.path().join("no-patch.stdin");
+        fs::write(&framed, frame(b"", &bundle)).unwrap();
         Fx {
             work,
             home,
             repo,
             sha,
             bundle,
+            inputs,
+            framed,
             root,
         }
+    }
+
+    /// A framed `prepare` stdin file with `patch` and `bundle`, kept outside the work directory.
+    fn framed_with(&self, name: &str, patch: &[u8], bundle: &Path) -> PathBuf {
+        let path = self.inputs.path().join(name);
+        fs::write(&path, frame(patch, bundle)).unwrap();
+        path
     }
 
     /// `cowproof host-agent <args>` with `--root` appended, stdin from `stdin` (or null).
@@ -127,9 +155,28 @@ impl Fx {
             &self.sha,
             "--director-version",
             VERSION,
+            "--protocol",
+            PROTOCOL,
         ];
         args.extend_from_slice(extra);
-        self.agent(&args, Some(&self.bundle))
+        self.agent(&args, Some(&self.framed))
+    }
+
+    /// `prepare` with `patch` as the director's base patch, framed on stdin.
+    fn prepare_with_patch(&self, id: &str, patch: &[u8]) -> Output {
+        let stdin = self.framed_with(&format!("{id}.stdin"), patch, &self.bundle);
+        let args = [
+            "prepare",
+            "--lane-id",
+            id,
+            "--base",
+            &self.sha,
+            "--director-version",
+            VERSION,
+            "--protocol",
+            PROTOCOL,
+        ];
+        self.agent(&args, Some(&stdin))
     }
 
     fn clone_of(&self, id: &str) -> PathBuf {
@@ -227,19 +274,20 @@ fn prepare_builds_the_local_runners_lane_at_the_base() {
 }
 
 #[test]
-fn prepare_applies_the_base_patch_on_top_of_the_base() {
+fn prepare_applies_the_base_patch_it_reads_on_stdin_on_top_of_the_base() {
     let fx = Fx::new();
-    // A base patch as the runner records one: tracked edits and a new file.
+    // A base patch as the runner records one: tracked edits, a new file and a binary one that
+    // is not UTF-8 and holds a NUL, so only a byte-exact frame gives it back.
     fs::write(fx.repo.join("README.md"), "first\nedited by the director\n").unwrap();
     fs::write(fx.repo.join("new.txt"), "new file\n").unwrap();
+    let binary = [0u8, 159, 146, 150, 255, 0, b'\n', 10, 13];
+    fs::write(fx.repo.join("new.bin"), binary).unwrap();
     git(&fx.repo, &["add", "-A"]);
     let patch = git_out(&fx.repo, &["diff", "--cached", "--binary", "HEAD"]);
-    let patch_file = fx.work.path().join("base.patch");
-    fs::write(&patch_file, patch).unwrap();
     git(&fx.repo, &["reset", "-q", "--hard", "HEAD"]);
     git(&fx.repo, &["clean", "-fdq"]);
 
-    let out = fx.prepare("lane-p", &["--base-patch", patch_file.to_str().unwrap()]);
+    let out = fx.prepare_with_patch("lane-p", &patch);
     let json = assert_ok(&out);
     assert_eq!(json["base_patch"], true);
 
@@ -252,6 +300,7 @@ fn prepare_applies_the_base_patch_on_top_of_the_base() {
         fs::read_to_string(clone.join("new.txt")).unwrap(),
         "new file\n"
     );
+    assert_eq!(fs::read(clone.join("new.bin")).unwrap(), binary);
     // base, "base patch", "launch baseline"; the tree is clean on top of both.
     assert_eq!(
         git_text(
@@ -261,15 +310,86 @@ fn prepare_applies_the_base_patch_on_top_of_the_base() {
         "2"
     );
     assert_eq!(git_text(&clone, &["status", "--porcelain"]), "");
-    assert_eq!(
-        fx.work_entries(),
-        ["base.bundle", "base.patch", "lanes", "repo"]
-    );
+    // The patch was read from stdin: no host file was named, and nothing is left beside the root.
+    assert_eq!(fx.work_entries(), ["base.bundle", "lanes", "repo"]);
 
-    // A base patch that is not a file is refused before anything is made.
-    let out = fx.prepare("lane-q", &["--base-patch", "/var/tmp/cp-no-such-patch"]);
-    assert!(assert_refused(&out).contains("not a file"));
+    // A header that promises more patch than stdin holds is refused, and leaves no lane.
+    let mut short = format!("{}\n", json!({"patch_bytes": patch.len() + 1000})).into_bytes();
+    short.extend_from_slice(&patch);
+    let short_file = fx.inputs.path().join("short.stdin");
+    fs::write(&short_file, short).unwrap();
+    let out = fx.agent(
+        &[
+            "prepare",
+            "--lane-id",
+            "lane-q",
+            "--base",
+            &fx.sha,
+            "--director-version",
+            VERSION,
+            "--protocol",
+            PROTOCOL,
+        ],
+        Some(&short_file),
+    );
+    assert!(assert_refused(&out).contains("ended inside the base patch"));
     assert!(!fx.root.join("lane-q").exists());
+
+    // A bundle with no header (what a director of the older protocol sends) is refused
+    // without being read as a patch, and a patch that does not apply leaves no lane either.
+    let out = fx.agent(
+        &[
+            "prepare",
+            "--lane-id",
+            "lane-r",
+            "--base",
+            &fx.sha,
+            "--director-version",
+            VERSION,
+            "--protocol",
+            PROTOCOL,
+        ],
+        Some(&fx.bundle),
+    );
+    assert!(assert_refused(&out).contains("header"));
+    let out = fx.prepare_with_patch("lane-s", b"diff --git a/nope b/nope\nnot a patch\n");
+    assert_refused(&out);
+    assert!(!fx.root.join("lane-r").exists() && !fx.root.join("lane-s").exists());
+    assert_eq!(fx.work_entries(), ["base.bundle", "lanes", "repo"]);
+}
+
+#[test]
+fn prepare_refuses_a_missing_or_different_protocol_naming_both_and_leaves_no_lane() {
+    let fx = Fx::new();
+    let base = |protocol: Option<&'static str>| {
+        let mut args = vec![
+            "prepare",
+            "--lane-id",
+            "lane-n",
+            "--base",
+            &fx.sha,
+            "--director-version",
+            VERSION,
+        ];
+        if let Some(p) = protocol {
+            args.extend(["--protocol", p]);
+        }
+        fx.agent(&args, Some(&fx.framed))
+    };
+    let error = assert_refused(&base(Some("1")));
+    assert!(
+        error.contains("protocol 1") && error.contains(&format!("protocol {PROTOCOL}")),
+        "{error}"
+    );
+    let error = assert_refused(&base(None));
+    assert!(
+        error.contains("protocol mismatch") && error.contains("no host-agent protocol"),
+        "{error}"
+    );
+    assert!(!fx.root.join("lane-n").exists());
+    assert_eq!(fx.work_entries(), ["base.bundle", "repo"]);
+    // The right one works.
+    assert_ok(&base(Some(PROTOCOL)));
 }
 
 #[test]
@@ -284,8 +404,10 @@ fn a_different_version_is_refused_naming_both_and_leaves_no_lane() {
             &fx.sha,
             "--director-version",
             "9.9.9-director",
+            "--protocol",
+            PROTOCOL,
         ],
-        Some(&fx.bundle),
+        Some(&fx.framed),
     );
     let error = assert_refused(&out);
     assert!(error.contains("9.9.9-director"), "{error}");
@@ -323,16 +445,19 @@ fn a_bundle_without_the_commit_or_not_a_bundle_leaves_no_lane() {
             &absent,
             "--director-version",
             VERSION,
+            "--protocol",
+            PROTOCOL,
         ],
-        Some(&fx.bundle),
+        Some(&fx.framed),
     );
     let error = assert_refused(&out);
     assert!(error.contains("does not contain"), "{error}");
     assert!(error.contains(&absent), "{error}");
     assert!(!fx.root.join("lane-m").exists());
 
-    let garbage = fx.work.path().join("garbage");
-    fs::write(&garbage, "this is not a bundle\n").unwrap();
+    let garbage_bundle = fx.inputs.path().join("garbage");
+    fs::write(&garbage_bundle, "this is not a bundle\n").unwrap();
+    let garbage = fx.framed_with("garbage.stdin", b"", &garbage_bundle);
     let out = fx.agent(
         &[
             "prepare",
@@ -342,6 +467,8 @@ fn a_bundle_without_the_commit_or_not_a_bundle_leaves_no_lane() {
             &fx.sha,
             "--director-version",
             VERSION,
+            "--protocol",
+            PROTOCOL,
         ],
         Some(&garbage),
     );
@@ -358,8 +485,10 @@ fn a_bundle_without_the_commit_or_not_a_bundle_leaves_no_lane() {
             &fx.sha[..8],
             "--director-version",
             VERSION,
+            "--protocol",
+            PROTOCOL,
         ],
-        Some(&fx.bundle),
+        Some(&fx.framed),
     );
     assert!(assert_refused(&out).contains("full commit id"));
 
@@ -368,10 +497,7 @@ fn a_bundle_without_the_commit_or_not_a_bundle_leaves_no_lane() {
         0,
         "no lane directory was left"
     );
-    assert_eq!(
-        fx.work_entries(),
-        ["base.bundle", "garbage", "lanes", "repo"]
-    );
+    assert_eq!(fx.work_entries(), ["base.bundle", "lanes", "repo"]);
 }
 
 #[test]
@@ -387,8 +513,10 @@ fn prepare_refuses_ids_that_could_leave_the_root() {
                 &fx.sha,
                 "--director-version",
                 VERSION,
+                "--protocol",
+                PROTOCOL,
             ],
-            Some(&fx.bundle),
+            Some(&fx.framed),
         );
         assert_refused(&out);
     }
@@ -515,6 +643,7 @@ fn doctor_reports_the_version_claude_and_the_sandbox() {
     let out = fx.agent(&["doctor", "--claude-bin", claude.to_str().unwrap()], None);
     let json = json_of(&out);
     assert_eq!(json["version"], VERSION);
+    assert_eq!(json["protocol"].to_string(), PROTOCOL, "{json}");
     assert_eq!(json["claude"], true, "{json}");
     assert!(
         json["claude_detail"]
@@ -768,14 +897,23 @@ mkdir -p "$rec"
             let _g = fork_lock();
             cmd.spawn().unwrap()
         };
-        let mut pipe = child.stdin.take().unwrap();
+        // One line, ended by a newline. The pipe stays in `child.stdin`, open: for `builder`
+        // that is the lifeline, and `wait_with_output` (for `check`, which reads to the end of
+        // its stdin) closes it.
+        let pipe = child.stdin.as_mut().unwrap();
         // A refusal can exit before it has read everything; that is not a failure here.
-        let _ = pipe.write_all(stdin.to_string().as_bytes());
+        let _ = pipe.write_all(format!("{stdin}\n").as_bytes());
+        let _ = pipe.flush();
         child
     }
 
+    /// The builder to its end, with its stdin held open until then (the lifeline).
     fn run_builder(&self, spec: &Value) -> Output {
-        self.start(&["builder"], spec).wait_with_output().unwrap()
+        let mut child = self.start(&["builder"], spec);
+        let lifeline = child.stdin.take();
+        let out = child.wait_with_output().unwrap();
+        drop(lifeline);
+        out
     }
 
     fn run_check(&self, check_id: &str, spec: &Value) -> Output {
@@ -1171,6 +1309,139 @@ while :; do echo tick >> "$rec/marker"; sleep 0.2; done
 "#,
         Duration::from_secs(60),
     );
+}
+
+/// How long `host-agent builder` gets to end its group after a stop: the grace it gives the
+/// builder (`TERM_GRACE`, 10 s) and five seconds more.
+const STOP_WITHIN: Duration = Duration::from_secs(15);
+
+/// Kills `host-agent` when dropped, so a test that fails leaves nothing running.
+struct KillOnDrop(Child);
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// Kills the builder's whole process group by the pgid it recorded, whatever the test did. The
+/// sandbox shares the host's pid space on macOS only, so the number means nothing elsewhere.
+struct GroupReaper(PathBuf);
+
+impl Drop for GroupReaper {
+    fn drop(&mut self) {
+        if cfg!(target_os = "macos")
+            && let Ok(pgid) = fs::read_to_string(&self.0)
+        {
+            signal_pid("-KILL", &format!("-{}", pgid.trim()));
+        }
+    }
+}
+
+/// A fake builder that records its pgid, starts a background child that ignores SIGTERM and
+/// ticks into `marker`, and then sleeps.
+const TICKING_BUILDER: &str = r#"echo $$ > "$rec/pgid"
+( trap '' TERM; while :; do echo tick >> "$rec/marker"; sleep 0.2; done ) >/dev/null 2>&1 &
+echo $! > "$rec/bg.pid"
+sleep 600
+"#;
+
+/// After the stop: the builder's group is gone (on macOS, where the sandbox shares the pid
+/// space) and its background child stopped writing, which holds everywhere.
+fn assert_builder_group_ended(bfx: &Bfx) {
+    let marker = bfx.rec().join("marker");
+    let size = fs::metadata(&marker).unwrap().len();
+    std::thread::sleep(Duration::from_millis(1500));
+    assert_eq!(
+        fs::metadata(&marker).unwrap().len(),
+        size,
+        "a child kept writing after the stop"
+    );
+    if cfg!(target_os = "macos") {
+        let pgid = fs::read_to_string(bfx.rec().join("pgid")).unwrap();
+        assert!(
+            group_gone(pgid.trim()),
+            "process group {} is still alive",
+            pgid.trim()
+        );
+    }
+}
+
+#[test]
+fn the_remote_builder_ends_when_its_stdin_closes() {
+    if !sandbox_available() {
+        return;
+    }
+    let bfx = Bfx::new(TICKING_BUILDER);
+    let _reaper = GroupReaper(bfx.rec().join("pgid"));
+    let mut agent = KillOnDrop(bfx.start(&["builder"], &bfx.spec()));
+    // The spec line was written and the pipe is still open: the builder lives on.
+    wait_for(&bfx.rec().join("marker"));
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(
+        agent.0.try_wait().unwrap().is_none(),
+        "the builder ended while the lifeline was open"
+    );
+
+    // The director lets go (or its ssh dies and sshd closes the pipe): end of file.
+    let began = Instant::now();
+    drop(agent.0.stdin.take());
+    let status = wait_exit(&mut agent.0, STOP_WITHIN);
+    assert_eq!(status.code(), Some(130), "an ended builder exits 130");
+    assert!(began.elapsed() < STOP_WITHIN);
+    assert_builder_group_ended(&bfx);
+}
+
+#[test]
+fn a_builder_whose_stdout_breaks_is_ended() {
+    if !sandbox_available() {
+        return;
+    }
+    let bfx = Bfx::new(
+        r#"echo $$ > "$rec/pgid"
+while :; do echo tick >> "$rec/marker"; printf 'line\n'; sleep 0.2; done
+"#,
+    );
+    let _reaper = GroupReaper(bfx.rec().join("pgid"));
+    let mut agent = KillOnDrop(bfx.start(&["builder"], &bfx.spec()));
+    // It is delivering output, then nobody reads it any more.
+    let mut out = agent.0.stdout.take().unwrap();
+    let mut first = [0u8; 5];
+    std::io::Read::read_exact(&mut out, &mut first).unwrap();
+    assert_eq!(&first, b"line\n");
+    drop(out);
+
+    // Stdin is still open: only the broken stdout ends it.
+    let status = wait_exit(&mut agent.0, STOP_WITHIN);
+    assert_eq!(status.code(), Some(130), "an ended builder exits 130");
+    assert!(agent.0.stdin.is_some());
+    assert_builder_group_ended(&bfx);
+}
+
+#[test]
+fn a_spec_that_ends_at_end_of_file_is_refused_as_an_older_protocol_and_nothing_starts() {
+    if !sandbox_available() {
+        return;
+    }
+    let bfx = Bfx::new("echo started > \"$rec/started\"\nexit 0");
+    // What a director of protocol 1 sends: the spec with no newline, then end of file.
+    let mut child = {
+        let mut cmd = bfx.command(&["builder"], &bfx.id);
+        let _g = fork_lock();
+        cmd.spawn().unwrap()
+    };
+    let mut pipe = child.stdin.take().unwrap();
+    let _ = pipe.write_all(bfx.spec().to_string().as_bytes());
+    drop(pipe);
+    let out = child.wait_with_output().unwrap();
+    let error = assert_refused(&out);
+    assert!(
+        error.contains("ended by a newline") && error.contains("protocol"),
+        "{error}"
+    );
+    assert!(!bfx.rec().exists(), "a builder started");
+    assert!(!bfx.lane().join("home/settings.json").exists());
 }
 
 fn check_spec(command: &str, timeout_secs: u64) -> Value {

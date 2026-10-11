@@ -9,7 +9,8 @@
 mod common;
 
 use common::{
-    Lane, REAL_KEY, fork_lock, output, run_checks, sandbox_available, spawn_to_file, text, var_tmp,
+    Lane, REAL_KEY, fork_lock, group_gone, output, run_checks, sandbox_available, spawn_to_file,
+    text, var_tmp,
 };
 use cowproof_prove::Capsule;
 use serde_json::{Value, json};
@@ -275,8 +276,8 @@ fn the_ssh_log_has_every_step_in_order_and_each_one_goes_through_the_master() {
     assert_eq!(
         remote.steps(),
         [
-            "master", "doctor", "prepare", "forward", "builder", "check", "patch", "cleanup",
-            "exit"
+            "master", "doctor", "prepare", "forward", "builder", "check", "patch", "stderr",
+            "cleanup", "exit"
         ],
         "{:?}",
         remote.argvs()
@@ -346,6 +347,7 @@ fn the_ssh_log_has_every_step_in_order_and_each_one_goes_through_the_master() {
         prepare.contains(&format!("--director-version {}", env!("CARGO_PKG_VERSION"))),
         "{prepare}"
     );
+    assert!(prepare.contains(" --protocol 2"), "{prepare}");
     assert!(
         prepare.contains(remote.root.path().to_str().unwrap()),
         "{prepare}"
@@ -681,6 +683,286 @@ fn run_check_runs_in_the_hosts_clone_not_the_directors() {
 }
 
 // ---------------------------------------------------------------------------
+// The lifeline, the dirty base and the builder's stderr (R-4)
+// ---------------------------------------------------------------------------
+
+/// The `command-started` entry of the ssh that runs `host-agent <verb>`: the command's pid and
+/// the fake ssh's own pid.
+fn command_started(remote: &Remote, verb: &str) -> (i64, i64) {
+    let needle = format!(" host-agent {verb} ");
+    let event = remote
+        .log()
+        .into_iter()
+        .find(|e| {
+            e["event"] == "command-started"
+                && e["command"].as_str().is_some_and(|c| c.contains(&needle))
+        })
+        .unwrap_or_else(|| panic!("no host-agent {verb} was started: {:?}", remote.log()));
+    (
+        event["pid"].as_i64().unwrap(),
+        event["ssh_pid"].as_i64().unwrap(),
+    )
+}
+
+/// Poll `kill -0 <pid>` until the process is gone, at most `within`.
+fn assert_pid_gone_within(pid: i64, within: Duration) {
+    let deadline = Instant::now() + within;
+    loop {
+        let alive = output(Command::new("kill").args(["-0", &pid.to_string()]))
+            .status
+            .success();
+        if !alive {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "process {pid} is still alive after {within:?}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// Wait for a run that was started with `spawn_to_file` to end, killing it by pid after a minute.
+fn wait_run(run: &mut Child, stderr: &Path) -> std::process::ExitStatus {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        if let Some(status) = run.try_wait().unwrap() {
+            return status;
+        }
+        if Instant::now() > deadline {
+            let _ = run.kill();
+            let _ = run.wait();
+            panic!(
+                "the run outlived the builder's loss:\n{}",
+                fs::read_to_string(stderr).unwrap_or_default()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn killing_the_directors_ssh_ends_the_remote_builder() {
+    if !sandbox_available() {
+        return;
+    }
+    let remote = Remote::new(&waiting_builder(), checks());
+    let stderr = remote.ssh_dir.path().join("director.stderr");
+    let mut run = spawn_to_file(&mut remote.command(&[]), &stderr);
+    let home = remote.remote_lane().join("home");
+    wait_for(&home.join("bgpid"), &mut run);
+    let (builder, background) = (
+        pid_in(&home.join("builderpid")),
+        pid_in(&home.join("bgpid")),
+    );
+    let (host_agent, director_ssh) = command_started(&remote, "builder");
+
+    // The director's ssh for the builder dies without a word, as a dropped link or a killed
+    // laptop does. The fake relays no hangup (a real ssh without a pty sends none); all the host
+    // sees is the end of its stdin.
+    let out = output(Command::new("kill").args(["-KILL", &director_ssh.to_string()]));
+    assert!(out.status.success(), "{}", text(&out));
+    let began = Instant::now();
+    assert_pid_gone_within(host_agent, STOP_WITHIN);
+    assert!(began.elapsed() < STOP_WITHIN);
+    // The builder's group went with `host-agent` (the sandbox shares the pid space on macOS only).
+    if cfg!(target_os = "macos") {
+        assert!(group_gone(&builder.to_string()), "builder group is alive");
+        assert!(!pid_alive(background), "the background child is alive");
+    }
+
+    // The director saw its builder's ssh die and finished the lane its usual way.
+    let status = wait_run(&mut run, &stderr);
+    assert_ne!(status.code(), Some(0));
+    remote.assert_torn_down();
+}
+
+fn pid_alive(pid: i64) -> bool {
+    output(Command::new("kill").args(["-0", &pid.to_string()]))
+        .status
+        .success()
+}
+
+/// What the director may take as the grace a stopped remote builder gets: `TERM_GRACE` and five
+/// seconds.
+const STOP_WITHIN: Duration = Duration::from_secs(15);
+
+#[test]
+fn a_dirty_base_reaches_the_remote_lane() {
+    if !sandbox_available() {
+        return;
+    }
+    // `notes.txt` is committed, then changed and left uncommitted; no packet owns it. The
+    // check runs on the host, in the clone the builder works in, and again in the proof here.
+    let dirty_checks = json!([
+        {"id": "dirty", "command": "grep -q two notes.txt"},
+        {"id": "edit", "command": "grep -q edited README.md"},
+        {"id": "made", "command": "test -f created.txt"},
+    ]);
+    let remote = Remote::new(&run_checks(&["dirty", "edit", "made"]), dirty_checks);
+    remote.lane.commit_files(&[("notes.txt", "one\n")]);
+    fs::write(remote.lane.repo.join("notes.txt"), "two\n").unwrap();
+
+    let out = finish(remote.command(&["--allow-dirty"]));
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    assert_eq!(remote.lane.verdict()["verdict"], "proved", "{}", text(&out));
+
+    // The local proof applied the base patch it recorded...
+    let base_patch = fs::read(remote.lane.capsule_dir().join("base.patch")).unwrap();
+    assert!(
+        String::from_utf8_lossy(&base_patch).contains("+two"),
+        "{}",
+        String::from_utf8_lossy(&base_patch)
+    );
+    // ...and those are exactly the bytes the director sent to the host, after the header line
+    // and before the bundle.
+    let argvs = remote.log();
+    let prepare = argvs
+        .iter()
+        .find(|e| {
+            e["argv"]
+                .as_array()
+                .and_then(|a| a.last())
+                .and_then(Value::as_str)
+                .is_some_and(|c| c.contains(" host-agent prepare "))
+        })
+        .expect("no prepare was logged");
+    let sent = fs::read(prepare["stdin"].as_str().unwrap()).unwrap();
+    let newline = sent.iter().position(|b| *b == b'\n').unwrap();
+    let header: Value = serde_json::from_slice(&sent[..newline]).unwrap();
+    assert_eq!(header["patch_bytes"], base_patch.len());
+    let patch_at = newline + 1;
+    assert_eq!(
+        &sent[patch_at..patch_at + base_patch.len()],
+        base_patch.as_slice()
+    );
+    assert!(
+        sent[patch_at + base_patch.len()..].starts_with(b"# v2 git bundle\n"),
+        "the bundle does not follow the patch"
+    );
+    // The host never saw the director's working tree otherwise: no host-side file named the patch.
+    assert!(!prepare["argv"].to_string().contains("base-patch"));
+    remote.assert_torn_down();
+}
+
+/// A credential-shaped value made of letters only, built at run time: never a real token.
+fn synthetic_secret() -> String {
+    format!("sk-ant-api03-{}", "abcdefghij".repeat(3))
+}
+
+/// A fake builder that writes the synthetic credential to stderr, then does `rest`.
+fn leaking_builder(rest: &str) -> String {
+    format!("echo 'oops {} in the log' >&2\n{rest}", synthetic_secret())
+}
+
+fn local_stderr(remote: &Remote) -> String {
+    fs::read_to_string(remote.lane.lane_dir().join("control/builder.stderr"))
+        .expect("the lane has no builder.stderr")
+}
+
+#[test]
+fn the_remote_stderr_is_fetched_and_redacted_again() {
+    if !sandbox_available() {
+        return;
+    }
+    let secret = synthetic_secret();
+    // A proved run: the builder's own stderr was on the host only, and is here now. The host
+    // redacted it; the line around the value is intact.
+    let remote = Remote::new(&leaking_builder(&proving_builder()), checks());
+    let out = finish(remote.command(&[]));
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    let local = local_stderr(&remote);
+    assert!(local.contains("oops [redacted] in the log"), "{local}");
+    assert!(local.contains("stderr of the builder on fake"), "{local}");
+    assert!(!local.contains(&secret), "{local}");
+    assert!(!local.contains("abcdefghij"), "{local}");
+    remote.assert_torn_down();
+
+    // A refuted run keeps it too.
+    let failing = json!([{"id": "edit", "command": "grep -q nothere README.md"}]);
+    let remote = Remote::new(&leaking_builder(&run_checks(&["edit"])), failing);
+    let out = finish(remote.command(&[]));
+    assert_eq!(out.status.code(), Some(2), "{}", text(&out));
+    let local = local_stderr(&remote);
+    assert!(local.contains("oops [redacted] in the log"), "{local}");
+    assert!(!local.contains(&secret), "{local}");
+    remote.assert_torn_down();
+}
+
+/// A `cowproof` for the hosts config that runs the real one, except that `host-agent <verb>`
+/// answers with `reply` (printed as is): a host that does not do what it should.
+fn lying_cowproof(dir: &Path, real: &Path, verb: &str, reply: &str) -> PathBuf {
+    let path = dir.join("cowproof");
+    let script = format!(
+        "#!/bin/sh\nif [ \"$1\" = host-agent ] && [ \"$2\" = {verb} ]; then\n  printf '%s\\n' '{reply}'\n  exit 0\nfi\nexec '{}' \"$@\"\n",
+        real.display()
+    );
+    let _g = fork_lock();
+    fs::write(&path, script).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
+
+#[test]
+fn a_host_that_returns_the_stderr_unredacted_is_redacted_again_by_the_director() {
+    if !sandbox_available() {
+        return;
+    }
+    let secret = synthetic_secret();
+    let wrapper = var_tmp("cp-remote-lying-");
+    let reply = format!("host said {secret} plainly");
+    let remote = Remote::with_host(&proving_builder(), checks(), |lane, entry| {
+        entry["cowproof"] = json!(lying_cowproof(
+            wrapper.path(),
+            &lane.cowproof,
+            "stderr",
+            &reply
+        ));
+    });
+    let out = finish(remote.command(&[]));
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    let local = local_stderr(&remote);
+    assert!(local.contains("host said [redacted] plainly"), "{local}");
+    assert!(!local.contains(&secret), "{local}");
+    assert!(!local.contains("abcdefghij"), "{local}");
+    remote.assert_torn_down();
+}
+
+#[test]
+fn a_host_without_the_protocol_is_an_infrastructure_error_before_anything_is_prepared() {
+    if !sandbox_available() {
+        return;
+    }
+    let wrapper = var_tmp("cp-remote-old-");
+    // What a cowproof of the older protocol answers: no `protocol` field.
+    let old = r#"{"ok":true,"version":"0.1.0","claude":true,"sandbox":true}"#;
+    let remote = Remote::with_host(&proving_builder(), checks(), |lane, entry| {
+        entry["cowproof"] = json!(lying_cowproof(
+            wrapper.path(),
+            &lane.cowproof,
+            "doctor",
+            old
+        ));
+    });
+    let out = finish(remote.command(&[]));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(4), "{}", text(&out));
+    assert!(
+        stderr.contains("host-agent protocol") && stderr.contains("older cowproof"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("nothing was started"), "{stderr}");
+    assert_eq!(
+        remote.steps(),
+        ["master", "doctor", "exit"],
+        "{:?}",
+        remote.argvs()
+    );
+    assert!(!remote.remote_lane().exists());
+    assert_eq!(remote.run_json()["status"], "infrastructure");
+}
+
+// ---------------------------------------------------------------------------
 // The host entry and the hosts config
 // ---------------------------------------------------------------------------
 
@@ -715,17 +997,15 @@ fn a_host_entry_without_cowproof_or_claude_says_what_to_add() {
 }
 
 #[test]
-fn allow_dirty_and_unsandboxed_are_refused_with_host() {
+fn unsandboxed_is_refused_with_host() {
     let remote = Remote::new("true\n", checks());
-    for flag in ["--allow-dirty", "--unsandboxed"] {
-        let out = finish(remote.command(&[flag]));
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        assert_eq!(out.status.code(), Some(1), "{}", text(&out));
-        assert!(
-            stderr.contains(&format!("{flag} cannot be combined with --host")),
-            "{stderr}"
-        );
-    }
+    let out = finish(remote.command(&["--unsandboxed"]));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+    assert!(
+        stderr.contains("--unsandboxed cannot be combined with --host"),
+        "{stderr}"
+    );
     assert!(remote.log().is_empty(), "ssh was started");
 }
 

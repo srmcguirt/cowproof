@@ -2,35 +2,54 @@
 //!
 //! The director keeps the runner (queue, rulings, proxy, key, proof, held-out checks); a remote
 //! host runs only the sandboxed processes. This is the closed set of verbs the director may
-//! run there over SSH. `prepare`, `patch`, `doctor` and `cleanup` need no sockets; `builder`
-//! and `check` run sandboxed processes in a prepared lane:
+//! run there over SSH. `prepare`, `patch`, `stderr`, `doctor` and `cleanup` need no sockets;
+//! `builder` and `check` run sandboxed processes in a prepared lane:
 //!
-//! - `prepare --lane-id <id> --base <sha> --director-version <v> [--base-patch <file>]`: a git
-//!   bundle on stdin that contains `<sha>`. The lane is built by the local runner's own
-//!   `prepare_lane` (same layout, permissions, isolated clone, launch baseline and
-//!   `control/lane.json`) from a throwaway source repository made out of the bundle, with the
-//!   base patch applied there as uncommitted work, so there is no second clone implementation.
+//! - `prepare --lane-id <id> --base <sha> --director-version <v> --protocol <n>`: stdin is
+//!   one JSON header line `{"patch_bytes":M}`, then exactly M bytes of the director's
+//!   `base.patch` (M may be 0), then a git bundle that contains `<sha>`, to end of file. The
+//!   patch is the only part whose length the director knows before it starts sending (the
+//!   bundle is streamed from `git bundle create -`), so only it is counted and the bundle is
+//!   delimited by end of file: no temporary file on the director and nothing ambiguous. The
+//!   lane is built by the local runner's own `prepare_lane` (same layout, permissions,
+//!   isolated clone, launch baseline and `control/lane.json`) from a throwaway source
+//!   repository made out of the bundle, with the base patch applied there as uncommitted work,
+//!   so there is no second clone implementation.
 //! - `patch --lane-id <id>`: the lane patch, the bytes `cowproof run` writes to `lane.patch`,
 //!   from the same `capture_patch` (run in the check sandbox, because the builder owns the
 //!   clone's `.git`).
-//! - `doctor [--claude-bin <name>]`: the preflight's `sandbox` and `claude` checks.
+//! - `stderr --lane-id <id>`: the last [`MAX_STDERR_FETCH`] bytes of `control/builder.stderr`
+//!   (already redacted here; the director redacts them again), raw, empty when there is none.
+//! - `doctor [--claude-bin <name>]`: the preflight's `sandbox` and `claude` checks, and the
+//!   protocol this binary speaks.
 //! - `cleanup --lane-id <id>`: removes `<root>/<id>`; idempotent; never follows a link.
-//! - `builder --lane-id <id>`: one JSON launch spec on stdin ([`BuilderSpec`]); starts the
-//!   builder in the lane's sandbox, through the same `write_lane_files` and `builder_command`
-//!   as `cowproof run`. The builder's stdout is this process's stdout, byte for byte; its
-//!   stderr goes redacted to `control/builder.stderr`; the exit code is the builder's (130
-//!   after SIGINT, SIGTERM or SIGHUP, which end the builder's whole process group). It needs
+//! - `builder --lane-id <id>`: stdin is one JSON launch spec ([`BuilderSpec`]) on ONE line
+//!   ended by `\n`, and then the director's lifeline: it keeps stdin open for as long as the
+//!   builder should live, and end of file on it ends the builder like SIGHUP does (an `ssh`
+//!   without a pty sends no hangup when the director's `ssh` dies, but `sshd` does close the
+//!   command's stdin). It starts the builder in the lane's sandbox, through the same
+//!   `write_lane_files` and `builder_command` as `cowproof run`. The builder's stdout is this
+//!   process's stdout, byte for byte; a stdout that breaks ends the builder too. Its stderr
+//!   goes redacted to `control/builder.stderr` (appended, so a lane's launches follow each
+//!   other); the exit code is the builder's (130 after SIGINT, SIGTERM, SIGHUP, end of stdin
+//!   or a broken stdout, which end the builder's whole process group). It needs
 //!   `<lane>/proxy.sock` and `<lane>/sock/runner.sock` to exist already (forwarded with
 //!   `ssh -R`, D24). A refusal, before anything starts, is the usual JSON error and exit 1.
-//! - `check --lane-id <id> --check-id <id>`: one JSON check spec on stdin ([`CheckSpec`]);
-//!   runs the command through the same `run_check_command` as the local `run_check` tool and
-//!   prints `{ok, exit_code, timed_out, output_tail}`. It exits 0 whenever the check ran
-//!   (`ok` says whether it passed) and 1, with the JSON error, when it could not be run.
+//! - `check --lane-id <id> --check-id <id>`: one JSON check spec on stdin ([`CheckSpec`]),
+//!   read to end of file; runs the command through the same `run_check_command` as the local
+//!   `run_check` tool and prints `{ok, exit_code, timed_out, output_tail}`. It exits 0
+//!   whenever the check ran (`ok` says whether it passed) and 1, with the JSON error, when it
+//!   could not be run.
 //!
 //! Every verb prints one JSON object (`{"ok": true, ...}` or `{"ok": false, "error": "..."}`)
-//! and exits 0 or 1, with one exception: `patch` prints the raw patch bytes on success (a
+//! and exits 0 or 1, with two exceptions: `patch` and `stderr` print raw bytes on success (a
 //! patch need not be UTF-8, and JSON would change it), and the JSON error only on failure.
 //! The lanes root is `--root`, or `~/.cache/cowproof/remote-lanes`.
+//!
+//! The protocol ([`HOST_PROTOCOL`]) names the stdin framings above. A director sends it to
+//! `prepare` and reads it from `doctor`; either side refuses a mismatch with a message naming
+//! both numbers, before any lane exists or any builder starts. Protocol 1 (no number) had a
+//! builder spec that ended at end of file and a base patch passed as a host file name.
 
 use crate::preflight::{Check, CheckStatus, PreflightOptions, preflight};
 use crate::run::{
@@ -48,13 +67,14 @@ use cowproof_run::{LaneLayout, NetworkMode, lane_tmp};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{BufRead, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::signal::unix::{SignalKind, signal};
+use tokio::sync::oneshot;
 use tokio::time::Instant as TokioInstant;
 
 /// The remote host's side of D27.
@@ -76,15 +96,22 @@ enum HostAgentAction {
         /// The director's cowproof version; this binary must be the same
         #[arg(long)]
         director_version: String,
-        /// A file on this host with the director's `base.patch`, applied on top of the base
+        /// The host-agent protocol the director speaks; this binary must speak the same
         #[arg(long)]
-        base_patch: Option<PathBuf>,
+        protocol: Option<u32>,
         /// Directory that holds the lanes (default: ~/.cache/cowproof/remote-lanes)
         #[arg(long)]
         root: Option<PathBuf>,
     },
     /// Print the lane patch (raw bytes) against the launch baseline.
     Patch {
+        #[arg(long)]
+        lane_id: String,
+        #[arg(long)]
+        root: Option<PathBuf>,
+    },
+    /// Print the builder's redacted stderr (raw bytes, the last megabyte).
+    Stderr {
         #[arg(long)]
         lane_id: String,
         #[arg(long)]
@@ -105,7 +132,7 @@ enum HostAgentAction {
         #[arg(long)]
         root: Option<PathBuf>,
     },
-    /// Run the builder from the launch spec on stdin; its stdout is ours.
+    /// Run the builder from the launch spec line on stdin; its stdout is ours. End of stdin ends it.
     Builder {
         #[arg(long)]
         lane_id: String,
@@ -131,17 +158,10 @@ pub async fn run(args: HostAgentArgs) -> Result<i32> {
             lane_id,
             base,
             director_version,
-            base_patch,
+            protocol,
             root,
-        } => remote_root(root).and_then(|root| {
-            prepare(
-                &lane_id,
-                &base,
-                &director_version,
-                base_patch.as_deref(),
-                &root,
-            )
-        }),
+        } => remote_root(root)
+            .and_then(|root| prepare(&lane_id, &base, &director_version, protocol, &root)),
         HostAgentAction::Doctor { claude_bin, root } => match remote_root(root) {
             Ok(root) => doctor(&claude_bin, &root).await,
             Err(e) => Err(e),
@@ -155,7 +175,7 @@ pub async fn run(args: HostAgentArgs) -> Result<i32> {
                 Err(e) => Err(e),
             };
             return match launched {
-                Ok(launched) => match drive_builder(launched).await {
+                Ok(launched) => match drive_builder(launched, watch_stdin()).await {
                     Ok(code) => Ok(code),
                     Err(e) => print_outcome(Err(e)),
                 },
@@ -184,18 +204,27 @@ pub async fn run(args: HostAgentArgs) -> Result<i32> {
                 Ok(root) => patch(&lane_id, &root).await,
                 Err(e) => Err(e),
             };
-            return Ok(match bytes {
-                Ok(bytes) => {
-                    let mut out = std::io::stdout().lock();
-                    out.write_all(&bytes)?;
-                    out.flush()?;
-                    0
-                }
-                Err(e) => print_outcome(Err(e))?,
-            });
+            return raw_outcome(bytes);
+        }
+        HostAgentAction::Stderr { lane_id, root } => {
+            let bytes = remote_root(root).and_then(|root| builder_stderr(&lane_id, &root));
+            return raw_outcome(bytes);
         }
     };
     print_outcome(outcome)
+}
+
+/// The raw bytes of a verb that prints them (`patch`, `stderr`), or its JSON error.
+fn raw_outcome(bytes: Result<Vec<u8>>) -> Result<i32> {
+    Ok(match bytes {
+        Ok(bytes) => {
+            let mut out = std::io::stdout().lock();
+            out.write_all(&bytes)?;
+            out.flush()?;
+            0
+        }
+        Err(e) => print_outcome(Err(e))?,
+    })
 }
 
 /// Print a verb's JSON and return its exit code. A returned error becomes `ok: false`.
@@ -259,12 +288,69 @@ fn git(dir: &Path, args: &[&str]) -> Result<()> {
     Ok(())
 }
 
-/// Build the lane `<root>/<id>` from the bundle on stdin.
+/// The host-agent protocol this binary speaks (see the module doc). Bump it whenever a stdin
+/// framing or a verb's meaning changes: the director sends it to `prepare` and reads it from
+/// `doctor`, and either side refuses a different number before anything runs.
+pub(crate) const HOST_PROTOCOL: u32 = 2;
+
+/// The most a `prepare` header line may hold.
+const MAX_HEADER_BYTES: u64 = 1024;
+/// The most a base patch may hold.
+const MAX_BASE_PATCH_BYTES: u64 = 256 * 1024 * 1024;
+/// How much of `control/builder.stderr` the `stderr` verb returns (its end).
+pub(crate) const MAX_STDERR_FETCH: u64 = 1024 * 1024;
+
+/// The first line of `prepare`'s stdin.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PrepareHeader {
+    /// How many bytes of the director's `base.patch` follow the header line; the git bundle
+    /// follows them, to end of file.
+    patch_bytes: u64,
+}
+
+/// Read `prepare`'s stdin: the header line, the base patch (into `patch_file`, when it has
+/// bytes) and the bundle (into `bundle_file`). Returns whether there is a base patch.
+fn read_prepare_input(patch_file: &Path, bundle_file: &Path) -> Result<bool> {
+    let mut stdin = std::io::stdin().lock();
+    let mut line = Vec::new();
+    (&mut stdin)
+        .take(MAX_HEADER_BYTES + 1)
+        .read_until(b'\n', &mut line)
+        .context("reading the header line from stdin")?;
+    if line.last() != Some(&b'\n') {
+        bail!(
+            "stdin must start with a one-line JSON header ended by a newline (this host speaks \
+             host-agent protocol {HOST_PROTOCOL})"
+        );
+    }
+    let header: PrepareHeader =
+        serde_json::from_slice(&line).context("the header line is not a valid prepare header")?;
+    if header.patch_bytes > MAX_BASE_PATCH_BYTES {
+        bail!("the base patch is larger than {MAX_BASE_PATCH_BYTES} bytes");
+    }
+    if header.patch_bytes > 0 {
+        let mut file = fs::File::create(patch_file).context("creating the base patch file")?;
+        let copied = std::io::copy(&mut (&mut stdin).take(header.patch_bytes), &mut file)
+            .context("reading the base patch from stdin")?;
+        if copied != header.patch_bytes {
+            bail!(
+                "stdin ended inside the base patch ({copied} of {} bytes)",
+                header.patch_bytes
+            );
+        }
+    }
+    let mut file = fs::File::create(bundle_file).context("creating the bundle file")?;
+    std::io::copy(&mut stdin, &mut file).context("reading the bundle from stdin")?;
+    Ok(header.patch_bytes > 0)
+}
+
+/// Build the lane `<root>/<id>` from the framed stdin (header, base patch, bundle).
 fn prepare(
     lane_id: &str,
     base: &str,
     director_version: &str,
-    base_patch: Option<&Path>,
+    protocol: Option<u32>,
     root: &Path,
 ) -> Result<Value> {
     validate_lane_id(lane_id)?;
@@ -274,15 +360,18 @@ fn prepare(
             "version mismatch: the director runs cowproof {director_version}, this host runs {version}"
         );
     }
-    validate_commit_id(base)?;
-    let base_patch = base_patch
-        .map(|p| std::env::current_dir().map(|cwd| cwd.join(p)))
-        .transpose()?;
-    if let Some(p) = &base_patch
-        && !p.is_file()
-    {
-        bail!("the base patch {} is not a file", p.display());
+    match protocol {
+        Some(p) if p == HOST_PROTOCOL => {}
+        Some(p) => bail!(
+            "protocol mismatch: the director speaks host-agent protocol {p}, this host speaks \
+             protocol {HOST_PROTOCOL}; install the same cowproof build on both"
+        ),
+        None => bail!(
+            "protocol mismatch: the director named no host-agent protocol (it is older than this \
+             host's protocol {HOST_PROTOCOL}); install the same cowproof build on both"
+        ),
     }
+    validate_commit_id(base)?;
 
     fs::create_dir_all(root).with_context(|| format!("creating {}", root.display()))?;
     let root = root.canonicalize().context("resolving the lanes root")?;
@@ -304,19 +393,17 @@ fn prepare(
     let incoming = Throwaway(incoming);
     let src = incoming.0.join("src");
     let bundle = incoming.0.join("in.bundle");
-    {
-        let mut file = fs::File::create(&bundle).context("creating the bundle file")?;
-        std::io::copy(&mut std::io::stdin().lock(), &mut file)
-            .context("reading the bundle from stdin")?;
-    }
+    let patch_file = incoming.0.join("base.patch");
+    let has_base_patch = read_prepare_input(&patch_file, &bundle)?;
     git(&incoming.0, &["init", "-q", "src"])?;
     git(&src, &["bundle", "unbundle", &bundle.to_string_lossy()]).context("reading the bundle")?;
     if git(&src, &["cat-file", "-e", &format!("{base}^{{commit}}")]).is_err() {
         bail!("the bundle does not contain commit {base}");
     }
     git(&src, &["checkout", "-q", "--detach", base])?;
-    if let Some(p) = &base_patch {
-        git(&src, &["apply", "--", &p.to_string_lossy()]).context("applying the base patch")?;
+    if has_base_patch {
+        git(&src, &["apply", "--", &patch_file.to_string_lossy()])
+            .context("applying the base patch")?;
     }
 
     let prepared = prepare_lane(
@@ -324,7 +411,7 @@ fn prepare(
         &root,
         lane_id,
         PrepareOptions {
-            allow_dirty: base_patch.is_some(),
+            allow_dirty: has_base_patch,
         },
     )?;
     // As the runner does right after `prepare_lane`: the builder's and the checks' TMPDIR.
@@ -377,6 +464,27 @@ async fn patch_with_home(lane_id: &str, root: &Path, home: PathBuf) -> Result<Ve
     capture_patch(&layout, &control.launch_commit, &path).await
 }
 
+/// The end of `control/builder.stderr`, at most [`MAX_STDERR_FETCH`] bytes of it. The runner's
+/// pump wrote it redacted; a lane whose builder never ran has none, which is an empty answer.
+fn builder_stderr(lane_id: &str, root: &Path) -> Result<Vec<u8>> {
+    let lane_dir = lane_dir_of(lane_id, root)?;
+    let path = lane_dir.join("control/builder.stderr");
+    match fs::symlink_metadata(&path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => bail!("cannot look at {}: {e}", path.display()),
+        Ok(meta) if !meta.is_file() => bail!("{} is not a regular file", path.display()),
+        Ok(_) => {}
+    }
+    let mut file = fs::File::open(&path).with_context(|| format!("opening {}", path.display()))?;
+    let len = file.metadata()?.len();
+    file.seek(SeekFrom::Start(len.saturating_sub(MAX_STDERR_FETCH)))?;
+    let mut bytes = Vec::new();
+    file.take(MAX_STDERR_FETCH)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("reading {}", path.display()))?;
+    Ok(bytes)
+}
+
 /// The preflight's `sandbox` and `claude` checks. `ok` means both pass; the key is not
 /// checked, because a remote host must not have one (D27).
 async fn doctor(claude_bin: &str, root: &Path) -> Result<Value> {
@@ -405,6 +513,7 @@ async fn doctor(claude_bin: &str, root: &Path) -> Result<Value> {
     Ok(json!({
         "ok": passed(sandbox) && passed(claude),
         "version": env!("CARGO_PKG_VERSION"),
+        "protocol": HOST_PROTOCOL,
         "claude": passed(claude),
         "claude_detail": claude.detail,
         "sandbox": passed(sandbox),
@@ -438,7 +547,7 @@ fn cleanup(lane_id: &str, root: &Path) -> Result<Value> {
 /// The most a spec read from stdin may hold.
 const MAX_SPEC_BYTES: u64 = 16 * 1024 * 1024;
 
-/// Read one JSON spec from stdin, refuse one that holds a credential, then parse it as `T`.
+/// Read one JSON spec from stdin to end of file (`check`).
 fn read_spec<T: for<'de> Deserialize<'de>>() -> Result<T> {
     let mut bytes = Vec::new();
     std::io::stdin()
@@ -449,7 +558,39 @@ fn read_spec<T: for<'de> Deserialize<'de>>() -> Result<T> {
     if bytes.len() as u64 > MAX_SPEC_BYTES {
         bail!("the spec is larger than {MAX_SPEC_BYTES} bytes");
     }
-    let raw: Value = serde_json::from_slice(&bytes).context("the spec is not one JSON value")?;
+    parse_spec(&bytes)
+}
+
+/// Read one JSON spec that is one line ended by a newline (`builder`), and leave the rest of
+/// stdin alone: it is the director's lifeline, and its end is a stop signal ([`watch_stdin`]).
+/// A spec that ends at end of file instead of a newline comes from a director that speaks an
+/// older protocol, and is refused as such.
+fn read_spec_line<T: for<'de> Deserialize<'de>>() -> Result<T> {
+    let mut bytes = Vec::new();
+    let mut stdin = std::io::stdin().lock();
+    (&mut stdin)
+        .take(MAX_SPEC_BYTES + 2)
+        .read_until(b'\n', &mut bytes)
+        .context("reading the spec from stdin")?;
+    if bytes.last() != Some(&b'\n') {
+        if bytes.len() as u64 > MAX_SPEC_BYTES {
+            bail!("the spec is larger than {MAX_SPEC_BYTES} bytes");
+        }
+        bail!(
+            "the spec must be one JSON line ended by a newline, with stdin kept open after it \
+             (this host speaks host-agent protocol {HOST_PROTOCOL}; the director may be older)"
+        );
+    }
+    bytes.pop();
+    if bytes.len() as u64 > MAX_SPEC_BYTES {
+        bail!("the spec is larger than {MAX_SPEC_BYTES} bytes");
+    }
+    parse_spec(&bytes)
+}
+
+/// Parse one JSON spec, refuse one that holds a credential, then read it as `T`.
+fn parse_spec<T: for<'de> Deserialize<'de>>(bytes: &[u8]) -> Result<T> {
+    let raw: Value = serde_json::from_slice(bytes).context("the spec is not one JSON value")?;
     if let Some(at) = find_secret(&raw, "") {
         // The place only: the value is never repeated.
         bail!("the spec contains an API key or credential (at {at}); a remote host never gets one");
@@ -573,7 +714,7 @@ fn forwarded_socket(path: &Path, what: &str) -> Result<()> {
 /// happens before anything runs and before any lane file changes, except when the resume id is
 /// the thing refused (the files are then written but nothing starts).
 fn builder_launch(lane_id: &str, root: &Path) -> Result<BuilderLaunched> {
-    let spec: BuilderSpec = read_spec()?;
+    let spec: BuilderSpec = read_spec_line()?;
     let lane_dir = lane_dir_of(lane_id, root)?;
     let home = real_home()?;
     let layout = LaneLayout::for_lane_dir(&lane_dir, home.clone())?;
@@ -689,7 +830,7 @@ impl Drop for Group {
     }
 }
 
-/// The next SIGINT, SIGTERM or SIGHUP (the last is what an SSH channel that closes sends).
+/// The next SIGINT, SIGTERM or SIGHUP (the last is what a pty hangup sends).
 async fn stop_signal(
     sigint: &mut tokio::signal::unix::Signal,
     sigterm: &mut tokio::signal::unix::Signal,
@@ -702,46 +843,100 @@ async fn stop_signal(
     }
 }
 
+/// The director's lifeline: resolves when stdin reaches end of file or fails. It is called after
+/// the spec line was read, so what is left of stdin is the open pipe the director keeps for the
+/// builder's whole life; `sshd` closes it when the director's `ssh` dies, and an `ssh` without
+/// a pty sends no hangup, so this is the only way the host learns. Anything the director sends
+/// on it is read and ignored. A plain thread, because a blocking read cannot be cancelled and
+/// must not keep the process from exiting.
+fn watch_stdin() -> oneshot::Receiver<()> {
+    let (tx, rx) = oneshot::channel();
+    std::thread::spawn(move || {
+        let mut stdin = std::io::stdin().lock();
+        let mut buf = [0u8; 4096];
+        loop {
+            match stdin.read(&mut buf) {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(_) => break,
+            }
+        }
+        let _ = tx.send(());
+    });
+    rx
+}
+
+/// Copy the builder's stdout to ours, byte for byte, flushing each piece. Only a failure to
+/// write is an error (our stdout is the SSH channel, and a broken one means the director is
+/// gone); a failure to read just ends the copy.
+async fn forward_stdout(mut from: tokio::process::ChildStdout) -> std::io::Result<()> {
+    let mut out = tokio::io::stdout();
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = match from.read(&mut buf).await {
+            Ok(0) => return Ok(()),
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return Ok(()),
+        };
+        out.write_all(&buf[..n]).await?;
+        out.flush().await?;
+    }
+}
+
 /// Run the launched builder to its end. Its stdout is this process's stdout; its stderr is
-/// written redacted to `control/builder.stderr` by the runner's own pump. The first stop signal
-/// ends the builder's whole process group (SIGTERM, then SIGKILL after the same grace the local
-/// runner gives); when the leader exits, whatever it left running is killed. Returns the
-/// builder's exit code, or the runner's interrupted code (130) after a signal.
-async fn drive_builder(launched: BuilderLaunched) -> Result<i32> {
+/// written redacted to `control/builder.stderr` by the runner's own pump. The first stop ends
+/// the builder's whole process group (SIGTERM, then SIGKILL after the same grace the local
+/// runner gives): a SIGINT, SIGTERM or SIGHUP, end of file on `lifeline` (the director let go
+/// of stdin, or its `ssh` died), or a stdout that cannot be written. When the leader exits,
+/// whatever it left running is killed. Returns the builder's exit code, or the runner's
+/// interrupted code (130) after a stop.
+async fn drive_builder(
+    launched: BuilderLaunched,
+    mut lifeline: oneshot::Receiver<()>,
+) -> Result<i32> {
     use std::os::unix::process::ExitStatusExt;
     // Handlers first, so a signal between here and the spawn is not lost to the default.
     let mut sigint = signal(SignalKind::interrupt()).context("installing the SIGINT handler")?;
     let mut sigterm = signal(SignalKind::terminate()).context("installing the SIGTERM handler")?;
     let mut sighup = signal(SignalKind::hangup()).context("installing the SIGHUP handler")?;
+    // Appended: a lane's launches (a resume after a park) follow each other in one file, which
+    // the director fetches once at the end.
     let stderr_file = fs::OpenOptions::new()
         .create(true)
-        .write(true)
-        .truncate(true)
+        .append(true)
         .open(&launched.stderr_file)
         .with_context(|| format!("opening {}", launched.stderr_file.display()))?;
     let mut command = launched.command;
     let mut child = command
-        .stdout(Stdio::inherit())
+        .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .context("launching the builder")?;
     // `builder_command` made the child its own group leader, so its pid is the pgid.
     let pgid = child.id().context("reading the builder's process id")?;
     let _group = Group(pgid);
+    let stdout = child.stdout.take().context("taking the builder's stdout")?;
     let stderr = child.stderr.take().context("taking the builder's stderr")?;
     let mut sink = tokio::fs::File::from_std(stderr_file);
     let mut pending: Vec<u8> = Vec::new();
 
     let mut status = None;
     let mut stderr_done = false;
+    let mut stdout_done = false;
     let mut abandoned = false;
+    let mut stdout_abandoned = false;
     let mut interrupted = false;
     let mut kill_at: Option<TokioInstant> = None;
     let mut drain_until: Option<TokioInstant> = None;
     {
         let pump = pump_stderr(stderr, &mut sink, &mut pending, MAX_STDERR_LINE);
         tokio::pin!(pump);
-        while !(status.is_some() && (stderr_done || abandoned)) {
+        let forward = forward_stdout(stdout);
+        tokio::pin!(forward);
+        while !(status.is_some() && (stderr_done || abandoned) && (stdout_done || stdout_abandoned))
+        {
             tokio::select! {
                 waited = child.wait(), if status.is_none() => {
                     status = Some(waited.context("waiting for the builder")?);
@@ -757,10 +952,29 @@ async fn drive_builder(launched: BuilderLaunched) -> Result<i32> {
                         eprintln!("warning: builder.stderr: {e}");
                     }
                 }
-                _ = stop_signal(&mut sigint, &mut sigterm, &mut sighup), if !interrupted => {
+                result = &mut forward, if !stdout_done => {
+                    stdout_done = true;
+                    if let Err(e) = result {
+                        // Nobody is reading: the director is gone, so end the builder.
+                        eprintln!("the builder's output cannot be delivered ({e}): ending the builder");
+                        if !interrupted {
+                            interrupted = true;
+                            if status.is_none() {
+                                terminate_process_group(pgid);
+                                kill_at = Some(TokioInstant::now() + TERM_GRACE);
+                            }
+                        }
+                    }
+                }
+                why = async {
+                    tokio::select! {
+                        _ = stop_signal(&mut sigint, &mut sigterm, &mut sighup) => "interrupted",
+                        _ = &mut lifeline => "the director's stdin closed",
+                    }
+                }, if !interrupted => {
                     interrupted = true;
                     if status.is_none() {
-                        eprintln!("interrupted: ending the builder");
+                        eprintln!("{why}: ending the builder");
                         terminate_process_group(pgid);
                         kill_at = Some(TokioInstant::now() + TERM_GRACE);
                     }
@@ -771,6 +985,9 @@ async fn drive_builder(launched: BuilderLaunched) -> Result<i32> {
                 }
                 _ = sleep_until_opt(drain_until), if drain_until.is_some() && !stderr_done && !abandoned => {
                     abandoned = true;
+                }
+                _ = sleep_until_opt(drain_until), if drain_until.is_some() && !stdout_done && !stdout_abandoned => {
+                    stdout_abandoned = true;
                 }
             }
         }

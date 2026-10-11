@@ -14,13 +14,21 @@ It emulates only what cowproof uses:
   -S ctl -O exit <target>   stops the master and waits for it
   -S ctl <target> <words>   runs the words, joined by spaces and handed to `sh -c` like a real
                             sshd does, on this machine, in a fresh environment (a new HOME and
-                            PATH, none of the caller's variables), with stdin and stdout passed
-                            through. A SIGTERM, SIGINT or SIGHUP for this process is sent on to
-                            the command's group as SIGHUP: what a pty hangup does when a real
-                            ssh client dies.
+                            PATH, none of the caller's variables). Stdin, stdout and stderr go
+                            through THIS process, as they go through ssh and sshd, and nothing
+                            else is emulated: stdin is relayed as it arrives and closed on the
+                            command when this process's stdin reaches end of file OR this
+                            process dies (SIGKILL included, because the pipe that carries it is
+                            held only here), which is what sshd does when the client goes. No
+                            hangup is sent to the command, because an ssh without a pty sends
+                            none. When this process dies the command's stdout and stderr pipes
+                            lose their reader, as they do when sshd's channel closes.
 
 Every invocation appends one JSON line to $FAKE_SSH_LOG: its argv and, for a command, the file
-that holds the bytes it read on stdin ($FAKE_SSH_DIR/stdin.<pid>). Environment: FAKE_SSH_LOG,
+that holds the bytes it read on stdin ($FAKE_SSH_DIR/stdin.<pid>, written as they arrive), and a
+`command-started` line with the command's pid, this process's pid (`ssh_pid`) and the command
+line (`command`; not `argv`, which only the invocation lines carry).
+Environment: FAKE_SSH_LOG,
 FAKE_SSH_DIR and FAKE_REMOTE_HOME (the remote user's home and working directory). When
 FAKE_SSH_FORBIDDEN and FAKE_REMOTE_ROOT are set, the fake looks through every file under the
 remote root and home for the forbidden text just before it runs `host-agent cleanup` (the last
@@ -179,14 +187,32 @@ def scan_for_forbidden():
         f.write("".join(h + "\n" for h in hits))
 
 
+def pump_out(src, dst):
+    """Copy the file `src` (the command's stdout or stderr) to `dst` until end of file. When
+    `dst` has no reader any more, close `src`, so the command's next write fails as it does
+    when sshd's channel has closed."""
+    while True:
+        try:
+            data = os.read(src.fileno(), 65536)
+        except (OSError, ValueError):
+            return
+        if not data:
+            return
+        try:
+            dst.write(data)
+            dst.flush()
+        except (OSError, ValueError):
+            src.close()
+            return
+
+
 def run_command(ctl, words):
     if not master_alive(ctl):
         sys.stderr.write("Control socket connect(%s): No such file or directory\n" % ctl)
         return 255
     dirpath = os.environ["FAKE_SSH_DIR"]
     stdin_file = os.path.join(dirpath, "stdin.%d" % os.getpid())
-    with open(stdin_file, "wb") as f:
-        f.write(sys.stdin.buffer.read())
+    open(stdin_file, "wb").close()
     log({"argv": sys.argv[1:], "stdin": stdin_file})
     if " host-agent cleanup " in " ".join(words) + " ":
         scan_for_forbidden()
@@ -198,33 +224,52 @@ def run_command(ctl, words):
         "LOGNAME": "remote",
         "SHELL": "/bin/sh",
     }
-    with open(stdin_file, "rb") as stdin:
-        # Its own session, like a command sshd starts: a signal sent to this process's group
-        # does not reach it, only the SIGHUP below does.
-        child = subprocess.Popen(
-            ["/bin/sh", "-c", "exec " + " ".join(words)],
-            stdin=stdin,
-            env=env,
-            cwd=home,
-            start_new_session=True,
-        )
+    # Its own session, like a command sshd starts: a signal sent to this process's group does
+    # not reach it. Its stdin is a pipe this process holds the only write end of.
+    child = subprocess.Popen(
+        ["/bin/sh", "-c", "exec " + " ".join(words)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env,
+        cwd=home,
+        start_new_session=True,
+    )
+    log({"event": "command-started", "pid": child.pid, "ssh_pid": os.getpid(), "command": " ".join(words)})
 
-        log({"event": "command-started", "pid": child.pid})
+    def relay_stdin():
+        try:
+            with open(stdin_file, "ab") as record:
+                while True:
+                    data = os.read(0, 65536)
+                    if not data:
+                        break
+                    record.write(data)
+                    record.flush()
+                    child.stdin.write(data)
+                    child.stdin.flush()
+        except (OSError, ValueError):
+            pass
+        try:
+            child.stdin.close()
+        except OSError:
+            pass
 
-        def hangup(_sig, _frame):
-            try:
-                os.killpg(child.pid, signal.SIGHUP)
-            except OSError:
-                pass
-
-        for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
-            signal.signal(sig, hangup)
-        while True:
-            try:
-                code = child.wait()
-                break
-            except InterruptedError:
-                continue
+    threading.Thread(target=relay_stdin, daemon=True).start()
+    outs = [
+        threading.Thread(target=pump_out, args=(child.stdout, sys.stdout.buffer), daemon=True),
+        threading.Thread(target=pump_out, args=(child.stderr, sys.stderr.buffer), daemon=True),
+    ]
+    for t in outs:
+        t.start()
+    for sig in (signal.SIGINT, signal.SIGHUP):
+        signal.signal(sig, signal.SIG_DFL)
+    signal.signal(signal.SIGTERM, signal.SIG_DFL)
+    code = child.wait()
+    # The command is done: let its output drain (a stray process may hold the pipes open, so
+    # not for long).
+    for t in outs:
+        t.join(5)
     return 128 - code if code < 0 else code
 
 

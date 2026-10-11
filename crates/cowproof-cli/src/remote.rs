@@ -14,15 +14,27 @@
 //!   builder starts);
 //! - the remote cowproof is told what to do by a JSON spec on stdin, never by the environment.
 //!   A spec holds the lane's own `placeholder-...` key, which only the director's proxy
-//!   accepts; the real key is not in any argv, spec, bundle or environment sent to the host.
+//!   accepts; the real key is not in any argv, spec, bundle or environment sent to the host;
+//! - the builder's stdin is a lifeline: the spec is one line, and the director keeps the pipe
+//!   open for as long as the builder should live. An `ssh` without a pty sends no hangup when
+//!   it dies, but the host's `sshd` closes the command's stdin, and `host-agent builder` ends
+//!   its process group when it sees end of file ([`hold_lifeline`]);
+//! - the director's `base.patch` (an `--allow-dirty` lane) travels with the git bundle on
+//!   `prepare`'s stdin, so the host's lane starts from the same tree as the local one;
+//! - before the host's lane is removed, its redacted `control/builder.stderr` is fetched
+//!   (`host-agent stderr`), redacted again here, and appended to the lane's own, whatever the
+//!   outcome ([`RemoteLane::finish_blocking`]).
 //!
 //! Every ssh argument list is built by [`ssh_argv`] and every remote command line by
 //! [`agent_command`], so the exact bytes are unit-tested here.
 
+use crate::host_agent::{HOST_PROTOCOL, MAX_STDERR_FETCH};
 use anyhow::{Context, Result, anyhow, bail};
+use cowproof_core::redact;
 use cowproof_run::tools::CheckOutcome;
 use serde_json::{Value, json};
 use std::fs;
+use std::io::{Read as _, Write as _};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -43,6 +55,8 @@ const PATCH_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(30);
 /// Removing the remote lane at the end.
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(60);
+/// Fetching the builder's stderr before that: a dead link must not hold the lane's end.
+const STDERR_TIMEOUT: Duration = Duration::from_secs(20);
 /// Stopping the master: the request, then how long the process gets before it is killed.
 const EXIT_TIMEOUT: Duration = Duration::from_secs(10);
 const MASTER_EXIT_WAIT: Duration = Duration::from_secs(5);
@@ -290,6 +304,30 @@ pub(crate) fn builder_spec(p: &BuilderSpecParts<'_>) -> Value {
     spec
 }
 
+/// The spec as `host-agent builder` reads it: one line of compact JSON (which holds no raw
+/// newline) ended by `\n`. The pipe must stay open after it (see [`hold_lifeline`]).
+pub(crate) fn spec_line(spec: &Value) -> Result<Vec<u8>> {
+    let mut bytes = serde_json::to_vec(spec).context("serializing the builder spec")?;
+    bytes.push(b'\n');
+    Ok(bytes)
+}
+
+/// Write the spec line to the builder's ssh and then hold its stdin open until the task is
+/// aborted or dropped, which is when the builder's launch ends: the host takes end of file on
+/// it as the order to stop the builder, whether the director let go on purpose or its `ssh`
+/// died. If the write fails, `ssh` is already gone and the pipe is released at once.
+pub(crate) async fn hold_lifeline(mut stdin: tokio::process::ChildStdin, line: Vec<u8>) {
+    if stdin.write_all(&line).await.is_ok() && stdin.flush().await.is_ok() {
+        std::future::pending::<()>().await;
+    }
+}
+
+/// The header line that starts `prepare`'s stdin: how many bytes of base patch follow it
+/// (the bundle follows those, to end of file).
+fn prepare_header(patch_bytes: usize) -> Vec<u8> {
+    format!("{}\n", json!({"patch_bytes": patch_bytes})).into_bytes()
+}
+
 /// `host-agent check`'s `CheckSpec`.
 pub(crate) fn check_spec(command: &str, timeout_secs: u64, port_base: Option<u16>) -> Value {
     let mut spec = json!({"command": command, "timeout_secs": timeout_secs});
@@ -389,6 +427,9 @@ pub(crate) struct LocalSide<'a> {
     pub repo: &'a Path,
     /// The lane's base commit (the repository's HEAD when the lane was prepared).
     pub base_commit: &'a str,
+    /// The lane's `base.patch` (an `--allow-dirty` lane with changes), the same bytes the local
+    /// proof applies. The host applies it on top of the base before its launch baseline.
+    pub base_patch: Option<&'a [u8]>,
     /// The files the local launch baseline removed. The host must remove the same ones, or the
     /// patch it returns would not apply to the tree the proof rebuilds.
     pub launch_removed: &'a [String],
@@ -405,6 +446,8 @@ struct State {
     prepare_attempted: bool,
     /// The absolute lane directory on the host, as `prepare` reported it.
     remote_dir: Option<PathBuf>,
+    /// A builder was started there, so it has a `builder.stderr` worth fetching.
+    builder_started: bool,
     finished: bool,
 }
 
@@ -547,6 +590,18 @@ impl RemoteLane {
                 stderr_tail(&ran.stderr)
             );
         };
+        if report["error"].as_str().is_none() {
+            let theirs = report["protocol"].as_u64();
+            if theirs != Some(u64::from(HOST_PROTOCOL)) {
+                bail!(
+                    "remote doctor on {}: the host speaks host-agent protocol {} and this cowproof \
+                     speaks {HOST_PROTOCOL}; install the same cowproof build on both",
+                    self.host.alias,
+                    theirs.map_or("1 (it reports none: an older cowproof)".to_string(), |p| p
+                        .to_string())
+                );
+            }
+        }
         if report["ok"] == true {
             return Ok(());
         }
@@ -568,9 +623,10 @@ impl RemoteLane {
         )
     }
 
-    /// `host-agent prepare`: the base as a git bundle on stdin. The lane the host builds must
-    /// agree with the local one about the base and the launch baseline, or the patch it returns
-    /// would not apply to the tree the proof rebuilds.
+    /// `host-agent prepare`: the base patch and the base as a git bundle on stdin (a header
+    /// line with the patch's length, the patch, then the bundle to end of file). The lane the
+    /// host builds must agree with the local one about the base, the base patch and the launch
+    /// baseline, or the patch it returns would not apply to the tree the proof rebuilds.
     async fn prepare(&self, side: &LocalSide<'_>) -> Result<()> {
         self.lock().prepare_attempted = true;
         // `git bundle create` takes a ref, not a bare object name, and the lane's base is the
@@ -592,6 +648,9 @@ impl RemoteLane {
             ]
             .map(String::from),
         );
+        args.extend(["--protocol".to_string(), HOST_PROTOCOL.to_string()]);
+        let patch: Vec<u8> = side.base_patch.map(<[u8]>::to_vec).unwrap_or_default();
+        let header = prepare_header(patch.len());
         let ssh_args = self.argv(&Step::Agent {
             verb: "prepare",
             args: &args,
@@ -619,7 +678,12 @@ impl RemoteLane {
         let mut git_stderr = git.stderr.take().context("taking git's stderr")?;
         let mut ssh_stdin = ssh.stdin.take().context("taking ssh's stdin")?;
         let copy = async move {
-            let copied = tokio::io::copy(&mut bundle, &mut ssh_stdin).await;
+            let copied = async {
+                ssh_stdin.write_all(&header).await?;
+                ssh_stdin.write_all(&patch).await?;
+                tokio::io::copy(&mut bundle, &mut ssh_stdin).await
+            }
+            .await;
             let _ = ssh_stdin.shutdown().await;
             copied
         };
@@ -720,12 +784,14 @@ impl RemoteLane {
         Ok(())
     }
 
-    /// The command that runs the builder on the host: `host-agent builder` with the spec on
-    /// stdin (the caller writes it and closes stdin), its stdout the builder's stream. The
-    /// builder's ssh is the leader of its own process group, as a local builder is, so ending
-    /// that group ends the ssh and so the remote builder (`host-agent builder` ends its own
-    /// group on SIGHUP, SIGINT and SIGTERM).
+    /// The command that runs the builder on the host: `host-agent builder` with the spec line
+    /// on stdin (the caller writes it with [`spec_line`] and keeps the pipe open with
+    /// [`hold_lifeline`]), its stdout the builder's stream. The builder's ssh is the leader of
+    /// its own process group, as a local builder is, so ending that group ends the ssh; the
+    /// host sees its stdin close and ends the remote builder's group (`host-agent builder`
+    /// does the same on SIGHUP, SIGINT and SIGTERM).
     pub(crate) fn builder_command(&self) -> Command {
+        self.lock().builder_started = true;
         let args = self.lane_args();
         let mut command = Command::new("ssh");
         command
@@ -813,22 +879,29 @@ impl RemoteLane {
         let _ = tokio::task::spawn_blocking(move || lane.finish_blocking()).await;
     }
 
-    /// The blocking form of [`RemoteLane::finish`], safe to call from any exit path: `host-agent
-    /// cleanup` (when `prepare` was attempted), then `-O exit`, then the master process itself,
-    /// killed if it will not go.
+    /// The blocking form of [`RemoteLane::finish`], safe to call from any exit path: the
+    /// builder's stderr (when one was started), `host-agent cleanup` (when `prepare` was
+    /// attempted), then `-O exit`, then the master process itself, killed if it will not go.
     pub(crate) fn finish_blocking(&self) {
-        let (cleanup, master) = {
+        let (cleanup, fetch, master) = {
             let mut state = self.lock();
             if state.finished {
                 return;
             }
             state.finished = true;
-            (state.prepare_attempted, state.master.take())
+            (
+                state.prepare_attempted,
+                state.builder_started,
+                state.master.take(),
+            )
         };
         let Some(mut master) = master else {
             return;
         };
         if cleanup {
+            if fetch {
+                self.fetch_stderr();
+            }
             let args = self.lane_args();
             let argv = self.argv(&Step::Agent {
                 verb: "cleanup",
@@ -848,6 +921,102 @@ impl RemoteLane {
                 let _ = master.kill();
                 let _ = master.wait();
                 break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// Best effort, on every outcome: copy the host's `control/builder.stderr` (redacted there)
+    /// to the end of the lane's own, redacted again here, because the director does not trust
+    /// the host's redaction. Bounded in size and time; a failure is a warning, never an error.
+    fn fetch_stderr(&self) {
+        let args = self.lane_args();
+        let argv = self.argv(&Step::Agent {
+            verb: "stderr",
+            args: &args,
+        });
+        let fetched = self
+            .blocking_ssh_output(&argv, STDERR_TIMEOUT, MAX_STDERR_FETCH as usize)
+            .and_then(|bytes| {
+                if bytes.is_empty() {
+                    return Ok(());
+                }
+                self.append_stderr(&bytes)
+            });
+        if let Err(e) = fetched {
+            eprintln!(
+                "[{}] warning: the builder's stderr on {} was not fetched: {e:#}",
+                self.lane_id, self.host.alias
+            );
+        }
+    }
+
+    /// Append the fetched stderr, whole-text redacted, under a header that says where it ran.
+    fn append_stderr(&self, bytes: &[u8]) -> Result<()> {
+        let text = redact(&String::from_utf8_lossy(bytes));
+        let path = self.control.join("builder.stderr");
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .with_context(|| format!("opening {}", path.display()))?;
+        write!(
+            file,
+            "\n--- stderr of the builder on {} ---\n{text}",
+            self.host.alias
+        )?;
+        if !text.ends_with('\n') {
+            writeln!(file)?;
+        }
+        Ok(())
+    }
+
+    /// One ssh to completion, blocking, with `timeout`; its stdout, at most `max` bytes (more is
+    /// an error), is returned and its stderr is appended to `control/ssh-finish.log`.
+    fn blocking_ssh_output(
+        &self,
+        argv: &[String],
+        timeout: Duration,
+        max: usize,
+    ) -> Result<Vec<u8>> {
+        let log = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.control.join("ssh-finish.log"))
+            .context("opening ssh-finish.log")?;
+        let mut child = std::process::Command::new("ssh")
+            .args(argv)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::from(log))
+            .spawn()
+            .context("starting ssh")?;
+        let out = child.stdout.take().context("taking ssh's stdout")?;
+        let reader = std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let _ = out.take(max as u64 + 1).read_to_end(&mut bytes);
+            bytes
+        });
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(status) = child.try_wait()? {
+                let bytes = reader.join().unwrap_or_default();
+                if bytes.len() > max {
+                    bail!("the host sent more than {max} bytes");
+                }
+                if !status.success() {
+                    // A refusing verb prints its reason as JSON on stdout.
+                    let why = last_json(&bytes)
+                        .and_then(|v| v["error"].as_str().map(String::from))
+                        .unwrap_or_default();
+                    bail!("ssh ended with {}: {why}", exit_text(&status));
+                }
+                return Ok(bytes);
+            }
+            if Instant::now() > deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                bail!("ssh did not finish in {timeout:?}");
             }
             std::thread::sleep(Duration::from_millis(50));
         }
@@ -1176,6 +1345,27 @@ mod tests {
             ..parts
         });
         assert_eq!(resumed["resume_session_id"], "0a1b2c3d-1111");
+    }
+
+    #[test]
+    fn a_builder_spec_is_one_line_ended_by_a_newline_even_when_its_text_has_newlines() {
+        let spec = json!({"prompt": "line one\nline two\r\n", "system_prompt": "a\n\nb"});
+        let line = spec_line(&spec).unwrap();
+        assert_eq!(line.last(), Some(&b'\n'));
+        assert_eq!(
+            line.iter().filter(|b| **b == b'\n').count(),
+            1,
+            "a raw newline inside the line: {}",
+            String::from_utf8_lossy(&line)
+        );
+        let back: Value = serde_json::from_slice(&line[..line.len() - 1]).unwrap();
+        assert_eq!(back, spec);
+    }
+
+    #[test]
+    fn the_prepare_header_counts_the_patch_and_nothing_else() {
+        assert_eq!(prepare_header(0), b"{\"patch_bytes\":0}\n");
+        assert_eq!(prepare_header(1234), b"{\"patch_bytes\":1234}\n");
     }
 
     #[test]

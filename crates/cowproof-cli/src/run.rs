@@ -851,7 +851,7 @@ impl Launcher {
                     max_turns: self.max_turns,
                     claude_bin: remote.claude(),
                 });
-                (remote.builder_command(), Some(serde_json::to_vec(&spec)?))
+                (remote.builder_command(), Some(remote::spec_line(&spec)?))
             }
             None => {
                 let files = write_lane_files(
@@ -912,14 +912,16 @@ impl Launcher {
         // `process_group(0)` makes the child its own leader, so its pid is the pgid.
         let pgid = child.id().context("reading the builder's process id")?;
         let _group = GroupGuard::new(pgid, self.interrupt.clone());
-        if let (Some(spec), Some(mut stdin)) = (spec, child.stdin.take()) {
-            // The spec, then end of input: `host-agent builder` reads it to the end. Written
-            // on its own task so a spec larger than the pipe cannot stall the stream pump.
-            tokio::spawn(async move {
-                let _ = stdin.write_all(&spec).await;
-                let _ = stdin.shutdown().await;
-            });
-        }
+        // The spec line, and then the pipe stays open for the builder's whole life: end of
+        // input is how `host-agent builder` learns that the director is gone (an `ssh` without
+        // a pty sends no hangup). Written on its own task so a spec larger than the pipe
+        // cannot stall the stream pump; the pipe is released when this launch ends.
+        let _lifeline = match (spec, child.stdin.take()) {
+            (Some(spec), Some(stdin)) => Some(AbortOnDrop(tokio::spawn(remote::hold_lifeline(
+                stdin, spec,
+            )))),
+            _ => None,
+        };
         let stdout = child.stdout.take().context("taking the builder's stdout")?;
         // The builder never writes to `builder.stderr` itself: the runner reads
         // this pipe and writes the file, redacted, so a raw token is never on disk.
@@ -2203,13 +2205,6 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
     let remote_host = match args.host.as_deref() {
         None => None,
         Some(alias) => {
-            if args.allow_dirty {
-                bail!(
-                    "--allow-dirty cannot be combined with --host: a remote lane starts from a \
-                     commit (the base patch would have to be copied to the host); commit the \
-                     changes first"
-                );
-            }
             if args.unsandboxed {
                 bail!(
                     "--unsandboxed cannot be combined with --host: a remote builder is always sandboxed"
@@ -2503,6 +2498,7 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
         let side = LocalSide {
             repo: &repo,
             base_commit: &prepared.base_commit,
+            base_patch: prepared.base_patch.as_deref(),
             launch_removed: &prepared.launch_removed,
             proxy_socket: &endpoint.socket,
             runner_socket: &socket,
