@@ -553,7 +553,17 @@ fn a_failing_remote_doctor_is_infrastructure_and_nothing_is_prepared() {
 /// --forced"`): the hosts config names `named` as the host's cowproof, the key names the real
 /// binary, and the fake ssh runs only the key's command with the director's as
 /// SSH_ORIGINAL_COMMAND.
+///
+/// The host's owner has written `~/.config/cowproof/host.toml` in the remote home, naming the
+/// `claude` and the lanes root the hosts config also names (a forced key takes both from it).
 fn forced_remote(named: &'static str) -> Remote {
+    let remote = forced_remote_without_config(named);
+    write_host_config(&remote, remote.lane.fake_claude());
+    remote
+}
+
+/// [`forced_remote`] before its owner has written the host config.
+fn forced_remote_without_config(named: &'static str) -> Remote {
     let mut remote = Remote::with_host(&proving_builder(), checks(), |_, entry| {
         entry["cowproof"] = json!(named);
     });
@@ -563,6 +573,26 @@ fn forced_remote(named: &'static str) -> Remote {
         format!("{real} host-agent --forced"),
     );
     remote
+}
+
+/// The owner's host config in the remote home: `claude`, and the remote root of the hosts
+/// config. Its file is mode 0600 in a directory of mode 0700, as `host setup` makes it.
+fn write_host_config(remote: &Remote, claude: &Path) {
+    let dir = remote._home.path().join(".config/cowproof");
+    fs::create_dir_all(&dir).unwrap();
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+    let quoted = |p: &Path| toml::Value::String(p.to_str().unwrap().to_string()).to_string();
+    let file = dir.join("host.toml");
+    fs::write(
+        &file,
+        format!(
+            "claude = {}\nroot = {}\n",
+            quoted(claude),
+            quoted(remote.root.path())
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&file, fs::Permissions::from_mode(0o600)).unwrap();
 }
 
 #[test]
@@ -632,6 +662,57 @@ fn a_forced_key_refuses_a_cowproof_that_is_not_named_cowproof_and_nothing_is_pre
     assert!(!remote.remote_lane().exists());
     assert_eq!(remote.run_json()["status"], "infrastructure");
     assert!(remote.log().iter().any(|e| e["event"] == "master-stopped"));
+    assert_pid_gone(remote.master_pid());
+}
+
+#[test]
+fn a_forced_key_on_a_host_without_the_owners_config_stops_at_doctor_and_says_what_to_run() {
+    if !sandbox_available() {
+        return;
+    }
+    let remote = forced_remote_without_config("/no/such/dir/cowproof");
+    let out = finish(remote.command(&[]));
+    assert_eq!(out.status.code(), Some(4), "{}", text(&out));
+    let shown = text(&out);
+    assert!(
+        shown.contains("host.toml") && shown.contains("missing"),
+        "{shown}"
+    );
+    assert!(shown.contains("host setup --write-config"), "{shown}");
+    assert_eq!(
+        remote.steps(),
+        ["master", "doctor", "exit"],
+        "{:?}",
+        remote.argvs()
+    );
+    assert!(!remote.remote_lane().exists());
+    assert_eq!(remote.run_json()["status"], "infrastructure");
+    assert!(remote.log().iter().any(|e| e["event"] == "master-stopped"));
+    assert_pid_gone(remote.master_pid());
+}
+
+#[test]
+fn a_forced_key_refuses_a_claude_the_director_names_that_is_not_the_owners() {
+    if !sandbox_available() {
+        return;
+    }
+    // The owner's config names one claude; the director's hosts config names another.
+    let remote = forced_remote_without_config("/no/such/dir/cowproof");
+    write_host_config(&remote, Path::new("/opt/owner/claude"));
+    let out = finish(remote.command(&[]));
+    assert_eq!(out.status.code(), Some(4), "{}", text(&out));
+    let shown = text(&out);
+    assert!(
+        shown.contains("--claude-bin") && shown.contains("host.toml"),
+        "{shown}"
+    );
+    assert_eq!(
+        remote.steps(),
+        ["master", "doctor", "exit"],
+        "{:?}",
+        remote.argvs()
+    );
+    assert!(!remote.remote_lane().exists());
     assert_pid_gone(remote.master_pid());
 }
 

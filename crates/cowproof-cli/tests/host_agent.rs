@@ -129,6 +129,7 @@ impl Fx {
             .args(args)
             .current_dir(self.work.path())
             .env("HOME", self.home.path())
+            .env_remove("XDG_CONFIG_HOME")
             .env_remove("ANTHROPIC_API_KEY")
             .stdin(match stdin {
                 Some(p) => Stdio::from(fs::File::open(p).unwrap()),
@@ -1846,12 +1847,19 @@ const FORCED_REFUSED: i32 = 77;
 impl Fx {
     /// `cowproof host-agent --forced` with `original` as SSH_ORIGINAL_COMMAND (or none).
     fn forced(&self, original: Option<&str>) -> Output {
+        self.forced_with_env(original, &[])
+    }
+
+    /// [`Fx::forced`] with more environment variables (`XDG_CONFIG_HOME`, say).
+    fn forced_with_env(&self, original: Option<&str>, env: &[(&str, &Path)]) -> Output {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_cowproof"));
         cmd.args(["host-agent", "--forced"])
             .current_dir(self.work.path())
             .env("HOME", self.home.path())
             .env_remove("ANTHROPIC_API_KEY")
+            .env_remove("XDG_CONFIG_HOME")
             .env_remove("SSH_ORIGINAL_COMMAND")
+            .envs(env.iter().copied())
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -1888,6 +1896,8 @@ fn forced_runs_the_verb_the_client_asked_for_in_this_process() {
         &claude,
         "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo \"fake-claude 9.9.9\"; exit 0; fi\nexit 99\n",
     );
+    // The owner's config says which claude may run and where the lanes are.
+    fx.write_config(&claude, &fx.root);
     // word 0 is not the binary that runs: it only has to be a path named cowproof.
     let asked = format!(
         "/nonexistent dir/it's/cowproof host-agent doctor --claude-bin {} --root {}",
@@ -1923,6 +1933,7 @@ fn forced_runs_the_verb_the_client_asked_for_in_this_process() {
 #[test]
 fn forced_gives_a_verbs_own_failure_its_own_exit_code() {
     let fx = Fx::new();
+    fx.write_config(&fx.work.path().join("claude"), &fx.root);
     let out = fx.forced(Some(&format!(
         "cowproof host-agent cleanup --lane-id ../escape --root {}",
         fx.root.display()
@@ -2002,4 +2013,551 @@ fn forced_is_a_flag_of_host_agent_not_of_a_verb_and_not_combined_with_one() {
     // A verb has no `--forced` of its own.
     let out = fx.agent(&["doctor", "--forced"], None);
     assert_eq!(out.status.code(), Some(2));
+}
+
+// ---------------------------------------------------------------------------
+// The forced key and the host owner's config (D27 clause 6): `~/.config/cowproof/host.toml`
+// decides which `claude` may run and which lanes directory may be used; the director may only
+// repeat it.
+
+impl Fx {
+    /// The owner's config file in this host's home.
+    fn config_file(&self) -> PathBuf {
+        self.home.path().join(".config/cowproof/host.toml")
+    }
+
+    /// The text of a config naming `claude` and `root`.
+    fn config_text(claude: &Path, root: &Path) -> String {
+        let quoted = |p: &Path| toml::Value::String(p.to_str().unwrap().to_string()).to_string();
+        format!("claude = {}\nroot = {}\n", quoted(claude), quoted(root))
+    }
+
+    /// Write the owner's config the way `host setup --write-config` does (file 0600, its
+    /// directory 0700) and return its path.
+    fn write_config(&self, claude: &Path, root: &Path) -> PathBuf {
+        let path = self.config_file();
+        let dir = path.parent().unwrap();
+        fs::create_dir_all(dir).unwrap();
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(&path, Self::config_text(claude, root)).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        path
+    }
+
+    /// An executable that records that it ran, by creating `marker`, and says it is a fake.
+    fn marker_claude(&self, name: &str, marker: &Path) -> PathBuf {
+        let path = self.work.path().join(name);
+        write_executable(
+            &path,
+            &format!(
+                "#!/bin/sh\necho ran > '{}'\nif [ \"$1\" = \"--version\" ]; then echo \"{name} 9.9.9\"; exit 0; fi\nexit 99\n",
+                marker.display()
+            ),
+        );
+        path
+    }
+
+    /// Everything directly inside this host's home.
+    fn home_entries(&self) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(self.home.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+}
+
+/// The error of a forced refusal (exit 77, one JSON line).
+fn forced_refusal_of(fx: &Fx, asked: &str) -> String {
+    assert_forced_refusal(&fx.forced(Some(asked)))
+}
+
+#[test]
+fn forced_doctor_runs_the_configs_claude_not_the_directors() {
+    let fx = Fx::new();
+    let ran = fx.work.path().join("config-claude-ran");
+    let claude = fx.marker_claude("config-claude", &ran);
+    fx.write_config(&claude, &fx.root);
+
+    // Without `--claude-bin`: the config's claude is the one checked.
+    let out = fx.forced(Some("cowproof host-agent doctor"));
+    let json = json_of(&out);
+    assert_eq!(json["config"], "ok", "{json}");
+    assert_eq!(json["claude"], true, "{json}");
+    assert!(
+        json["claude_detail"]
+            .as_str()
+            .unwrap()
+            .contains("config-claude 9.9.9"),
+        "{json}"
+    );
+    assert!(ran.exists(), "the configured claude did not run");
+    assert_eq!(json["protocol"].to_string(), PROTOCOL, "{json}");
+    assert_eq!(json["sandbox"], sandbox_available(), "{json}");
+    assert_eq!(
+        out.status.code(),
+        Some(if sandbox_available() { 0 } else { 1 })
+    );
+
+    // The director may repeat the config's values, as it does, and the answer is the same.
+    let asked = format!(
+        "cowproof host-agent doctor --claude-bin {} --root {}",
+        claude.display(),
+        fx.root.display()
+    );
+    let again = json_of(&fx.forced(Some(&asked)));
+    assert_eq!(again["config"], "ok", "{again}");
+    assert_eq!(again["claude"], true, "{again}");
+    assert!(!fx.root.exists(), "doctor does not create the lanes root");
+}
+
+#[test]
+fn forced_doctor_refuses_a_claude_that_is_not_the_configured_one_and_never_runs_it() {
+    let fx = Fx::new();
+    let config_ran = fx.work.path().join("config-claude-ran");
+    let claude = fx.marker_claude("config-claude", &config_ran);
+    fx.write_config(&claude, &fx.root);
+    let other_ran = fx.work.path().join("other-ran");
+    let other = fx.marker_claude("other-claude", &other_ran);
+    let trap = fx.work.path().join("trap-dir");
+    fs::create_dir(&trap).unwrap();
+    let on_path = fx.marker_claude("claude", &other_ran);
+    fs::rename(&on_path, trap.join("claude")).unwrap();
+
+    for given in [
+        other.to_str().unwrap().to_string(),
+        // The same file by another name is still another name: compared as written.
+        format!(
+            "{}/../{}/config-claude",
+            fx.work.path().display(),
+            fx.work.path().file_name().unwrap().to_str().unwrap()
+        ),
+        // A bare name would be looked up on PATH.
+        "claude".to_string(),
+        trap.join("claude").to_str().unwrap().to_string(),
+    ] {
+        let out = fx.forced(Some(&format!(
+            "cowproof host-agent doctor --claude-bin {given}"
+        )));
+        let error = assert_forced_refusal(&out);
+        assert!(error.contains("--claude-bin"), "{error}");
+        assert!(error.contains("host.toml"), "{error}");
+        // The argument is named, its value is not repeated (a bare `claude` is a word of
+        // the message itself).
+        assert!(given == "claude" || !error.contains(&given), "{error}");
+    }
+    assert!(!other_ran.exists(), "a claude the director chose ran");
+    assert!(
+        !config_ran.exists(),
+        "nothing runs when the call is refused"
+    );
+}
+
+#[test]
+fn forced_without_a_config_only_doctor_answers_and_nothing_runs() {
+    let fx = Fx::new();
+    let ran = fx.work.path().join("other-ran");
+    let other = fx.marker_claude("other-claude", &ran);
+    let home_before = fx.home_entries();
+
+    // doctor says so, with the command the owner runs, and runs no claude at all, whatever
+    // `--claude-bin` it was given.
+    let out = fx.forced(Some(&format!(
+        "cowproof host-agent doctor --claude-bin {}",
+        other.display()
+    )));
+    let json = json_of(&out);
+    assert_eq!(out.status.code(), Some(1), "{json}");
+    assert_eq!(json["ok"], false, "{json}");
+    assert_eq!(json["config"], "missing", "{json}");
+    assert_eq!(json["protocol"].to_string(), PROTOCOL, "{json}");
+    assert_eq!(json["version"], VERSION, "{json}");
+    let fix = json["fix"].as_str().unwrap();
+    assert!(fix.ends_with(" host setup --write-config"), "{fix}");
+    assert!(fix.contains("cowproof"), "{fix}");
+    assert!(
+        json["config_detail"]
+            .as_str()
+            .unwrap()
+            .contains(".config/cowproof/host.toml"),
+        "{json}"
+    );
+    assert!(!ran.exists(), "doctor ran a claude with no config");
+
+    // Every other verb is refused, in the form the director writes.
+    let sha = "a".repeat(40);
+    let root = fx.root.display();
+    for asked in [
+        format!(
+            "cowproof host-agent prepare --lane-id l-1 --base {sha} --director-version {VERSION} --protocol {PROTOCOL} --root {root}"
+        ),
+        format!("cowproof host-agent builder --lane-id l-1 --root {root}"),
+        format!("cowproof host-agent check --lane-id l-1 --check-id c --root {root}"),
+        format!("cowproof host-agent patch --lane-id l-1 --root {root}"),
+        format!("cowproof host-agent stderr --lane-id l-1 --root {root}"),
+        format!("cowproof host-agent cleanup --lane-id l-1 --root {root}"),
+        "cowproof host-agent cleanup --lane-id l-1".to_string(),
+    ] {
+        let error = forced_refusal_of(&fx, &asked);
+        assert!(error.contains("missing"), "{error}");
+        assert!(error.contains("host setup --write-config"), "{error}");
+    }
+    assert!(!fx.root.exists());
+    assert_eq!(
+        fx.home_entries(),
+        home_before,
+        "a refused call wrote in HOME"
+    );
+}
+
+#[test]
+fn forced_refuses_a_config_that_others_could_have_written() {
+    let fx = Fx::new();
+    let ran = fx.work.path().join("config-claude-ran");
+    let claude = fx.marker_claude("config-claude", &ran);
+    let path = fx.write_config(&claude, &fx.root);
+    let cleanup = format!(
+        "cowproof host-agent cleanup --lane-id l-1 --root {}",
+        fx.root.display()
+    );
+
+    // Writable by others (0666), by the group (0620): the verbs refuse, naming the problem;
+    // doctor reports it and runs no claude.
+    for mode in [0o666, 0o620] {
+        fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+        let error = forced_refusal_of(&fx, &cleanup);
+        assert!(error.contains("invalid"), "{error}");
+        assert!(
+            error.contains("writable by its group or by others"),
+            "{mode:o}: {error}"
+        );
+        let out = fx.forced(Some("cowproof host-agent doctor"));
+        let json = json_of(&out);
+        assert_eq!(out.status.code(), Some(1), "{json}");
+        assert_eq!(json["config"], "invalid", "{json}");
+        assert!(
+            json["config_detail"]
+                .as_str()
+                .unwrap()
+                .contains("writable by its group or by others"),
+            "{json}"
+        );
+        assert!(
+            json["fix"]
+                .as_str()
+                .unwrap()
+                .ends_with("--write-config --force"),
+            "{json}"
+        );
+        assert!(
+            !ran.exists(),
+            "doctor ran a claude from an untrusted config"
+        );
+    }
+
+    // A directory that others can write is as bad: they could swap the file.
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    fs::set_permissions(path.parent().unwrap(), fs::Permissions::from_mode(0o770)).unwrap();
+    let error = forced_refusal_of(&fx, &cleanup);
+    assert!(
+        error.contains("directory") && error.contains("writable"),
+        "{error}"
+    );
+    fs::set_permissions(path.parent().unwrap(), fs::Permissions::from_mode(0o700)).unwrap();
+
+    // A link in place of the file, and a file the parser rejects.
+    let real = fx.work.path().join("real-host.toml");
+    fs::rename(&path, &real).unwrap();
+    symlink(&real, &path).unwrap();
+    let error = forced_refusal_of(&fx, &cleanup);
+    assert!(error.contains("symbolic link"), "{error}");
+    fs::remove_file(&path).unwrap();
+    fs::write(&path, "claude = \"relative\"\n").unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    let error = forced_refusal_of(&fx, &cleanup);
+    assert!(error.contains("absolute"), "{error}");
+
+    // Put right, it is trusted again.
+    fx.write_config(&claude, &fx.root);
+    let json = json_of(&fx.forced(Some("cowproof host-agent doctor")));
+    assert_eq!(json["config"], "ok", "{json}");
+}
+
+#[test]
+fn forced_ignores_xdg_config_home_and_reads_only_the_one_in_home() {
+    let fx = Fx::new();
+    let xdg = var_tmp("cp-hostagent-xdg-");
+    let xdg_ran = fx.work.path().join("xdg-claude-ran");
+    let xdg_claude = fx.marker_claude("xdg-claude", &xdg_ran);
+    let dir = xdg.path().join("cowproof");
+    fs::create_dir(&dir).unwrap();
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+    let file = dir.join("host.toml");
+    fs::write(&file, Fx::config_text(&xdg_claude, &fx.root)).unwrap();
+    fs::set_permissions(&file, fs::Permissions::from_mode(0o600)).unwrap();
+    let xdg_env = [("XDG_CONFIG_HOME", xdg.path())];
+
+    // Nothing in HOME: a valid file in XDG_CONFIG_HOME does not count. The client cannot set
+    // HOME through sshd's AcceptEnv the way it can set XDG_*.
+    let doctor = "cowproof host-agent doctor";
+    let out = fx.forced_with_env(Some(doctor), &xdg_env);
+    let json = json_of(&out);
+    assert_eq!(out.status.code(), Some(1), "{json}");
+    assert_eq!(json["config"], "missing", "{json}");
+    assert!(
+        json["config_detail"]
+            .as_str()
+            .unwrap()
+            .contains(&fx.home.path().display().to_string()),
+        "{json}"
+    );
+    let asked = format!(
+        "cowproof host-agent cleanup --lane-id l-1 --root {}",
+        fx.root.display()
+    );
+    let error = assert_forced_refusal(&fx.forced_with_env(Some(&asked), &xdg_env));
+    assert!(error.contains("missing"), "{error}");
+
+    // A different valid file in HOME: that one is the config, and the XDG one never runs.
+    let home_ran = fx.work.path().join("home-claude-ran");
+    let home_claude = fx.marker_claude("home-claude", &home_ran);
+    fx.write_config(&home_claude, &fx.root);
+    for env in [&xdg_env[..], &[]] {
+        let json = json_of(&fx.forced_with_env(Some(doctor), env));
+        assert_eq!(json["config"], "ok", "{json}");
+        assert!(
+            json["claude_detail"]
+                .as_str()
+                .unwrap()
+                .contains("home-claude 9.9.9"),
+            "{json}"
+        );
+    }
+    assert!(home_ran.exists());
+    assert!(!xdg_ran.exists(), "the claude of the XDG file ran");
+    // The director cannot name the XDG file's claude either.
+    let out = fx.forced_with_env(
+        Some(&format!(
+            "cowproof host-agent doctor --claude-bin {}",
+            xdg_claude.display()
+        )),
+        &xdg_env,
+    );
+    let error = assert_forced_refusal(&out);
+    assert!(error.contains("--claude-bin"), "{error}");
+    assert!(!xdg_ran.exists(), "the claude of the XDG file ran");
+}
+
+#[test]
+fn forced_refuses_a_config_that_lies_under_the_lanes_root() {
+    let fx = Fx::new();
+    let ran = fx.work.path().join("config-claude-ran");
+    let claude = fx.marker_claude("config-claude", &ran);
+    let cleanup = |root: &Path| {
+        format!(
+            "cowproof host-agent cleanup --lane-id l-1 --root {}",
+            root.display()
+        )
+    };
+
+    // The lanes root is a directory that holds the config (here the home itself): whatever a
+    // lane holds, the director filled, so the config could be one of its files.
+    fx.write_config(&claude, fx.home.path());
+    let error = forced_refusal_of(&fx, &cleanup(fx.home.path()));
+    assert!(
+        error.contains("invalid") && error.contains("lanes root"),
+        "{error}"
+    );
+    let out = fx.forced(Some("cowproof host-agent doctor"));
+    let json = json_of(&out);
+    assert_eq!(json["config"], "invalid", "{json}");
+    assert!(
+        json["config_detail"]
+            .as_str()
+            .unwrap()
+            .contains("lanes root"),
+        "{json}"
+    );
+    assert!(
+        !ran.exists(),
+        "doctor ran a claude from a config in the lanes root"
+    );
+
+    // Through a link to the root, and as a root that is the config's own directory.
+    let link = fx.work.path().join("home-link");
+    symlink(fx.home.path(), &link).unwrap();
+    fx.write_config(&claude, &link);
+    assert!(forced_refusal_of(&fx, &cleanup(&link)).contains("lanes root"));
+    let own_dir = fx.home.path().join(".config/cowproof");
+    fx.write_config(&claude, &own_dir);
+    assert!(forced_refusal_of(&fx, &cleanup(&own_dir)).contains("lanes root"));
+
+    // The default remote root counts even when the config names another root: with `~/.config`
+    // reaching into it, the config is a file a lane could hold.
+    let inside = fx.home.path().join(".cache/cowproof/remote-lanes/cfg");
+    fs::remove_dir_all(fx.home.path().join(".config")).unwrap();
+    fs::create_dir_all(&inside).unwrap();
+    symlink(&inside, fx.home.path().join(".config")).unwrap();
+    fx.write_config(&claude, &fx.root);
+    let error = forced_refusal_of(&fx, &cleanup(&fx.root));
+    assert!(error.contains("lanes root"), "{error}");
+    fs::remove_file(fx.home.path().join(".config")).unwrap();
+    fs::remove_dir_all(fx.home.path().join(".cache")).unwrap();
+
+    // A root beside the config, not above it, is fine.
+    let sibling = fx.home.path().join("lanes");
+    fx.write_config(&claude, &sibling);
+    let json = json_of(&fx.forced(Some("cowproof host-agent doctor")));
+    assert_eq!(json["config"], "ok", "{json}");
+}
+
+#[test]
+fn forced_root_must_be_the_configured_one_for_every_verb() {
+    let fx = Fx::new();
+    let claude = fx.work.path().join("claude");
+    write_executable(&claude, "#!/bin/sh\nexit 0\n");
+    fx.write_config(&claude, &fx.root);
+
+    // Another lanes directory the host user can write, holding a lane that must survive.
+    let other = fx.work.path().join("somewhere-else");
+    let victim = other.join("victim");
+    fs::create_dir_all(victim.join("control")).unwrap();
+    fs::write(victim.join("precious.txt"), "keep\n").unwrap();
+    let sha = "a".repeat(40);
+    for given in [
+        other.display().to_string(),
+        // Relative to the working directory, which is not the configured root either.
+        "somewhere-else".to_string(),
+        format!("{}/../somewhere-else", fx.root.display()),
+    ] {
+        for asked in [
+            format!("cowproof host-agent cleanup --lane-id victim --root {given}"),
+            format!("cowproof host-agent patch --lane-id victim --root {given}"),
+            format!("cowproof host-agent stderr --lane-id victim --root {given}"),
+            format!("cowproof host-agent builder --lane-id victim --root {given}"),
+            format!("cowproof host-agent check --lane-id victim --check-id c --root {given}"),
+            format!("cowproof host-agent doctor --root {given}"),
+            format!(
+                "cowproof host-agent prepare --lane-id fresh --base {sha} --director-version {VERSION} --protocol {PROTOCOL} --root {given}"
+            ),
+        ] {
+            let error = forced_refusal_of(&fx, &asked);
+            assert!(error.contains("--root"), "{asked}: {error}");
+            assert!(error.contains("host.toml"), "{error}");
+            assert!(!error.contains(&given), "{error}");
+        }
+    }
+    // Nothing under the other root was touched, and nothing was made under it or the real one.
+    assert_eq!(
+        fs::read_to_string(victim.join("precious.txt")).unwrap(),
+        "keep\n"
+    );
+    assert!(victim.join("control").is_dir());
+    assert!(!other.join("fresh").exists());
+    assert!(!fx.root.exists());
+
+    // The configured root applies when `--root` is left out, and when it is repeated.
+    assert_ok(&fx.prepare("lane-a", &[]));
+    assert_ok(&fx.prepare("lane-b", &[]));
+    let out = fx.forced(Some("cowproof host-agent cleanup --lane-id lane-a"));
+    assert_eq!(json_of(&out)["removed"], true);
+    let out = fx.forced(Some(&format!(
+        "cowproof host-agent cleanup --lane-id lane-b --root {}",
+        fx.root.display()
+    )));
+    assert_eq!(json_of(&out)["removed"], true);
+    assert!(!fx.root.join("lane-a").exists() && !fx.root.join("lane-b").exists());
+}
+
+impl Bfx {
+    /// `host-agent --forced` asked to run `builder` for this lane, with `spec` on stdin and the
+    /// lifeline held open until it ends. The owner's config must already be in place.
+    fn forced_builder(&self, spec: &Value) -> Output {
+        let asked = format!(
+            "{} host-agent builder --lane-id {} --root {}",
+            self.cowproof.display(),
+            self.id,
+            self.fx.root.display()
+        );
+        let mut cmd = Command::new(&self.cowproof);
+        cmd.args(["host-agent", "--forced"])
+            .current_dir(self.fx.work.path())
+            .env("HOME", self.fx.home.path())
+            .env_remove("ANTHROPIC_API_KEY")
+            .env_remove("XDG_CONFIG_HOME")
+            .env("SSH_ORIGINAL_COMMAND", asked)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = {
+            let _g = fork_lock();
+            cmd.spawn().unwrap()
+        };
+        let pipe = child.stdin.as_mut().unwrap();
+        let _ = pipe.write_all(format!("{spec}\n").as_bytes());
+        let _ = pipe.flush();
+        let lifeline = child.stdin.take();
+        let out = child.wait_with_output().unwrap();
+        drop(lifeline);
+        out
+    }
+}
+
+#[test]
+fn forced_builder_refuses_a_claude_that_is_not_the_configured_one_and_launches_nothing() {
+    if !sandbox_available() {
+        return;
+    }
+    let bfx = Bfx::new("echo started > \"$rec/started\"\nexit 0");
+    bfx.fx.write_config(&bfx.fake, &bfx.fx.root);
+    let ran = bfx.fx.work.path().join("other-ran");
+    let other = bfx.fx.marker_claude("other-claude", &ran);
+
+    for given in [
+        json!(other),
+        // Not even a spelling of the configured file, and not an absolute path at all.
+        json!(format!(
+            "{}/../{}/fake-claude",
+            bfx.fake.parent().unwrap().display(),
+            bfx.fake
+                .parent()
+                .unwrap()
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+        )),
+        json!("claude"),
+    ] {
+        let mut spec = bfx.spec();
+        spec["claude_bin"] = given.clone();
+        let out = bfx.forced_builder(&spec);
+        let error = assert_forced_refusal(&out);
+        assert!(error.contains("claude_bin"), "{error}");
+        assert!(error.contains("host.toml"), "{error}");
+        let given = given.as_str().unwrap();
+        assert!(given == "claude" || !error.contains(given), "{error}");
+    }
+    assert!(!ran.exists(), "a claude the director chose ran");
+    assert!(!bfx.rec().exists(), "the configured claude started too");
+    let control = bfx.lane().join("control");
+    assert!(
+        !control.join("builder.group.json").exists(),
+        "a builder group was recorded"
+    );
+    assert!(!control.join("builder.stderr").exists());
+    // The lane files were not rewritten either.
+    assert!(!bfx.lane().join("home/settings.json").exists());
+
+    // The configured claude, in the same call, runs: the pin is the only difference.
+    let out = bfx.forced_builder(&bfx.spec());
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(bfx.recorded("started").trim(), "started");
+    assert!(!ran.exists());
 }

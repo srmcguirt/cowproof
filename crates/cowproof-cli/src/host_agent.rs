@@ -22,7 +22,7 @@
 //! - `stderr --lane-id <id>`: the last [`MAX_STDERR_FETCH`] bytes of `control/builder.stderr`
 //!   (already redacted here; the director redacts them again), raw, empty when there is none.
 //! - `doctor [--claude-bin <name>]`: the preflight's `sandbox` and `claude` checks, and the
-//!   protocol this binary speaks.
+//!   protocol this binary speaks. Under `--forced` it also reports `"config": "ok"`.
 //! - `cleanup --lane-id <id>`: ends the lane's builder group if one is still alive (see below),
 //!   then removes `<root>/<id>`; idempotent; never follows a link. The JSON reports what it
 //!   ended in `group`.
@@ -72,12 +72,25 @@
 //! JSON error line and exits [`FORCED_REFUSED_EXIT`] (77), which a verb never returns on its own
 //! account; `--forced` inside the command is refused. The wire is unchanged.
 //!
+//! What the director may choose under `--forced` is narrower than a direct call: the host
+//! owner's `host.toml` ([`config`]) names the `claude` and the lanes `root`. `doctor` runs that
+//! `claude`, and a `--claude-bin` that differs is refused (77, naming the argument and never its
+//! value); the builder spec's `claude_bin` must equal it, else the launch is refused before the
+//! lane is touched; `--root` must equal the configured root and, left out, is the configured
+//! root. With no usable config (missing, or a file or directory someone else could write, a
+//! link, a bad key) every verb but `doctor` is refused, and `doctor` reports `"config":
+//! "missing"` or `"invalid"` with the owner's command in `fix` and runs no `claude`. A direct
+//! call does not read the file and behaves as it always did.
+//!
 //! The protocol ([`HOST_PROTOCOL`]) names the stdin framings above. A director sends it to
 //! `prepare` and reads it from `doctor`; either side refuses a mismatch with a message naming
 //! both numbers, before any lane exists or any builder starts. Protocol 1 (no number) had a
 //! builder spec that ended at end of file and a base patch passed as a host file name. The
 //! group record is not part of the wire, so it did not change the number.
 
+pub(crate) mod config;
+
+use self::config::{HostConfig, Loaded};
 use crate::preflight::{Check, CheckStatus, PreflightOptions, preflight};
 use crate::remote::is_bare_char;
 use crate::run::{
@@ -155,9 +168,10 @@ enum HostAgentAction {
     },
     /// Report the version, `claude` and the sandbox.
     Doctor {
-        /// The Claude Code executable to check, resolved on PATH
-        #[arg(long, default_value = "claude")]
-        claude_bin: String,
+        /// The Claude Code executable to check, resolved on PATH (default: `claude`). Under
+        /// `--forced` it must be the host's configured `claude`, which is also the default.
+        #[arg(long)]
+        claude_bin: Option<String>,
         #[arg(long)]
         root: Option<PathBuf>,
     },
@@ -191,7 +205,7 @@ enum HostAgentAction {
 pub async fn run(args: HostAgentArgs) -> Result<i32> {
     match (args.forced, args.command) {
         (true, None) => forced().await,
-        (false, Some(action)) => run_action(action).await,
+        (false, Some(action)) => run_action(action, None).await,
         (forced, command) => {
             // `args_conflicts_with_subcommands` keeps `--forced` and a verb apart; this is
             // the case with neither.
@@ -206,7 +220,25 @@ pub async fn run(args: HostAgentArgs) -> Result<i32> {
     }
 }
 
-async fn run_action(action: HostAgentAction) -> Result<i32> {
+impl HostAgentAction {
+    /// The verb's `--root`, whichever verb it is.
+    fn root_mut(&mut self) -> &mut Option<PathBuf> {
+        match self {
+            HostAgentAction::Prepare { root, .. }
+            | HostAgentAction::Patch { root, .. }
+            | HostAgentAction::Stderr { root, .. }
+            | HostAgentAction::Doctor { root, .. }
+            | HostAgentAction::Cleanup { root, .. }
+            | HostAgentAction::Builder { root, .. }
+            | HostAgentAction::Check { root, .. } => root,
+        }
+    }
+}
+
+/// Run a verb. `pins` is the host owner's config under `--forced` (`None` for a direct call):
+/// [`pin`] has already made `--root` and `doctor`'s claude agree with it, and the builder's
+/// spec is checked against it here, where the spec is read.
+async fn run_action(action: HostAgentAction, pins: Option<&HostConfig>) -> Result<i32> {
     let outcome = match action {
         HostAgentAction::Prepare {
             lane_id,
@@ -217,7 +249,15 @@ async fn run_action(action: HostAgentAction) -> Result<i32> {
         } => remote_root(root)
             .and_then(|root| prepare(&lane_id, &base, &director_version, protocol, &root)),
         HostAgentAction::Doctor { claude_bin, root } => match remote_root(root) {
-            Ok(root) => doctor(&claude_bin, &root).await,
+            Ok(root) => {
+                let claude_bin = claude_bin.as_deref().unwrap_or("claude");
+                doctor(claude_bin, &root).await.map(|mut report| {
+                    if pins.is_some() {
+                        report["config"] = json!("ok");
+                    }
+                    report
+                })
+            }
             Err(e) => Err(e),
         },
         HostAgentAction::Cleanup { lane_id, root } => {
@@ -225,7 +265,7 @@ async fn run_action(action: HostAgentAction) -> Result<i32> {
         }
         HostAgentAction::Builder { lane_id, root } => {
             let launched = match remote_root(root) {
-                Ok(root) => builder_launch(&lane_id, &root),
+                Ok(root) => builder_launch(&lane_id, &root, pins.map(|c| c.claude.as_path())),
                 Err(e) => Err(e),
             };
             return match launched {
@@ -233,7 +273,11 @@ async fn run_action(action: HostAgentAction) -> Result<i32> {
                     Ok(code) => Ok(code),
                     Err(e) => print_outcome(Err(e)),
                 },
-                Err(e) => print_outcome(Err(e)),
+                // The spec asked for an executable the owner did not configure.
+                Err(e) => match e.downcast_ref::<Pin>() {
+                    Some(pin) => refuse(pin),
+                    None => print_outcome(Err(e)),
+                },
             };
         }
         HostAgentAction::Check {
@@ -363,19 +407,124 @@ impl std::fmt::Display for Refusal {
 /// the closed set, and its arguments go through the same clap definitions as a direct call.
 /// Word 0 only has to look like cowproof: it is never executed, the binary that runs is the
 /// one the key names.
+///
+/// What the verbs may be told to run or to touch is then decided by the host owner's
+/// `host.toml` ([`config`]), not by the director: see [`pin`]. Without a usable config only
+/// `doctor` runs, and it reports that and runs nothing.
 async fn forced() -> Result<i32> {
-    match forced_action(std::env::var_os("SSH_ORIGINAL_COMMAND")) {
-        Ok(action) => run_action(action).await,
-        Err(refusal) => {
-            println!(
-                "{}",
-                serde_json::to_string(
-                    &json!({"ok": false, "error": format!("refused: {refusal}")})
-                )?
-            );
-            Ok(FORCED_REFUSED_EXIT)
+    let action = match forced_action(std::env::var_os("SSH_ORIGINAL_COMMAND")) {
+        Ok(action) => action,
+        Err(refusal) => return refuse(refusal),
+    };
+    let path = match config::forced_config_path() {
+        Ok(path) => path,
+        Err(e) => return refuse(format!("{e:#}")),
+    };
+    match config::load(&path) {
+        Loaded::Ok(cfg) => match pin(action, &cfg) {
+            Ok(action) => run_action(action, Some(&cfg)).await,
+            Err(pin) => refuse(pin),
+        },
+        unusable => {
+            let (state, detail) = match unusable {
+                Loaded::Invalid(problem) => ("invalid", problem),
+                _ => ("missing", format!("there is no {}", path.display())),
+            };
+            let fix = setup_command(state == "invalid");
+            if matches!(action, HostAgentAction::Doctor { .. }) {
+                // Nothing is run, whatever `--claude-bin` says: the owner has not said what may be.
+                return print_outcome(Ok(json!({
+                    "ok": false,
+                    "version": env!("CARGO_PKG_VERSION"),
+                    "protocol": HOST_PROTOCOL,
+                    "config": state,
+                    "config_detail": detail,
+                    "fix": fix,
+                })));
+            }
+            refuse(format!(
+                "this host's config is {state} ({detail}); its owner runs `{fix}` on this host"
+            ))
         }
     }
+}
+
+/// The owner's command that writes the host config, for a message: with the path of this
+/// binary, which is the one the key names.
+fn setup_command(replace: bool) -> String {
+    let exe = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.to_str().map(crate::remote::sh_quote))
+        .unwrap_or_else(|| "cowproof".to_string());
+    let force = if replace { " --force" } else { "" };
+    format!("{exe} host setup --write-config{force}")
+}
+
+/// Print `refused: <why>` as the one JSON error line of a forced refusal and return its exit
+/// code. `why` names what was wrong and never quotes what the client sent.
+fn refuse(why: impl std::fmt::Display) -> Result<i32> {
+    println!(
+        "{}",
+        serde_json::to_string(&json!({"ok": false, "error": format!("refused: {why}")}))?
+    );
+    Ok(FORCED_REFUSED_EXIT)
+}
+
+/// An argument that the host owner's config decides and the director did not repeat. The
+/// message names the argument and never echoes what the director gave.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Pin {
+    /// `--root` is not the configured `root`.
+    Root,
+    /// `doctor --claude-bin` is not the configured `claude`.
+    ClaudeBin,
+    /// The builder spec's `claude_bin` is not the configured `claude`.
+    SpecClaudeBin,
+}
+
+impl std::fmt::Display for Pin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Pin::Root => {
+                "--root is not this host's configured root: leave it out, or give the path \
+                 its owner put in host.toml"
+            }
+            Pin::ClaudeBin => {
+                "--claude-bin is not this host's configured claude: leave it out, or give the \
+                 path its owner put in host.toml"
+            }
+            Pin::SpecClaudeBin => {
+                "the launch spec's claude_bin is not this host's configured claude (host.toml)"
+            }
+        })
+    }
+}
+
+impl std::error::Error for Pin {}
+
+/// Make the verb's `--root` and `doctor`'s `--claude-bin` the owner's, or refuse. A value the
+/// director gives must equal the configured one (compared as paths, lexically: no `..`, no
+/// link is followed); one it leaves out becomes the configured one. The builder's spec is
+/// checked where it is read, in [`builder_launch`].
+fn pin(mut action: HostAgentAction, cfg: &HostConfig) -> Result<HostAgentAction, Pin> {
+    let given = action.root_mut().take();
+    if let Some(root) = given {
+        // The same reading of a relative `--root` as `remote_root`.
+        let cwd = std::env::current_dir().map_err(|_| Pin::Root)?;
+        if cwd.join(root) != cfg.root {
+            return Err(Pin::Root);
+        }
+    }
+    *action.root_mut() = Some(cfg.root.clone());
+    if let HostAgentAction::Doctor { claude_bin, .. } = &mut action {
+        if let Some(given) = claude_bin.as_deref()
+            && Path::new(given) != cfg.claude
+        {
+            return Err(Pin::ClaudeBin);
+        }
+        *claude_bin = cfg.claude.to_str().map(str::to_string);
+    }
+    Ok(action)
 }
 
 /// What `host-agent --forced` accepts for `SSH_ORIGINAL_COMMAND`, or why not.
@@ -993,8 +1142,19 @@ fn forwarded_socket(path: &Path, what: &str) -> Result<()> {
 /// Read and check the spec, write the lane files and build the builder's command. A refusal
 /// happens before anything runs and before any lane file changes, except when the resume id is
 /// the thing refused (the files are then written but nothing starts).
-fn builder_launch(lane_id: &str, root: &Path) -> Result<BuilderLaunched> {
+fn builder_launch(
+    lane_id: &str,
+    root: &Path,
+    claude_pin: Option<&Path>,
+) -> Result<BuilderLaunched> {
     let spec: BuilderSpec = read_spec_line()?;
+    // Under `--forced` the executable is the owner's choice (`host.toml`): the first thing
+    // refused, before the lane is looked at.
+    if let Some(pinned) = claude_pin
+        && spec.claude_bin != pinned
+    {
+        return Err(anyhow::Error::new(Pin::SpecClaudeBin));
+    }
     let lane_dir = lane_dir_of(lane_id, root)?;
     let home = real_home()?;
     let layout = LaneLayout::for_lane_dir(&lane_dir, home.clone())?;
@@ -2118,7 +2278,7 @@ mod forced_tests {
                 claude_bin,
                 root: r,
             } => {
-                assert_eq!(claude_bin, "/o k/it's/claude");
+                assert_eq!(claude_bin.as_deref(), Some("/o k/it's/claude"));
                 assert_eq!(r, root);
             }
             _ => panic!("not doctor"),
@@ -2171,6 +2331,84 @@ mod forced_tests {
             forced(&line("cleanup", &["--lane-id", "l-1"])).unwrap(),
             HostAgentAction::Cleanup { .. }
         ));
+    }
+
+    fn owners_config() -> HostConfig {
+        HostConfig {
+            claude: PathBuf::from("/opt/cp/claude"),
+            root: PathBuf::from("/srv/cp lanes"),
+        }
+    }
+
+    fn doctor_args(claude_bin: Option<&str>, root: Option<&str>) -> HostAgentAction {
+        HostAgentAction::Doctor {
+            claude_bin: claude_bin.map(str::to_string),
+            root: root.map(PathBuf::from),
+        }
+    }
+
+    #[test]
+    fn a_pin_fills_in_what_the_director_left_out_and_accepts_only_the_owners_value() {
+        let cfg = owners_config();
+        // Left out: the owner's.
+        match pin(doctor_args(None, None), &cfg).unwrap() {
+            HostAgentAction::Doctor { claude_bin, root } => {
+                assert_eq!(claude_bin.as_deref(), Some("/opt/cp/claude"));
+                assert_eq!(root, Some(cfg.root.clone()));
+            }
+            _ => panic!("not doctor"),
+        }
+        // Repeated, in any spelling that is the same path: accepted.
+        assert!(
+            pin(
+                doctor_args(Some("/opt/cp/claude"), Some("/srv/cp lanes")),
+                &cfg
+            )
+            .is_ok()
+        );
+        assert!(
+            pin(
+                doctor_args(Some("/opt/cp//claude"), Some("/srv/cp lanes/")),
+                &cfg
+            )
+            .is_ok()
+        );
+        // Anything else is refused, each naming its own argument.
+        for (claude_bin, root, why) in [
+            (Some("claude"), None, Pin::ClaudeBin),
+            (Some("/opt/cp/claude2"), None, Pin::ClaudeBin),
+            (Some("/opt/cp/../cp/claude"), None, Pin::ClaudeBin),
+            (None, Some("/srv/other"), Pin::Root),
+            (None, Some("/srv/cp lanes/../x"), Pin::Root),
+            (None, Some("lanes"), Pin::Root),
+        ] {
+            assert_eq!(
+                pin(doctor_args(claude_bin, root), &cfg).err(),
+                Some(why),
+                "{claude_bin:?} {root:?}"
+            );
+        }
+        // The other verbs get the owner's root, and refuse another.
+        let patch = |root: Option<&str>| HostAgentAction::Patch {
+            lane_id: "l".to_string(),
+            root: root.map(PathBuf::from),
+        };
+        assert!(matches!(
+            pin(patch(None), &cfg).unwrap(),
+            HostAgentAction::Patch { root: Some(r), .. } if r == cfg.root
+        ));
+        assert_eq!(pin(patch(Some("/x")), &cfg).err(), Some(Pin::Root));
+    }
+
+    #[test]
+    fn a_pin_refusal_names_the_argument_and_never_the_value() {
+        for pin in [Pin::Root, Pin::ClaudeBin, Pin::SpecClaudeBin] {
+            let text = pin.to_string();
+            assert!(text.contains("host.toml"), "{text}");
+        }
+        assert!(Pin::Root.to_string().contains("--root"));
+        assert!(Pin::ClaudeBin.to_string().contains("--claude-bin"));
+        assert!(Pin::SpecClaudeBin.to_string().contains("claude_bin"));
     }
 
     #[test]

@@ -377,7 +377,8 @@ enum HostAction {
     SafeToStop,
     /// Run by the OWNER of a remote host, on that host: print the authorized_keys line that
     /// locks the director's public key to `cowproof host-agent --forced`, the hosts.json
-    /// entry for this machine, and this host's `host-agent doctor`. Writes nothing (D27).
+    /// entry for this machine, the host config a forced key needs and this host's
+    /// `host-agent doctor`. Writes nothing, except that host config under `--write-config` (D27).
     Setup(host_setup::SetupArgs),
 }
 

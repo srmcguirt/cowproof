@@ -1,9 +1,11 @@
 //! `cowproof host setup`: what the OWNER of a remote host does to lock the director's key to
 //! `cowproof host-agent` (D27). It runs on the host, as the user the director will log in as.
-//! It writes nothing: it prints the `authorized_keys` line for the director's public key, the
-//! file to put it in, the director-side `hosts.json` entry with this machine's absolute paths,
-//! and this host's `host-agent doctor`, so the owner sees whether `claude` and the sandbox work
-//! before the director tries. The director never runs it.
+//! It prints the `authorized_keys` line for the director's public key, the file to put it in,
+//! the director-side `hosts.json` entry with this machine's absolute paths, the host config
+//! (`host.toml`, see [`crate::host_agent::config`]) that a forced key needs, and this host's
+//! `host-agent doctor`, so the owner sees whether `claude` and the sandbox work before the
+//! director tries. It writes nothing, except the host config when `--write-config` asks for it
+//! (never over an existing one without `--force`). The director never runs it.
 //!
 //! The line is `command="<cowproof> host-agent --forced",restrict,port-forwarding,permitopen="127.0.0.1:1",permitlisten="127.0.0.1:1" <key>`:
 //! `command=` makes sshd run `host-agent --forced` for every session of that key whatever the
@@ -12,6 +14,7 @@
 //! director needs for its two socket forwards. See the README, "Locking the director's key to
 //! cowproof".
 
+use crate::host_agent::config;
 use crate::host_agent::{doctor, remote_root};
 use crate::remote::sh_quote;
 use crate::root::resolve_executable;
@@ -22,9 +25,11 @@ use std::path::{Path, PathBuf};
 
 #[derive(clap::Args)]
 pub struct SetupArgs {
-    /// The director's PUBLIC key: the `.pub` file, holding exactly one OpenSSH public key line
-    #[arg(long)]
-    key: PathBuf,
+    /// The director's PUBLIC key: the `.pub` file, holding exactly one OpenSSH public key line.
+    /// Left out, only the host config and this host's check are shown (with `--write-config`,
+    /// written)
+    #[arg(long, required_unless_present = "write_config")]
+    key: Option<PathBuf>,
     /// What the director's `ssh` calls this machine (`user@host` or a name from its ssh
     /// config), for the hosts.json entry; a placeholder is printed when it is left out
     #[arg(long)]
@@ -35,6 +40,15 @@ pub struct SetupArgs {
     /// The Claude Code executable on this machine (default: `claude` on PATH)
     #[arg(long)]
     claude: Option<PathBuf>,
+    /// Write the host config (`$XDG_CONFIG_HOME/cowproof/host.toml`, else
+    /// `~/.config/cowproof/host.toml`; a forced key reads only the latter) with this machine's `claude` and lanes root, which a
+    /// forced key requires. Without this flag the file is only shown. An existing file is not
+    /// replaced unless `--force` is given
+    #[arg(long)]
+    write_config: bool,
+    /// With `--write-config`: replace the host config if there is one
+    #[arg(long, requires = "write_config")]
+    force: bool,
 }
 
 /// The most a public key file may hold. A key line is under 1 KiB; a larger file is not one.
@@ -171,11 +185,15 @@ fn hosts_entry(alias: &str, ssh: &str, exe: &Path, claude: &str) -> Value {
 }
 
 /// Print the setup. Exit 1 when this host's doctor reports a failure (the text is still
-/// printed); an error, with nothing printed, when the key file is not one public key.
+/// printed); an error, with nothing printed or written, when the key file is not one public
+/// key, or when `--write-config` cannot write (no `claude` found, or a file in the way).
 pub async fn run(args: SetupArgs) -> Result<i32> {
-    let key = read_key(&args.key)?;
+    let key = args.key.as_deref().map(read_key).transpose()?;
     let exe = std::env::current_exe().context("finding this cowproof")?;
-    let line = authorized_keys_line(&exe, &key)?;
+    let line = key
+        .as_deref()
+        .map(|key| authorized_keys_line(&exe, key))
+        .transpose()?;
 
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
@@ -194,26 +212,99 @@ pub async fn run(args: SetupArgs) -> Result<i32> {
     let ssh = args
         .ssh
         .unwrap_or_else(|| "USER@HOST-OR-SSH-CONFIG-NAME".to_string());
-
-    println!(
-        "1. Put this line in {}",
-        home.join(".ssh/authorized_keys").display()
-    );
-    println!(
-        "   (append it as ONE line; create the file with mode 600 and ~/.ssh with mode 700 if"
-    );
-    println!(
-        "   they are missing; the director's key must appear nowhere else on this machine):\n"
-    );
-    println!("{line}\n");
-    println!("2. On the director's machine, add this to ~/.config/cowproof/hosts.json");
-    println!("   (choose the alias; set \"ssh\" to what its ssh calls this machine):\n");
-    println!(
-        "{}\n",
-        serde_json::to_string_pretty(&hosts_entry(&args.alias, &ssh, &exe, &claude_shown))?
-    );
-    println!("3. This machine's check (cowproof host-agent doctor):\n");
     let root = remote_root(None)?;
+    let config_path = config::current_config_path(true)?;
+    let forced_path = config::forced_config_path()?;
+    // The text is made before anything is printed or written, so a `claude` that cannot be
+    // found stops `--write-config` while nothing has changed.
+    let config_text = match &claude {
+        Ok(claude) => Some(config::render(claude, &root)?),
+        Err(_) => None,
+    };
+    let to_write = if args.write_config {
+        Some(config_text.as_deref().ok_or_else(|| {
+            anyhow!("claude was not found on this machine, so there is nothing to write: pass --claude <path>")
+        })?)
+    } else {
+        None
+    };
+    // Before anything is printed: a file in the way is an error with nothing else shown.
+    if let Some(text) = to_write {
+        config::write(&config_path, text, args.force)?;
+    }
+
+    let mut step = 0;
+    let mut next = || {
+        step += 1;
+        step
+    };
+    if let Some(line) = &line {
+        println!(
+            "{}. Put this line in {}",
+            next(),
+            home.join(".ssh/authorized_keys").display()
+        );
+        println!(
+            "   (append it as ONE line; create the file with mode 600 and ~/.ssh with mode 700 if"
+        );
+        println!(
+            "   they are missing; the director's key must appear nowhere else on this machine):\n"
+        );
+        println!("{line}\n");
+        println!(
+            "{}. On the director's machine, add this to ~/.config/cowproof/hosts.json",
+            next()
+        );
+        println!("   (choose the alias; set \"ssh\" to what its ssh calls this machine):\n");
+        println!(
+            "{}\n",
+            serde_json::to_string_pretty(&hosts_entry(&args.alias, &ssh, &exe, &claude_shown))?
+        );
+    }
+    println!(
+        "{}. The host config {}, which a forced key needs: it, not the director, decides which",
+        next(),
+        if args.write_config {
+            "(written)"
+        } else {
+            "(not written)"
+        }
+    );
+    println!(
+        "   `claude` and which lanes directory the key may use. It is {}:\n",
+        config_path.display()
+    );
+    match &config_text {
+        Some(text) => println!("{text}"),
+        None => println!("   (claude was not found: pass --claude <path> to see it)\n"),
+    }
+    if config_path != forced_path {
+        println!(
+            "   WARNING: XDG_CONFIG_HOME points elsewhere, so this is not the file a forced key reads."
+        );
+        println!(
+            "   A forced key reads only {}, whatever XDG_CONFIG_HOME says: copy it there, or",
+            forced_path.display()
+        );
+        println!("   run this again without XDG_CONFIG_HOME, or the key will find no config.\n");
+    }
+    if to_write.is_some() {
+        println!(
+            "   Written. Only you can change it; to change it, edit it, or run this again with --force.\n"
+        );
+    } else {
+        println!(
+            "   To write it: cowproof host setup --write-config{} (an existing file is kept unless --force).",
+            if config_path.exists() { " --force" } else { "" }
+        );
+        println!(
+            "   Until it exists, the forced key refuses every verb except doctor, which says so.\n"
+        );
+    }
+    println!(
+        "{}. This machine's check (cowproof host-agent doctor):\n",
+        next()
+    );
     let report = doctor(&claude_name, &root).await;
     let ok = match &report {
         Ok(v) => {

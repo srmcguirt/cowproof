@@ -707,6 +707,18 @@ impl RemoteLane {
         if let Some(error) = report["error"].as_str() {
             bail!("remote doctor on {}: {error}", self.host.alias);
         }
+        // A forced key whose host has no (usable) config of its own: nothing else was checked.
+        if let Some(state) = report["config"].as_str().filter(|c| *c != "ok") {
+            bail!(
+                "remote doctor on {}: the host's config (host.toml) is {state}: {}; its owner \
+                 runs `{}` on the host",
+                self.host.alias,
+                report["config_detail"].as_str().unwrap_or("not reported"),
+                report["fix"]
+                    .as_str()
+                    .unwrap_or("cowproof host setup --write-config"),
+            );
+        }
         bail!(
             "remote doctor on {} failed: {}; {}",
             self.host.alias,

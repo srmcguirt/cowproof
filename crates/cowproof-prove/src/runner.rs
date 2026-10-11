@@ -199,6 +199,13 @@ pub fn signal_pid(pid: u32, signal: libc::c_int) -> bool {
     unsafe { libc::kill(pid, signal) == 0 }
 }
 
+/// The effective user id of this process. `cowproof host-agent --forced` compares it with the
+/// owner of the host's config file, which only that user may have written.
+pub fn effective_uid() -> u32 {
+    // SAFETY: `geteuid(2)` takes no arguments, touches no memory and cannot fail.
+    unsafe { libc::geteuid() }
+}
+
 /// SIGTERM the one process `pid`: the polite first step before [`kill_pid`].
 pub fn terminate_pid(pid: u32) -> bool {
     signal_pid(pid, libc::SIGTERM)

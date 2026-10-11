@@ -136,9 +136,11 @@ By default the key the director logs in with is an ordinary login key: whoever h
 Owner steps, on the host, as the user the director logs in as:
 
 1. Get the director's PUBLIC key (the `.pub` file). Never copy a private key anywhere; `cowproof host setup` refuses one.
-2. Run `cowproof host setup --key director.pub --ssh user@host --alias buildbox` (`--claude <path>` if `claude` is not on `PATH`). It prints three things and writes nothing: the line for `~/.ssh/authorized_keys`, the `hosts.json` entry for the director with this machine's absolute paths, and this host's `host-agent doctor`, so you see whether `claude` and the sandbox work before the director tries. It exits 1 when the doctor fails or the key file is not exactly one OpenSSH public key line.
+2. Run `cowproof host setup --key director.pub --ssh user@host --alias buildbox --write-config` (`--claude <path>` if `claude` is not on `PATH`). It prints the line for `~/.ssh/authorized_keys`, the `hosts.json` entry for the director with this machine's absolute paths, the host config below and this host's `host-agent doctor`, so you see whether `claude` and the sandbox work before the director tries. Without `--write-config` it writes nothing and only shows the config. It exits 1 when the doctor fails or the key file is not exactly one OpenSSH public key line.
 3. Append the line to `~/.ssh/authorized_keys` (mode 600, `~/.ssh` mode 700). Remove any other line that holds the same key: an ordinary line for it still gives a full login.
 4. Send the `hosts.json` entry to the director, who adds it to `~/.config/cowproof/hosts.json` and sets `ssh` to what its `ssh` calls this machine.
+
+The host config in step 2 is what makes the key useful: see "The host config" below. Until it exists, the forced key refuses every verb except `doctor`.
 
 The line looks like this:
 
@@ -150,8 +152,32 @@ command="/opt/cowproof/bin/cowproof host-agent --forced",restrict,port-forwardin
 
 What the director can do with the key: run those seven verbs, and open the control connection and the two Unix socket forwards. What it cannot: get a shell, run any other command, copy files with `scp` or `sftp` (a subsystem is replaced by the forced command too), get a terminal, or forward its agent or X11. What the key does not narrow, so do not read it as more than it is:
 
-- The verbs still do their job. `check` runs the lane's declared check command and `builder` runs an executable the director names by absolute path, both inside the sandbox, as the host user. The sandbox, not the key, limits those. `doctor --claude-bin <path>` runs `<path> --version` outside the sandbox, as the host user. `--root` names the lanes directory, anywhere the host user can write.
+- The verbs still do their job. `check` runs the lane's declared check command and `builder` runs the configured `claude`, both inside the sandbox, as the host user. The sandbox, not the key, limits those. (The director no longer chooses which executable runs outside the sandbox or which directory is the lanes root: see "The host config".)
 - `port-forwarding` on its own would let the key open any forward the host's `sshd` allows, TCP included. The two pins `permitopen="127.0.0.1:1",permitlisten="127.0.0.1:1"` take TCP away. A `-L` forward may only reach port 1 on the host, where nothing listens, and a `-R` forward may only listen there, which only root can bind. The director needs only Unix-socket forwards, and the pins do not apply to those.
+
+### The host config
+
+A forced key limits the director to seven verbs, but three of their arguments used to reach outside the sandbox or across the host user's files: `doctor --claude-bin <path>` runs `<path> --version` as the host user, the builder's launch spec names the executable the sandbox runs, and `--root` names the lanes directory (`cleanup` removes under it). So under `--forced`, the host's owner decides them, in `~/.config/cowproof/host.toml`, where `~` is the `HOME` that `sshd` sets from the passwd entry:
+
+```toml
+claude = "/home/u/.local/bin/claude"
+root = "/home/u/.cache/cowproof/remote-lanes"
+```
+
+`cowproof host setup --write-config` writes it from the paths `setup` resolved (mode 0600, in a directory of mode 0700, and never over an existing file unless you also pass `--force`); you can edit it by hand. A forced key ignores `XDG_CONFIG_HOME` entirely, because a client can pass `XDG_*` variables through `sshd`'s `AcceptEnv` and cannot change `HOME`; `setup` does honour `XDG_CONFIG_HOME`, so when it is set to somewhere else `setup` writes there and prints a warning that the forced key will not read that file. Run it without `XDG_CONFIG_HOME`, or copy the file to `~/.config/cowproof/host.toml`. `root` is optional and defaults to the remote root a direct call uses. No other key is accepted.
+
+- `doctor` checks the configured `claude`. A `--claude-bin` that is not that path is refused with exit 77, and nothing runs.
+- The builder's launch spec must name that `claude` as its `claude_bin`, or the launch is refused (exit 77) before any lane file changes.
+- `--root` must be the configured `root`; left out, it is the configured `root`. Another directory is refused (exit 77), so `cleanup` cannot be pointed at one.
+- The refusal names the argument and never repeats the value the director sent.
+- Without the file, every verb except `doctor` is refused, and `doctor` runs nothing: it reports `"config": "missing"` and the exact command for you to run on the host (`<cowproof> host setup --write-config`). A forced key with no config does nothing until you opt in. The director's `run --host` stops at its doctor, before any lane exists, with exit 4 and that message.
+- The file is trusted only if it is a regular file (not a link) owned by the user running `host-agent`, with no group or world write bit, in a directory with no group or world write bit either. Otherwise it is not trusted: the key refuses as it does without the file, and the message names the problem (for example "writable by its group or by others (mode 0666)").
+- The file is also refused when it lies under the configured `root` or under the default remote root (compared by canonical path, links resolved): whatever a lane directory holds, the director filled, so a config there is not yours. Keep `root` away from `~/.config`.
+- A direct call (your own shell, not the forced key) does not read the file.
+
+The director's `hosts.json` must repeat what the file says: its `claude` is the configured `claude`, and its `remoteRoot` is the configured `root`, or is left out when `root` is the default. If you change the file, send the director the new entry.
+
+Still not narrowed by the key: `check` and `builder` run what the director asks inside the sandbox, and the forwards are as above.
 
 Tested on 2026-10-11 against OpenSSH 9.6p1 (Ubuntu), with a throwaway `sshd` holding exactly this line:
 - the Unix-socket `-R` forward through the control master carried data both ways;
@@ -161,7 +187,7 @@ Tested on 2026-10-11 against OpenSSH 9.6p1 (Ubuntu), with a throwaway `sshd` hol
 
 `permitopen="none"` is not valid in `authorized_keys`: `sshd` rejects the whole line, and the key stops working. `none` is only valid in `sshd_config`.
 
-The host-agent wire did not change (`HOST_PROTOCOL` stays 2): a director and a host that spoke before still speak.
+The host-agent wire did not change (`HOST_PROTOCOL` stays 2): a director and a host that spoke before still speak. `doctor` only gained the fields `config`, `config_detail` and `fix`.
 
 ## What a builder trusts
 
