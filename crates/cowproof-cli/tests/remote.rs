@@ -9,8 +9,8 @@
 mod common;
 
 use common::{
-    Lane, REAL_KEY, fork_lock, group_gone, output, run_checks, sandbox_available, spawn_to_file,
-    text, unique_lane_id, var_tmp,
+    Lane, REAL_KEY, fork_lock, group_gone, output, run_checks, sandbox_available, signal_pid,
+    spawn_to_file, text, unique_lane_id, var_tmp,
 };
 use cowproof_prove::Capsule;
 use serde_json::{Value, json};
@@ -213,14 +213,11 @@ fn step_name(argv: &[String]) -> Option<String> {
     verb.split(' ').next().map(String::from)
 }
 
-/// Poll `kill -0 <pid>` until the process is gone, at most 10 s.
+/// Poll until the process `pid` is gone (`kill(2)` with signal 0 says ESRCH), at most 10 s.
 fn assert_pid_gone(pid: i64) {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        let alive = output(Command::new("kill").args(["-0", &pid.to_string()]))
-            .status
-            .success();
-        if !alive {
+        if !pid_alive(pid) {
             return;
         }
         assert!(Instant::now() < deadline, "process {pid} is still alive");
@@ -770,8 +767,7 @@ fn sigint_during_the_remote_builder_ends_it_and_its_group_and_stops_the_master()
         .and_then(|e| e["pid"].as_i64())
         .expect("no command started");
 
-    let out = output(Command::new("kill").args(["-INT", &run.id().to_string()]));
-    assert!(out.status.success(), "{}", text(&out));
+    assert!(signal_pid("INT", run.id()), "could not signal the run");
     let deadline = Instant::now() + Duration::from_secs(60);
     let status = loop {
         if let Some(status) = run.try_wait().unwrap() {
@@ -902,14 +898,11 @@ fn command_started(remote: &Remote, verb: &str) -> (i64, i64) {
     )
 }
 
-/// Poll `kill -0 <pid>` until the process is gone, at most `within`.
+/// Poll until the process `pid` is gone, at most `within`.
 fn assert_pid_gone_within(pid: i64, within: Duration) {
     let deadline = Instant::now() + within;
     loop {
-        let alive = output(Command::new("kill").args(["-0", &pid.to_string()]))
-            .status
-            .success();
-        if !alive {
+        if !pid_alive(pid) {
             return;
         }
         assert!(
@@ -958,8 +951,10 @@ fn killing_the_directors_ssh_ends_the_remote_builder() {
     // The director's ssh for the builder dies without a word, as a dropped link or a killed
     // laptop does. The fake relays no hangup (a real ssh without a pty sends none); all the host
     // sees is the end of its stdin.
-    let out = output(Command::new("kill").args(["-KILL", &director_ssh.to_string()]));
-    assert!(out.status.success(), "{}", text(&out));
+    assert!(
+        signal_pid("KILL", as_pid(director_ssh)),
+        "could not signal the director's ssh"
+    );
     let began = Instant::now();
     assert_pid_gone_within(host_agent, STOP_WITHIN);
     assert!(began.elapsed() < STOP_WITHIN);
@@ -975,10 +970,13 @@ fn killing_the_directors_ssh_ends_the_remote_builder() {
     remote.assert_torn_down();
 }
 
+/// A pid read from a log or a file, as the `u32` the signalling helpers take.
+fn as_pid(pid: i64) -> u32 {
+    u32::try_from(pid).expect("a positive pid")
+}
+
 fn pid_alive(pid: i64) -> bool {
-    output(Command::new("kill").args(["-0", &pid.to_string()]))
-        .status
-        .success()
+    common::pid_alive(as_pid(pid))
 }
 
 /// What the director may take as the grace a stopped remote builder gets: `TERM_GRACE` and five
@@ -1271,11 +1269,9 @@ impl Drop for MasterReaper {
             if let Ok(e) = serde_json::from_str::<Value>(line)
                 && e["event"] == "master-started"
                 && let Some(pid) = e["pid"].as_i64()
+                && let Ok(pid) = u32::try_from(pid)
             {
-                let _ = Command::new("kill")
-                    .args(["-KILL", &pid.to_string()])
-                    .stderr(std::process::Stdio::null())
-                    .status();
+                signal_pid("KILL", pid);
             }
         }
     }
@@ -1406,8 +1402,7 @@ fn a_live_directors_lane_is_never_swept() {
     assert_ne!(remote.remote_json()["swept"], true);
 
     // End it the proper way; it cleans up after itself.
-    let out = output(Command::new("kill").args(["-TERM", &run.id().to_string()]));
-    assert!(out.status.success(), "{}", text(&out));
+    assert!(signal_pid("TERM", run.id()), "could not signal the run");
     wait_run(&mut run, &stderr);
     remote.assert_torn_down();
 }

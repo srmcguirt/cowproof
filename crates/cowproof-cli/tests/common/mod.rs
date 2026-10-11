@@ -88,6 +88,44 @@ pub fn group_gone(pgid: &str) -> bool {
     cowproof_prove::runner::group_exists(pgid) == Some(false)
 }
 
+/// A signal by the name `kill` takes without its dash (`"KILL"`, `"TERM"`, `"INT"`, or `"0"`
+/// for the existence probe), as its `libc` number. No test starts the `kill` program: Ubuntu's
+/// procps `kill` keeps only the first digit of a negative id not preceded by `--`, so
+/// `kill -KILL -1234` is `kill(-1, SIGKILL)`, which ends every process of the user. Every
+/// signal here goes through `kill(2)` in `cowproof_prove::runner`, which refuses group 0 and 1.
+#[allow(dead_code)] // each test crate that shares this module uses some of the helpers
+pub fn signal_number(name: &str) -> libc::c_int {
+    match name {
+        "0" => 0,
+        "HUP" => libc::SIGHUP,
+        "INT" => libc::SIGINT,
+        "KILL" => libc::SIGKILL,
+        "TERM" => libc::SIGTERM,
+        other => panic!("no signal named {other:?} in tests/common"),
+    }
+}
+
+/// Send the named signal (see [`signal_number`]) to the one process `pid`. Whether `kill(2)`
+/// accepted it; with `"0"` that is "the process exists and is ours to signal".
+#[allow(dead_code)]
+pub fn signal_pid(name: &str, pid: u32) -> bool {
+    cowproof_prove::runner::signal_pid(pid, signal_number(name))
+}
+
+/// Send the named signal to every process in the group `pgid` (never 0 or 1: those are
+/// refused, and the answer is false).
+#[allow(dead_code)]
+pub fn signal_group(name: &str, pgid: u32) -> bool {
+    cowproof_prove::runner::signal_group(pgid, signal_number(name))
+}
+
+/// Whether the process `pid` exists (a zombie does): the system's own answer, `ESRCH` being no.
+/// A pid it cannot be asked about is not alive.
+#[allow(dead_code)]
+pub fn pid_alive(pid: u32) -> bool {
+    cowproof_prove::runner::pid_exists(pid) == Some(true)
+}
+
 /// A temporary directory under `/var/tmp`: not `/tmp` (bwrap hides it) and not the home
 /// (both sandboxes hide it).
 pub fn var_tmp(prefix: &str) -> TempDir {

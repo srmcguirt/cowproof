@@ -11,6 +11,10 @@
 //! so a change to what the queue records cannot leave the tool reading a format
 //! the tests made up.
 
+#[allow(dead_code)] // this file needs only the signal helper of the shared module
+mod common;
+
+use common::signal_pid;
 use cowproof_run::escalate::{Ask, AskKind, Clock, Opt, Origin, Queue, QueueEvent, Verdict};
 use serde_json::{Value, json};
 use std::fs;
@@ -105,9 +109,7 @@ fn wait_bounded(child: Child) -> Output {
     match rx.recv_timeout(Duration::from_secs(60)) {
         Ok(out) => out.unwrap(),
         Err(_) => {
-            let _ = Command::new("kill")
-                .args(["-KILL", &pid.to_string()])
-                .status();
+            signal_pid("KILL", pid);
             panic!("process {pid} did not finish within 60 s");
         }
     }

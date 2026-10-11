@@ -525,11 +525,11 @@ pub fn lane_status(dir: &Path, runner: &impl CommandRunner) -> Result<LaneStatus
         "systemd" => runner
             .output("systemctl", &["--user", "is-active", &record.identifier])
             .is_ok_and(|r| r.0 && r.1 == "active"),
-        "process-group" => record.pid.is_some_and(|pid| {
-            runner
-                .output("kill", &["-0", "--", &format!("-{pid}")])
-                .is_ok_and(|r| r.0)
-        }),
+        // `kill(2)` with signal 0 (never the `kill` program), through the guard that refuses
+        // groups 0 and 1: any process left in the group means it is running.
+        "process-group" => record
+            .pid
+            .is_some_and(|pid| cowproof_prove::runner::group_exists(pid) == Some(true)),
         _ => false,
     };
     Ok(if alive {
@@ -544,19 +544,26 @@ pub fn stop_lane(dir: &Path, runner: &impl CommandRunner) -> Result<()> {
         &fs::read(dir.join("host.json"))
             .with_context(|| format!("reading {}/host.json", dir.display()))?,
     )?;
-    let (program, args): (&str, Vec<&str>) = match record.backend.as_str() {
-        "systemd" => ("systemctl", vec!["--user", "stop", &record.identifier]),
+    let (ok, err) = match record.backend.as_str() {
+        "systemd" => {
+            let (ok, _, err) =
+                runner.output("systemctl", &["--user", "stop", &record.identifier])?;
+            (ok, err)
+        }
         "process-group" => {
             let pid = record
                 .pid
                 .ok_or_else(|| anyhow!("host record has no process group id"))?;
-            let pid = format!("-{pid}");
-            let leaked = Box::leak(pid.into_boxed_str());
-            ("kill", vec!["-TERM", "--", leaked])
+            // SIGTERM to the recorded group by `kill(2)`, never the `kill` program (procps's
+            // keeps one digit of a negative id without `--`, and dash's rejects `--`).
+            let sent = cowproof_prove::runner::signal_group(pid, libc::SIGTERM);
+            (
+                sent,
+                "no such process group, or not ours to signal".to_owned(),
+            )
         }
         _ => bail!("unsupported host backend {}", record.backend),
     };
-    let (ok, _, err) = runner.output(program, &args)?;
     if !ok {
         bail!(
             "could not stop recorded {} {}: {err}",
@@ -760,23 +767,60 @@ mod tests {
         );
         let _ = fs::remove_dir_all(dir);
     }
-    #[test]
-    fn lost_when_recorded_process_is_gone() {
-        let dir = std::env::temp_dir().join(format!("lanes-host-{}", std::process::id()));
+    /// A process-group host record naming `pgid`, in a directory of its own.
+    fn group_record_dir(name: &str, pgid: u32) -> PathBuf {
+        let dir = test_dir(name);
         fs::create_dir_all(&dir).unwrap();
         fs::write(
             dir.join("host.json"),
             serde_json::to_vec(&HostRecord {
                 backend: "process-group".into(),
-                identifier: "123".into(),
-                pid: Some(123),
+                identifier: pgid.to_string(),
+                pid: Some(pgid),
                 lane_id: "abc".into(),
             })
             .unwrap(),
         )
         .unwrap();
+        dir
+    }
+
+    #[test]
+    fn lost_when_recorded_process_is_gone() {
+        use std::os::unix::process::CommandExt;
+        // A group that existed and has been reaped: nothing is left under its number.
+        let mut child = Command::new("true").process_group(0).spawn().unwrap();
+        let pgid = child.id();
+        child.wait().unwrap();
+        let dir = group_record_dir("gone", pgid);
         assert_eq!(lane_status(&dir, &fake()).unwrap(), LaneStatus::Lost);
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_recorded_process_group_is_running_until_stop_lane_ends_it() {
+        use std::os::unix::process::{CommandExt, ExitStatusExt};
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let dir = group_record_dir("running", child.id());
+        assert_eq!(lane_status(&dir, &fake()).unwrap(), LaneStatus::Running);
+        // `fake()` has no answers: stopping a group never asks a command runner.
+        stop_lane(&dir, &fake()).unwrap();
+        let status = child.wait().unwrap();
+        assert_eq!(status.signal(), Some(libc::SIGTERM));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn stop_lane_refuses_group_zero_and_one_without_signalling() {
+        for pgid in [0, 1] {
+            let dir = group_record_dir(&format!("refused-{pgid}"), pgid);
+            assert!(stop_lane(&dir, &fake()).is_err());
+            let _ = fs::remove_dir_all(dir);
+        }
     }
     #[test]
     fn stop_uses_only_recorded_identifier() {

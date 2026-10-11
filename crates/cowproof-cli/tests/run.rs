@@ -11,6 +11,10 @@
 //! `/var/tmp` (not `/tmp`, which bwrap hides, and not the home, which both
 //! sandboxes hide), and the lanes root sits beside, not around, the fake.
 
+#[allow(dead_code)] // this file keeps its own copies of most shared helpers
+mod common;
+
+use common::{pid_alive, signal_group, signal_pid};
 use cowproof_prove::Capsule;
 use cowproof_run::prefix::PREAMBLE;
 use serde_json::{Value, json};
@@ -1829,14 +1833,11 @@ fn first_then(first: &str, later: &str) -> String {
     format!("if [ \"$n\" = 1 ]; then\n{first}else\n{later}fi\n")
 }
 
-/// Poll `kill -0 <pid>` until the process is gone (ESRCH), at most 5 s.
+/// Poll until the process `pid` is gone (`kill(2)` with signal 0 says ESRCH), at most 5 s.
 fn assert_pid_gone(pid: &str) {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        let alive = output(Command::new("kill").args(["-0", pid]))
-            .status
-            .success();
-        if !alive {
+        if !pid_alive(pid.parse().expect("a numeric pid")) {
             return;
         }
         assert!(
@@ -1989,10 +1990,22 @@ fn rule_the_moment_it_is_asked(h: &Harness, verdict: &[&str]) -> (Child, String,
     (child, id, ruled_at)
 }
 
+/// Ends the first builder's process group by the pid the fake recorded in `home/fakepid`
+/// (it is the group leader), on macOS only. The sandbox shares the host's pid space there; on
+/// Linux the number is a pid in bwrap's namespace (often 1 to 3) that means nothing out here,
+/// and the namespace dies with its init, so nothing is signalled.
+fn reap_fake_group(h: &Harness) {
+    if cfg!(target_os = "macos")
+        && let Ok(pid) = fs::read_to_string(h.lane().join("home/fakepid"))
+        && let Ok(pgid) = pid.trim().parse::<u32>()
+    {
+        signal_group("KILL", pgid);
+    }
+}
+
 /// Wait for the run to end, at most `RULED_WITHIN` after `ruled_at`. A run
 /// that is still going is killed (by its pid), and so is the first builder's
-/// process group (by the pid the fake recorded: it is the group leader), and
-/// the test fails.
+/// process group (macOS only, see [`reap_fake_group`]), and the test fails.
 fn ends_within_of_the_ruling(h: &Harness, mut child: Child, ruled_at: Instant) -> Output {
     loop {
         if child.try_wait().unwrap().is_some() {
@@ -2001,10 +2014,7 @@ fn ends_within_of_the_ruling(h: &Harness, mut child: Child, ruled_at: Instant) -
         if ruled_at.elapsed() > RULED_WITHIN {
             let _ = child.kill();
             let _ = child.wait();
-            if let Ok(pid) = fs::read_to_string(h.lane().join("home/fakepid")) {
-                let group = format!("-{}", pid.trim());
-                let _ = Command::new("kill").args(["-KILL", "--", &group]).output();
-            }
+            reap_fake_group(h);
             panic!("the run was still going {RULED_WITHIN:?} after the ruling");
         }
         std::thread::sleep(Duration::from_millis(50));
@@ -2018,10 +2028,7 @@ fn second_segment_starts_within(h: &Harness, child: &mut Child, ruled_at: Instan
         if ruled_at.elapsed() > RULED_WITHIN {
             let _ = child.kill();
             let _ = child.wait();
-            if let Ok(pid) = fs::read_to_string(h.lane().join("home/fakepid")) {
-                let group = format!("-{}", pid.trim());
-                let _ = Command::new("kill").args(["-KILL", "--", &group]).output();
-            }
+            reap_fake_group(h);
             panic!("no second segment {RULED_WITHIN:?} after the ruling");
         }
         std::thread::sleep(Duration::from_millis(50));
@@ -2417,13 +2424,12 @@ fn net_bridge_wrapper_passes_argv_whole_and_forwards_the_exit_status() {
 /// machine. A builder that ignores SIGTERM would take 10 s; none here does.
 const INTERRUPT_EXIT_WITHIN: Duration = Duration::from_secs(20);
 
-/// `kill -<signal> <pid>` of a process this test started.
+/// Send `signal` (`"INT"`, `"TERM"`) to a process this test started, by `kill(2)`.
 fn send_signal(signal: &str, child: &Child) {
-    let out = output(Command::new("kill").args([&format!("-{signal}"), &child.id().to_string()]));
     assert!(
-        out.status.success(),
-        "kill -{signal}: {}",
-        String::from_utf8_lossy(&out.stderr)
+        signal_pid(signal, child.id()),
+        "could not send {signal} to pid {}",
+        child.id()
     );
 }
 

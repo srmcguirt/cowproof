@@ -8,7 +8,8 @@
 mod common;
 
 use common::{
-    Lane, fork_lock, output, run_checks, sandbox_available, spawn_to_file, text, var_tmp,
+    Lane, fork_lock, output, run_checks, sandbox_available, signal_pid, spawn_to_file, text,
+    var_tmp,
 };
 use cowproof_prove::Capsule;
 use serde_json::{Value, json};
@@ -177,9 +178,10 @@ impl Running {
     }
 
     fn signal(&self, name: &str) {
-        let out =
-            output(Command::new("kill").args([&format!("-{name}"), &self.child.id().to_string()]));
-        assert!(out.status.success(), "kill -{name}: {}", text(&out));
+        assert!(
+            signal_pid(name, self.child.id()),
+            "could not send {name} to the run"
+        );
     }
 }
 

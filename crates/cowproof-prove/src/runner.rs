@@ -129,24 +129,13 @@ async fn run_with_timeout(
 /// Public so `cowproof run` ends a builder's group with the same code the verifier
 /// uses for a timed-out check, not a second copy.
 pub fn kill_process_group(pgid: u32) {
-    signal_process_group(pgid, libc::SIGKILL);
+    signal_group(pgid, libc::SIGKILL);
 }
 
 /// SIGTERM every process in the group `pgid`: the polite first step before
 /// [`kill_process_group`].
 pub fn terminate_process_group(pgid: u32) {
-    signal_process_group(pgid, libc::SIGTERM);
-}
-
-fn signal_process_group(pgid: u32, signal: libc::c_int) {
-    // A pgid of 0 would make `-pgid` the caller's own group, and 1 would make it -1: every
-    // process the caller may signal.
-    if let Some(pgid) = group_id(pgid) {
-        // SAFETY: `kill(2)` takes two integers and touches no memory.
-        unsafe {
-            libc::kill(-pgid, signal);
-        }
-    }
+    signal_group(pgid, libc::SIGTERM);
 }
 
 /// `id` as a positive `pid_t`, or `None` for 0 and anything too large. `kill(0, ..)` signals
@@ -197,6 +186,34 @@ pub fn signal_pid(pid: u32, signal: libc::c_int) -> bool {
     };
     // SAFETY: `kill(2)` takes two integers and touches no memory; `pid` is positive.
     unsafe { libc::kill(pid, signal) == 0 }
+}
+
+/// Send `signal` to every process in the group `pgid`, through `kill(2)` with the group
+/// negated. Whether `kill(2)` accepted it; false, with nothing sent, for a pgid of 0, 1 or
+/// one that is not a valid pid.
+///
+/// Group 0 would be the caller's own group and group 1 would make the id -1, which reaches
+/// every process the caller may signal, so the id goes through `group_id` first. Never run
+/// the `kill` program for this: procps's `kill` keeps only the first digit of a negative id
+/// that is not preceded by `--` (`kill -KILL -1234` is `kill(-1, SIGKILL)`).
+pub fn signal_group(pgid: u32, signal: libc::c_int) -> bool {
+    let Some(pgid) = group_id(pgid) else {
+        return false;
+    };
+    // SAFETY: `kill(2)` takes two integers and touches no memory; `pgid` is greater than 1,
+    // so `-pgid` names one group and never a wildcard.
+    unsafe { libc::kill(-pgid, signal) == 0 }
+}
+
+/// [`cowproof_core::try_acquire_slot`] with the real probe: a slot's recorded pid is alive unless
+/// `kill(2)` signal 0 answers ESRCH. A pid it cannot be asked about counts as alive, so a slot is
+/// never taken from a holder that may still be running.
+pub fn try_acquire_slot(
+    class: &str,
+    limit: usize,
+    dir: &Path,
+) -> Result<Option<std::path::PathBuf>> {
+    cowproof_core::try_acquire_slot(class, limit, dir, &|pid| pid_exists(pid) != Some(false))
 }
 
 /// The effective user id of this process. `cowproof host-agent --forced` compares it with the
@@ -470,7 +487,7 @@ impl Drop for SlotGuard {
 ///
 /// The wait is a tokio sleep, so other tasks (including the slot's current holder, when
 /// it runs on the same executor thread) keep running. The slot probe itself touches the
-/// filesystem and spawns `kill -0`, so it runs on the blocking pool.
+/// filesystem and asks `kill(2)`, so it runs on the blocking pool.
 pub async fn acquire_slot(class: &str, limit: usize, dir: &Path) -> Result<SlotGuard> {
     acquire_slot_notifying(class, limit, dir, || {}).await
 }
@@ -493,11 +510,9 @@ pub async fn acquire_slot_notifying(
 
     loop {
         let (class, dir) = (class.to_string(), dir.to_path_buf());
-        let probe = tokio::task::spawn_blocking(move || {
-            cowproof_core::try_acquire_slot(&class, limit, &dir)
-        })
-        .await
-        .map_err(|e| anyhow!("slot probe task failed: {e}"))??;
+        let probe = tokio::task::spawn_blocking(move || try_acquire_slot(&class, limit, &dir))
+            .await
+            .map_err(|e| anyhow!("slot probe task failed: {e}"))??;
         match probe {
             Some(slot) => return Ok(SlotGuard::new(slot)),
             None => {
@@ -561,6 +576,34 @@ pub(crate) mod tests {
         assert_eq!(group_exists(1), None);
         // This process is still here and so is the test.
         assert_eq!(pid_exists(std::process::id()), Some(true));
+    }
+
+    #[test]
+    fn signal_group_refuses_0_1_and_oversized_ids_before_any_kill() {
+        // Only signal 0 here: delivering nothing, it cannot hurt this process even if a
+        // refusal were missing (group 0 is the caller's own, group 1 is kill(-1, ..)), and
+        // the answer must still be false because nothing was sent.
+        assert!(!signal_group(0, 0));
+        assert!(!signal_group(1, 0));
+        assert!(!signal_group(u32::MAX, 0));
+        // This process is still here and so is the test.
+        assert_eq!(pid_exists(std::process::id()), Some(true));
+    }
+
+    #[test]
+    fn signal_group_ends_the_children_of_a_group_it_names() {
+        use std::os::unix::process::{CommandExt, ExitStatusExt};
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .expect("spawn sleep in its own group");
+        let pgid = child.id();
+        assert_eq!(group_exists(pgid), Some(true));
+        assert!(signal_group(pgid, libc::SIGKILL));
+        let status = child.wait().expect("reap sleep");
+        assert_eq!(status.signal(), Some(libc::SIGKILL));
+        assert_eq!(group_exists(pgid), Some(false));
     }
 
     #[test]

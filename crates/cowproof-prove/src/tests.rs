@@ -1613,7 +1613,7 @@ async fn test_check_timeout_is_infrastructure_naming_the_check_and_frees_the_slo
         .unwrap();
     crate::runner::tests::assert_process_gone(pid);
     assert!(
-        cowproof_core::try_acquire_slot("rust", 1, &slot_dir)
+        crate::runner::try_acquire_slot("rust", 1, &slot_dir)
             .unwrap()
             .is_some(),
         "the timed-out verify still holds its slot"
@@ -1654,7 +1654,7 @@ async fn test_slot_is_released_when_verification_errors() {
         "{result:?}"
     );
     assert!(
-        cowproof_core::try_acquire_slot("rust", 1, &slot_dir)
+        crate::runner::try_acquire_slot("rust", 1, &slot_dir)
             .unwrap()
             .is_some(),
         "the failed verify still holds its slot"
@@ -1671,7 +1671,7 @@ async fn test_verify_reuses_a_held_slot_instead_of_taking_another() {
     let (_unused, work) = dirs();
     let mut opts = test_opts(work.path());
     opts.slot_limit = 1;
-    let held = cowproof_core::try_acquire_slot("rust", 1, &opts.slot_dir)
+    let held = crate::runner::try_acquire_slot("rust", 1, &opts.slot_dir)
         .unwrap()
         .expect("the one slot is free");
     opts.held_slot_path = Some(held.clone());

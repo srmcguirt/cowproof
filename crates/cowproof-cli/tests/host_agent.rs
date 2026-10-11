@@ -10,7 +10,8 @@
 mod common;
 
 use common::{
-    REAL_KEY, fork_lock, git, group_gone, output, sandbox_available, unique_lane_id, var_tmp,
+    REAL_KEY, fork_lock, git, group_gone, output, pid_alive, sandbox_available, signal_group,
+    signal_pid, unique_lane_id, var_tmp,
 };
 use cowproof_run::bridge::bridge_port;
 use serde_json::{Value, json};
@@ -1237,23 +1238,19 @@ fn wait_exit(child: &mut Child, limit: Duration) -> std::process::ExitStatus {
     }
 }
 
-fn signal_pid(signal: &str, pid: &str) -> bool {
-    let _g = fork_lock();
-    Command::new("kill")
-        .args([signal, pid])
-        .stderr(Stdio::null())
-        .status()
-        .unwrap()
-        .success()
-}
-
-/// Kills the fake's background child by the pid it recorded, whatever the test did.
+/// Kills the fake's background child by the pid it recorded, whatever the test did. The
+/// sandbox shares the host's pid space on macOS only: on Linux the recorded number is a pid in
+/// bwrap's namespace (often 1 to 3) that names some other process here, and the namespace dies
+/// with its init, so nothing is signalled.
 struct Reaper(PathBuf);
 
 impl Drop for Reaper {
     fn drop(&mut self) {
-        if let Ok(pid) = fs::read_to_string(&self.0) {
-            signal_pid("-KILL", pid.trim());
+        if cfg!(target_os = "macos")
+            && let Ok(pid) = fs::read_to_string(&self.0)
+            && let Ok(pid) = pid.trim().parse::<u32>()
+        {
+            signal_pid("KILL", pid);
         }
     }
 }
@@ -1266,8 +1263,8 @@ fn assert_sigterm_ends_the_builder(body: &str, limit: Duration) {
     let mut child = bfx.start(&["builder"], &bfx.spec());
     let marker = bfx.rec().join("marker");
     wait_for(&marker);
-    let pid = child.id().to_string();
-    assert!(signal_pid("-TERM", &pid), "could not signal host-agent");
+    let pid = child.id();
+    assert!(signal_pid("TERM", pid), "could not signal host-agent");
 
     let status = wait_exit(&mut child, limit);
     assert_eq!(status.code(), Some(130), "an interrupted builder exits 130");
@@ -1278,11 +1275,15 @@ fn assert_sigterm_ends_the_builder(body: &str, limit: Duration) {
         size,
         "a child kept writing after the kill"
     );
-    let bg = fs::read_to_string(bfx.rec().join("bg.pid")).unwrap();
-    assert!(
-        !signal_pid("-0", bg.trim()),
-        "the background child is still alive"
-    );
+    // By pid only where the sandbox shares the host's pid space (macOS); by effect (the
+    // marker above) everywhere.
+    if cfg!(target_os = "macos") {
+        let bg = fs::read_to_string(bfx.rec().join("bg.pid")).unwrap();
+        assert!(
+            !pid_alive(bg.trim().parse().unwrap()),
+            "the background child is still alive"
+        );
+    }
 }
 
 #[test]
@@ -1335,8 +1336,9 @@ impl Drop for GroupReaper {
     fn drop(&mut self) {
         if cfg!(target_os = "macos")
             && let Ok(pgid) = fs::read_to_string(&self.0)
+            && let Ok(pgid) = pgid.trim().parse::<u32>()
         {
-            signal_pid("-KILL", &format!("-{}", pgid.trim()));
+            signal_group("KILL", pgid);
         }
     }
 }
@@ -1440,9 +1442,9 @@ impl Drop for RecordReaper {
     fn drop(&mut self) {
         if let Ok(text) = fs::read_to_string(&self.0)
             && let Ok(record) = serde_json::from_str::<Value>(&text)
-            && let Some(pgid) = record["pgid"].as_u64()
+            && let Some(pgid) = record["pgid"].as_u64().and_then(|p| u32::try_from(p).ok())
         {
-            signal_pid("-KILL", &format!("-{pgid}"));
+            signal_group("KILL", pgid);
         }
     }
 }
@@ -1452,7 +1454,9 @@ struct PgidReaper(u64);
 
 impl Drop for PgidReaper {
     fn drop(&mut self) {
-        signal_pid("-KILL", &format!("-{}", self.0));
+        if let Ok(pgid) = u32::try_from(self.0) {
+            signal_group("KILL", pgid);
+        }
     }
 }
 
@@ -1557,7 +1561,7 @@ fn a_recorded_group_whose_leader_was_replaced_is_not_signalled() {
     assert_eq!(json["group"]["signals"], json!([]), "{json}");
     std::thread::sleep(Duration::from_millis(500));
     assert!(
-        signal_pid("-0", &pid.to_string()),
+        pid_alive(pid),
         "a process that only shares the recorded pid was signalled"
     );
     assert!(!group_gone(&pid.to_string()), "its group was signalled");

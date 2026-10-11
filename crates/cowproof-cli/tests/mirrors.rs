@@ -4,6 +4,10 @@
 //! runner. The CLI is then run with the flags that should mean the same thing,
 //! against a second fake runner, and the two recorded requests must be equal.
 
+#[allow(dead_code)] // this file needs only the signal helper of the shared module
+mod common;
+
+use common::signal_pid;
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixListener;
@@ -54,9 +58,7 @@ fn wait_bounded(child: Child) -> Output {
     match rx.recv_timeout(Duration::from_secs(60)) {
         Ok(out) => out.unwrap(),
         Err(_) => {
-            let _ = Command::new("kill")
-                .args(["-KILL", &pid.to_string()])
-                .status();
+            signal_pid("KILL", pid);
             panic!("process {pid} did not finish within 60 s");
         }
     }

@@ -6,7 +6,6 @@ use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 
 pub mod git_show;
 pub mod heldout;
@@ -492,10 +491,21 @@ pub fn remove_build_output(root: &Path) -> Vec<String> {
     r
 }
 
-pub fn try_acquire_slot(class: &str, limit: usize, dir: &Path) -> Result<Option<PathBuf>> {
+/// Take one slot of `class` under `dir`, or `None` when all `limit` are held. A slot whose
+/// recorded pid is no longer alive is reclaimed.
+///
+/// `alive` says whether a pid is still running. This crate forbids unsafe code and never starts
+/// the `kill` program, so the caller supplies the probe: `cowproof_prove::runner` wraps this
+/// with `kill(2)` signal 0 (`cowproof_prove::runner::try_acquire_slot`).
+pub fn try_acquire_slot(
+    class: &str,
+    limit: usize,
+    dir: &Path,
+    alive: &dyn Fn(u32) -> bool,
+) -> Result<Option<PathBuf>> {
     fs::create_dir_all(dir)?;
     for n in 0..limit {
-        if class == "port" && scratch_busy(PORT_BASE + (n as u16) * PORT_BLOCK_SIZE) {
+        if class == "port" && scratch_busy(PORT_BASE + (n as u16) * PORT_BLOCK_SIZE, alive) {
             continue;
         }
         let slot = dir.join(format!("{class}-{n}"));
@@ -508,9 +518,9 @@ pub fn try_acquire_slot(class: &str, limit: usize, dir: &Path) -> Result<Option<
                 let pid = fs::read_to_string(slot.join("pid"))
                     .ok()
                     .and_then(|s| s.parse::<u32>().ok());
-                if pid.is_some_and(|p| !pid_alive(p)) {
+                if pid.is_some_and(|p| !alive(p)) {
                     let _ = fs::remove_dir_all(&slot);
-                    return try_acquire_slot(class, limit, dir);
+                    return try_acquire_slot(class, limit, dir, alive);
                 }
             }
             Err(e) => return Err(e.into()),
@@ -518,7 +528,7 @@ pub fn try_acquire_slot(class: &str, limit: usize, dir: &Path) -> Result<Option<
     }
     Ok(None)
 }
-fn scratch_busy(port_base: u16) -> bool {
+fn scratch_busy(port_base: u16, alive: &dyn Fn(u32) -> bool) -> bool {
     let root = PathBuf::from(format!("/tmp/cowproof/l{port_base}"));
     let Ok(entries) = fs::read_dir(root) else {
         return false;
@@ -530,29 +540,13 @@ fn scratch_busy(port_base: u16) -> bool {
         ] {
             if let Ok(pid) = fs::read_to_string(pid_file)
                 && let Some(pid) = pid.lines().next().and_then(|line| line.parse().ok())
-                && pid_alive(pid)
+                && alive(pid)
             {
                 return true;
             }
         }
     }
     false
-}
-fn pid_alive(pid: u32) -> bool {
-    #[cfg(unix)]
-    {
-        std::process::Command::new("kill")
-            .args(["-0", &pid.to_string()])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .is_ok_and(|s| s.success())
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = pid;
-        true
-    }
 }
 pub fn release_slot(slot: Option<&Path>) {
     if let Some(p) = slot {
@@ -815,13 +809,29 @@ mod tests {
     fn slot_capacity_is_shared_by_class_and_released() {
         let dir = std::env::temp_dir().join(format!("lanes-slot-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
-        let a = try_acquire_slot("rust", 2, &dir).unwrap().unwrap();
-        let b = try_acquire_slot("rust", 2, &dir).unwrap().unwrap();
+        let a = try_acquire_slot("rust", 2, &dir, &|p| p == std::process::id())
+            .unwrap()
+            .unwrap();
+        let b = try_acquire_slot("rust", 2, &dir, &|p| p == std::process::id())
+            .unwrap()
+            .unwrap();
         assert_ne!(a, b);
-        assert!(try_acquire_slot("rust", 2, &dir).unwrap().is_none());
+        assert!(
+            try_acquire_slot("rust", 2, &dir, &|p| p == std::process::id())
+                .unwrap()
+                .is_none()
+        );
         release_slot(Some(&a));
-        assert!(try_acquire_slot("rust", 2, &dir).unwrap().is_some());
-        assert!(try_acquire_slot("light", 1, &dir).unwrap().is_some());
+        assert!(
+            try_acquire_slot("rust", 2, &dir, &|p| p == std::process::id())
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            try_acquire_slot("light", 1, &dir, &|p| p == std::process::id())
+                .unwrap()
+                .is_some()
+        );
         let _ = fs::remove_dir_all(dir);
     }
     #[test]
