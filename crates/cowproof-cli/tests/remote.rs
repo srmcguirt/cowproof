@@ -1412,6 +1412,49 @@ fn a_live_directors_lane_is_never_swept() {
     remote.assert_torn_down();
 }
 
+/// The lane id a logged `... host-agent cleanup --lane-id <id> ...` command names, or `None`
+/// for any other command.
+fn cleanup_lane_id(command: &str) -> Option<&str> {
+    let words: Vec<&str> = command.split_whitespace().collect();
+    let verb = words
+        .windows(2)
+        .position(|w| w == ["host-agent", "cleanup"])?;
+    let flag = words[verb + 2..].iter().position(|w| *w == "--lane-id")?;
+    words.get(verb + 2 + flag + 1).copied()
+}
+
+/// How many `host-agent cleanup` commands the fake ssh ran for exactly `lane_id`. The id is
+/// compared whole: the ids of one test process differ only by a counter, so `...-1` is a
+/// prefix of `...-10`, and another run's cleanup must not be taken for this lane's.
+fn cleanup_count(log: &[Value], lane_id: &str) -> usize {
+    log.iter()
+        .filter(|e| e["event"] == "command-started")
+        .filter_map(|e| e["command"].as_str())
+        .filter(|c| cleanup_lane_id(c) == Some(lane_id))
+        .count()
+}
+
+#[test]
+fn the_cleanup_count_matches_a_lane_id_whole_not_as_a_substring() {
+    let entry = |id: &str| {
+        json!({
+            "event": "command-started",
+            "command": format!("/opt/cp/cowproof host-agent cleanup --lane-id {id} --root /srv/lanes"),
+        })
+    };
+    let log = vec![
+        entry("t-ver-7-1"),
+        entry("t-ver-7-10"),
+        entry("t-ver-7-10"),
+        json!({"event": "command-started", "command": "/opt/cp/cowproof host-agent prepare --lane-id t-ver-7-1"}),
+        json!({"event": "invocation", "command": "host-agent cleanup --lane-id t-ver-7-1"}),
+    ];
+    assert_eq!(cleanup_count(&log, "t-ver-7-1"), 1);
+    assert_eq!(cleanup_count(&log, "t-ver-7-10"), 2);
+    assert_eq!(cleanup_count(&log, "t-ver-7"), 0);
+    assert_eq!(cleanup_lane_id("host-agent cleanup"), None);
+}
+
 #[test]
 fn a_finished_lane_is_never_swept() {
     if !sandbox_available() {
@@ -1421,18 +1464,7 @@ fn a_finished_lane_is_never_swept() {
     let record = remote.remote_json();
     assert_eq!(record["finished"], true, "{record}");
     assert_ne!(record["swept"], true);
-    let cleanups = |remote: &Remote| {
-        remote
-            .log()
-            .iter()
-            .filter(|e| {
-                e["event"] == "command-started"
-                    && e["command"].as_str().is_some_and(|c| {
-                        c.contains(" host-agent cleanup ") && c.contains(&remote.lane.id)
-                    })
-            })
-            .count()
-    };
+    let cleanups = |remote: &Remote| cleanup_count(&remote.log(), &remote.lane.id);
     assert_eq!(cleanups(&remote), 1, "the run's own cleanup");
 
     let out = finish(remote.second_command(&unique_lane_id()));

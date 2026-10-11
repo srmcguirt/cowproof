@@ -2427,9 +2427,11 @@ fn send_signal(signal: &str, child: &Child) {
     );
 }
 
-/// Wait for the file the fake writes once its background child runs.
+/// Wait for the file the fake writes once its background child runs. Only a run that never
+/// gets there fails the wait, so the deadline is long: a sandbox start on a loaded host has
+/// taken most of thirty seconds.
 fn wait_for_file(run: &mut Watched, path: &Path) {
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = Instant::now() + Duration::from_secs(120);
     while !path.exists() {
         assert!(
             run.child.try_wait().unwrap().is_none(),
@@ -2580,13 +2582,38 @@ fn a_signal_while_the_lane_waits_for_a_ruling_ends_the_run_without_a_builder() {
     assert_eq!(h.launches(), 1);
 }
 
+/// The runner's `TERM_GRACE`, read from its source so the two cannot drift: how long the
+/// launcher lets a builder that ignores SIGTERM live before it sends SIGKILL.
+fn term_grace() -> Duration {
+    const SRC: &str = include_str!("../src/run.rs");
+    let line = SRC
+        .lines()
+        .find(|l| l.contains("const TERM_GRACE: Duration"))
+        .expect("src/run.rs no longer defines TERM_GRACE");
+    let secs = line
+        .split("from_secs(")
+        .nth(1)
+        .and_then(|rest| rest.split(')').next())
+        .and_then(|n| n.trim().parse::<u64>().ok())
+        .unwrap_or_else(|| panic!("cannot read TERM_GRACE from {line:?}"));
+    Duration::from_secs(secs)
+}
+
 #[test]
 fn a_second_signal_does_not_wait_out_a_builder_that_ignores_sigterm() {
     if !sandbox_available() {
         return;
     }
-    // The leader ignores SIGTERM, so the first signal would take ten seconds to
-    // become a SIGKILL. The second must not wait for them.
+    // The leader ignores SIGTERM, so the first signal would take TERM_GRACE (ten seconds) to
+    // become a SIGKILL. The second must not wait for them. The bound is a share of that grace
+    // and not a number of seconds picked for an idle machine. The second signal is sent at
+    // once, so a run that waited the grace out exits about TERM_GRACE later. A run that did
+    // not exits when the runner has torn down, however slowly a loaded host does that; a
+    // teardown that waits out the stream drain (`PUMP_DRAIN`, five seconds) would sit right
+    // on the old five-second bound. Three quarters of the grace clears that and still fails
+    // a wait for the grace.
+    let grace = term_grace();
+    let bound = grace * 3 / 4;
     let body = format!(
         "{}trap '' TERM\n( trap '' TERM; sleep 300 ) &\necho $! > \"$HOME/bgpid\"\nwhile true; do sleep 1; done\n",
         init_line()
@@ -2596,13 +2623,18 @@ fn a_second_signal_does_not_wait_out_a_builder_that_ignores_sigterm() {
     wait_for_file(&mut run, &h.lane().join("home/bgpid"));
 
     send_signal("INT", &run.child);
-    run.wait_for_stderr("ending the builder", Duration::from_secs(10));
+    run.wait_for_stderr("ending the builder", INTERRUPT_EXIT_WITHIN);
     let second = Instant::now();
     send_signal("INT", &run.child);
-    let status = exit_within(&mut run, Duration::from_secs(5));
+    // Past `grace` the launcher's own SIGKILL has fired, which proves nothing about the
+    // second signal; the wait here only keeps a hung run from hanging the test.
+    let status = exit_within(&mut run, grace + INTERRUPT_EXIT_WITHIN);
+    let took = second.elapsed();
     assert!(
-        second.elapsed() < Duration::from_secs(5),
-        "the second signal waited for the SIGTERM grace"
+        took < bound,
+        "the second signal waited for the SIGTERM grace: exit {took:?} after it, \
+         bound {bound:?} of a {grace:?} grace:\n{}",
+        run.stderr()
     );
     assert_interrupted_cleanly(&h, status, &run);
     if cfg!(target_os = "macos") {
@@ -2911,20 +2943,32 @@ fn the_headers_timeout_min_beats_the_flag() {
     assert_eq!(h.verdict()["verdict"], "incomplete");
 }
 
+/// The wall-clock limit of the parked-time test, in seconds. Only the two launches count
+/// (a sandbox start and the park, then a resumed start and two checks run in sandboxes):
+/// a fraction of a second to a few seconds on a macOS machine, many times that on a loaded
+/// Linux host where every sandbox start queues. The limit is wide enough for the counted
+/// time to stay well under it.
+const PARKED_TEST_LIMIT_SECS: u64 = 30;
+
+/// How long the director leaves the lane parked: longer than the whole limit, so that
+/// counting the wait would end the resumed launch at once.
+const PARKED_TEST_WAIT_SECS: u64 = PARKED_TEST_LIMIT_SECS + 4;
+
 #[test]
 fn time_parked_waiting_for_a_ruling_does_not_count_toward_the_timeout() {
     if !sandbox_available() {
         return;
     }
-    // Eight seconds of wall clock in all. The builder parks on a blocking ask at
-    // once, the director rules twelve seconds later (more than the whole limit),
-    // and the resumed builder runs its checks. Only the time inside the two
+    // The builder parks on a blocking ask at once, the director rules more than the whole
+    // limit later, and the resumed builder runs its checks. Only the time inside the two
     // launches counts, so the lane is proved.
+    let limit = PARKED_TEST_LIMIT_SECS;
+    let wait = PARKED_TEST_WAIT_SECS;
     let h = owned_packet(&asks_first("Choose A or B?", true, &then_checks()));
     let mut child = {
         let _g = fork_lock();
         h.command(h.lanes.path())
-            .args(["--timeout-secs", "8"])
+            .args(["--timeout-secs", &limit.to_string()])
             .env("ANTHROPIC_API_KEY", REAL_KEY)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -2933,7 +2977,7 @@ fn time_parked_waiting_for_a_ruling_does_not_count_toward_the_timeout() {
             .unwrap()
     };
     let id = wait_for_ask(&h, &mut child, 1);
-    std::thread::sleep(Duration::from_secs(12));
+    std::thread::sleep(Duration::from_secs(wait));
     rule(&h, &id, &["--answer", "use option B"]);
     let out = finish(child);
     assert_eq!(out.status.code(), Some(0), "{}", stdout_of(&out));
@@ -2951,16 +2995,19 @@ fn time_parked_waiting_for_a_ruling_does_not_count_toward_the_timeout() {
 
     // The run took longer than the limit, the counted time well under it.
     let json = h.run_json();
-    assert_eq!(json["timeoutSecs"], 8);
+    assert_eq!(json["timeoutSecs"], limit);
     let whole = json["durationMs"].as_u64().unwrap();
     let counted = json["activeMs"].as_u64().unwrap();
     assert!(
-        whole >= 12_000,
-        "the run included the twelve-second wait: {whole} ms"
+        whole >= wait * 1000,
+        "the run included the {wait}-second wait: {whole} ms"
     );
-    assert!(counted < 8_000, "only launch time counts: {counted} ms");
     assert!(
-        whole - counted >= 12_000,
+        counted < limit * 1000,
+        "only launch time counts: {counted} ms of a {limit} s limit"
+    );
+    assert!(
+        whole - counted >= wait * 1000,
         "at least the wait was left out: {whole} ms whole, {counted} ms counted"
     );
     assert_eq!(h.verdict()["verdict"], "proved");
