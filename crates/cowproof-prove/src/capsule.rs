@@ -8,8 +8,19 @@ use thiserror::Error;
 
 /// The launch baseline: a JSON array of the relative paths the runner removed from
 /// the clone before the builder started. Paths only, never content (R15). It lives in
-/// its own hashed file, not in `capsule.json`, which is itself never hashed.
+/// its own hashed file, listed in `capsule.json`'s `file_hashes`.
 const LAUNCH_REMOVED_FILE: &str = "launch_removed.json";
+
+/// The seal: the SHA256 of `capsule.json`'s raw bytes, exactly as written. `capsule.json`
+/// cannot carry its own hash, so the seal is a separate file, and `read` checks it
+/// before it parses a byte of `capsule.json`. Nothing is re-serialized to compute it.
+/// This catches edits and damage, not a forger who also rewrites the seal; signing
+/// comes later.
+pub const SEAL_FILE: &str = "capsule.sha256";
+
+/// The held-out checks a lane was proved against, copied in from the director's store
+/// (D5). It sits among the packets, so it is hashed like them, and `verify` runs it.
+pub const HELDOUT_FILE: &str = "packets/heldout.toml";
 
 /// Files at the capsule root whose hashes `write` records.
 const CAPSULE_TOP_FILES: &[&str] = &[
@@ -127,7 +138,8 @@ impl Capsule {
     /// Write the capsule to a directory. Writes `launch_removed.json`, then records
     /// the SHA256 of every capsule file present in `dir` (patches, the launch
     /// baseline, packets, checks, gates, escalations, applied records) in
-    /// `file_hashes` before writing `capsule.json`, which is itself never hashed.
+    /// `file_hashes` before writing `capsule.json`, then seals `capsule.json` itself by
+    /// writing the hash of its raw bytes to `capsule.sha256`.
     pub fn write(&mut self, dir: &Path) -> Result<()> {
         fs::create_dir_all(dir)?;
         fs::write(
@@ -159,24 +171,40 @@ impl Capsule {
             }
         }
 
-        let capsule_json = serde_json::to_string_pretty(self)?;
-        fs::write(dir.join("capsule.json"), &capsule_json)?;
+        // The seal covers the exact bytes on disk, so hash what was written.
+        let capsule_path = dir.join("capsule.json");
+        fs::write(&capsule_path, serde_json::to_vec_pretty(self)?)?;
+        fs::write(dir.join(SEAL_FILE), Self::hash_file(&capsule_path)?)?;
 
         Ok(())
     }
 
-    /// Read a capsule from a directory and verify all file hashes.
+    /// Read a capsule from a directory. `capsule.json` is checked against its seal
+    /// before it is parsed, then every file it lists is checked against its hash.
     pub fn read(dir: &Path) -> Result<Self, CapsuleError> {
         let capsule_path = dir.join("capsule.json");
 
         if !capsule_path.exists() {
             return Err(CapsuleError::MissingFile("capsule.json".to_string()));
         }
+        let raw = fs::read(&capsule_path).map_err(CapsuleError::IoError)?;
+        let expected = match fs::read_to_string(dir.join(SEAL_FILE)) {
+            Ok(text) => text.trim().to_string(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(CapsuleError::MissingFile(SEAL_FILE.to_string()));
+            }
+            Err(e) => return Err(CapsuleError::IoError(e)),
+        };
+        let actual = Self::hash_bytes(&raw);
+        if actual != expected {
+            return Err(CapsuleError::HashMismatch(
+                "capsule.json".to_string(),
+                expected,
+                actual,
+            ));
+        }
 
-        let capsule_content = fs::read_to_string(&capsule_path).map_err(CapsuleError::IoError)?;
-
-        let mut capsule: Capsule =
-            serde_json::from_str(&capsule_content).map_err(CapsuleError::JsonError)?;
+        let mut capsule: Capsule = serde_json::from_slice(&raw).map_err(CapsuleError::JsonError)?;
 
         for (file_path, expected_hash) in &capsule.file_hashes {
             let full_path = dir.join(file_path);
@@ -213,9 +241,11 @@ impl Capsule {
 
     /// Compute the SHA256 hash of a file and return it as hex.
     pub fn hash_file(path: &Path) -> Result<String> {
-        let content = fs::read(path)?;
-        let mut hasher = Sha256::new();
-        hasher.update(&content);
-        Ok(format!("{:x}", hasher.finalize()))
+        Ok(Self::hash_bytes(&fs::read(path)?))
+    }
+
+    /// The SHA256 of `bytes`, as hex.
+    pub fn hash_bytes(bytes: &[u8]) -> String {
+        format!("{:x}", Sha256::digest(bytes))
     }
 }

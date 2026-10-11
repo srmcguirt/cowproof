@@ -30,6 +30,7 @@ use tokio::process::Command;
 
 mod lane_tools;
 mod run;
+mod verify;
 mod watch;
 
 #[derive(Parser)]
@@ -50,6 +51,12 @@ enum Action {
     /// failed); 3 incomplete (a declared check was never run); 4 infrastructure (the proof could
     /// not run, never a refutation); 1 the run itself failed before a verdict.
     Run(RunOneArgs),
+    /// Replay a proof capsule against a repository, from any directory
+    ///
+    /// Rebuilds the capsule's base commit from `--repo`, applies its patches and re-runs
+    /// every recorded check, then every held-out check, in the verifier sandbox. Exit
+    /// codes: 0 reproduced; 2 diverged (a check named in the output); 4 infrastructure.
+    Verify(verify::VerifyArgs),
     /// the multi-packet host runner ported from the source project; superseded by `cowproof run`
     LegacyRun(RunArgs),
     Lint(LintArgs),
@@ -164,6 +171,11 @@ struct RunOneArgs {
     /// as opus) reaches 40% of it, once per segment. It is a trigger, not a hard stop
     #[arg(long, default_value_t = 5.0)]
     cost_cap_usd: f64,
+    /// Held-out checks file (D5). It must lie outside the repository; the runner copies it
+    /// into the capsule's `packets/`, never into the lane's clone or home. Default:
+    /// `~/.cowproof/heldout/<repo-id>/<lane-id>.toml`, used when that file exists
+    #[arg(long)]
+    heldout: Option<PathBuf>,
 }
 
 #[derive(Parser)]
@@ -228,6 +240,13 @@ async fn main() -> Result<()> {
     match Args::parse().command {
         Action::Run(args) => {
             let code = run::run_one(args).await?;
+            if code != 0 {
+                std::process::exit(code);
+            }
+            Ok(())
+        }
+        Action::Verify(args) => {
+            let code = verify::verify_capsule(args).await?;
             if code != 0 {
                 std::process::exit(code);
             }

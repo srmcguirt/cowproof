@@ -1,4 +1,4 @@
-use crate::capsule::{Capsule, CapsuleError, CheckResult};
+use crate::capsule::{Capsule, CapsuleError, CheckResult, HELDOUT_FILE};
 use crate::runner::{CheckRunner, acquire_slot};
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -54,16 +54,31 @@ pub struct CheckMatch {
     pub actual_exit_status: i32,
 }
 
+/// A held-out check run on the rebuilt tree. It has no recorded result to match: it
+/// passes or it fails.
+#[derive(Debug, Clone)]
+pub struct HeldOutOutcome {
+    pub check_id: String,
+    pub passed: bool,
+}
+
 #[derive(Debug)]
 pub enum VerifyResult {
+    /// Every recorded check matched and every held-out check passed.
     Reproduced,
+    /// A recorded check's pass or fail differs from the capsule's.
     Diverged { check_ids: Vec<String> },
+    /// Every recorded check matched, but a held-out check failed on the rebuilt tree.
+    HeldOutFailed { check_ids: Vec<String> },
 }
 
 #[derive(Debug)]
 pub struct VerifyReport {
     pub result: VerifyResult,
     pub checks: Vec<CheckMatch>,
+    /// The held-out checks, in file order. Empty when the capsule holds none. Filled
+    /// even when a recorded check diverged, so a refutation names every failure.
+    pub heldout: Vec<HeldOutOutcome>,
 }
 
 const FLAKY_ATTEMPTS: u32 = 3;
@@ -83,6 +98,10 @@ const FLAKY_ATTEMPTS: u32 = 3;
 /// 4. Apply `lane.patch`.
 /// 5. Run each recorded check's command through the `CheckRunner`.
 /// 6. Compare pass or fail per check id; durations and output hashes are never compared.
+/// 7. Run the held-out checks in `packets/heldout.toml` (when the capsule has one) on the
+///    same tree, after the recorded checks. They have no recorded result: one that fails
+///    refutes the lane (`HeldOutFailed`), naming the check. A held-out file that cannot be
+///    read is an infrastructure error.
 ///
 /// Checks marked flaky in the capsule are retried up to three times. Any failure to
 /// rebuild the tree, apply a patch, replay the baseline or run a check is `VerifyError::Infrastructure`,
@@ -167,17 +186,39 @@ pub async fn verify(
         });
     }
 
-    let result = if diverged_ids.is_empty() {
-        VerifyResult::Reproduced
-    } else {
+    let mut heldout_outcomes = Vec::new();
+    for check in load_heldout(capsule_dir)? {
+        let outcome = runner
+            .run(&tree, &check.command, opts.default_timeout)
+            .await
+            .map_err(|e| infra(format!("held-out check {}: {e}", check.id)))?;
+        heldout_outcomes.push(HeldOutOutcome {
+            check_id: check.id,
+            passed: outcome.exit_status == 0,
+        });
+    }
+    let heldout_failed: Vec<String> = heldout_outcomes
+        .iter()
+        .filter(|o| !o.passed)
+        .map(|o| o.check_id.clone())
+        .collect();
+
+    let result = if !diverged_ids.is_empty() {
         VerifyResult::Diverged {
             check_ids: diverged_ids,
         }
+    } else if !heldout_failed.is_empty() {
+        VerifyResult::HeldOutFailed {
+            check_ids: heldout_failed,
+        }
+    } else {
+        VerifyResult::Reproduced
     };
 
     Ok(VerifyReport {
         result,
         checks: check_matches,
+        heldout: heldout_outcomes,
     })
 }
 
@@ -209,6 +250,19 @@ fn load_checks(capsule_dir: &Path) -> Result<BTreeMap<String, CheckResult>, Veri
         checks.insert(id, check);
     }
     Ok(checks)
+}
+
+/// The held-out checks the capsule carries, in file order; none when it has no
+/// `packets/heldout.toml`. The file is hashed, so `Capsule::read` has already proved
+/// it is the one the lane was gated on.
+fn load_heldout(capsule_dir: &Path) -> Result<Vec<cowproof_core::heldout::Check>, VerifyError> {
+    let path = capsule_dir.join(HELDOUT_FILE);
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    cowproof_core::heldout::load(&path)
+        .map(|h| h.check)
+        .map_err(|e| infra(format!("{HELDOUT_FILE}: {e:#}")))
 }
 
 async fn git(dir: &Path, args: &[&str]) -> Result<String, VerifyError> {

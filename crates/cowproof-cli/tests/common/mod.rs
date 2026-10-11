@@ -1,0 +1,267 @@
+//! Shared pieces for the CLI tests that drive a whole lane: a fork lock, sandbox
+//! availability, a real git repository, a copy of the `cowproof` binary outside the
+//! home, a FAKE `claude`, and the MCP frames the fake sends to `cowproof lane-tools`.
+//!
+//! `tests/run.rs` keeps its own copies of these (another lane is editing it); new test
+//! files use this module so there is one copy to move it to.
+
+use serde_json::{Value, json};
+use std::fs;
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output, Stdio};
+use std::sync::Mutex;
+use tempfile::TempDir;
+
+pub const REAL_KEY: &str = "sk-test-real-xyz";
+
+/// What the fake prints on stdout: a session, two turns, a result.
+const FAKE_STREAM: &str = concat!(
+    r#"{"type":"system","subtype":"init","session_id":"0a1b2c3d-1111-2222-3333-444455556666"}"#,
+    "\n",
+    r#"{"type":"assistant","message":{"id":"m1","usage":{"input_tokens":3,"output_tokens":5,"cache_read_input_tokens":0,"cache_creation_input_tokens":7}}}"#,
+    "\n",
+    r#"{"type":"assistant","message":{"id":"m2","usage":{"input_tokens":4,"output_tokens":6,"cache_read_input_tokens":7,"cache_creation_input_tokens":0}}}"#,
+    "\n",
+    r#"{"type":"result","subtype":"success","result":"done","num_turns":2}"#,
+);
+
+/// Linux refuses to exec a file some process holds open for writing (ETXTBSY), and a
+/// fork on another test thread can inherit that handle. Writing executables and
+/// forking both take this lock.
+static FORK_LOCK: Mutex<()> = Mutex::new(());
+
+pub fn fork_lock() -> std::sync::MutexGuard<'static, ()> {
+    FORK_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// `Command::output` with the spawn under `FORK_LOCK`; only the fork is held.
+pub fn output(cmd: &mut Command) -> Output {
+    let child = {
+        let _g = fork_lock();
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap()
+    };
+    child.wait_with_output().unwrap()
+}
+
+/// Whether a sandbox can run here. With `COWPROOF_REQUIRE_SANDBOX=1` an unavailable
+/// sandbox fails the test; otherwise the test skips.
+pub fn sandbox_available() -> bool {
+    if cfg!(target_os = "macos") {
+        return true;
+    }
+    let probe = {
+        let _g = fork_lock();
+        Command::new("bwrap")
+            .args(["--ro-bind", "/", "/", "true"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+    };
+    let reason = match probe.and_then(|c| c.wait_with_output()) {
+        Ok(o) if o.status.success() => return true,
+        Ok(o) => format!(
+            "bwrap cannot create a sandbox here: {}",
+            String::from_utf8_lossy(&o.stderr).trim()
+        ),
+        Err(e) => format!("bwrap is not installed: {e}"),
+    };
+    if std::env::var_os("COWPROOF_REQUIRE_SANDBOX").is_some_and(|v| v == "1") {
+        panic!("COWPROOF_REQUIRE_SANDBOX=1 but {reason}");
+    }
+    eprintln!("SKIP: {reason}");
+    false
+}
+
+/// A temporary directory under `/var/tmp`: not `/tmp` (bwrap hides it) and not the home
+/// (both sandboxes hide it).
+pub fn var_tmp(prefix: &str) -> TempDir {
+    tempfile::Builder::new()
+        .prefix(prefix)
+        .tempdir_in("/var/tmp")
+        .unwrap()
+}
+
+pub fn git(repo: &Path, args: &[&str]) {
+    let out = output(
+        Command::new("git")
+            .args(["-C", repo.to_str().unwrap()])
+            .args(args),
+    );
+    assert!(
+        out.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// Shell that feeds an MCP session to `cowproof lane-tools` on the lane's own socket
+/// and saves the frames to `$rec/<out>`. `calls` are `(id, tool, arguments)`.
+pub fn mcp_session(out: &str, calls: &[(u64, &str, Value)]) -> String {
+    let mut lines = vec![
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"fake","version":"0"}}}),
+        json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
+    ];
+    for (id, tool, arguments) in calls {
+        lines.push(json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{"name":tool,"arguments":arguments}}));
+    }
+    let printed: String = lines
+        .iter()
+        .map(|l| format!("printf '%s\\n' '{l}'\n"))
+        .collect();
+    format!(
+        "{{\n{printed}}} | \"$cp_bin\" lane-tools --socket \"$sock\" > \"$rec/{out}\" 2> \"$rec/{out}.err\"\n"
+    )
+}
+
+/// Shell for a fake that calls `run_check` once for each id, in order.
+pub fn run_checks(ids: &[&str]) -> String {
+    let calls: Vec<(u64, &str, Value)> = ids
+        .iter()
+        .enumerate()
+        .map(|(i, id)| (3 + i as u64, "run_check", json!({ "id": id })))
+        .collect();
+    mcp_session("mcp.out", &calls)
+}
+
+/// One lane of `cowproof run` against a fake `claude`, with a `cowproof` copy outside
+/// the home and a `HOME` of its own for every child (so no test touches the real one).
+pub struct Lane {
+    /// Holds the repository, the packet, the fake and the cowproof copy.
+    _work: TempDir,
+    /// Holds the lanes, nothing else.
+    pub lanes: TempDir,
+    /// The `HOME` of every cowproof child: the director store lives under it.
+    pub home: TempDir,
+    pub repo: PathBuf,
+    packet: PathBuf,
+    fake: PathBuf,
+    pub cowproof: PathBuf,
+}
+
+pub const LANE_ID: &str = "t-ver";
+
+impl Lane {
+    /// A committed repository with a README, and a packet that owns `README.md` and
+    /// `created.txt` and declares `checks`. The fake edits README.md, creates
+    /// created.txt, then runs `fake_body`.
+    pub fn new(fake_body: &str, checks: Value) -> Self {
+        let work = var_tmp("cp-ver-work-");
+        let lanes = var_tmp("cp-ver-lanes-");
+        let home = var_tmp("cp-ver-home-");
+        let repo = work.path().join("repo");
+        fs::create_dir(&repo).unwrap();
+        git(&repo, &["init", "-q"]);
+        git(&repo, &["config", "user.email", "t@example.com"]);
+        git(&repo, &["config", "user.name", "T"]);
+        fs::write(repo.join("README.md"), "base\n").unwrap();
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-q", "-m", "base"]);
+
+        let packet = work.path().join("packet.md");
+        fs::write(
+            &packet,
+            format!(
+                "# Task\n\n<!-- lane {} -->\n\nChange the README.\n",
+                json!({
+                    "id": LANE_ID,
+                    "owns": ["README.md", "created.txt"],
+                    "class": "light",
+                    "checks": checks,
+                })
+            ),
+        )
+        .unwrap();
+
+        // The test binary lives under the home in a normal checkout, which the sandbox
+        // hides, so a copy outside it is what runs.
+        let cowproof = work.path().join("cowproof");
+        {
+            let _g = fork_lock();
+            fs::copy(env!("CARGO_BIN_EXE_cowproof"), &cowproof).unwrap();
+        }
+        let fake = work.path().join("fake-claude");
+        let script = format!(
+            r#"#!/bin/sh
+rec="$HOME/fake"
+mkdir -p "$rec"
+sock="$(dirname "$HOME")/sock/runner.sock"
+echo edited >> README.md
+echo created > created.txt
+cp_bin='{cowproof}'
+{fake_body}
+printf '%s' '{stream}'
+exit 0
+"#,
+            cowproof = cowproof.display(),
+            stream = FAKE_STREAM,
+        );
+        {
+            let _g = fork_lock();
+            fs::write(&fake, script).unwrap();
+            fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        Lane {
+            _work: work,
+            lanes,
+            home,
+            repo,
+            packet,
+            fake,
+            cowproof,
+        }
+    }
+
+    /// `cowproof` with the lane's `HOME` and no inherited API key.
+    pub fn cowproof_cmd(&self) -> Command {
+        let mut c = Command::new(&self.cowproof);
+        c.env("HOME", self.home.path())
+            .env_remove("ANTHROPIC_API_KEY");
+        c
+    }
+
+    /// `cowproof run` with the real key set, plus `extra` arguments.
+    pub fn run(&self, extra: &[&Path]) -> Output {
+        let mut c = self.cowproof_cmd();
+        c.arg("run")
+            .arg(&self.packet)
+            .arg("--repo")
+            .arg(&self.repo)
+            .arg("--lanes-root")
+            .arg(self.lanes.path())
+            .arg("--claude-bin")
+            .arg(&self.fake)
+            .args(extra)
+            .env("ANTHROPIC_API_KEY", REAL_KEY);
+        output(&mut c)
+    }
+
+    pub fn lane_dir(&self) -> PathBuf {
+        self.lanes.path().canonicalize().unwrap().join(LANE_ID)
+    }
+
+    pub fn capsule_dir(&self) -> PathBuf {
+        self.lane_dir().join("control/capsule")
+    }
+
+    pub fn verdict(&self) -> Value {
+        let p = self.lane_dir().join("control/verdict.json");
+        serde_json::from_str(
+            &fs::read_to_string(&p).unwrap_or_else(|e| panic!("{}: {e}", p.display())),
+        )
+        .unwrap()
+    }
+}
+
+/// `out`'s stdout and stderr, for assertion messages.
+pub fn text(out: &Output) -> String {
+    format!(
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    )
+}

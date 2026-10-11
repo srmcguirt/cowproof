@@ -275,10 +275,13 @@ pub fn glob_matches(glob: &str, value: &str) -> bool {
     )
 }
 
-pub fn repo_rules(root: &Path) -> (Vec<String>, String) {
-    let config = fs::read(root.join("lanes.config.json"))
-        .ok()
-        .and_then(|s| serde_json::from_slice::<Value>(&s).ok())
+/// The protected globs and handoff directory named by a `lanes.config.json` text.
+/// `None`, or text that does not parse, gives the defaults. The one place the
+/// defaults live: the working-tree reader below and the gates, which read the file
+/// from the base commit, both go through it.
+pub fn repo_rules_from_config(text: Option<&str>) -> (Vec<String>, String) {
+    let config = text
+        .and_then(|s| serde_json::from_str::<Value>(s).ok())
         .unwrap_or_else(|| json!({}));
     let protected = config
         .get("protected")
@@ -310,6 +313,13 @@ pub fn repo_rules(root: &Path) -> (Vec<String>, String) {
         .unwrap_or(DEFAULT_HANDOFF_DIR)
         .to_owned();
     (protected, handoff)
+}
+
+/// `repo_rules_from_config` over the working tree's `lanes.config.json`. Proof gates
+/// must not use this: a lane's patch could edit the file they would read.
+pub fn repo_rules(root: &Path) -> (Vec<String>, String) {
+    let text = fs::read_to_string(root.join("lanes.config.json")).ok();
+    repo_rules_from_config(text.as_deref())
 }
 
 pub fn outside_ownership(files: &[String], owns: &[String], protected: &[String]) -> Vec<String> {
@@ -502,6 +512,21 @@ pub fn release_slot(slot: Option<&Path>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repo_rules_from_config_reads_the_given_text_and_defaults_otherwise() {
+        let (defaults, handoff) = repo_rules_from_config(None);
+        assert!(defaults.contains(&"AGENTS.md".to_string()));
+        assert!(defaults.contains(&"lanes.config.json".to_string()));
+        assert_eq!(handoff, DEFAULT_HANDOFF_DIR);
+        // Text that does not parse is the defaults, never "protect nothing".
+        assert_eq!(repo_rules_from_config(Some("{ not json")).0, defaults);
+        let (custom, handoff) =
+            repo_rules_from_config(Some(r#"{"protected":["secret/**"],"handoffDir":"h"}"#));
+        assert_eq!(custom, vec!["secret/**".to_string()]);
+        assert_eq!(handoff, "h");
+    }
+
     #[test]
     fn header_defaults_and_refusals() {
         let h =

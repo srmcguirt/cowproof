@@ -1560,3 +1560,299 @@ async fn test_slot_is_released_when_verification_errors() {
         "the failed verify still holds its slot"
     );
 }
+
+// ============================================================================
+// The seal on capsule.json: the hash of its raw bytes, in capsule.sha256.
+// ============================================================================
+
+fn sealed_capsule(dir: &Path) {
+    let mut capsule = Capsule::new(
+        "abc123".to_string(),
+        "tree_hash_123".to_string(),
+        fingerprint(),
+        "claude:haiku".to_string(),
+        "api-key".to_string(),
+    );
+    capsule.write(dir).unwrap();
+}
+
+/// Replace `from` with `to` in capsule.json, as a hand edit would, leaving the seal alone.
+fn edit_capsule_json(dir: &Path, from: &str, to: &str) {
+    let path = dir.join("capsule.json");
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.contains(from), "capsule.json has no {from:?}:\n{text}");
+    std::fs::write(&path, text.replace(from, to)).unwrap();
+}
+
+fn assert_capsule_json_mismatch(dir: &Path) {
+    match Capsule::read(dir) {
+        Err(CapsuleError::HashMismatch(file, _, _)) => assert_eq!(file, "capsule.json"),
+        other => panic!("expected a capsule.json HashMismatch, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_editing_lane_state_after_write_makes_read_fail() {
+    let dir = TempDir::new().unwrap();
+    sealed_capsule(dir.path());
+    assert_eq!(Capsule::read(dir.path()).unwrap().lane_state, "finished");
+    edit_capsule_json(
+        dir.path(),
+        "\"lane_state\": \"finished\"",
+        "\"lane_state\": \"proved\"",
+    );
+    assert_capsule_json_mismatch(dir.path());
+}
+
+#[test]
+fn test_editing_unsandboxed_after_write_makes_read_fail() {
+    let dir = TempDir::new().unwrap();
+    sealed_capsule(dir.path());
+    edit_capsule_json(
+        dir.path(),
+        "\"unsandboxed\": false",
+        "\"unsandboxed\": true",
+    );
+    assert_capsule_json_mismatch(dir.path());
+}
+
+/// The seal is over the bytes on disk: a byte-for-byte different file with the same
+/// meaning (compact JSON instead of the written form) is refused too.
+#[test]
+fn test_a_reformatted_but_equal_capsule_json_is_refused() {
+    let dir = TempDir::new().unwrap();
+    sealed_capsule(dir.path());
+    let path = dir.path().join("capsule.json");
+    let value: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+    assert_capsule_json_mismatch(dir.path());
+}
+
+#[test]
+fn test_the_seal_is_the_sha256_of_the_raw_capsule_json_and_is_not_inside_it() {
+    use sha2::{Digest, Sha256};
+    let dir = TempDir::new().unwrap();
+    sealed_capsule(dir.path());
+    let raw = std::fs::read(dir.path().join("capsule.json")).unwrap();
+    let seal = std::fs::read_to_string(dir.path().join("capsule.sha256")).unwrap();
+    assert_eq!(seal.trim(), format!("{:x}", Sha256::digest(&raw)));
+    // Not a self-hash inside the hashed file: capsule.json does not list itself or
+    // carry the seal.
+    let json: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+    assert!(
+        !json["file_hashes"]
+            .as_object()
+            .unwrap()
+            .contains_key("capsule.json")
+    );
+    assert!(!String::from_utf8_lossy(&raw).contains(seal.trim()));
+}
+
+#[test]
+fn test_a_capsule_without_its_seal_is_refused() {
+    let dir = TempDir::new().unwrap();
+    sealed_capsule(dir.path());
+    std::fs::remove_file(dir.path().join("capsule.sha256")).unwrap();
+    match Capsule::read(dir.path()) {
+        Err(CapsuleError::MissingFile(file)) => assert_eq!(file, "capsule.sha256"),
+        other => panic!("expected MissingFile, got {other:?}"),
+    }
+}
+
+/// Rewriting a capsule (as `cowproof run` does to record the verdict) reseals it.
+#[test]
+fn test_rewriting_a_capsule_reseals_it() {
+    let dir = TempDir::new().unwrap();
+    sealed_capsule(dir.path());
+    let mut capsule = Capsule::read(dir.path()).unwrap();
+    capsule.lane_state = "proved".to_string();
+    capsule.write(dir.path()).unwrap();
+    assert_eq!(Capsule::read(dir.path()).unwrap().lane_state, "proved");
+}
+
+// ============================================================================
+// Held-out checks in the capsule (D5): `packets/heldout.toml` is hashed with the
+// packets and RUN by `verify` on the rebuilt tree.
+// ============================================================================
+
+const HELDOUT_PASSING: &str =
+    "[[check]]\nid = \"hidden-edit\"\ncommand = \"grep -q line=edited src.txt\"\n";
+const HELDOUT_FAILING: &str = "[[check]]\nid = \"hidden-edit\"\ncommand = \"grep -q line=edited src.txt\"\n\n[[check]]\nid = \"hidden-base\"\ncommand = \"grep -q line=base src.txt\"\n";
+
+/// The shared chain's capsule with one recorded passing check and `heldout` in `packets/`.
+fn capsule_with_heldout(c: &Chain, heldout: &str) -> TempDir {
+    let dir = TempDir::new().unwrap();
+    std::fs::create_dir_all(dir.path().join("packets")).unwrap();
+    std::fs::write(dir.path().join(crate::HELDOUT_FILE), heldout).unwrap();
+    write_capsule(
+        dir.path(),
+        &CapsuleSpec {
+            base: &c.base,
+            patches: &[("lane.patch", &c.lane)],
+            launch_removed: &[".env"],
+            checks: &[("visible", "true", 0)],
+            flaky: &[],
+            unsandboxed: false,
+        },
+    );
+    dir
+}
+
+#[tokio::test]
+async fn test_held_out_checks_that_pass_on_the_rebuilt_tree_reproduce() {
+    let c = chain();
+    let (_, work) = dirs();
+    let capsule_dir = capsule_with_heldout(&c, HELDOUT_PASSING);
+    let report = verify(
+        capsule_dir.path(),
+        c.repo.path(),
+        work.path(),
+        &ProcessRunner::new(),
+        test_opts(work.path()),
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(report.result, VerifyResult::Reproduced),
+        "{report:?}"
+    );
+    assert_eq!(report.heldout.len(), 1);
+    assert_eq!(report.heldout[0].check_id, "hidden-edit");
+    assert!(report.heldout[0].passed);
+}
+
+/// The failing held-out check is named; the one that passes is not.
+#[tokio::test]
+async fn test_a_failing_held_out_check_refutes_and_is_named() {
+    let c = chain();
+    let (_, work) = dirs();
+    let capsule_dir = capsule_with_heldout(&c, HELDOUT_FAILING);
+    let report = verify(
+        capsule_dir.path(),
+        c.repo.path(),
+        work.path(),
+        &ProcessRunner::new(),
+        test_opts(work.path()),
+    )
+    .await
+    .unwrap();
+    match &report.result {
+        VerifyResult::HeldOutFailed { check_ids } => {
+            assert_eq!(check_ids, &vec!["hidden-base".to_string()])
+        }
+        other => panic!("expected HeldOutFailed, got {other:?}"),
+    }
+    assert!(report.checks.iter().all(|m| m.matched_capsule));
+}
+
+/// Held-out commands run once each, after the recorded checks, on the same tree.
+#[tokio::test]
+async fn test_held_out_commands_run_after_the_recorded_checks() {
+    let c = chain();
+    let (_, work) = dirs();
+    let capsule_dir = capsule_with_heldout(&c, HELDOUT_FAILING);
+    let runner = ScriptedRunner::new(&[
+        ("true", &[0]),
+        ("grep -q line=edited src.txt", &[0]),
+        ("grep -q line=base src.txt", &[1]),
+    ]);
+    verify(
+        capsule_dir.path(),
+        c.repo.path(),
+        work.path(),
+        &runner,
+        test_opts(work.path()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        *runner.calls.lock().unwrap(),
+        vec![
+            "true".to_string(),
+            "grep -q line=edited src.txt".to_string(),
+            "grep -q line=base src.txt".to_string(),
+        ]
+    );
+}
+
+/// A diverged recorded check wins the verdict, and the held-out failure is still reported.
+#[tokio::test]
+async fn test_a_divergence_and_a_held_out_failure_are_both_reported() {
+    let c = chain();
+    let (_, work) = dirs();
+    let capsule_dir = capsule_with_heldout(&c, HELDOUT_FAILING);
+    let runner = ScriptedRunner::new(&[
+        ("true", &[1]),
+        ("grep -q line=edited src.txt", &[0]),
+        ("grep -q line=base src.txt", &[1]),
+    ]);
+    let report = verify(
+        capsule_dir.path(),
+        c.repo.path(),
+        work.path(),
+        &runner,
+        test_opts(work.path()),
+    )
+    .await
+    .unwrap();
+    match &report.result {
+        VerifyResult::Diverged { check_ids } => assert_eq!(check_ids, &vec!["visible".to_string()]),
+        other => panic!("expected Diverged, got {other:?}"),
+    }
+    assert_eq!(
+        report
+            .heldout
+            .iter()
+            .filter(|o| !o.passed)
+            .map(|o| o.check_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["hidden-base"]
+    );
+}
+
+#[tokio::test]
+async fn test_an_edited_held_out_file_is_refused_before_anything_runs() {
+    let c = chain();
+    let (_, work) = dirs();
+    let capsule_dir = capsule_with_heldout(&c, HELDOUT_FAILING);
+    std::fs::write(
+        capsule_dir.path().join(crate::HELDOUT_FILE),
+        HELDOUT_PASSING,
+    )
+    .unwrap();
+    let runner = ScriptedRunner::new(&[]);
+    let result = verify(
+        capsule_dir.path(),
+        c.repo.path(),
+        work.path(),
+        &runner,
+        test_opts(work.path()),
+    )
+    .await;
+    match result {
+        Err(VerifyError::Capsule(CapsuleError::HashMismatch(file, _, _))) => {
+            assert_eq!(file, "packets/heldout.toml")
+        }
+        other => panic!("expected a HashMismatch, got {other:?}"),
+    }
+    assert_eq!(runner.call_count(), 0);
+}
+
+#[tokio::test]
+async fn test_a_held_out_file_that_does_not_parse_is_infrastructure() {
+    let c = chain();
+    let (_, work) = dirs();
+    let capsule_dir = capsule_with_heldout(&c, "[[check]\nid = ");
+    let result = verify(
+        capsule_dir.path(),
+        c.repo.path(),
+        work.path(),
+        &ScriptedRunner::new(&[("true", &[0])]),
+        test_opts(work.path()),
+    )
+    .await;
+    match result {
+        Err(VerifyError::Infrastructure(msg)) => assert!(msg.contains("heldout.toml"), "{msg}"),
+        other => panic!("expected Infrastructure, got {other:?}"),
+    }
+}

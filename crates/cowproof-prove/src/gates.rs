@@ -83,6 +83,32 @@ pub fn run_gates(
     Ok(GateReport { gates, any_failed })
 }
 
+/// The protected globs from `lanes.config.json` as committed at `base_commit`, or the
+/// defaults when the base has none. Never the working tree: a patch could edit that.
+fn load_protected_from_base(base_repo: &Path, base_commit: &str) -> Result<Vec<String>> {
+    let text = git_show_optional(base_repo, base_commit, "lanes.config.json")?;
+    Ok(cowproof_core::repo_rules_from_config(text.as_deref()).0)
+}
+
+/// Whether the base `cowproof.toml` sets `[proof] require_heldout = true`: a lane
+/// without held-out checks then fails the held-out gate instead of only warning. Read
+/// from the base commit, so a patch cannot switch it off. A missing file or key means
+/// false; a file that does not parse is an error.
+pub fn base_requires_heldout(repo: &Path, commit: &str) -> Result<bool> {
+    verify_commit(repo, commit)?;
+    let Some(text) = git_show_optional(repo, commit, "cowproof.toml")? else {
+        return Ok(false);
+    };
+    let config: toml::Table =
+        toml::from_str(&text).context("cowproof.toml in the base does not parse")?;
+    Ok(config
+        .get("proof")
+        .and_then(|p| p.as_table())
+        .and_then(|p| p.get("require_heldout"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false))
+}
+
 /// Gate 1: Ownership - files outside `owns` fail.
 fn check_ownership(lane_patch: &str, packet: &GatePacket) -> Result<GateResult> {
     let deltas = parse_patch(lane_patch);
@@ -148,8 +174,8 @@ fn check_protected_paths(
     lane_patch: &str,
     packet: &GatePacket,
 ) -> Result<GateResult> {
-    // Load protected list from repo config
-    let (repo_protected, _) = cowproof_core::repo_rules(base_repo);
+    // Load protected list from repo config in the base commit, not the working tree
+    let repo_protected = load_protected_from_base(base_repo, base_commit)?;
 
     // Build complete protected list
     let mut protected = Vec::new();
@@ -711,6 +737,80 @@ diff --git a/AGENTS.md b/AGENTS.md
             "{:?}",
             result.evidence
         );
+        Ok(())
+    }
+
+    /// A hand-written patch touching `path`, so the test controls the paths and the
+    /// repository's working tree stays out of the patch.
+    fn touching(path: &str) -> String {
+        format!(
+            "diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n@@ -1 +1,2 @@\n old\n+new\n"
+        )
+    }
+
+    const PROTECT_SECRET: &str = "{\"protected\": [\"secret/**\"]}";
+
+    #[test]
+    fn a_protected_rule_committed_in_the_base_applies() -> Result<()> {
+        let repo = TestRepo::new(&[("lanes.config.json", PROTECT_SECRET)])?;
+        let result = check_protected_paths(
+            repo.path(),
+            &repo.base,
+            &touching("secret/key.txt"),
+            &packet(&["docs/**"]),
+        )?;
+        assert!(!result.passed);
+        assert_eq!(
+            result.evidence,
+            vec!["Protected paths touched: secret/key.txt".to_string()]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_protected_rule_only_in_the_working_tree_has_no_effect() -> Result<()> {
+        // The base commit has no lanes.config.json. The director's working tree gains one
+        // that protects `secret/**`, uncommitted: the gate must not see it.
+        let repo = TestRepo::new(&[])?;
+        repo.write("lanes.config.json", PROTECT_SECRET)?;
+        let result = check_protected_paths(
+            repo.path(),
+            &repo.base,
+            &touching("secret/key.txt"),
+            &packet(&["docs/**"]),
+        )?;
+        assert!(result.passed, "{:?}", result.evidence);
+        assert!(result.evidence.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn a_committed_protected_rule_edited_away_in_the_working_tree_still_applies() -> Result<()> {
+        let repo = TestRepo::new(&[("lanes.config.json", PROTECT_SECRET)])?;
+        repo.write("lanes.config.json", "{\"protected\": [\"other/**\"]}")?;
+        let result = check_protected_paths(
+            repo.path(),
+            &repo.base,
+            &touching("secret/key.txt"),
+            &packet(&["docs/**"]),
+        )?;
+        assert!(!result.passed);
+        assert!(result.evidence[0].contains("secret/key.txt"));
+        Ok(())
+    }
+
+    #[test]
+    fn require_heldout_is_read_from_the_base_cowproof_toml() -> Result<()> {
+        let on = TestRepo::new(&[("cowproof.toml", "[proof]\nrequire_heldout = true\n")])?;
+        assert!(base_requires_heldout(on.path(), &on.base)?);
+        let off = TestRepo::new(&[("cowproof.toml", "[proof]\npacks = []\n")])?;
+        assert!(!base_requires_heldout(off.path(), &off.base)?);
+        let none = TestRepo::new(&[])?;
+        assert!(!none.path().join("cowproof.toml").exists());
+        assert!(!base_requires_heldout(none.path(), &none.base)?);
+        // Only the base counts: switching it on in the working tree does nothing.
+        none.write("cowproof.toml", "[proof]\nrequire_heldout = true\n")?;
+        assert!(!base_requires_heldout(none.path(), &none.base)?);
         Ok(())
     }
 

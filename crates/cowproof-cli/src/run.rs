@@ -29,12 +29,14 @@
 //! (`env_clear`), so the director's `ANTHROPIC_API_KEY` is never inherited:
 //! the builder sees only the proxy's placeholder key.
 
+use crate::verify::verifier_runner;
 use anyhow::{Context, Result, anyhow, bail};
 use cowproof_core::parse_header;
 use cowproof_prove::{
+    capsule::HELDOUT_FILE,
     capsule::{Capsule, CheckResult, EnvironmentFingerprint},
-    gates::{GatePacket, run_gates},
-    runner::{SandboxedRunner, kill_process_group, terminate_process_group},
+    gates::{GatePacket, base_requires_heldout, run_gates},
+    runner::{kill_process_group, terminate_process_group},
     verify::{VerifyOptions, verify},
 };
 use cowproof_run::{
@@ -1479,6 +1481,9 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
     let real_home =
         PathBuf::from(std::env::var_os("HOME").ok_or_else(|| anyhow!("HOME is not set"))?);
     let lanes_root = lanes_root(args.lanes_root.as_deref(), &cwd, &real_home);
+    // The held-out checks (D5) are found before any lane exists: a path inside the
+    // repository, or one that is unreadable, stops the run here.
+    let heldout = resolve_heldout(args.heldout.as_deref(), &repo, &real_home, &header.id)?;
     let path = builder_path(&director_path, &real_home);
     let claude_bin = claude_bin
         .canonicalize()
@@ -1740,6 +1745,7 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
             model: &lane_run.model,
             cost_usd: total_cost_usd,
             tokens: total_tokens,
+            heldout_path: heldout.as_deref(),
         },
         results,
     )
@@ -1803,6 +1809,8 @@ struct Evidence {
     infrastructure: Vec<String>,
     /// The packet declared no checks, so nothing was verified.
     no_checks_declared: bool,
+    /// Held-out checks that failed on the verifier's rebuilt tree.
+    heldout_failed: Vec<String>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1837,6 +1845,9 @@ fn judge(e: &Evidence) -> Verdict {
             },
             d.verify_exit
         ));
+    }
+    for id in &e.heldout_failed {
+        reasons.push(format!("held-out check {id:?} failed on the rebuilt tree"));
     }
     for g in &e.failed_gates {
         if g.evidence.is_empty() {
@@ -1886,6 +1897,34 @@ struct ProofInput<'a> {
     model: &'a str,
     cost_usd: f64,
     tokens: u64,
+    /// The director's held-out checks for this lane, outside the repository. `None`
+    /// means the lane has none (the gate warns, or fails when the base requires them).
+    heldout_path: Option<&'a Path>,
+}
+
+/// Find the lane's held-out checks (D5): the explicit `--heldout` path, which must exist,
+/// or the director store `~/.cowproof/heldout/<repo-id>/<lane-id>.toml` when that file
+/// exists. Either way the path is canonical and outside the repository, and the file
+/// parses; anything else is an error, before a lane is created.
+fn resolve_heldout(
+    explicit: Option<&Path>,
+    repo: &Path,
+    home: &Path,
+    lane_id: &str,
+) -> Result<Option<PathBuf>> {
+    let repo_id = cowproof_core::heldout::repo_id(repo)?;
+    let path = cowproof_core::heldout::resolve(explicit, home, repo, &repo_id, lane_id)?;
+    if explicit.is_none() && !path.exists() {
+        return Ok(None);
+    }
+    let checks = cowproof_core::heldout::load(&path)?;
+    if checks.check.is_empty() {
+        bail!(
+            "the held-out checks file {} holds no checks",
+            path.display()
+        );
+    }
+    Ok(Some(path))
 }
 
 /// Prove the lane after the builder exits: capsule, gates, verify, verdict.
@@ -1932,6 +1971,7 @@ async fn prove_lane(
         "reasons": verdict.reasons,
         "unrun": evidence.unrun,
         "failedChecks": evidence.failed_checks,
+        "heldOutFailed": evidence.heldout_failed,
         "diverged": evidence.diverged.iter().map(|d| d.id.clone()).collect::<Vec<_>>(),
         "failedGates": evidence.failed_gates.iter().map(|g| g.name.clone()).collect::<Vec<_>>(),
     });
@@ -1970,16 +2010,6 @@ async fn prove_lane(
     Ok(verdict)
 }
 
-/// Remove `path` whatever it is, without following a symlink.
-fn remove_path(path: &Path) -> io::Result<()> {
-    match fs::symlink_metadata(path) {
-        Ok(m) if m.is_dir() => fs::remove_dir_all(path),
-        Ok(_) => fs::remove_file(path),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(e),
-    }
-}
-
 /// Gates, capsule, verify. Gate and verify findings go into `evidence`;
 /// an `Err` means the proof itself could not be built.
 async fn replay_and_gate(
@@ -1997,8 +2027,9 @@ async fn replay_and_gate(
         owns: header.owns.clone(),
         append_only: header.append_only.clone(),
         protected: vec![],
-        require_heldout: false,
-        heldout_path: None,
+        // The repository's own setting, from the base commit: a patch cannot switch it off.
+        require_heldout: base_requires_heldout(input.repo, &input.prepared.base_commit)?,
+        heldout_path: input.heldout_path.map(Path::to_path_buf),
     };
     match run_gates(
         input.repo,
@@ -2078,6 +2109,14 @@ async fn replay_and_gate(
         fs::write(capsule_dir.join("base.patch"), base_patch)?;
     }
     fs::write(capsule_dir.join("lane.patch"), &lane_patch)?;
+    // The held-out checks go into the capsule's `packets/` (hashed there, run by the
+    // verifier), copied from the director's store. Never into the lane's clone or home.
+    if let Some(heldout) = input.heldout_path {
+        let dest = capsule_dir.join(HELDOUT_FILE);
+        fs::create_dir_all(dest.parent().context("packets path has no parent")?)?;
+        fs::copy(heldout, &dest)
+            .with_context(|| format!("copying the held-out checks {}", heldout.display()))?;
+    }
     let escalations = layout.control.join("escalations.jsonl");
     if escalations.is_file() {
         fs::copy(&escalations, capsule_dir.join("escalations.jsonl"))
@@ -2102,17 +2141,11 @@ async fn replay_and_gate(
     capsule.write(&capsule_dir).context("writing the capsule")?;
 
     // Verify in a fresh directory of its own. The verifier policy grants the
-    // layout's scratch read and write, so the layout it gets names only this
-    // directory: whatever the builder left in the lane's scratch is hidden.
-    // The builder has exited, but it owned `scratch/`, so anything it left at
-    // `scratch/verify` is removed first.
+    // layout's scratch read and write, so the runner's layout names only that
+    // directory: whatever the builder left in the lane's scratch is hidden, and
+    // anything it left at `scratch/verify` is cleared first (`verifier_runner`).
     let verify_dir = layout.scratch.join("verify");
-    remove_path(&verify_dir).context("clearing the verify directory")?;
-    let cache = verify_dir.join("cache");
-    fs::create_dir_all(cache.join(".cargo")).context("creating the verify directory")?;
-    let mut verify_layout = layout.clone();
-    verify_layout.scratch = verify_dir.clone();
-    let runner = SandboxedRunner::new(verify_layout, cache, platform().to_string());
+    let runner = verifier_runner(layout, &verify_dir)?;
     // The builder's class slot (D12) is not held in this flow, so the
     // verifier takes the lane's class slot without waiting on itself.
     let options = VerifyOptions {
@@ -2121,6 +2154,13 @@ async fn replay_and_gate(
     };
     match verify(&capsule_dir, input.repo, &verify_dir, &runner, options).await {
         Ok(report) => {
+            evidence.heldout_failed.extend(
+                report
+                    .heldout
+                    .iter()
+                    .filter(|o| !o.passed)
+                    .map(|o| o.check_id.clone()),
+            );
             for (check, passed) in ran {
                 match report.checks.iter().find(|m| m.check_id == check.id) {
                     None => evidence
@@ -2416,15 +2456,17 @@ body"#;
             }],
             infrastructure: vec![],
             no_checks_declared: false,
+            heldout_failed: vec!["hidden-edge".into()],
         };
         let (outcome, reasons) = reasons_of(&e);
         assert_eq!(outcome, Outcome::Refuted);
         assert_eq!(outcome.exit_code(), 2);
-        assert_eq!(reasons.len(), 4, "{reasons:?}");
+        assert_eq!(reasons.len(), 5, "{reasons:?}");
         assert!(reasons[0].contains("\"unit\" failed"));
         assert!(reasons[1].contains("\"marker\" diverged") && reasons[1].contains("exit 1"));
-        assert!(reasons[2].contains("gate ownership failed") && reasons[2].contains("x.txt"));
-        assert!(reasons[3].contains("\"late\" was never run"));
+        assert!(reasons[2].contains("held-out check \"hidden-edge\" failed"));
+        assert!(reasons[3].contains("gate ownership failed") && reasons[3].contains("x.txt"));
+        assert!(reasons[4].contains("\"late\" was never run"));
     }
 
     #[test]
@@ -2442,6 +2484,18 @@ body"#;
         assert_eq!(outcome, Outcome::Infrastructure);
         assert_eq!(outcome.exit_code(), 4);
         assert_eq!(reasons, vec!["verify could not run: sandbox".to_string()]);
+    }
+
+    #[test]
+    fn judge_a_failed_held_out_check_alone_refutes() {
+        let e = Evidence {
+            heldout_failed: vec!["hidden-edge".into()],
+            ..Evidence::default()
+        };
+        let (outcome, reasons) = reasons_of(&e);
+        assert_eq!(outcome, Outcome::Refuted);
+        assert_eq!(reasons.len(), 1, "{reasons:?}");
+        assert!(reasons[0].contains("\"hidden-edge\""));
     }
 
     #[test]

@@ -15,13 +15,13 @@ pub mod gates;
 pub mod runner;
 pub mod verify;
 
-pub use capsule::{Capsule, CapsuleError};
+pub use capsule::{Capsule, CapsuleError, HELDOUT_FILE, SEAL_FILE};
 pub use flaws::{FlawFinding, FlawRule, PatchDelta, RuleFile};
 pub use gates::{GatePacket, GateReport, GateResult, run_gates};
 pub use runner::{
     CheckOutcome, CheckRunner, InfraError, SandboxedRunner, SlotGuard, acquire_slot, host_platform,
 };
-pub use verify::{VerifyError, VerifyOptions, VerifyReport, VerifyResult, verify};
+pub use verify::{HeldOutOutcome, VerifyError, VerifyOptions, VerifyReport, VerifyResult, verify};
 
 #[cfg(test)]
 mod tests;
