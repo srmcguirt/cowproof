@@ -32,6 +32,8 @@
 //! (`env_clear`), so the director's `ANTHROPIC_API_KEY` is never inherited:
 //! the builder sees only the proxy's placeholder key.
 
+use crate::preflight::{CheckStatus, PreflightOptions, preflight};
+use crate::root::resolve_executable;
 use crate::verify::{Rebuild, fetch_dependencies, verifier_runner};
 use anyhow::{Context, Result, anyhow, bail};
 use cowproof_core::{LinkedFile, git_show_following_links, parse_header};
@@ -105,6 +107,10 @@ const PUMP_DRAIN: Duration = Duration::from_secs(5);
 
 /// The exit code when the run is interrupted by a signal (SIGINT or SIGTERM).
 const INTERRUPTED_EXIT_CODE: i32 = 130;
+
+/// The exit code for an infrastructure failure: a failed preflight check, or a lane that
+/// could not be run (`Outcome::Infrastructure`).
+const INFRASTRUCTURE_EXIT_CODE: i32 = 4;
 
 /// The exit code when the wall-clock timeout ended the lane (`run.json` status `timeout`).
 const TIMEOUT_EXIT_CODE: i32 = 5;
@@ -1428,34 +1434,10 @@ fn lane_dir(layout: &LaneLayout) -> Result<PathBuf> {
         .ok_or_else(|| anyhow!("lane clone {} has no parent", layout.clone.display()))
 }
 
-/// Resolve an executable once. A bare name is searched on `path` (absolute,
-/// non-empty entries only: an empty entry means the current directory). The
-/// result is absolute but not canonicalized, so a symlinked install keeps its
-/// own name.
-fn resolve_executable(name: &str, path: &str, cwd: &Path) -> Result<PathBuf> {
-    let is_executable = |p: &Path| {
-        fs::metadata(p)
-            .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-            .unwrap_or(false)
-    };
-    let candidates: Vec<PathBuf> = if name.contains('/') {
-        vec![cwd.join(name)]
-    } else {
-        path.split(':')
-            .filter(|d| !d.is_empty() && Path::new(d).is_absolute())
-            .map(|d| Path::new(d).join(name))
-            .collect()
-    };
-    candidates
-        .into_iter()
-        .find(|c| is_executable(c))
-        .ok_or_else(|| anyhow!("cannot find an executable {name:?} on the director's PATH"))
-}
-
 /// The builder's `PATH`: the director's, minus empty, relative and
 /// real-home entries (the home is hidden from the sandbox, and an empty entry
 /// would search the builder's clone).
-fn builder_path(director_path: &str, real_home: &Path) -> String {
+pub(crate) fn builder_path(director_path: &str, real_home: &Path) -> String {
     let kept: Vec<&str> = director_path
         .split(':')
         .filter(|e| {
@@ -1479,7 +1461,7 @@ fn platform() -> &'static str {
 
 /// A command that runs `argv` under `policy`, with exactly `env` (plus the
 /// policy's own variables) and nothing inherited.
-fn sandboxed_command(
+pub(crate) fn sandboxed_command(
     policy: &SandboxPolicy,
     profile: &Path,
     argv: &[String],
@@ -1804,18 +1786,48 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
         eprintln!("warning: the packet declares no checks, so run_check will refuse every id");
     }
 
-    // 2. The real key lives in this process and the proxy, nowhere else.
+    // 2. Preflight: the host can sandbox, clone and has room, the builder runs, the key
+    // is set and the repository has a commit. Any failure stops the run here, before
+    // any lane directory, clone or socket exists (it probes under a throwaway
+    // directory it removes, and does not create the lanes root).
+    let director_path = std::env::var("PATH").unwrap_or_default();
+    let real_home =
+        PathBuf::from(std::env::var_os("HOME").ok_or_else(|| anyhow!("HOME is not set"))?);
+    let lanes_root = lanes_root(args.lanes_root.as_deref(), &cwd, &real_home);
+    let preflight_checks = preflight(&PreflightOptions {
+        repo: &repo,
+        lanes_root: &lanes_root,
+        disk_floor_gb: args.disk_floor_gb,
+        claude_bin: &args.claude_bin,
+        director_path: &director_path,
+        cwd: &cwd,
+        real_home: &real_home,
+        for_run: true,
+    })
+    .await;
+    for check in &preflight_checks {
+        match check.status {
+            CheckStatus::Ok => {}
+            CheckStatus::Warn => eprintln!("preflight warning: {}: {}", check.name, check.detail),
+            CheckStatus::Fail => eprintln!("preflight failed: {}: {}", check.name, check.detail),
+        }
+    }
+    if preflight_checks
+        .iter()
+        .any(|c| c.status == CheckStatus::Fail)
+    {
+        eprintln!("nothing was started; `cowproof doctor` shows every check");
+        return Ok(INFRASTRUCTURE_EXIT_CODE);
+    }
+
+    // The real key lives in this process and the proxy, nowhere else.
     let api_key = match std::env::var_os("ANTHROPIC_API_KEY") {
         Some(k) if !k.is_empty() => k
             .into_string()
             .map_err(|_| anyhow!("ANTHROPIC_API_KEY is not valid UTF-8"))?,
         _ => bail!("ANTHROPIC_API_KEY is not set; the proxy needs the real key"),
     };
-    let director_path = std::env::var("PATH").unwrap_or_default();
     let claude_bin = resolve_executable(&args.claude_bin, &director_path, &cwd)?;
-    let real_home =
-        PathBuf::from(std::env::var_os("HOME").ok_or_else(|| anyhow!("HOME is not set"))?);
-    let lanes_root = lanes_root(args.lanes_root.as_deref(), &cwd, &real_home);
     // The held-out checks (D5) are found before any lane exists: a path inside the
     // repository, or one that is unreadable, stops the run here.
     let heldout = resolve_heldout(args.heldout.as_deref(), &repo, &real_home, &header.id)?;
@@ -2217,7 +2229,7 @@ impl Outcome {
             Outcome::Proved => 0,
             Outcome::Refuted => 2,
             Outcome::Incomplete => 3,
-            Outcome::Infrastructure => 4,
+            Outcome::Infrastructure => INFRASTRUCTURE_EXIT_CODE,
         }
     }
 }

@@ -20,6 +20,8 @@ The package is named `cowproof-cli` and is not on crates.io yet; renaming it to 
 
 Status: design stage. Nothing here is ready to use yet. See [docs/design.md](docs/design.md).
 
+`cowproof doctor` checks that this host can run lanes (the sandbox actually starts a program, copy-on-write cloning, free disk, the `claude` binary, `ANTHROPIC_API_KEY`, a committed repository) and exits 1 when a check fails; `cowproof run` runs the same checks first and stops with exit 4 before it creates a lane.
+
 ## What a builder trusts
 
 A builder trusts what its repository tells it, and that can be hostile.

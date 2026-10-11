@@ -480,6 +480,27 @@ fn copy_objects_cow(src: &Path, dst: &Path) -> Result<String> {
     copy_objects_with(src, dst, &copy_strategies())
 }
 
+/// Which copy strategy works on the filesystem under `dir`: copies a small directory
+/// tree with the same strategies, in the same order, that `prepare_lane` uses for the
+/// object store, and returns the label (`clonefile`, `reflink` or `copy`). `dir` must
+/// exist and be one the caller owns; the probe creates two entries in it and removes
+/// both before returning. `cowproof doctor` and the `run` preflight use it, so a
+/// "copy" answer here is the method the lane would record in `lane.json`.
+pub fn probe_clone_method(dir: &Path) -> Result<String> {
+    let src = dir.join("clone-probe-src");
+    let dst = dir.join("clone-probe-dst");
+    fs::create_dir(&src).with_context(|| format!("creating {}", src.display()))?;
+    let result = (|| {
+        fs::create_dir(src.join("sub")).context("creating the probe tree")?;
+        fs::write(src.join("sub/file"), b"cowproof clone probe")
+            .context("writing the probe tree")?;
+        copy_objects_cow(&src, &dst)
+    })();
+    let _ = fs::remove_dir_all(&dst);
+    let _ = fs::remove_dir_all(&src);
+    result
+}
+
 /// Try each strategy in order. A strategy that fails may leave a partial
 /// destination behind; it is removed before the next one runs, or a later
 /// `cp -R src dst` would copy into it and nest `objects/objects`.
@@ -902,6 +923,19 @@ mod tests {
         let clone_inodes = object_inodes(clone);
         let shared: Vec<_> = source_inodes.intersection(&clone_inodes).copied().collect();
         assert!(shared.is_empty(), "shared inodes: {shared:?}");
+    }
+
+    #[test]
+    fn probe_clone_method_names_a_known_strategy_and_leaves_the_directory_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let method = probe_clone_method(dir.path()).unwrap();
+        assert!(
+            ["clonefile", "reflink", "copy"].contains(&method.as_str()),
+            "{method}"
+        );
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
+        // The probe refuses a directory that is not there rather than creating it.
+        assert!(probe_clone_method(&dir.path().join("missing")).is_err());
     }
 
     #[test]

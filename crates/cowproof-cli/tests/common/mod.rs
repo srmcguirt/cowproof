@@ -213,6 +213,8 @@ impl Lane {
         let fake = work.path().join("fake-claude");
         let script = format!(
             r#"#!/bin/sh
+# The preflight runs `claude --version`; answer it before the lane's body.
+if [ "$1" = "--version" ]; then echo "fake-claude 0.0.0"; exit 0; fi
 rec="$HOME/fake"
 mkdir -p "$rec"
 sock="$(dirname "$HOME")/sock/runner.sock"

@@ -22,7 +22,9 @@ use std::process::Stdio;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 mod director_tools;
+mod doctor;
 mod lane_tools;
+mod preflight;
 mod root;
 mod run;
 mod verify;
@@ -56,6 +58,13 @@ enum Action {
     /// every recorded check, then every held-out check, in the verifier sandbox. Exit
     /// codes: 0 reproduced; 2 diverged (a check named in the output); 4 infrastructure.
     Verify(verify::VerifyArgs),
+    /// Check that this host can run lanes: sandbox, clone, disk, claude, key, git.
+    ///
+    /// `cowproof run` runs the same checks first and stops on any failure with exit 4.
+    /// The sandbox check runs `true` through the runner's own sandbox, so it passes only
+    /// when a lane could start. Exit codes: 0 no check failed (warnings do not count; a
+    /// missing API key is a warning here and a failure for `run`); 1 a check failed.
+    Doctor(doctor::DoctorArgs),
     Lint(LintArgs),
     Host(HostArgs),
     Hosts,
@@ -286,6 +295,10 @@ struct RunOneArgs {
     /// still wins). It exists so tests can reach the limit in seconds, not in minutes
     #[arg(long, hide = true)]
     timeout_secs: Option<u64>,
+    /// Free space, in GB, on the lanes filesystem below which the preflight fails the run
+    /// (exit 4, before any lane exists)
+    #[arg(long, default_value_t = 5.0)]
+    disk_floor_gb: f64,
     /// Held-out checks file (D5). It must lie outside the repository; the runner copies it
     /// into the capsule's `packets/`, never into the lane's clone or home. Default:
     /// `~/.cowproof/heldout/<repo-id>/<lane-id>.toml`, used when that file exists
@@ -355,6 +368,13 @@ async fn dispatch(command: Action) -> Result<()> {
         }
         Action::Verify(args) => {
             let code = verify::verify_capsule(args).await?;
+            if code != 0 {
+                std::process::exit(code);
+            }
+            Ok(())
+        }
+        Action::Doctor(args) => {
+            let code = doctor::doctor(args).await?;
             if code != 0 {
                 std::process::exit(code);
             }
