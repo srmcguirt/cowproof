@@ -575,7 +575,12 @@ fn lanes_of_different_classes_running_at_once_get_different_port_blocks() {
         return;
     }
     let slots = var_tmp("cp-slots-");
-    let body = format!("env > \"$rec/env\"\n{}", held_builder());
+    // Written whole under a temp name, then renamed: the test reads it while the builder
+    // still runs, and `env > file` makes the file before it fills it.
+    let body = format!(
+        "env > \"$rec/env.tmp\" && mv \"$rec/env.tmp\" \"$rec/env\"\n{}",
+        held_builder()
+    );
     let a = lane(slots.path(), "light", None, &body, checks());
     let b = lane(slots.path(), "rust", None, &body, checks());
     let mut run_a = start_run(&a, "a", &[]);
