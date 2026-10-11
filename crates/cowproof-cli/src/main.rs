@@ -44,9 +44,11 @@ enum Action {
     ///
     /// Exit codes: 0 proved; 2 refuted (a recorded check failed, verify diverged, or a gate
     /// failed); 3 incomplete (a declared check was never run); 4 infrastructure (the proof could
-    /// not run, never a refutation); 1 the run itself failed before a verdict; 130 interrupted
-    /// by SIGINT or SIGTERM (the builder's process group is ended, nothing is proved, and
-    /// `control/run.json` says `interrupted`).
+    /// not run, never a refutation); 5 timeout (wall-clock limit exceeded, nothing is proved,
+    /// `control/run.json` says `timeout`); 6 cost-cap (cost estimate reached 100% of the cap,
+    /// nothing is proved, `control/run.json` says `cost-cap`); 1 the run itself failed before
+    /// a verdict; 130 interrupted by SIGINT or SIGTERM (the builder's process group is ended,
+    /// nothing is proved, and `control/run.json` says `interrupted`).
     Run(RunOneArgs),
     /// Replay a proof capsule against a repository, from any directory
     ///
@@ -269,9 +271,21 @@ struct RunOneArgs {
     turn_budget: u32,
     /// The lane's cost cap in US dollars. Escalate early when the running cost ESTIMATE (per-turn
     /// usage times a built-in price table for haiku, sonnet and opus; unknown models are priced
-    /// as opus) reaches 40% of it, once per segment. It is a trigger, not a hard stop
+    /// as opus) reaches 40% of it, once per segment. At 100% the lane ends: the builder's group
+    /// is ended, nothing is proved, `run.json` says `cost-cap` and the exit code is 6. The
+    /// packet header's `maxCostUsd` wins over this flag. The figure is an estimate, not the bill
     #[arg(long, default_value_t = 5.0)]
     cost_cap_usd: f64,
+    /// The lane's wall-clock limit in minutes, over every launch of the lane (resumes included)
+    /// and not counting time parked waiting for a ruling. At the limit the builder's group is
+    /// ended, nothing is proved, `run.json` says `timeout` and the exit code is 5. The packet
+    /// header's `timeoutMin` wins over this flag
+    #[arg(long, default_value_t = 45)]
+    timeout_min: u64,
+    /// The wall-clock limit in seconds, replacing `--timeout-min` (the header's `timeoutMin`
+    /// still wins). It exists so tests can reach the limit in seconds, not in minutes
+    #[arg(long, hide = true)]
+    timeout_secs: Option<u64>,
     /// Held-out checks file (D5). It must lie outside the repository; the runner copies it
     /// into the capsule's `packets/`, never into the lane's clone or home. Default:
     /// `~/.cowproof/heldout/<repo-id>/<lane-id>.toml`, used when that file exists

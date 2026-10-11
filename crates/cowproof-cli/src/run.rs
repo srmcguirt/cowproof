@@ -23,7 +23,10 @@
 //!    `control/verdict.json`. The exit code is the verdict (0 proved, 2
 //!    refuted, 3 incomplete, 4 infrastructure). A lane the director stopped,
 //!    or one that hit the escalation limit, keeps its work and is not proved:
-//!    `run.json` says how it ended and the exit code is 1.
+//!    `run.json` says how it ended and the exit code is 1. The two hard limits
+//!    end a lane the same way, with its work kept and no proof: a wall-clock
+//!    timeout (exit 5, status `timeout`) and a running cost ESTIMATE at 100% of
+//!    the cap (exit 6, status `cost-cap`).
 //!
 //! Every child process started here gets an explicit environment
 //! (`env_clear`), so the director's `ANTHROPIC_API_KEY` is never inherited:
@@ -102,6 +105,13 @@ const PUMP_DRAIN: Duration = Duration::from_secs(5);
 
 /// The exit code when the run is interrupted by a signal (SIGINT or SIGTERM).
 const INTERRUPTED_EXIT_CODE: i32 = 130;
+
+/// The exit code when the wall-clock timeout ended the lane (`run.json` status `timeout`).
+const TIMEOUT_EXIT_CODE: i32 = 5;
+
+/// The exit code when the cost estimate reached 100% of the cap and ended the
+/// lane (`run.json` status `cost-cap`).
+const COST_CAP_EXIT_CODE: i32 = 6;
 
 /// On the first SIGINT or SIGTERM, how long past [`TERM_GRACE`] the runner waits
 /// for the launcher to finish ending the builder's group before it stops waiting.
@@ -476,6 +486,9 @@ struct LiveEscalation {
     /// The estimate for earlier launches of this queue segment (a segment ends
     /// at `reassign`), so the share is the lane's, not one launch's.
     spent_before_usd: f64,
+    /// The estimate for every earlier launch of the lane, `reassign` included:
+    /// the hard stop is on the lane's total, not on one queue segment.
+    lane_spent_before_usd: f64,
     cost_cap_usd: f64,
     seen_turns: usize,
     /// A trigger fired (or the lane ended): nothing more is recorded this launch.
@@ -486,6 +499,15 @@ struct LiveEscalation {
 impl LiveEscalation {
     fn observe(&mut self, meter: &StreamMeter) {
         if self.done {
+            return;
+        }
+        // The hard stop: the lane's running estimate has reached the whole cap.
+        // It is checked before the escalate-early triggers, so nothing below
+        // can park a lane that is already over its cap.
+        let estimate = meter.estimated_cost_usd(&self.model);
+        if self.lane_spent_before_usd + estimate >= self.cost_cap_usd {
+            self.done = true;
+            let _ = self.end.send(SessionEnd::CostCap);
             return;
         }
         let shared = self.queue.clone();
@@ -511,7 +533,7 @@ impl LiveEscalation {
                 return;
             }
         }
-        let spent = self.spent_before_usd + meter.estimated_cost_usd(&self.model);
+        let spent = self.spent_before_usd + estimate;
         let fired = queue.record_cost(&self.lane, spent, self.cost_cap_usd);
         self.finish(&queue, fired);
     }
@@ -584,6 +606,14 @@ struct Launcher {
     /// or None if there were no project instructions. Recorded in the capsule
     /// and run.json.
     project_instructions_sha256: Option<String>,
+    /// The wall-clock limit: the packet header's `timeoutMin`, else the flag.
+    /// It covers every launch of the lane together.
+    timeout: Duration,
+    /// How much of `timeout` the finished launches used. This is the only clock
+    /// the limit runs on, and it advances only inside [`Launcher::launch`], so
+    /// the time between launches (parked, waiting for the director's ruling) is
+    /// never counted.
+    active: Mutex<Duration>,
 }
 
 impl Launcher {
@@ -599,12 +629,19 @@ impl Launcher {
     /// (or a forced escalation) parks the lane, and [`PARK_GRACE`] later the
     /// runner sends SIGTERM to the group, waits up to [`TERM_GRACE`] for the
     /// leader, then SIGKILLs the group whether or not the leader has gone.
-    /// `spent_before_usd` is the estimated cost of this queue segment so far.
+    /// `spent_before_usd` is the estimated cost of this queue segment so far,
+    /// `lane_spent_before_usd` that of the whole lane (the hard cost stop).
+    ///
+    /// Two hard limits end the launch the same way (SIGTERM to the group, then
+    /// SIGKILL after [`TERM_GRACE`], reported through `session_end`): the
+    /// wall-clock timeout, for what is left of it after the earlier launches,
+    /// and a cost estimate at the whole cap.
     async fn launch(
         &self,
         index: usize,
         launch: &Launch,
         spent_before_usd: f64,
+        lane_spent_before_usd: f64,
     ) -> Result<SegmentRun> {
         let started = Instant::now();
         // Subscribed before anything else: an interrupt raised from here on is
@@ -719,6 +756,7 @@ impl Launcher {
             lane: self.lane_id.clone(),
             model: launch.model.clone(),
             spent_before_usd,
+            lane_spent_before_usd,
             cost_cap_usd: self.cost_cap_usd,
             seen_turns: 0,
             done: false,
@@ -735,6 +773,15 @@ impl Launcher {
         let mut drain_until: Option<TokioInstant> = None;
         let mut abandoned = false;
         let mut interrupted = false;
+
+        // What is left of the lane's wall-clock limit after the earlier launches.
+        let left = self.timeout.saturating_sub(
+            *self
+                .active
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        );
+        let mut timeout_at = Some(TokioInstant::now() + left);
         {
             let mut observe = |m: &StreamMeter| live.observe(m);
             let pump = pump_stream(
@@ -770,8 +817,15 @@ impl Launcher {
                                     "[{}] session ends in {:?}: {end:?}",
                                     self.lane_id, PARK_GRACE
                                 );
+                                // A park gets PARK_GRACE to flush its session; a
+                                // lane over its cost cap is not given more spending.
+                                let grace = if end == SessionEnd::CostCap {
+                                    Duration::ZERO
+                                } else {
+                                    PARK_GRACE
+                                };
                                 session_end = Some(end);
-                                term_at = Some(TokioInstant::now() + PARK_GRACE);
+                                term_at = Some(TokioInstant::now() + grace);
                             }
                             None => signals_open = false,
                         }
@@ -801,6 +855,19 @@ impl Launcher {
                     _ = sleep_until_opt(drain_until), if drain_until.is_some() && pump_result.is_none() => {
                         abandoned = true;
                     }
+                    _ = sleep_until_opt(timeout_at), if timeout_at.is_some() && status.is_none() => {
+                        eprintln!(
+                            "[{}] wall-clock timeout: ending the builder",
+                            self.lane_id
+                        );
+                        // The limit wins over whatever else was ending the session.
+                        session_end = Some(SessionEnd::Timeout);
+                        terminate_process_group(pgid);
+                        killed = true;
+                        timeout_at = None;
+                        term_at = None;
+                        kill_at = Some(TokioInstant::now() + TERM_GRACE);
+                    }
                 }
             }
         }
@@ -821,6 +888,11 @@ impl Launcher {
                 .context("reading the builder's stream")?
         };
         let estimated_cost_usd = meter.estimated_cost_usd(&launch.model);
+        // Only the time this launch ran counts against the limit.
+        *self
+            .active
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) += started.elapsed();
         Ok(SegmentRun {
             status,
             stats,
@@ -842,6 +914,10 @@ enum LaneEnd {
     Stopped,
     /// The park limit or the escalation limit ended the lane.
     EscalationLimit,
+    /// The wall-clock timeout fired: the builder was terminated.
+    Timeout,
+    /// The cost cap at 100% fired: the builder was terminated.
+    CostCap,
     /// A ruling could not be carried out; the work is kept.
     Refused(String),
 }
@@ -853,6 +929,8 @@ impl LaneEnd {
             LaneEnd::Builder | LaneEnd::Refused(_) => "failed",
             LaneEnd::Stopped => "stopped",
             LaneEnd::EscalationLimit => "escalation-limit",
+            LaneEnd::Timeout => "timeout",
+            LaneEnd::CostCap => "cost-cap",
         }
     }
 }
@@ -1034,6 +1112,8 @@ impl Drive<'_> {
                 SessionEnd::Parked(_) => "parked",
                 SessionEnd::Forced(_) => "forced",
                 SessionEnd::LimitReached => "escalation-limit",
+                SessionEnd::Timeout => "timeout",
+                SessionEnd::CostCap => "cost-cap",
             }),
             "killedByRunner": seg.killed,
             "turns": seg.summary.turns.len(),
@@ -1071,22 +1151,33 @@ impl Drive<'_> {
         // The estimated cost of the queue's current segment (it restarts at
         // `reassign`, as the queue's own counters do).
         let mut segment_cost_usd = 0.0_f64;
+        // The estimate for the whole lane, which `reassign` does not restart:
+        // the hard cost stop is on this.
+        let mut lane_cost_usd = 0.0_f64;
 
         let (end, status) = loop {
             let seg = self
                 .launcher
-                .launch(segments.len(), &launch, segment_cost_usd)
+                .launch(segments.len(), &launch, segment_cost_usd, lane_cost_usd)
                 .await?;
             segment_cost_usd += seg.estimated_cost_usd;
+            lane_cost_usd += seg.estimated_cost_usd;
             stats.add(&seg.stats);
             if let Some(id) = &seg.summary.session_id {
                 session_id = Some(id.clone());
             }
             let status = seg.status;
             let mut record = Self::segment_record(segments.len(), &launch, &seg);
+            // A hard limit ended the launch: no fallback, no relaunch, no proof.
+            let hard_end = match seg.session_end {
+                Some(SessionEnd::Timeout) => Some(LaneEnd::Timeout),
+                Some(SessionEnd::CostCap) => Some(LaneEnd::CostCap),
+                _ => None,
+            };
 
             if let Some(id) = resuming.take() {
-                if resume_session_gone(&seg) {
+                let gone = resume_session_gone(&seg);
+                if hard_end.is_none() && gone {
                     record["resumeFailed"] = json!("session-gone");
                     segments.push(record);
                     summaries.push(seg.summary);
@@ -1103,7 +1194,11 @@ impl Drive<'_> {
                     };
                     continue;
                 }
-                self.mark_delivered(&id)?;
+                // A hard stop on a resume that never got going leaves the ruling
+                // recorded and undelivered: the lane is over either way.
+                if !gone {
+                    self.mark_delivered(&id)?;
+                }
             }
 
             let parked = self.lock()?.pending_blocking(self.lane_id);
@@ -1112,6 +1207,10 @@ impl Drive<'_> {
             }
             segments.push(record);
             summaries.push(seg.summary);
+
+            if let Some(end) = hard_end {
+                break (end, status);
+            }
 
             if self.lock()?.lane_state(self.lane_id) == Some(LaneState::EscalationLimit) {
                 break (LaneEnd::EscalationLimit, status);
@@ -1589,6 +1688,16 @@ fn record_interrupted(
     }
 }
 
+/// The lane's wall-clock limit: the packet header's `timeoutMin` if it sets
+/// one, else the hidden `--timeout-secs` (tests), else `--timeout-min`.
+fn lane_timeout(header_min: Option<u64>, flag_secs: Option<u64>, flag_min: u64) -> Duration {
+    match (header_min, flag_secs) {
+        (Some(minutes), _) => Duration::from_secs(minutes.saturating_mul(60)),
+        (None, Some(secs)) => Duration::from_secs(secs),
+        (None, None) => Duration::from_secs(flag_min.saturating_mul(60)),
+    }
+}
+
 pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
     let started = Instant::now();
     if args.turn_budget == 0 {
@@ -1596,6 +1705,9 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
     }
     if !args.cost_cap_usd.is_finite() || args.cost_cap_usd <= 0.0 {
         bail!("--cost-cap-usd must be a positive number of US dollars");
+    }
+    if args.timeout_min == 0 || args.timeout_secs == Some(0) {
+        bail!("--timeout-min must be at least 1");
     }
     let cwd = std::env::current_dir().context("reading the current directory")?;
 
@@ -1619,6 +1731,15 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
         bail!("packet lint found errors");
     }
     let header = parse_header(&packet_text)?;
+    if header.timeout_min == Some(0) {
+        bail!("the packet's timeoutMin must be at least 1");
+    }
+    if header
+        .max_cost_usd
+        .is_some_and(|c| !c.is_finite() || c <= 0.0)
+    {
+        bail!("the packet's maxCostUsd must be a positive number of US dollars");
+    }
     let checks = &header.checks;
     if checks.is_empty() {
         eprintln!("warning: the packet declares no checks, so run_check will refuse every id");
@@ -1774,6 +1895,10 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
     let interrupt = Interrupt::new();
     // The proxy's socket, read before the endpoint is moved: removed if interrupted.
     let proxy_sock = endpoint.socket.clone();
+    let timeout = lane_timeout(header.timeout_min, args.timeout_secs, args.timeout_min);
+    // The cost cap is the header's `maxCostUsd`, else the flag; the escalate-early
+    // share and the hard stop both use it.
+    let cost_cap_usd = header.max_cost_usd.unwrap_or(args.cost_cap_usd);
     let launcher = Launcher {
         layout: layout.clone(),
         claude_bin: claude_bin.clone(),
@@ -1788,13 +1913,15 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
         socket,
         queue: queue.clone(),
         lane_id: header.id.clone(),
-        cost_cap_usd: args.cost_cap_usd,
+        cost_cap_usd,
         end_tx,
         end_rx: tokio::sync::Mutex::new(end_rx),
         interrupt: interrupt.clone(),
         prefix_version: preamble_version.clone(),
         project_instructions: project_instructions_content.clone(),
         project_instructions_sha256: project_instructions_hash.clone(),
+        timeout,
+        active: Mutex::new(Duration::ZERO),
     };
     let drive = Drive {
         launcher: &launcher,
@@ -1908,6 +2035,12 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
         "status": status_name,
         "estimatedCostUsd": estimated_cost_usd,
         "costIsEstimate": true,
+        "costCapUsd": launcher.cost_cap_usd,
+        "timeoutSecs": launcher.timeout.as_secs(),
+        "activeMs": launcher
+            .active
+            .lock()
+            .map_or(0, |a| a.as_millis() as u64),
         "error": match end {
             LaneEnd::Refused(why) => json!(why),
             _ => serde_json::Value::Null,
@@ -1964,6 +2097,8 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
             "lane {} ended as escalation-limit; its work is kept",
             header.id
         ),
+        LaneEnd::Timeout => return Ok(TIMEOUT_EXIT_CODE),
+        LaneEnd::CostCap => return Ok(COST_CAP_EXIT_CODE),
         LaneEnd::Refused(why) => bail!("{why}"),
     }
     if !status.success() {
@@ -2529,6 +2664,79 @@ mod tests {
             sock: dir.join("lane/sock/runner.sock"),
             lanes_root: dir.to_path_buf(),
         }
+    }
+
+    #[test]
+    fn the_headers_timeout_wins_over_both_flags_and_the_flag_default_is_minutes() {
+        let min = |m: u64| Duration::from_secs(m * 60);
+        assert_eq!(lane_timeout(Some(100), Some(2), 45), min(100));
+        assert_eq!(lane_timeout(Some(100), None, 3), min(100));
+        assert_eq!(lane_timeout(None, Some(2), 45), Duration::from_secs(2));
+        assert_eq!(lane_timeout(None, None, 45), min(45));
+        assert_eq!(lane_timeout(None, None, 7), min(7));
+    }
+
+    /// A live observer over an empty queue, and a meter holding one haiku turn
+    /// of `input` input tokens ($1 per million).
+    fn observed_turn(
+        input: u64,
+        spent_before_usd: f64,
+        lane_spent_before_usd: f64,
+    ) -> (
+        tokio::sync::mpsc::UnboundedReceiver<SessionEnd>,
+        LiveEscalation,
+        StreamMeter,
+        tempfile::TempDir,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let queue = Queue::new(dir.path(), Box::new(SystemClock)).unwrap();
+        let (end, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut meter = StreamMeter::new(false);
+        meter
+            .feed(
+                &json!({"type":"assistant","message":{"id":"m1","usage":{"input_tokens":input,"output_tokens":0}}})
+                    .to_string(),
+            )
+            .unwrap();
+        let live = LiveEscalation {
+            queue: Arc::new(Mutex::new(queue)),
+            lane: "lane-x".to_string(),
+            model: "haiku".to_string(),
+            spent_before_usd,
+            lane_spent_before_usd,
+            cost_cap_usd: 1.0,
+            seen_turns: 0,
+            done: false,
+            end,
+        };
+        (rx, live, meter, dir)
+    }
+
+    #[test]
+    fn the_hard_cost_stop_is_on_the_lanes_total_and_a_reassign_does_not_restart_it() {
+        // A reassign restarted the queue segment ($0) but the lane has spent $0.95:
+        // another $0.10 reaches the whole cap.
+        let (mut rx, mut live, meter, _dir) = observed_turn(100_000, 0.0, 0.95);
+        live.observe(&meter);
+        assert_eq!(rx.try_recv(), Ok(SessionEnd::CostCap));
+        // Once is enough: the observer is done.
+        live.observe(&meter);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn the_hard_cost_stop_fires_exactly_at_the_cap_and_not_below_it() {
+        let (mut rx, mut live, meter, _dir) = observed_turn(1_000_000, 0.0, 0.0);
+        live.observe(&meter);
+        assert_eq!(rx.try_recv(), Ok(SessionEnd::CostCap), "$1.00 of $1.00");
+        let (mut rx, mut live, meter, _dir) = observed_turn(990_000, 0.0, 0.0);
+        live.observe(&meter);
+        // Past the 40% share but short of the cap: the escalate-early trigger,
+        // not the stop.
+        assert!(
+            matches!(rx.try_recv(), Ok(SessionEnd::Forced(_))),
+            "$0.99 of $1.00 is not the cap"
+        );
     }
 
     #[test]

@@ -277,6 +277,21 @@ exit 0
         }
     }
 
+    /// Add (or replace) one field of the packet's `<!-- lane {...} -->` header,
+    /// on disk and in `packet_text`.
+    fn set_header_field(&mut self, key: &str, value: Value) {
+        let start = self.packet_text.find("<!-- lane ").unwrap() + "<!-- lane ".len();
+        let end = start + self.packet_text[start..].find(" -->").unwrap();
+        let mut header: Value = serde_json::from_str(&self.packet_text[start..end]).unwrap();
+        header[key] = value;
+        self.packet_text = format!(
+            "{}{header}{}",
+            &self.packet_text[..start],
+            &self.packet_text[end..]
+        );
+        fs::write(&self.packet, &self.packet_text).unwrap();
+    }
+
     fn command(&self, lanes_root: &Path) -> Command {
         let mut c = Command::new(&self.cowproof);
         c.arg("run")
@@ -1218,6 +1233,8 @@ fn run_help_documents_every_exit_code() {
         "2 refuted",
         "3 incomplete",
         "4 infrastructure",
+        "5 timeout",
+        "6 cost-cap",
         "130 interrupted by SIGINT or SIGTERM",
     ] {
         assert!(help.contains(code), "no {code:?} in: {help}");
@@ -1865,7 +1882,7 @@ fn the_runner_ends_the_whole_process_group_so_no_background_child_survives() {
     // fake sleeps.
     let ask = mcp_session("ask.out", &[(3, "ask", blocking_ask("Stuck?"))]);
     let first = format!(
-        "{}{ask}( trap '' TERM; sleep 6; echo alive > \"$HOME/survived\" ) &\n( trap '' TERM; sleep 60 ) &\necho $! > \"$HOME/bgpid\"\nsleep 120\n",
+        "{}{ask}( trap '' TERM; sleep 14; echo alive > \"$HOME/survived\" ) &\n( trap '' TERM; sleep 60 ) &\necho $! > \"$HOME/bgpid\"\nsleep 120\n",
         init_line()
     );
     let h = owned_packet(&first_then(&first, &then_checks()));
@@ -2269,7 +2286,7 @@ fn assert_interrupted_cleanly(h: &Harness, status: std::process::ExitStatus, run
 /// writer, and one whose pid it records), then sleeps.
 fn builder_with_background_children() -> String {
     format!(
-        "{}( trap '' TERM; sleep 6; echo alive > \"$HOME/survived\" ) &\n( trap '' TERM; sleep 300 ) &\necho $! > \"$HOME/bgpid\"\nsleep 120\n",
+        "{}( trap '' TERM; sleep 14; echo alive > \"$HOME/survived\" ) &\n( trap '' TERM; sleep 300 ) &\necho $! > \"$HOME/bgpid\"\nsleep 120\n",
         init_line()
     )
 }
@@ -2567,4 +2584,293 @@ fn prefix_version_in_run_json_and_the_capsule_is_the_runners_prefix_version() {
         field(&h.run_json(), "projectInstructionsSha256"),
         &json!(sha256_hex(b"root instructions\n"))
     );
+}
+
+// ---------------------------------------------------------------- hard limits
+//
+// The wall-clock timeout and the cost-cap stop end a lane with its work kept
+// and no proof: status `timeout` / `cost-cap`, exit 5 / 6.
+
+/// No verdict, no capsule and no proof run: the lane was ended, not judged.
+fn assert_not_proved(h: &Harness) {
+    let control = h.lane().join("control");
+    assert!(
+        !control.join("verdict.json").exists(),
+        "a lane ended by a hard limit has no verdict"
+    );
+    assert!(
+        !control.join("capsule").exists(),
+        "a lane ended by a hard limit is not sealed"
+    );
+}
+
+#[test]
+fn the_timeout_ends_a_silent_builder_and_a_child_that_ignores_sigterm_and_nothing_is_proved() {
+    if !sandbox_available() {
+        return;
+    }
+    // The builder says nothing and sleeps. A background child ignores SIGTERM
+    // (only the group SIGKILL ends it) and would write a marker fourteen seconds in. The limit is eight seconds, wide enough for a
+    // cold sandbox start on a loaded machine (the clock runs from the builder's spawn).
+    let first = "( trap '' TERM; sleep 14; echo alive > \"$HOME/survived\" ) &\necho $! > \"$HOME/bgpid\"\nsleep 120\n";
+    let h = owned_packet(first);
+    let began = Instant::now();
+    let child = {
+        let _g = fork_lock();
+        h.command(h.lanes.path())
+            .args(["--timeout-secs", "8"])
+            .env("ANTHROPIC_API_KEY", REAL_KEY)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap()
+    };
+    let out = finish(child);
+    let took = began.elapsed();
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert_eq!(out.status.code(), Some(5), "{}\n{stderr}", stdout_of(&out));
+    assert!(stderr.contains("wall-clock timeout"), "{stderr}");
+    assert!(
+        took < Duration::from_secs(45),
+        "the 120 s sleep was cut short: {took:?}"
+    );
+    assert_eq!(
+        stdout_of(&out)
+            .lines()
+            .last()
+            .unwrap()
+            .split(',')
+            .next()
+            .unwrap(),
+        format!("{}: timeout", h.id)
+    );
+
+    let run = h.run_json();
+    assert_eq!(run["status"], "timeout");
+    assert_eq!(run["timeoutSecs"], 8);
+    let segs = segments(&h);
+    assert_eq!(segs.len(), 1, "no relaunch: {segs:?}");
+    assert_eq!(h.launches(), 1);
+    assert_eq!(segs[0]["sessionEnd"], "timeout", "{segs:?}");
+    assert_eq!(segs[0]["killedByRunner"], true);
+    assert_eq!(segs[0]["status"], "ended-by-runner");
+    assert_eq!(segs[0]["signal"], 15, "SIGTERM ended the leader: {segs:?}");
+    assert_not_proved(&h);
+
+    // The stubborn child is gone: by pid where the sandbox shares the host's
+    // pid space (macOS), and by effect everywhere (its marker would appear at
+    // fourteen seconds into the builder, after the run has already ended).
+    if cfg!(target_os = "macos") {
+        assert_pid_gone(h.read("home/bgpid").trim());
+    }
+    std::thread::sleep(Duration::from_secs(8));
+    assert!(
+        !h.lane().join("home/survived").exists(),
+        "a background child outlived the timeout and wrote its marker"
+    );
+}
+
+#[test]
+fn the_headers_timeout_min_beats_the_flag() {
+    if !sandbox_available() {
+        return;
+    }
+    // The flag says two seconds; the builder takes five. The header's 100
+    // minutes win, so the builder finishes and the lane goes on to its proof.
+    let mut h = owned_packet("sleep 5\n");
+    h.set_header_field("timeoutMin", json!(100));
+    let run = start_watched(&h, &["--timeout-secs", "2"]);
+    let out = finish(run.child);
+    // No check ran, so the proof says incomplete (3): a verdict, not a timeout.
+    assert_eq!(out.status.code(), Some(3), "{}", stdout_of(&out));
+    let json = h.run_json();
+    assert_eq!(json["status"], "finished");
+    assert_eq!(json["timeoutSecs"], 6000);
+    let segs = segments(&h);
+    assert_eq!(segs[0]["sessionEnd"], Value::Null, "{segs:?}");
+    assert_eq!(segs[0]["killedByRunner"], false);
+    assert_eq!(h.verdict()["verdict"], "incomplete");
+}
+
+#[test]
+fn time_parked_waiting_for_a_ruling_does_not_count_toward_the_timeout() {
+    if !sandbox_available() {
+        return;
+    }
+    // Eight seconds of wall clock in all. The builder parks on a blocking ask at
+    // once, the director rules twelve seconds later (more than the whole limit),
+    // and the resumed builder runs its checks. Only the time inside the two
+    // launches counts, so the lane is proved.
+    let h = owned_packet(&asks_first("Choose A or B?", true, &then_checks()));
+    let mut child = {
+        let _g = fork_lock();
+        h.command(h.lanes.path())
+            .args(["--timeout-secs", "8"])
+            .env("ANTHROPIC_API_KEY", REAL_KEY)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap()
+    };
+    let id = wait_for_ask(&h, &mut child, 1);
+    std::thread::sleep(Duration::from_secs(12));
+    rule(&h, &id, &["--answer", "use option B"]);
+    let out = finish(child);
+    assert_eq!(out.status.code(), Some(0), "{}", stdout_of(&out));
+    assert_eq!(
+        stdout_of(&out).lines().last().unwrap(),
+        format!("{}: proved", h.id)
+    );
+    assert_eq!(h.launches(), 2);
+    let segs = segments(&h);
+    assert_eq!(segs[1]["start"], "resumed", "{segs:?}");
+    assert!(
+        segs.iter().all(|s| s["sessionEnd"] != "timeout"),
+        "{segs:?}"
+    );
+
+    // The run took longer than the limit, the counted time well under it.
+    let json = h.run_json();
+    assert_eq!(json["timeoutSecs"], 8);
+    let whole = json["durationMs"].as_u64().unwrap();
+    let counted = json["activeMs"].as_u64().unwrap();
+    assert!(
+        whole >= 12_000,
+        "the run included the twelve-second wait: {whole} ms"
+    );
+    assert!(counted < 8_000, "only launch time counts: {counted} ms");
+    assert!(
+        whole - counted >= 12_000,
+        "at least the wait was left out: {whole} ms whole, {counted} ms counted"
+    );
+    assert_eq!(h.verdict()["verdict"], "proved");
+}
+
+/// A fake that, on its first launch, prints `first_turns` $0.30 turns (haiku
+/// input at $1 per million) and sleeps; on every later launch it prints
+/// `later_turns` of them and sleeps for `later_sleep` seconds.
+fn costly_builder(first_turns: usize, later_turns: usize, later_sleep: u32) -> String {
+    let turns = |from: usize, count: usize| -> String {
+        (from..from + count)
+            .map(|i| turn_line(&format!("m{i}"), 300_000))
+            .collect()
+    };
+    first_then(
+        &format!("{}{}sleep 120\n", init_line(), turns(1, first_turns)),
+        &format!("{}sleep {later_sleep}\n", turns(10, later_turns)),
+    )
+}
+
+#[test]
+fn a_cost_estimate_at_the_whole_cap_ends_the_lane_after_the_early_escalation_fired_first() {
+    if !sandbox_available() {
+        return;
+    }
+    // Cap $1.00. The first launch's second turn brings the estimate to $0.60,
+    // past the 40% share: one forced escalation, which the director answers.
+    // The resumed launch adds $0.30 ($0.90, below the cap) and then $0.30 more
+    // ($1.20): the lane ends there, long before the builder's 30 s sleep does.
+    let h = owned_packet(&costly_builder(2, 2, 30));
+    let mut run = start_watched(&h, &["--cost-cap-usd", "1.0"]);
+    let id = wait_for_ask(&h, &mut run.child, 1);
+    run.wait_for_stderr(WAITING, SESSION_END_WITHIN);
+    let forced = forced_escalation(&h);
+    let reason = forced["origin"]["forced"]["reason"].as_str().unwrap();
+    assert!(reason.contains("estimated cost"), "{reason}");
+    assert_eq!(h.launches(), 1, "nothing relaunched before the ruling");
+
+    rule(&h, &id, &["--answer", "keep going"]);
+    let out = finish(run.child);
+    assert_eq!(out.status.code(), Some(6), "{}", stdout_of(&out));
+    assert_eq!(
+        stdout_of(&out)
+            .lines()
+            .last()
+            .unwrap()
+            .split(',')
+            .next()
+            .unwrap(),
+        format!("{}: cost-cap", h.id)
+    );
+
+    let json = h.run_json();
+    assert_eq!(json["status"], "cost-cap");
+    assert_eq!(json["costIsEstimate"], true);
+    assert_eq!(json["costCapUsd"], 1.0);
+    assert!(
+        json["estimatedCostUsd"].as_f64().unwrap() >= 1.0,
+        "{}",
+        json["estimatedCostUsd"]
+    );
+    // The early escalation fired once, before the stop; the stop opened none.
+    assert_eq!(queue_events(&h, "asked").len(), 1);
+    let segs = segments(&h);
+    assert_eq!(segs.len(), 2, "{segs:?}");
+    assert_eq!(segs[0]["sessionEnd"], "forced", "{segs:?}");
+    assert_eq!(segs[1]["start"], "resumed");
+    assert_eq!(segs[1]["sessionEnd"], "cost-cap", "{segs:?}");
+    assert_eq!(segs[1]["killedByRunner"], true);
+    assert_eq!(segs[1]["signal"], 15, "{segs:?}");
+    assert_eq!(h.launches(), 2, "no relaunch after the stop");
+    assert_not_proved(&h);
+}
+
+#[test]
+fn the_headers_max_cost_usd_beats_the_flag_and_a_single_jump_past_the_cap_stops_without_asking() {
+    if !sandbox_available() {
+        return;
+    }
+    // One turn of $1.20 against a header cap of $1.00 (the flag says $100):
+    // the estimate jumps over the 40% share and the cap together, and the stop
+    // wins over the early escalation.
+    let first = format!("{}{}sleep 120\n", init_line(), turn_line("m1", 1_200_000));
+    let mut h = owned_packet(&first);
+    h.set_header_field("maxCostUsd", json!(1.0));
+    let child = {
+        let _g = fork_lock();
+        h.command(h.lanes.path())
+            .args(["--cost-cap-usd", "100"])
+            .env("ANTHROPIC_API_KEY", REAL_KEY)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap()
+    };
+    let out = finish(child);
+    assert_eq!(out.status.code(), Some(6), "{}", stdout_of(&out));
+    let json = h.run_json();
+    assert_eq!(json["status"], "cost-cap");
+    assert_eq!(json["costCapUsd"], 1.0);
+    assert_eq!(json["costIsEstimate"], true);
+    let queue = fs::read_to_string(h.lane().join("control/escalations.jsonl")).unwrap_or_default();
+    assert!(
+        !queue.contains("\"asked\""),
+        "no escalation was opened: {queue}"
+    );
+    let segs = segments(&h);
+    assert_eq!(segs.len(), 1, "{segs:?}");
+    assert_eq!(segs[0]["sessionEnd"], "cost-cap");
+    assert_not_proved(&h);
+}
+
+#[test]
+fn run_help_documents_the_two_hard_limits_and_hides_the_test_flag() {
+    let out = output(Command::new(env!("CARGO_BIN_EXE_cowproof")).args(["run", "--help"]));
+    let help = String::from_utf8_lossy(&out.stdout)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    for needle in [
+        "--timeout-min",
+        "[default: 45]",
+        "header's `timeoutMin` wins",
+        "header's `maxCostUsd` wins",
+        "not the bill",
+    ] {
+        assert!(help.contains(needle), "{needle} missing from:\n{help}");
+    }
+    assert!(!help.contains("--timeout-secs"), "the test flag is hidden");
 }

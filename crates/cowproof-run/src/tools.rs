@@ -101,6 +101,12 @@ pub enum SessionEnd {
     /// A call hit the escalation limit and the lane ended as
     /// `escalation-limit`; nothing is parked, but nothing more may run.
     LimitReached,
+    /// The lane's wall-clock limit ran out. Only the launcher decides this, so
+    /// it is never sent through [`SessionEndSignal`].
+    Timeout,
+    /// The running cost estimate reached 100% of the cap: the lane ends now,
+    /// without a grace period, and is not proved.
+    CostCap,
 }
 
 /// Where [`serve_signalling`] sends a [`SessionEnd`]. Create the channel
