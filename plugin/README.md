@@ -1,0 +1,38 @@
+# cowproof plugin for Claude Code
+
+Skills for directing cowproof lanes from a Claude Code session: write a packet and launch a lane, watch and rule on escalations, judge and apply the result.
+
+- `cowproof-dispatch`: write a packet, lint it, launch it with `cowproof run`
+- `cowproof-escalate`: watch running lanes and rule with an answer, a redirect, a reassign or a stop
+- `cowproof-handback`: judge a lane's verdict and capsule, replay it, review the patch, apply and commit
+
+A `SessionStart` hook runs `scripts/check-cowproof.sh`. It prints an install hint when the `cowproof` binary is not on the PATH, or when its version is older than this plugin's, and prints nothing otherwise.
+
+## Install
+
+Inside Claude Code:
+
+```text
+/plugin marketplace add srmcguirt/cowproof
+/plugin install cowproof@cowproof
+```
+
+To try a local checkout, add its path as the marketplace instead: `/plugin marketplace add /path/to/cowproof`.
+
+The plugin works in the Claude Code CLI, the desktop app's Code tab and the IDE extensions.
+
+Cloud sessions are not supported yet. Lanes need a local sandbox and a local `claude` runtime, which a cloud session does not give you.
+
+## The binary
+
+The plugin does not ship the `cowproof` binary. Install it separately, the way the repository README's Install section says:
+
+```sh
+cargo install --git https://github.com/srmcguirt/cowproof cowproof-cli
+```
+
+`cowproof run` also needs `claude` on the PATH and `ANTHROPIC_API_KEY` in the environment.
+
+## Not here yet
+
+There is no `.mcp.json`. The director MCP server (`cowproof serve --director`) does not exist yet. It is the next step for this plugin, tracked at the top of `docs/backlog.md`. Until then the skills drive `cowproof` through the shell.

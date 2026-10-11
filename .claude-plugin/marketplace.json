@@ -1,0 +1,13 @@
+{
+  "name": "cowproof",
+  "description": "Run isolated AI builder lanes with proof of correctness",
+  "owner": {
+    "name": "srmcguirt"
+  },
+  "plugins": [
+    {
+      "source": "./plugin",
+      "name": "cowproof"
+    }
+  ]
+}

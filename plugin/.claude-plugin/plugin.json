@@ -1,0 +1,11 @@
+{
+  "name": "cowproof",
+  "description": "Run isolated AI builder lanes with proof of correctness",
+  "version": "0.1.0",
+  "author": {
+    "name": "srmcguirt"
+  },
+  "homepage": "https://github.com/srmcguirt/cowproof",
+  "repository": "https://github.com/srmcguirt/cowproof",
+  "license": "MIT"
+}
