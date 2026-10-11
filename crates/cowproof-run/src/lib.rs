@@ -16,6 +16,7 @@ pub mod claude;
 pub mod deps;
 pub mod director;
 pub mod lane;
+pub mod opencode;
 pub mod prefix;
 pub mod proxy;
 pub mod stream;

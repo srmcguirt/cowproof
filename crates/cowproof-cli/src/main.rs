@@ -26,6 +26,7 @@ mod doctor;
 mod host_agent;
 mod host_setup;
 mod lane_tools;
+mod openrouter;
 mod preflight;
 mod remote;
 mod report;
@@ -289,6 +290,11 @@ struct RunOneArgs {
     /// The Claude Code executable, resolved once on the director's PATH
     #[arg(long, default_value = "claude")]
     claude_bin: String,
+    /// The OpenCode executable, resolved once on the director's PATH. Used for `openrouter`
+    /// rungs (D28); a lane that never runs one does not need it. The real key comes from the
+    /// director's `OPENROUTER_API_KEY` and goes only to the egress proxy
+    #[arg(long, default_value = "opencode")]
+    opencode_bin: String,
     /// Hard cap on builder turns per session, passed to the builder (`--max-turns`)
     #[arg(long, default_value_t = 60)]
     max_turns: u32,

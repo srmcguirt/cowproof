@@ -7,8 +7,9 @@
 //! from the lane's BASE commit, never from a working tree, so a lane cannot rewrite its own
 //! routing, exactly as the class limits cannot be raised by a patch.
 //!
-//! Only the `claude` runtime has an adapter. The ladder may list rungs of other runtimes; the
-//! runner refuses a lane that would start or be reassigned onto one.
+//! The `claude` runtime (Claude Code) and the `openrouter` runtime (OpenCode, D28 step 2) have an
+//! adapter. The ladder may list rungs of other runtimes; the runner refuses a lane that would
+//! start or be reassigned onto one.
 
 use anyhow::{Context, Result, bail};
 use std::collections::BTreeMap;
@@ -27,14 +28,14 @@ pub const DEFAULT_RUNGS: [&str; 3] = ["claude:haiku", "claude:sonnet", "claude:o
 const MODEL_NAME_MAX: usize = 64;
 
 /// A model name goes into a builder's argv, so it is held to a conservative alphabet and never
-/// starts like a flag.
+/// starts like a flag. `/` is in the alphabet because OpenRouter names a model `vendor/name`.
 pub fn valid_model_name(model: &str) -> bool {
     !model.is_empty()
         && model.len() <= MODEL_NAME_MAX
         && !model.starts_with('-')
-        && model
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | ':' | '[' | ']'))
+        && model.chars().all(|c| {
+            c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | ':' | '[' | ']' | '/')
+        })
 }
 
 /// The CLI that drives a builder. A closed set: a name outside it is refused everywhere.
@@ -61,9 +62,10 @@ impl Runtime {
         Self::ALL.into_iter().find(|r| r.name() == name)
     }
 
-    /// Whether the runner can launch this runtime. D28 step 1: only Claude Code.
+    /// Whether the runner can launch this runtime: Claude Code (D28 step 1) and OpenCode for
+    /// OpenRouter models (step 2).
     pub fn has_adapter(self) -> bool {
-        matches!(self, Self::Claude)
+        matches!(self, Self::Claude | Self::Openrouter)
     }
 
     /// The refusal for a rung of this runtime, or `None` when it has an adapter.
@@ -583,7 +585,7 @@ mod tests {
     }
 
     #[test]
-    fn runtimes_are_a_closed_set_and_only_claude_has_an_adapter() {
+    fn runtimes_are_a_closed_set_and_claude_and_openrouter_have_adapters() {
         for runtime in Runtime::ALL {
             assert_eq!(Runtime::from_name(runtime.name()), Some(runtime));
         }
@@ -594,12 +596,21 @@ mod tests {
             Runtime::Codex.adapter_refusal().as_deref(),
             Some("runtime `codex` has no adapter yet (D28 step 1)")
         );
-        assert!(!Runtime::Openrouter.has_adapter());
+        assert!(Runtime::Openrouter.has_adapter());
+        assert!(Runtime::Openrouter.adapter_refusal().is_none());
+        assert!(!Runtime::Codex.has_adapter());
     }
 
     #[test]
     fn model_names_keep_the_old_alphabet() {
-        for ok in ["opus", "claude-haiku-5-5", "opus[1m]", "a.b_c:d"] {
+        for ok in [
+            "opus",
+            "claude-haiku-5-5",
+            "opus[1m]",
+            "a.b_c:d",
+            // OpenRouter's `vendor/name`.
+            "z-ai/glm-5.3-flash",
+        ] {
             assert!(valid_model_name(ok), "{ok}");
         }
         for bad in ["", "-x", "--model", "a b", "a;b", "a\nb", &"x".repeat(65)] {

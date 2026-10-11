@@ -37,13 +37,38 @@ default = "claude:haiku"                  # the first rung, unless you say other
 classes = { rust = "claude:sonnet", pg = "claude:sonnet" }
 ```
 
-- A rung is `runtime:model`. The runtime is one of `claude`, `openrouter`, `codex`. The model is a name of letters, digits and `.` `_` `-` `:` `[` `]`, at most 64 characters, never starting with `-`. A bare `haiku` is read as `claude:haiku`. The first `:` ends the runtime, so a model name that contains a `:` needs the `claude:` prefix.
+- A rung is `runtime:model`. The runtime is one of `claude`, `openrouter`, `codex`. The model is a name of letters, digits and `.` `_` `-` `:` `[` `]` `/`, at most 64 characters, never starting with `-`. A bare `haiku` is read as `claude:haiku`. The first `:` ends the runtime, so a model name that contains a `:` needs the `claude:` prefix.
 - The ladder may not be empty or list a rung twice. A table with an unknown key, an unknown runtime, a bad model name, a class that is not `rust`, `crate`, `pg` or `light`, or a routing rung that is not on the ladder is an error.
 - The starting rung is, in order: `cowproof run --model` (when given; it need not be on the ladder), the packet header's `"rung": "claude:sonnet"`, the `[routing] classes` entry for the packet's class, then `[routing] default`. `run.json` records the runtime and model of every segment, and `rungSource` (`flag`, `header`, `class` or `default`); the capsule records `builder_runtime` and `rung_source` beside `builder_model`.
 - A header rung that is not on the ladder is an error in `cowproof lint`, and `cowproof run` refuses it with exit 4, naming the rung, before it creates a lane. So does a ladder or routing that does not parse.
 - `reassign` without a model moves one rung up the ladder. At the top, the lane ends as it always has: refused, the work kept, the ruling left undelivered.
 
-Only the `claude` runtime has an adapter so far. The ladder may list `openrouter` and `codex` rungs, but a lane that would start on one is refused with exit 4 ("runtime `codex` has no adapter yet (D28 step 1)"), and a `reassign` that would land on one ends the lane the way the top of the ladder does.
+The `claude` and `openrouter` runtimes have an adapter ([OpenRouter models through OpenCode](#openrouter-models-through-opencode) below). The ladder may list `codex` rungs, but a lane that would start on one is refused with exit 4 ("runtime `codex` has no adapter yet (D28 step 1)"), and a `reassign` that would land on one ends the lane the way the top of the ladder does. So does a `reassign` onto a rung that cannot run here: no `opencode` on `PATH`, no `OPENROUTER_API_KEY`, no `claude` or `ANTHROPIC_API_KEY`, or a remote lane.
+
+## OpenRouter models through OpenCode
+
+A rung `openrouter:<model>` (for example `openrouter:z-ai/glm-5.3-flash`) runs the model through [OpenCode](https://opencode.ai), not Claude Code: OpenRouter's own Claude Code integration is only guaranteed to work with Anthropic models. The runner, the sandbox, the queue, the checks and the proof are the same as for a Claude lane; only the builder's launcher, its event parser and the provider the proxy forwards to differ.
+
+**Setup.** Install `opencode` (tested against 1.18.33), then put your OpenRouter key in the environment of the shell that runs `cowproof`:
+
+```sh
+export OPENROUTER_API_KEY=sk-or-v1-...       # yours; read once, held by the proxy
+cowproof run packet.md --model openrouter:z-ai/glm-5.3-flash
+```
+
+or name the rung in the ladder, the header or a class route (`openrouter:z-ai/glm-5.3-flash` is a valid model name: `/` is allowed). `--opencode-bin <path>` names the executable when it is not `opencode` on `PATH`. A lane that starts on an `openrouter` rung needs `opencode` and `OPENROUTER_API_KEY` and does not need `claude` or `ANTHROPIC_API_KEY`; the other provider's key only lets a later `reassign` cross runtimes, because one proxy per lane serves both.
+
+**What the lane sees.** A placeholder, never your key. The lane's `home/opencode.json` points OpenCode's `openrouter` provider at the in-sandbox bridge (`http://127.0.0.1:<port>/api/v1`) with the lane's `placeholder-...` as its API key. The proxy accepts that placeholder on `POST /api/v1/chat/completions`, the one path OpenCode uses, replaces it with `Authorization: Bearer <your key>` and forwards to `https://openrouter.ai`. Any other path or method, and any request that carries a credential other than the placeholder, is refused with 403 and goes nowhere. The OS sandbox is the same as for Claude, so the lane reaches no other host either.
+
+- **Permissions.** OpenCode is configured, never run with `--auto`. The permission block is default-deny, then allows `edit` (which covers `write`), `read`, `bash`, `glob` and `grep` inside the clone, and the three cowproof tools (`cowproof-tools_ask`, `cowproof-tools_check_ruling`, `cowproof-tools_run_check`); `external_directory` is denied, and `webfetch`, `websearch`, `task` and `skill` are denied by name. The model is not even offered a denied tool. OpenCode is told to ignore the clone's own `opencode.json` and `.opencode/` (`OPENCODE_DISABLE_PROJECT_CONFIG`), so nothing the builder writes there can change the endpoint or loosen the permissions; as a second line the block is passed as `OPENCODE_PERMISSION` and the config as `OPENCODE_CONFIG_CONTENT`, which OpenCode applies after any project file, and the config file is rewritten before every launch.
+- **Offline.** OpenCode's own network habits are switched off: no model catalog fetch (the config defines the one model it runs, with its context limit and price), no update check, no sharing, no LSP downloads, no title request to a second model. Its background install of `@opencode-ai/plugin` has no flag; it is pointed at an offline npm configuration instead, so it never leaves the machine.
+- **Prompt and session.** The packet is OpenCode's first message, sent on stdin (OpenCode would quote and escape a multi-line argument). A ruling resumes the same OpenCode session with `-s <session id>` and the ruling as the message; the session id is the `sessionID` every event carries. If the session is gone, the existing D9 fallback starts a fresh session with a carry-over summary.
+- **Cost.** OpenCode reports a cost per model call, computed from the price written into its config. When the built-in price table (`crates/cowproof-run/src/opencode.rs`) knows the model, that is the runtime's own figure and `run.json` says `costSource: "reported"`. Otherwise it is estimated from the table's dearest default and says `"estimate"`. The turn and cost caps read the same running figure as for Claude. The table is written by hand and is not a bill.
+- **Recording.** `run.json` records `runtime: "openrouter"`, the OpenRouter model id and `runtimeVersion` (the output of `opencode --version`) for every segment, and `opencodeVersion` at the top; the capsule records `builder_runtime` and `builder_runtime_version`. If you set `COWPROOF_OPENROUTER_UPSTREAM`, `run.json` records `openrouterUpstream`.
+
+`COWPROOF_OPENROUTER_UPSTREAM` replaces `https://openrouter.ai` as the proxy's upstream, for a test server or a self-hosted gateway. It is read from the environment and never from `cowproof.toml`, so repository content cannot redirect your key.
+
+**Limits.** Remote lanes (`--host`) run Claude only: `--host` with an `openrouter` rung is refused with exit 4, naming the rung. OpenCode has no hooks, so an `openrouter` lane is untraced by portkit. The model's context limit and output limit come from the same hand-written table (128k and 16k when the model is not in it), because OpenCode's bundled catalog does not list OpenRouter offline. The builder preamble names the tools `ask`, `check_ruling` and `run_check`; in OpenCode they are `cowproof-tools_ask` and so on, which the lane's instructions say. A provider that is unreachable makes OpenCode retry silently, so the lane ends at its wall-clock limit rather than at once. Packet profiles for low rungs, the Codex adapter and subscription logins are still to come.
 
 ## Tune the ladder from data: `cowproof report rollup`
 

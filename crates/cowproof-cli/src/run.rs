@@ -36,6 +36,7 @@
 //! (`env_clear`), so the director's `ANTHROPIC_API_KEY` is never inherited:
 //! the builder sees only the proxy's placeholder key.
 
+use crate::openrouter::{self, Opencode, OpencodeLaunch, opencode_builder_command};
 use crate::preflight::{CheckStatus, PreflightOptions, preflight};
 use crate::remote::{self, BuilderSpecParts, LocalSide, RemoteHost, RemoteLane};
 use crate::root::resolve_executable;
@@ -67,7 +68,7 @@ use cowproof_run::{
     lane::{PrepareOptions, prepare_lane},
     lane_tmp,
     prefix::{assemble_prompt, prefix_version},
-    proxy::{ProxyConfig, ProxyServer},
+    proxy::{Provider, ProxyConfig, ProxyServer},
     render_macos_profile, sandbox_command,
     stream::{MeterSummary, StreamMeter},
     tools::{self, CheckOutcome, CheckTable, RunCheck, SessionEnd, SessionEndSignal},
@@ -151,6 +152,25 @@ const BUILDER_ALLOW: [&str; 7] = [
 ];
 const BUILDER_DENY: [&str; 2] = ["WebFetch", "WebSearch"];
 
+/// The real credentials the proxy holds, one per provider it serves. They live in the
+/// director's process and the proxy's memory, nowhere else.
+pub struct ProxyKeys {
+    /// The Anthropic key, for `claude` rungs.
+    pub anthropic: Option<String>,
+    /// The OpenRouter key and the upstream to send it to, for `openrouter` rungs.
+    pub openrouter: Option<(String, String)>,
+}
+
+impl From<String> for ProxyKeys {
+    /// An Anthropic key alone, as before D28 step 2.
+    fn from(anthropic: String) -> Self {
+        ProxyKeys {
+            anthropic: Some(anthropic),
+            openrouter: None,
+        }
+    }
+}
+
 /// A running egress proxy and what the builder needs to reach it.
 pub struct ProxyEndpoint {
     /// `ANTHROPIC_BASE_URL` for the builder: the in-sandbox bridge's
@@ -176,14 +196,29 @@ pub struct ProxyEndpoint {
 /// [`builder_argv`] starts inside the sandbox, listening on `127.0.0.1:<port>`
 /// where the port is [`bridge_port`] of the lane id.
 ///
-/// The real key goes only into the proxy's memory.
+/// The real keys go only into the proxy's memory. One proxy serves every provider the lane may
+/// use (D28): it routes by path and holds the placeholder all of them accept, so a `reassign`
+/// across runtimes needs no new endpoint.
 pub async fn start_proxy(
     layout: &LaneLayout,
     lane_id: &str,
-    real_api_key: String,
+    keys: impl Into<ProxyKeys>,
 ) -> Result<ProxyEndpoint> {
-    let config =
-        ProxyConfig::new(real_api_key, UPSTREAM).context("configuring the egress proxy")?;
+    let keys = keys.into();
+    let mut config: Option<ProxyConfig> = None;
+    if let Some(key) = keys.anthropic {
+        config = Some(ProxyConfig::new(key, UPSTREAM).context("configuring the egress proxy")?);
+    }
+    if let Some((key, upstream)) = keys.openrouter {
+        config = Some(
+            match config {
+                Some(config) => config.with_provider(Provider::Openrouter, key, upstream),
+                None => ProxyConfig::for_provider(Provider::Openrouter, key, upstream),
+            }
+            .context("configuring the egress proxy")?,
+        );
+    }
+    let config = config.context("the egress proxy has no provider to forward to")?;
     let placeholder_key = config.placeholder_key().to_string();
     let server = ProxyServer::new(config);
     let socket = lane_dir(layout)?.join("proxy.sock");
@@ -217,7 +252,7 @@ pub async fn start_proxy(
 /// starts the bridge inside the sandbox, waits for it to be ready, and then
 /// replaces itself with `claude`. It is argv end to end: no shell, no
 /// interpolation. If the bridge cannot start, `claude` never does.
-fn builder_argv(
+pub(crate) fn builder_argv(
     cowproof_exe: &Path,
     bridge_port: u16,
     proxy_socket: &Path,
@@ -279,6 +314,15 @@ fn fenced(text: &str) -> String {
         .unwrap_or_default();
     let fence = "`".repeat((longest + 1).max(3));
     format!("{fence}\n{text}\n{fence}")
+}
+
+/// Whether `session_id` has the shape the runtime's resume flag accepts: Claude's `--resume` takes
+/// hex and dashes, OpenCode's `-s` takes `ses_` and letters or digits.
+pub(crate) fn resumable_for(runtime: Runtime, session_id: &str) -> bool {
+    match runtime {
+        Runtime::Openrouter => cowproof_run::opencode::valid_session_id(session_id),
+        _ => resumable(session_id),
+    }
 }
 
 /// A resumed session that fails faster than this, with nothing on stdout, is
@@ -385,7 +429,7 @@ impl StartKind {
 
 /// One builder launch.
 struct Launch {
-    /// The runtime that drives this launch. Only `claude` has an adapter (D28 step 1).
+    /// The runtime that drives this launch: `claude` or `openrouter` (OpenCode).
     runtime: Runtime,
     model: String,
     /// The packet this session works from (the system prompt is assembled
@@ -724,7 +768,15 @@ pub(crate) fn builder_command(l: &BuilderLaunch<'_>) -> Result<Command> {
 /// Everything a launch needs that does not change between launches.
 struct Launcher {
     layout: LaneLayout,
-    claude_bin: PathBuf,
+    /// The Claude Code executable. `None` for a lane that starts on another runtime and found
+    /// no `claude`: a `reassign` onto a Claude rung is then refused.
+    claude_bin: Option<PathBuf>,
+    /// OpenCode and its version, when the lane may use an `openrouter` rung and it was found.
+    opencode: Option<Opencode>,
+    /// The director holds an Anthropic key / an OpenRouter key. The proxy has the values;
+    /// these only say which rungs can run.
+    has_anthropic_key: bool,
+    has_openrouter_key: bool,
     cowproof_exe: PathBuf,
     /// The portkit CLI `pk`, the sibling of the running `cowproof` executable
     /// (G8). Without it the builder gets no hooks and the lane is `untraced` (D5).
@@ -783,6 +835,57 @@ struct Launcher {
 }
 
 impl Launcher {
+    /// Why this lane cannot start a builder of `runtime`, or `None` when it can. The same
+    /// answer for the first rung (before any lane exists, by the caller's own checks) and for a
+    /// `reassign` onto another runtime, which is refused with the work kept.
+    fn runtime_refusal(&self, runtime: Runtime) -> Option<String> {
+        if let Some(refusal) = runtime.adapter_refusal() {
+            return Some(refusal);
+        }
+        match runtime {
+            Runtime::Claude => {
+                if self.claude_bin.is_none() {
+                    return Some(
+                        "`claude` was not found on this machine's PATH, so the lane has no Claude builder"
+                            .to_string(),
+                    );
+                }
+                (!self.has_anthropic_key).then(|| {
+                    "ANTHROPIC_API_KEY is not set, so the proxy holds no Anthropic key".to_string()
+                })
+            }
+            Runtime::Openrouter => {
+                if self.remote.is_some() {
+                    return Some(
+                        "a remote lane (--host) runs Claude only; the `openrouter` runtime has no remote adapter"
+                            .to_string(),
+                    );
+                }
+                if self.opencode.is_none() {
+                    return Some(
+                        "`opencode` was not found on this machine's PATH, so the lane has no OpenCode builder"
+                            .to_string(),
+                    );
+                }
+                (!self.has_openrouter_key).then(|| {
+                    format!(
+                        "{} is not set, so the proxy holds no OpenRouter key",
+                        openrouter::KEY_ENV
+                    )
+                })
+            }
+            Runtime::Codex => None,
+        }
+    }
+
+    /// The version string the runner read from the runtime's executable, if it read one.
+    fn runtime_version(&self, runtime: Runtime) -> Option<&str> {
+        match runtime {
+            Runtime::Openrouter => self.opencode.as_ref().map(|o| o.version.as_str()),
+            _ => None,
+        }
+    }
+
     /// Launch the builder once and wait for it to exit.
     ///
     /// The lane home is writable by the builder, so `settings.json`,
@@ -826,64 +929,94 @@ impl Launcher {
         if *interrupted_rx.borrow_and_update() {
             return Err(Interrupted.into());
         }
-        // The callers refuse a rung with no adapter before they build a launch; this is the
+        // The callers refuse a rung that cannot run before they build a launch; this is the
         // last line, so no other runtime's rung is ever started as a `claude` process.
-        if let Some(refusal) = launch.runtime.adapter_refusal() {
+        if let Some(refusal) = self.runtime_refusal(launch.runtime) {
             bail!("{refusal}");
         }
         let layout = &self.layout;
         let assembled = assemble_prompt(self.project_instructions.as_deref(), &launch.packet);
-        let (mut child_cmd, spec) = match &self.remote {
-            Some(remote) => {
-                // Everything the local branch decides, as a spec for `host-agent builder`; it
-                // holds the lane's placeholder key and never the real one. No portkit hooks:
-                // `pk` is not installed on the host (`builder_settings(None)`).
-                let settings = builder_settings(None);
-                let spec = remote::builder_spec(&BuilderSpecParts {
-                    model: &launch.model,
-                    prompt: &launch.prompt,
-                    system_prompt: &assembled.system_append,
-                    settings: &settings,
-                    resume_session_id: launch.resume.as_deref(),
-                    placeholder_key: &self.placeholder_key,
-                    bridge_port: self.bridge_port,
-                    port_base: self.port_base,
-                    max_turns: self.max_turns,
-                    claude_bin: remote.claude(),
-                });
-                (remote.builder_command(), Some(remote::spec_line(&spec)?))
-            }
-            None => {
-                let files = write_lane_files(
-                    layout,
-                    &builder_settings(self.pk_exe.as_deref()),
-                    &self.cowproof_exe,
-                    &self.socket,
-                    &assembled.system_append,
-                )?;
-                let command = builder_command(&BuilderLaunch {
-                    layout,
-                    files,
-                    claude_bin: &self.claude_bin,
-                    cowproof_exe: &self.cowproof_exe,
-                    pk_exe: self.pk_exe.as_deref(),
-                    portkit_dir: &self.portkit_dir,
-                    path: &self.path,
-                    base_url: &self.base_url,
-                    bridge_port: self.bridge_port,
-                    proxy_socket: &self.proxy_socket,
-                    placeholder_key: &self.placeholder_key,
-                    network: self.network.clone(),
-                    max_turns: self.max_turns,
-                    runner_socket: &self.socket,
-                    lane_id: &self.lane_id,
-                    port_base: self.port_base,
-                    model: &launch.model,
-                    prompt: &launch.prompt,
-                    resume: launch.resume.as_deref(),
-                    unsandboxed: self.unsandboxed,
-                })?;
-                (command, None)
+        let (mut child_cmd, spec) = if launch.runtime == Runtime::Openrouter {
+            // OpenCode, in the same sandbox, behind the same bridge. The refusal above has
+            // made sure it exists and that the lane is local.
+            let opencode = self.opencode.as_ref().context("opencode was not located")?;
+            let command = opencode_builder_command(&OpencodeLaunch {
+                layout,
+                opencode_bin: &opencode.bin,
+                cowproof_exe: &self.cowproof_exe,
+                path: &self.path,
+                base_url: &self.base_url,
+                bridge_port: self.bridge_port,
+                proxy_socket: &self.proxy_socket,
+                placeholder_key: &self.placeholder_key,
+                network: self.network.clone(),
+                max_turns: self.max_turns,
+                runner_socket: &self.socket,
+                port_base: self.port_base,
+                model: &launch.model,
+                packet: &launch.packet,
+                project_instructions: self.project_instructions.as_deref(),
+                prompt: &launch.prompt,
+                resume: launch.resume.as_deref(),
+                unsandboxed: self.unsandboxed,
+            })?;
+            (command, None)
+        } else {
+            match &self.remote {
+                Some(remote) => {
+                    // Everything the local branch decides, as a spec for `host-agent builder`; it
+                    // holds the lane's placeholder key and never the real one. No portkit hooks:
+                    // `pk` is not installed on the host (`builder_settings(None)`).
+                    let settings = builder_settings(None);
+                    let spec = remote::builder_spec(&BuilderSpecParts {
+                        model: &launch.model,
+                        prompt: &launch.prompt,
+                        system_prompt: &assembled.system_append,
+                        settings: &settings,
+                        resume_session_id: launch.resume.as_deref(),
+                        placeholder_key: &self.placeholder_key,
+                        bridge_port: self.bridge_port,
+                        port_base: self.port_base,
+                        max_turns: self.max_turns,
+                        claude_bin: remote.claude(),
+                    });
+                    (remote.builder_command(), Some(remote::spec_line(&spec)?))
+                }
+                None => {
+                    let files = write_lane_files(
+                        layout,
+                        &builder_settings(self.pk_exe.as_deref()),
+                        &self.cowproof_exe,
+                        &self.socket,
+                        &assembled.system_append,
+                    )?;
+                    let command = builder_command(&BuilderLaunch {
+                        layout,
+                        files,
+                        claude_bin: self
+                            .claude_bin
+                            .as_deref()
+                            .context("claude was not located")?,
+                        cowproof_exe: &self.cowproof_exe,
+                        pk_exe: self.pk_exe.as_deref(),
+                        portkit_dir: &self.portkit_dir,
+                        path: &self.path,
+                        base_url: &self.base_url,
+                        bridge_port: self.bridge_port,
+                        proxy_socket: &self.proxy_socket,
+                        placeholder_key: &self.placeholder_key,
+                        network: self.network.clone(),
+                        max_turns: self.max_turns,
+                        runner_socket: &self.socket,
+                        lane_id: &self.lane_id,
+                        port_base: self.port_base,
+                        model: &launch.model,
+                        prompt: &launch.prompt,
+                        resume: launch.resume.as_deref(),
+                        unsandboxed: self.unsandboxed,
+                    })?;
+                    (command, None)
+                }
             }
         };
         // The first launch starts the lane's stream and stderr files; every
@@ -930,7 +1063,11 @@ impl Launcher {
         // Text read but not yet written (a line still waiting for its newline).
         let mut stderr_pending: Vec<u8> = Vec::new();
 
-        let mut meter = StreamMeter::new(launch.resume.is_some());
+        let mut meter = if launch.runtime == Runtime::Openrouter {
+            StreamMeter::opencode(launch.resume.is_some(), &launch.model)
+        } else {
+            StreamMeter::new(launch.resume.is_some())
+        };
         let mut stream = tokio::fs::OpenOptions::new()
             .create(true)
             .write(true)
@@ -1358,10 +1495,18 @@ impl Drive<'_> {
         }
     }
 
-    fn segment_record(index: usize, launch: &Launch, seg: &SegmentRun) -> serde_json::Value {
+    fn segment_record(
+        index: usize,
+        launch: &Launch,
+        seg: &SegmentRun,
+        runtime_version: Option<&str>,
+    ) -> serde_json::Value {
         json!({
             "index": index,
             "runtime": launch.runtime.name(),
+            // The version the runtime's executable reported (`opencode --version`), when the
+            // runner read one.
+            "runtimeVersion": runtime_version,
             "model": launch.model,
             "start": launch.kind.name(),
             "resumedSession": launch.resume,
@@ -1388,6 +1533,13 @@ impl Drive<'_> {
             "turns": seg.summary.turns.len(),
             "estimatedCostUsd": seg.estimated_cost_usd,
             "costIsEstimate": true,
+            // The runtime's own figure for the segment, when it gave one for every turn
+            // (`costSource` says `reported`); otherwise null and the estimate stands.
+            "reportedCostUsd": match seg.summary.cost_source.as_deref() {
+                Some("reported") => seg.summary.total_cost_usd,
+                _ => None,
+            },
+            "costSource": seg.summary.cost_source,
             "durationMs": seg.elapsed.as_millis() as u64,
             "endedBy": serde_json::Value::Null,
         })
@@ -1437,7 +1589,12 @@ impl Drive<'_> {
                 session_id = Some(id.clone());
             }
             let status = seg.status;
-            let mut record = Self::segment_record(segments.len(), &launch, &seg);
+            let mut record = Self::segment_record(
+                segments.len(),
+                &launch,
+                &seg,
+                self.launcher.runtime_version(launch.runtime),
+            );
             // A hard limit ended the launch: no fallback, no relaunch, no proof.
             let hard_end = match seg.session_end {
                 Some(SessionEnd::Timeout) => Some(LaneEnd::Timeout),
@@ -1511,7 +1668,10 @@ impl Drive<'_> {
                 }
                 EscalationVerdict::Answer { text } => {
                     let prompt = format!("Director ruling on {id}:\n{}", fenced(&text));
-                    match session_id.clone().filter(|s| resumable(s)) {
+                    match session_id
+                        .clone()
+                        .filter(|s| resumable_for(rung.runtime, s))
+                    {
                         Some(session) => {
                             launch = Launch {
                                 runtime: rung.runtime,
@@ -1598,9 +1758,10 @@ impl Drive<'_> {
                             }
                         },
                     };
-                    // A rung with no adapter ends the lane exactly as the top of the ladder
-                    // does: refused, the work kept, the ruling left recorded and undelivered.
-                    if let Some(refusal) = to.runtime.adapter_refusal() {
+                    // A rung that cannot run (no adapter, no executable, no key, or a remote
+                    // lane) ends the lane exactly as the top of the ladder does: refused, the
+                    // work kept, the ruling left recorded and undelivered.
+                    if let Some(refusal) = self.launcher.runtime_refusal(to.runtime) {
                         break (
                             LaneEnd::Refused(format!(
                                 "reassign for {id} refused: {to} is the next rung, but {refusal}"
@@ -2302,15 +2463,36 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
     })
     .await;
     // A remote lane's `claude` runs on the host, whose own `doctor` checks it: a missing local
-    // `claude` is no reason to stop.
-    let needed = |c: &crate::preflight::Check| !(remote_host.is_some() && c.name == "claude");
+    // `claude` is no reason to stop. A lane that starts on an `openrouter` rung needs OpenCode
+    // and the OpenRouter key instead (checked below, once the rung is known), not `claude` or
+    // the Anthropic key; either may be missing.
+    let starts_on_openrouter = Routing::at_commit(&repo, "HEAD")
+        .ok()
+        .and_then(|r| {
+            r.start(
+                args.model.as_deref(),
+                header.rung.as_deref(),
+                &header.class_name,
+            )
+            .ok()
+        })
+        .is_some_and(|(rung, _)| rung.runtime == Runtime::Openrouter);
+    let needed = |c: &crate::preflight::Check| {
+        !(remote_host.is_some() && c.name == "claude")
+            && !(starts_on_openrouter && matches!(c.name, "claude" | "key"))
+    };
     for check in &preflight_checks {
         match check.status {
             CheckStatus::Ok => {}
             CheckStatus::Warn => eprintln!("preflight warning: {}: {}", check.name, check.detail),
             CheckStatus::Fail if !needed(check) => {
+                let why = if starts_on_openrouter {
+                    "the lane starts on an openrouter rung"
+                } else {
+                    "the builder runs on the host"
+                };
                 eprintln!(
-                    "preflight note: {}: {} (not needed: the builder runs on the host)",
+                    "preflight note: {}: {} (not needed: {why})",
                     check.name, check.detail
                 );
             }
@@ -2358,27 +2540,76 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
         return Ok(INFRASTRUCTURE_EXIT_CODE);
     }
 
-    // The real key lives in this process and the proxy, nowhere else.
-    let api_key = match std::env::var_os("ANTHROPIC_API_KEY") {
-        Some(k) if !k.is_empty() => k
-            .into_string()
-            .map_err(|_| anyhow!("ANTHROPIC_API_KEY is not valid UTF-8"))?,
-        _ => bail!("ANTHROPIC_API_KEY is not set; the proxy needs the real key"),
+    // The real keys live in this process and the proxy, nowhere else. A lane that starts on a
+    // Claude rung needs the Anthropic key; one that starts on an `openrouter` rung needs the
+    // OpenRouter key and OpenCode (exit 4, naming whichever is missing). The other provider's
+    // key is optional: it only lets a later `reassign` cross runtimes.
+    let anthropic_key = match std::env::var_os("ANTHROPIC_API_KEY") {
+        Some(k) if !k.is_empty() => Some(
+            k.into_string()
+                .map_err(|_| anyhow!("ANTHROPIC_API_KEY is not valid UTF-8"))?,
+        ),
+        _ if first_rung.runtime == Runtime::Claude => {
+            bail!("ANTHROPIC_API_KEY is not set; the proxy needs the real key")
+        }
+        _ => None,
     };
-    let claude_bin = match &remote_host {
-        Some(host) => PathBuf::from(&host.claude),
-        None => resolve_executable(&args.claude_bin, &director_path, &cwd)?,
+    let openrouter_key = openrouter::real_key()?;
+    let (openrouter_upstream, openrouter_upstream_overridden) = openrouter::upstream()?;
+    // OpenCode, found once on the director's PATH; its version goes into the record. A lane
+    // that starts on an `openrouter` rung refuses to start without it, and without the key.
+    let opencode = if remote_host.is_some()
+        || (first_rung.runtime != Runtime::Openrouter && openrouter_key.is_none())
+    {
+        None
+    } else {
+        match openrouter::locate(&args.opencode_bin, &director_path, &cwd).await {
+            Ok(found) => Some(found),
+            Err(_) if first_rung.runtime != Runtime::Openrouter => None,
+            Err(why) => {
+                eprintln!("preflight failed: opencode: {why}");
+                None
+            }
+        }
+    };
+    if first_rung.runtime == Runtime::Openrouter {
+        let mut missing = Vec::new();
+        if remote_host.is_some() {
+            eprintln!(
+                "rung {first_rung} refused ({} chose it): a remote lane (--host) runs Claude only; the `openrouter` runtime has no remote adapter yet",
+                rung_source.name()
+            );
+            missing.push("--host");
+        } else if opencode.is_none() {
+            missing.push("opencode");
+        }
+        if openrouter_key.is_none() {
+            eprintln!("preflight failed: key: {} is not set", openrouter::KEY_ENV);
+            missing.push(openrouter::KEY_ENV);
+        }
+        if !missing.is_empty() {
+            eprintln!("nothing was started");
+            return Ok(INFRASTRUCTURE_EXIT_CODE);
+        }
+    }
+    let claude_bin: Option<PathBuf> = match &remote_host {
+        Some(host) => Some(PathBuf::from(&host.claude)),
+        None => match resolve_executable(&args.claude_bin, &director_path, &cwd) {
+            Ok(found) => Some(found),
+            Err(e) if first_rung.runtime == Runtime::Claude => return Err(e),
+            Err(_) => None,
+        },
     };
     // The held-out checks (D5) are found before any lane exists: a path inside the
     // repository, or one that is unreadable, stops the run here.
     let heldout = resolve_heldout(args.heldout.as_deref(), &repo, &real_home, &header.id)?;
     let path = builder_path(&director_path, &real_home);
-    let claude_bin = if remote_host.is_some() {
-        claude_bin
-    } else {
-        claude_bin
-            .canonicalize()
-            .context("resolving the claude executable")?
+    let claude_bin = match claude_bin {
+        Some(bin) if remote_host.is_none() => Some(
+            bin.canonicalize()
+                .context("resolving the claude executable")?,
+        ),
+        other => other,
     };
     let cowproof_exe = std::env::current_exe()
         .and_then(|p| p.canonicalize())
@@ -2473,7 +2704,17 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
         .with_context(|| format!("the slot {} has no number", port_slot.path().display()))?;
 
     // 4. Proxy and tools, both live before the builder starts.
-    let endpoint = start_proxy(&layout, &header.id, api_key).await?;
+    let has_anthropic_key = anthropic_key.is_some();
+    let has_openrouter_key = openrouter_key.is_some();
+    let endpoint = start_proxy(
+        &layout,
+        &header.id,
+        ProxyKeys {
+            anthropic: anthropic_key,
+            openrouter: openrouter_key.map(|key| (key, openrouter_upstream.clone())),
+        },
+    )
+    .await?;
     let _proxy = AbortOnDrop(endpoint.task);
     // The session-end channel exists before the tools server and the builder
     // do, so no signal can be missed (D9: the runner ends the session).
@@ -2659,6 +2900,9 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
     let launcher = Launcher {
         layout: layout.clone(),
         claude_bin: claude_bin.clone(),
+        opencode: opencode.clone(),
+        has_anthropic_key,
+        has_openrouter_key,
         cowproof_exe: cowproof_exe.clone(),
         pk_exe: pk_exe.clone(),
         portkit_dir: portkit_dir.clone(),
@@ -2818,9 +3062,18 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
 
     // The builder is gone: ask `pk doctor` whether its hooks fired (D5). The
     // verdict is information about the lane and never changes the proof's.
+    let ran_other_runtime = lane_run
+        .segments
+        .iter()
+        .any(|s| s["runtime"].as_str() != Some(Runtime::Claude.name()));
     let trace = if remote.is_some() {
         untraced(
             "the builder ran on a remote host, which has no portkit hooks".to_string(),
+            json!([]),
+        )
+    } else if ran_other_runtime {
+        untraced(
+            "a segment ran on a runtime with no portkit hooks (openrouter)".to_string(),
             json!([]),
         )
     } else {
@@ -2855,6 +3108,11 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
         "exitCode": status.code(),
         "signal": status.signal(),
         "runtime": lane_run.runtime.name(),
+        "runtimeVersion": launcher.runtime_version(lane_run.runtime),
+        // The OpenCode the lane could use, and the director's override of the OpenRouter
+        // upstream when there is one (null otherwise: the default host is not a setting).
+        "opencodeVersion": launcher.opencode.as_ref().map(|o| o.version.as_str()),
+        "openrouterUpstream": openrouter_upstream_overridden.then_some(openrouter_upstream.as_str()),
         "model": lane_run.model,
         "startRung": first_rung.to_string(),
         "rungSource": rung_source.name(),
@@ -2943,6 +3201,7 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
             prepared: &prepared,
             header: &header,
             runtime: lane_run.runtime.name(),
+            runtime_version: launcher.runtime_version(lane_run.runtime),
             model: &lane_run.model,
             rung_source: rung_source.name(),
             cost_usd: total_cost_usd,
@@ -3118,6 +3377,8 @@ struct ProofInput<'a> {
     /// The runtime and the model of the last segment, and where the starting rung came from
     /// (`flag`, `header`, `class`, `default`): recorded in the capsule (D28).
     runtime: &'a str,
+    /// The version the last segment's runtime executable reported, when it was read.
+    runtime_version: Option<&'a str>,
     model: &'a str,
     rung_source: &'a str,
     cost_usd: f64,
@@ -3342,6 +3603,7 @@ async fn replay_and_gate(
         "api-key".to_string(),
     );
     capsule.builder_runtime = input.runtime.to_string();
+    capsule.builder_runtime_version = input.runtime_version.map(str::to_string);
     capsule.rung_source = Some(input.rung_source.to_string());
     capsule.estimated_cost_usd = input.cost_usd;
     capsule.estimated_tokens = input.tokens;
@@ -4105,7 +4367,7 @@ body"#;
         let layout = layout_in(tmp.path());
         fs::create_dir_all(&layout.clone).unwrap();
 
-        let proxy = start_proxy(&layout, "t-run", "sk-unit-real".into())
+        let proxy = start_proxy(&layout, "t-run", String::from("sk-unit-real"))
             .await
             .unwrap();
         let socket = tmp.path().join("lane/proxy.sock");
@@ -4131,6 +4393,61 @@ body"#;
         assert!(proxy.placeholder_key.starts_with("placeholder-"));
         assert!(!proxy.placeholder_key.contains("sk-unit-real"));
         proxy.task.abort();
+    }
+
+    #[tokio::test]
+    async fn an_openrouter_only_proxy_starts_without_an_anthropic_key_and_a_proxy_needs_a_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let layout = layout_in(tmp.path());
+        fs::create_dir_all(&layout.clone).unwrap();
+        let proxy = start_proxy(
+            &layout,
+            "t-run",
+            ProxyKeys {
+                anthropic: None,
+                openrouter: Some(("sk-or-unit-real".into(), "http://127.0.0.1:9".into())),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(proxy.base_url, "http://127.0.0.1:51003");
+        assert!(!proxy.placeholder_key.contains("sk-or-unit-real"));
+        proxy.task.abort();
+        // With no key at all there is nothing to forward to.
+        let Err(err) = start_proxy(
+            &layout,
+            "t-run2",
+            ProxyKeys {
+                anthropic: None,
+                openrouter: None,
+            },
+        )
+        .await
+        else {
+            panic!("no provider is an error");
+        };
+        assert!(format!("{err:#}").contains("no provider"), "{err:#}");
+    }
+
+    #[test]
+    fn a_session_is_resumable_in_the_shape_its_runtime_takes() {
+        assert!(resumable_for(
+            Runtime::Claude,
+            "0a1b2c3d-1111-2222-3333-444455556666"
+        ));
+        assert!(!resumable_for(
+            Runtime::Claude,
+            "ses_ed38dc388ffeb9FMHqRuDEw3t7"
+        ));
+        assert!(resumable_for(
+            Runtime::Openrouter,
+            "ses_ed38dc388ffeb9FMHqRuDEw3t7"
+        ));
+        assert!(!resumable_for(
+            Runtime::Openrouter,
+            "0a1b2c3d-1111-2222-3333-444455556666"
+        ));
+        assert!(!resumable_for(Runtime::Openrouter, "ses_;rm -rf /"));
     }
 
     #[test]

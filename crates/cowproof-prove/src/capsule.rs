@@ -163,6 +163,11 @@ pub struct Capsule {
     /// `claude`, the only runtime there was.
     #[serde(default = "default_runtime")]
     pub builder_runtime: String,
+    /// The version the runtime's executable reported (`opencode --version` for `openrouter`
+    /// lanes), when the runner read one. Sealed in `capsule.json`; absent in older capsules
+    /// and in lanes whose runtime version is not recorded, which read as null.
+    #[serde(default)]
+    pub builder_runtime_version: Option<String>,
     /// Where the lane's starting rung came from (D28): `flag`, `header`, `class` or
     /// `default`. Sealed in `capsule.json`; absent in older capsules, which read as null.
     #[serde(default)]
@@ -243,6 +248,7 @@ impl Capsule {
             lane_state: "finished".to_string(),
             builder_model,
             builder_runtime: default_runtime(),
+            builder_runtime_version: None,
             rung_source: None,
             auth_mode,
             estimated_cost_usd: 0.0,

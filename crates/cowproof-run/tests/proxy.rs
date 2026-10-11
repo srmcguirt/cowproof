@@ -5,7 +5,7 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use cowproof_run::proxy::{MetricsLog, ProxyConfig, ProxyServer, RequestMetrics};
+use cowproof_run::proxy::{MetricsLog, Provider, ProxyConfig, ProxyServer, RequestMetrics};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UnixStream};
 
@@ -863,4 +863,257 @@ async fn idle_timeout_client_stalls_mid_upload() {
         "proxy should detect idle timeout within 600ms; elapsed: {:?}",
         elapsed
     );
+}
+
+// ---------------------------------------------------------------- OpenRouter (D28 step 2)
+
+const OR_KEY: &str = "real-openrouter-key-SECRET-9876543210";
+const CHAT_PATH: &str = "/api/v1/chat/completions";
+
+async fn start_openrouter_proxy(upstream_base: &str) -> Proxy {
+    let config = ProxyConfig::for_provider(Provider::Openrouter, OR_KEY, upstream_base).unwrap();
+    serve(config).await
+}
+
+async fn serve(config: ProxyConfig) -> Proxy {
+    let placeholder = config.placeholder_key().to_string();
+    let server = ProxyServer::new(config);
+    let metrics = server.metrics();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(server.serve_tcp(listener));
+    Proxy {
+        addr,
+        placeholder,
+        metrics,
+    }
+}
+
+#[tokio::test]
+async fn openrouter_bearer_placeholder_is_swapped_for_the_real_bearer() {
+    let fake = fake_upstream(Reply::Json).await;
+    let proxy = start_openrouter_proxy(&fake.base()).await;
+    let bearer = format!("Bearer {}", proxy.placeholder);
+    // OpenCode's request: a Bearer, a user agent, its own session headers. The credential is
+    // swapped; headers the allowlist does not name are dropped.
+    let response = send(
+        &proxy,
+        &request(
+            "POST",
+            CHAT_PATH,
+            &[
+                ("authorization", &bearer),
+                ("user-agent", "opencode/1.18.33"),
+                ("x-session-id", "ses_x"),
+                ("x-api-key", &proxy.placeholder),
+                ("accept", "*/*"),
+                ("cookie", "session=builder"),
+            ],
+            REQUEST_BODY,
+        ),
+    )
+    .await;
+    assert_eq!(response.status, 200, "{}", response.head);
+    assert_eq!(response.body, JSON_BODY);
+    assert_eq!(fake.count(), 1);
+    let seen = fake.first();
+    assert_eq!(seen.request_line, format!("POST {CHAT_PATH} HTTP/1.1"));
+    let want = format!("Bearer {OR_KEY}");
+    assert_eq!(seen.header("authorization"), Some(want.as_str()));
+    assert_eq!(
+        seen.header("x-api-key"),
+        None,
+        "OpenRouter takes a Bearer only"
+    );
+    assert_eq!(seen.header("cookie"), None);
+    assert_eq!(seen.header("x-session-id"), None);
+    assert_eq!(seen.header("user-agent"), Some("opencode/1.18.33"));
+    assert_eq!(seen.header("content-type"), Some("application/json"));
+    assert_eq!(seen.header("host"), Some(fake.addr.to_string().as_str()));
+    assert_eq!(seen.body, REQUEST_BODY.as_bytes());
+    for (name, value) in &seen.headers {
+        assert!(!value.contains(&proxy.placeholder), "placeholder in {name}");
+    }
+    assert!(!response.head.contains(OR_KEY) && !response.body.contains(OR_KEY));
+}
+
+#[tokio::test]
+async fn an_openrouter_proxy_forwards_only_the_chat_completions_post() {
+    let fake = fake_upstream(Reply::Json).await;
+    let proxy = start_openrouter_proxy(&fake.base()).await;
+    let bearer = format!("Bearer {}", proxy.placeholder);
+    let auth: &[(&str, &str)] = &[("authorization", &bearer)];
+    let cases = [
+        (
+            "anthropic path",
+            request("POST", "/v1/messages", auth, REQUEST_BODY),
+        ),
+        ("models list", request("GET", "/api/v1/models", auth, "")),
+        ("chat by GET", request("GET", CHAT_PATH, auth, "")),
+        ("chat by PUT", request("PUT", CHAT_PATH, auth, REQUEST_BODY)),
+        (
+            "other path",
+            request("POST", "/api/v1/credits", auth, REQUEST_BODY),
+        ),
+        (
+            "path prefix trick",
+            request(
+                "POST",
+                "/api/v1/chat/completions/../keys",
+                auth,
+                REQUEST_BODY,
+            ),
+        ),
+        (
+            "absolute-form target",
+            request(
+                "POST",
+                &format!("http://evil.example{CHAT_PATH}"),
+                auth,
+                REQUEST_BODY,
+            ),
+        ),
+        (
+            "foreign bearer",
+            request(
+                "POST",
+                CHAT_PATH,
+                &[("authorization", "Bearer attacker-openrouter-key")],
+                REQUEST_BODY,
+            ),
+        ),
+        (
+            "no credential",
+            request("POST", CHAT_PATH, &[], REQUEST_BODY),
+        ),
+    ];
+    for (name, bytes) in cases {
+        let response = send(&proxy, &bytes).await;
+        assert_eq!(response.status, 403, "{name}: {}", response.head);
+    }
+    assert_eq!(fake.count(), 0, "nothing reached the upstream");
+}
+
+#[tokio::test]
+async fn an_anthropic_proxy_refuses_the_openrouter_path_and_the_reverse() {
+    let fake = fake_upstream(Reply::Json).await;
+    let proxy = start_proxy(&fake.base()).await;
+    let bearer = format!("Bearer {}", proxy.placeholder);
+    let response = send(
+        &proxy,
+        &request(
+            "POST",
+            CHAT_PATH,
+            &[("authorization", &bearer)],
+            REQUEST_BODY,
+        ),
+    )
+    .await;
+    assert_eq!(response.status, 403);
+    assert_eq!(fake.count(), 0);
+
+    let proxy = start_openrouter_proxy(&fake.base()).await;
+    let response = send(
+        &proxy,
+        &request(
+            "POST",
+            "/v1/messages",
+            &[("x-api-key", &proxy.placeholder)],
+            REQUEST_BODY,
+        ),
+    )
+    .await;
+    assert_eq!(response.status, 403);
+    assert_eq!(fake.count(), 0);
+}
+
+#[tokio::test]
+async fn one_proxy_serves_both_providers_each_with_its_own_key_and_upstream() {
+    let anthropic = fake_upstream(Reply::Json).await;
+    let openrouter = fake_upstream(Reply::Json).await;
+    let config = ProxyConfig::new(REAL_KEY, anthropic.base())
+        .unwrap()
+        .with_provider(Provider::Openrouter, OR_KEY, openrouter.base())
+        .unwrap();
+    let proxy = serve(config).await;
+    let ph = proxy.placeholder.clone();
+    let bearer = format!("Bearer {ph}");
+
+    let one = send(
+        &proxy,
+        &request("POST", "/v1/messages", &[("x-api-key", &ph)], REQUEST_BODY),
+    )
+    .await;
+    let two = send(
+        &proxy,
+        &request(
+            "POST",
+            CHAT_PATH,
+            &[("authorization", &bearer)],
+            REQUEST_BODY,
+        ),
+    )
+    .await;
+    assert_eq!((one.status, two.status), (200, 200));
+
+    assert_eq!((anthropic.count(), openrouter.count()), (1, 1));
+    let a = anthropic.first();
+    assert_eq!(a.header("x-api-key"), Some(REAL_KEY));
+    assert_eq!(a.header("authorization"), None);
+    let o = openrouter.first();
+    let want = format!("Bearer {OR_KEY}");
+    assert_eq!(o.header("authorization"), Some(want.as_str()));
+    assert_eq!(o.header("x-api-key"), None);
+    // Neither upstream ever saw the other's key.
+    for (seen, other) in [(&a, OR_KEY), (&o, REAL_KEY)] {
+        for (name, value) in &seen.headers {
+            assert!(!value.contains(other), "{name}");
+        }
+    }
+    let metrics = wait_for_metrics(&proxy.metrics, 2).await;
+    let paths: Vec<&str> = metrics.iter().map(|m| m.path.as_str()).collect();
+    assert!(
+        paths.contains(&"/v1/messages") && paths.contains(&CHAT_PATH),
+        "{paths:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_openrouter_stream_is_relayed_as_it_arrives() {
+    let fake = fake_upstream(Reply::Sse).await;
+    let proxy = start_openrouter_proxy(&fake.base()).await;
+    let bearer = format!("Bearer {}", proxy.placeholder);
+    let mut stream = TcpStream::connect(proxy.addr).await.unwrap();
+    stream
+        .write_all(&request(
+            "POST",
+            CHAT_PATH,
+            &[("authorization", &bearer), ("accept", "text/event-stream")],
+            REQUEST_BODY,
+        ))
+        .await
+        .unwrap();
+    let start = Instant::now();
+    let mut raw = Vec::new();
+    let mut first_event_at = None;
+    let mut buf = [0u8; 1024];
+    while first_event_at.is_none() || !raw.ends_with(b"0\r\n\r\n") {
+        let n = tokio::time::timeout(Duration::from_secs(10), stream.read(&mut buf))
+            .await
+            .expect("stream timed out")
+            .unwrap();
+        if n == 0 {
+            break;
+        }
+        raw.extend_from_slice(&buf[..n]);
+        if first_event_at.is_none() && String::from_utf8_lossy(&raw).contains("data: one") {
+            first_event_at = Some(start.elapsed());
+        }
+    }
+    let first = first_event_at.expect("the first event arrived");
+    assert!(
+        first < Duration::from_millis(250),
+        "the first event waited for the rest: {first:?}"
+    );
+    assert!(String::from_utf8_lossy(&raw).contains("data: three"));
 }

@@ -5,15 +5,22 @@
 //! (`NetworkMode::Proxy`) lets the builder reach only the proxy's loopback port or Unix socket.
 //! The builder sets `ANTHROPIC_BASE_URL` to the proxy and uses the per-lane placeholder key.
 //!
+//! A proxy serves one or more providers (D28): each [`Provider`] has its own upstream, its own
+//! real key, its own auth scheme and its own path allowlist. A request is routed by its path, so
+//! a lane that climbs from one runtime to another keeps one proxy and one placeholder.
+//!
 //! What the proxy enforces (design.md, "Trust boundaries": Network and Credentials):
-//! - It forwards only `POST /v1/messages` and `POST /v1/messages/count_tokens` (a query string is
-//!   allowed). Every other path, method, `CONNECT` and absolute-form request target gets 403 and
-//!   the upstream is never contacted.
+//! - It forwards only the allowlisted `POST` paths of a configured provider: for Anthropic
+//!   `/v1/messages` and `/v1/messages/count_tokens`, for OpenRouter `/api/v1/chat/completions`
+//!   (a query string is allowed). Every other path, method, `CONNECT` and absolute-form request
+//!   target, and every path of a provider that is not configured, gets 403 and the upstream is
+//!   never contacted.
 //! - Every credential on the request (`x-api-key`, `Authorization: Bearer`) must be the lane's
 //!   placeholder, and there must be at least one. Otherwise 403.
 //! - Incoming `x-api-key`, `authorization` and `proxy-authorization` are never forwarded; the proxy
-//!   sets `x-api-key` to the real key. Headers are forwarded by allowlist (see [`forward_header`]),
-//!   so a builder cannot add arbitrary headers to the upstream request.
+//!   sets the provider's own credential header to the real key (Anthropic: `x-api-key`;
+//!   OpenRouter: `Authorization: Bearer`). Headers are forwarded by allowlist (see
+//!   [`forward_header`]), so a builder cannot add arbitrary headers to the upstream request.
 //! - The upstream host comes only from [`ProxyConfig`]; nothing in a request can change it.
 //! - Request and response bodies stream in both directions. The response body is never collected
 //!   before it is sent, so server-sent events reach the builder as they are produced.
@@ -59,8 +66,11 @@ type BoxError = Box<dyn std::error::Error + Send + Sync>;
 type ProxyBody = UnsyncBoxBody<Bytes, BoxError>;
 type UpstreamClient = Client<HttpsConnector<HttpConnector>, ProxyBody>;
 
-/// The only paths that are forwarded, always with `POST`.
-const ALLOWED_PATHS: [&str; 2] = ["/v1/messages", "/v1/messages/count_tokens"];
+/// The paths of Anthropic that are forwarded, always with `POST`.
+const ANTHROPIC_PATHS: [&str; 2] = ["/v1/messages", "/v1/messages/count_tokens"];
+/// The only path OpenCode uses on OpenRouter (observed against its 1.18.33 binary, D28 step 2),
+/// always with `POST`.
+const OPENROUTER_PATHS: [&str; 1] = ["/api/v1/chat/completions"];
 /// Largest request body the proxy streams to the upstream.
 const MAX_REQUEST_BYTES: u64 = 64 * 1024 * 1024;
 /// Most response bytes copied aside to read `usage` from a non-streaming JSON response.
@@ -75,13 +85,50 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 
-/// Configuration for the proxy.
-pub struct ProxyConfig {
-    /// The real API key, as a sensitive header value. Never sent to the builder.
-    real_api_key: HeaderValue,
+/// A provider the proxy can forward to. The closed set of API shapes a runtime speaks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Provider {
+    /// The Anthropic Messages API (Claude Code). The real key goes in `x-api-key`.
+    Anthropic,
+    /// OpenRouter's OpenAI-style chat completions (OpenCode). The real key goes in
+    /// `Authorization: Bearer`.
+    Openrouter,
+}
+
+impl Provider {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Anthropic => "anthropic",
+            Self::Openrouter => "openrouter",
+        }
+    }
+
+    /// The `POST` paths forwarded for this provider.
+    pub fn allowed_paths(self) -> &'static [&'static str] {
+        match self {
+            Self::Anthropic => &ANTHROPIC_PATHS,
+            Self::Openrouter => &OPENROUTER_PATHS,
+        }
+    }
+}
+
+/// One provider's upstream and real credential.
+struct Route {
+    provider: Provider,
+    /// The real credential as the header value the upstream wants (`Bearer <key>` for
+    /// OpenRouter, the bare key for Anthropic). Sensitive; never sent to the builder.
+    credential: HeaderValue,
+    /// The header that carries it.
+    credential_header: HeaderName,
     /// The upstream base URL as given (for display only).
     upstream_base: String,
     upstream: Upstream,
+}
+
+/// Configuration for the proxy.
+pub struct ProxyConfig {
+    /// The providers served, in the order they were added. Never empty.
+    routes: Vec<Route>,
     /// Per-lane placeholder the builder must present.
     placeholder_key: String,
     /// Longest gap allowed between chunks while streaming a body in either direction.
@@ -89,27 +136,44 @@ pub struct ProxyConfig {
 }
 
 impl ProxyConfig {
-    /// Create a configuration with a freshly generated placeholder key.
+    /// Create a configuration for Anthropic with a freshly generated placeholder key.
     ///
     /// `upstream_base` is an `http` or `https` URL such as `https://api.anthropic.com`. It may
     /// carry a path prefix but no user info, query or fragment. Errors never contain the key.
     pub fn new(real_api_key: impl Into<String>, upstream_base: impl Into<String>) -> Result<Self> {
-        let real_api_key = real_api_key.into();
-        let upstream_base = upstream_base.into();
-        if real_api_key.is_empty() {
-            bail!("the real API key is empty");
-        }
-        let mut real_api_key = HeaderValue::from_str(&real_api_key)
-            .map_err(|_| anyhow::anyhow!("the real API key is not a valid header value"))?;
-        real_api_key.set_sensitive(true);
-        let upstream = Upstream::parse(&upstream_base)?;
+        Self::for_provider(Provider::Anthropic, real_api_key, upstream_base)
+    }
+
+    /// A configuration that serves `provider` alone, with a freshly generated placeholder key.
+    pub fn for_provider(
+        provider: Provider,
+        real_api_key: impl Into<String>,
+        upstream_base: impl Into<String>,
+    ) -> Result<Self> {
+        let route = Route::new(provider, real_api_key.into(), upstream_base.into())?;
         Ok(Self {
-            real_api_key,
-            upstream_base,
-            upstream,
+            routes: vec![route],
             placeholder_key: format!("placeholder-{}", uuid::Uuid::new_v4()),
             idle_timeout: DEFAULT_IDLE_TIMEOUT,
         })
+    }
+
+    /// Also serve `provider` (with the same placeholder). A provider is added once.
+    pub fn with_provider(
+        mut self,
+        provider: Provider,
+        real_api_key: impl Into<String>,
+        upstream_base: impl Into<String>,
+    ) -> Result<Self> {
+        if self.routes.iter().any(|r| r.provider == provider) {
+            bail!("the {} provider is already configured", provider.name());
+        }
+        self.routes.push(Route::new(
+            provider,
+            real_api_key.into(),
+            upstream_base.into(),
+        )?);
+        Ok(self)
     }
 
     /// Set the idle timeout (longest gap between chunks while streaming).
@@ -123,22 +187,65 @@ impl ProxyConfig {
         &self.placeholder_key
     }
 
-    /// The upstream base URL.
+    /// The first provider's upstream base URL.
     pub fn upstream_base(&self) -> &str {
-        &self.upstream_base
+        &self.routes[0].upstream_base
+    }
+
+    /// The upstream base URL of `provider`, when it is served.
+    pub fn upstream_of(&self, provider: Provider) -> Option<&str> {
+        self.routes
+            .iter()
+            .find(|r| r.provider == provider)
+            .map(|r| r.upstream_base.as_str())
     }
 
     /// The idle timeout.
     fn idle_timeout(&self) -> Duration {
         self.idle_timeout
     }
+
+    /// The route whose allowlist holds `path`.
+    fn route_for(&self, path: &str) -> Option<&Route> {
+        self.routes
+            .iter()
+            .find(|r| r.provider.allowed_paths().contains(&path))
+    }
+}
+
+impl Route {
+    fn new(provider: Provider, real_api_key: String, upstream_base: String) -> Result<Self> {
+        if real_api_key.is_empty() {
+            bail!("the real API key is empty");
+        }
+        let (credential_header, text) = match provider {
+            Provider::Anthropic => (HeaderName::from_static("x-api-key"), real_api_key),
+            Provider::Openrouter => (header::AUTHORIZATION, format!("Bearer {real_api_key}")),
+        };
+        let mut credential = HeaderValue::from_str(&text)
+            .map_err(|_| anyhow::anyhow!("the real API key is not a valid header value"))?;
+        credential.set_sensitive(true);
+        let upstream = Upstream::parse(&upstream_base)?;
+        Ok(Self {
+            provider,
+            credential,
+            credential_header,
+            upstream_base,
+            upstream,
+        })
+    }
 }
 
 impl fmt::Debug for ProxyConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let routes: Vec<String> = self
+            .routes
+            .iter()
+            .map(|r| format!("{}={}", r.provider.name(), r.upstream_base))
+            .collect();
         f.debug_struct("ProxyConfig")
             .field("real_api_key", &"<redacted>")
-            .field("upstream_base", &self.upstream_base)
+            .field("upstreams", &routes)
             .field("placeholder_key", &self.placeholder_key)
             .field("idle_timeout", &self.idle_timeout)
             .finish()
@@ -430,15 +537,22 @@ fn credential_ok(headers: &HeaderMap, placeholder: &str) -> bool {
     seen
 }
 
-/// Request headers that may reach the upstream. Everything else, including every credential
-/// header, is dropped. Framing (`content-length`, `transfer-encoding`) is not copied: the body
-/// is streamed and the client derives framing from it.
-fn forward_header(name: &HeaderName) -> bool {
+/// Request headers that may reach the upstream of `provider`. Everything else, including every
+/// credential header, is dropped. Framing (`content-length`, `transfer-encoding`) is not copied:
+/// the body is streamed and the client derives framing from it.
+fn forward_header(provider: Provider, name: &HeaderName) -> bool {
     let name = name.as_str();
-    matches!(
-        name,
-        "anthropic-version" | "anthropic-beta" | "content-type" | "accept" | "user-agent" | "x-app"
-    ) || name.starts_with("x-stainless-")
+    if matches!(name, "content-type" | "accept" | "user-agent") {
+        return true;
+    }
+    match provider {
+        Provider::Anthropic => {
+            matches!(name, "anthropic-version" | "anthropic-beta" | "x-app")
+                || name.starts_with("x-stainless-")
+        }
+        // OpenCode sends nothing else OpenRouter needs: the credential is the proxy's.
+        Provider::Openrouter => false,
+    }
 }
 
 /// Response headers that must not be relayed (hop-by-hop, RFC 9110 section 7.6.1).
@@ -503,9 +617,10 @@ async fn handle(req: Request<Incoming>, state: Arc<State>) -> Response<ProxyBody
     if req.uri().scheme().is_some() || req.uri().authority().is_some() {
         return forbidden(&state, path);
     }
-    if !ALLOWED_PATHS.contains(&req.uri().path()) {
+    // The path picks the provider; a path no configured provider allows is refused here.
+    let Some(route) = state.config.route_for(req.uri().path()) else {
         return forbidden(&state, path);
-    }
+    };
     if !credential_ok(req.headers(), state.config.placeholder_key()) {
         return forbidden(&state, path);
     }
@@ -523,7 +638,7 @@ async fn handle(req: Request<Incoming>, state: Arc<State>) -> Response<ProxyBody
         .uri
         .path_and_query()
         .map_or(parts.uri.path(), |pq| pq.as_str());
-    let Ok(target) = state.config.upstream.target(path_and_query) else {
+    let Ok(target) = route.upstream.target(path_and_query) else {
         return reject(&state, path, StatusCode::BAD_GATEWAY, "bad gateway\n");
     };
 
@@ -544,12 +659,12 @@ async fn handle(req: Request<Incoming>, state: Arc<State>) -> Response<ProxyBody
     *upstream_request.version_mut() = Version::HTTP_11;
     let headers = upstream_request.headers_mut();
     for (name, value) in &parts.headers {
-        if forward_header(name) {
+        if forward_header(route.provider, name) {
             headers.append(name.clone(), value.clone());
         }
     }
-    headers.insert(header::HOST, state.config.upstream.host.clone());
-    headers.insert("x-api-key", state.config.real_api_key.clone());
+    headers.insert(header::HOST, route.upstream.host.clone());
+    headers.insert(route.credential_header.clone(), route.credential.clone());
 
     let upstream_response = match state.client.request(upstream_request).await {
         Ok(response) => response,
@@ -618,19 +733,21 @@ fn is_plain_json(headers: &HeaderMap) -> bool {
     json && identity
 }
 
-/// Read `input_tokens` and `output_tokens` from a message or count_tokens response.
+/// Read `input_tokens` and `output_tokens` from a message or count_tokens response, or
+/// `prompt_tokens` and `completion_tokens` from an OpenAI-style chat completion.
 fn parse_usage(body: &[u8]) -> (Option<u64>, Option<u64>) {
     let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) else {
         return (None, None);
     };
     let usage = value.get("usage").unwrap_or(&value);
+    let count = |names: [&str; 2]| {
+        names
+            .iter()
+            .find_map(|n| usage.get(*n).and_then(serde_json::Value::as_u64))
+    };
     (
-        usage
-            .get("input_tokens")
-            .and_then(serde_json::Value::as_u64),
-        usage
-            .get("output_tokens")
-            .and_then(serde_json::Value::as_u64),
+        count(["input_tokens", "prompt_tokens"]),
+        count(["output_tokens", "completion_tokens"]),
     )
 }
 
@@ -915,7 +1032,11 @@ mod tests {
             "accept-encoding",
         ] {
             assert!(
-                !forward_header(&HeaderName::from_static(dropped)),
+                !forward_header(Provider::Anthropic, &HeaderName::from_static(dropped)),
+                "{dropped}"
+            );
+            assert!(
+                !forward_header(Provider::Openrouter, &HeaderName::from_static(dropped)),
                 "{dropped}"
             );
         }
@@ -926,7 +1047,28 @@ mod tests {
             "accept",
             "x-stainless-os",
         ] {
-            assert!(forward_header(&HeaderName::from_static(kept)), "{kept}");
+            assert!(
+                forward_header(Provider::Anthropic, &HeaderName::from_static(kept)),
+                "{kept}"
+            );
+        }
+        // OpenRouter gets the three generic headers and nothing Anthropic-specific.
+        for kept in ["content-type", "accept", "user-agent"] {
+            assert!(
+                forward_header(Provider::Openrouter, &HeaderName::from_static(kept)),
+                "{kept}"
+            );
+        }
+        for dropped in [
+            "anthropic-version",
+            "anthropic-beta",
+            "x-stainless-os",
+            "x-app",
+        ] {
+            assert!(
+                !forward_header(Provider::Openrouter, &HeaderName::from_static(dropped)),
+                "{dropped}"
+            );
         }
     }
 
@@ -937,6 +1079,10 @@ mod tests {
             (Some(12), Some(34))
         );
         assert_eq!(parse_usage(br#"{"input_tokens":7}"#), (Some(7), None));
+        assert_eq!(
+            parse_usage(br#"{"usage":{"prompt_tokens":9,"completion_tokens":3}}"#),
+            (Some(9), Some(3))
+        );
         assert_eq!(parse_usage(b"data: not json"), (None, None));
     }
 
@@ -958,5 +1104,84 @@ mod tests {
         let shown = format!("{config:?}");
         assert!(!shown.contains("secret-key-12345"));
         assert!(shown.contains("<redacted>"));
+    }
+
+    #[test]
+    fn a_config_serves_each_provider_once_and_routes_by_path() {
+        let config = ProxyConfig::new("anthropic-key", "https://api.test.com")
+            .unwrap()
+            .with_provider(Provider::Openrouter, "or-key", "https://or.test.com/gw")
+            .unwrap();
+        assert_eq!(config.upstream_base(), "https://api.test.com");
+        assert_eq!(
+            config.upstream_of(Provider::Openrouter),
+            Some("https://or.test.com/gw")
+        );
+        let route = |path| config.route_for(path).map(|r| r.provider);
+        assert_eq!(route("/v1/messages"), Some(Provider::Anthropic));
+        assert_eq!(
+            route("/v1/messages/count_tokens"),
+            Some(Provider::Anthropic)
+        );
+        assert_eq!(
+            route("/api/v1/chat/completions"),
+            Some(Provider::Openrouter)
+        );
+        for other in [
+            "/",
+            "/v1",
+            "/api/v1/models",
+            "/api/v1/chat/completions/",
+            "/v1/messages/x",
+        ] {
+            assert_eq!(route(other), None, "{other}");
+        }
+        // A provider twice is a mistake, and the message never echoes a key.
+        let err = config
+            .with_provider(Provider::Openrouter, "or-key-SECRET", "https://x.test.com")
+            .expect_err("a second openrouter route is refused");
+        assert!(!format!("{err:#}").contains("SECRET"));
+    }
+
+    #[test]
+    fn an_openrouter_only_config_has_no_anthropic_route() {
+        let config =
+            ProxyConfig::for_provider(Provider::Openrouter, "or-key", "https://or.test.com")
+                .unwrap();
+        assert_eq!(config.upstream_of(Provider::Anthropic), None);
+        assert!(config.route_for("/v1/messages").is_none());
+        assert_eq!(config.upstream_base(), "https://or.test.com");
+    }
+
+    #[test]
+    fn the_credential_is_the_providers_own_header_and_redacted_in_debug() {
+        let anthropic = Route::new(
+            Provider::Anthropic,
+            "k1".into(),
+            "https://a.test.com".into(),
+        )
+        .unwrap();
+        assert_eq!(anthropic.credential_header, "x-api-key");
+        assert_eq!(anthropic.credential.to_str().unwrap(), "k1");
+        let openrouter = Route::new(
+            Provider::Openrouter,
+            "k2".into(),
+            "https://o.test.com".into(),
+        )
+        .unwrap();
+        assert_eq!(openrouter.credential_header, header::AUTHORIZATION);
+        assert_eq!(openrouter.credential.to_str().unwrap(), "Bearer k2");
+        assert!(openrouter.credential.is_sensitive());
+        let config = ProxyConfig::new("secret-anthropic-1", "https://a.test.com")
+            .unwrap()
+            .with_provider(
+                Provider::Openrouter,
+                "secret-openrouter-2",
+                "https://o.test.com",
+            )
+            .unwrap();
+        let shown = format!("{config:?}");
+        assert!(!shown.contains("secret-anthropic-1") && !shown.contains("secret-openrouter-2"));
+        assert!(shown.contains("openrouter=https://o.test.com"), "{shown}");
     }
 }

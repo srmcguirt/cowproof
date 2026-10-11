@@ -399,3 +399,355 @@ pub fn text(out: &Output) -> String {
         String::from_utf8_lossy(&out.stderr)
     )
 }
+
+// ---------------------------------------------------------------------------------------------
+// A FAKE OpenRouter (D28 step 2): the upstream the proxy forwards OpenCode's requests to.
+// ---------------------------------------------------------------------------------------------
+
+/// One scripted model reply: some text, then tool calls (`(tool name, arguments)`). A reply
+/// with tool calls ends with `finish_reason: tool_calls`, one without ends the turn.
+#[allow(dead_code)] // only `tests/opencode.rs` scripts replies
+#[derive(Clone, Debug)]
+pub struct Reply {
+    pub text: Option<String>,
+    pub tools: Vec<(String, Value)>,
+    /// Wait this long before answering (a slow model).
+    pub delay_ms: u64,
+}
+
+#[allow(dead_code)]
+impl Reply {
+    pub fn text(text: &str) -> Self {
+        Reply {
+            text: Some(text.to_string()),
+            tools: Vec::new(),
+            delay_ms: 0,
+        }
+    }
+
+    /// The same reply, `ms` milliseconds late.
+    pub fn delayed(mut self, ms: u64) -> Self {
+        self.delay_ms = ms;
+        self
+    }
+
+    pub fn tools(text: &str, tools: Vec<(&str, Value)>) -> Self {
+        Reply {
+            text: Some(text.to_string()),
+            tools: tools.into_iter().map(|(n, a)| (n.to_string(), a)).collect(),
+            delay_ms: 0,
+        }
+    }
+}
+
+/// What the fake saw of one request.
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+pub struct Seen {
+    pub method: String,
+    pub path: String,
+    pub authorization: Option<String>,
+    pub host: Option<String>,
+    pub model: Option<String>,
+    /// Names of the tools the request offered the model.
+    pub tool_names: Vec<String>,
+    /// Number of messages in the conversation sent.
+    pub messages: usize,
+    /// The text of the last message, flattened.
+    pub last_message: String,
+    /// The system prompt, flattened.
+    pub system: String,
+    /// Header names, lower case.
+    pub header_names: Vec<String>,
+}
+
+struct FakeState {
+    script: Vec<Reply>,
+    next: usize,
+    seen: Vec<Seen>,
+    /// Answer every chat completion with this status and a JSON error body.
+    fail_with: Option<u16>,
+}
+
+/// A small HTTP server on 127.0.0.1 that answers OpenAI-style streaming chat completions
+/// (`POST /api/v1/chat/completions`) from a script and records every request it gets, whatever
+/// the path. A request that offers no tools (a title generator, say) gets a plain reply and does
+/// not consume the script.
+#[allow(dead_code)]
+pub struct FakeOpenRouter {
+    addr: std::net::SocketAddr,
+    state: std::sync::Arc<Mutex<FakeState>>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+#[allow(dead_code)]
+impl FakeOpenRouter {
+    pub fn start(script: Vec<Reply>) -> Self {
+        Self::start_with(script, None)
+    }
+
+    /// A fake that refuses every chat completion with `status` (an expired key, say).
+    pub fn failing(status: u16) -> Self {
+        Self::start_with(Vec::new(), Some(status))
+    }
+
+    fn start_with(script: Vec<Reply>, fail_with: Option<u16>) -> Self {
+        use std::sync::atomic::Ordering;
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let state = std::sync::Arc::new(Mutex::new(FakeState {
+            script,
+            next: 0,
+            seen: Vec::new(),
+            fail_with,
+        }));
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (st, sp) = (state.clone(), stop.clone());
+        let thread = std::thread::spawn(move || {
+            while !sp.load(Ordering::SeqCst) {
+                match listener.accept() {
+                    Ok((conn, _)) => {
+                        let st = st.clone();
+                        std::thread::spawn(move || {
+                            let _ = fake_serve(conn, st);
+                        });
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        FakeOpenRouter {
+            addr,
+            state,
+            stop,
+            thread: Some(thread),
+        }
+    }
+
+    /// `http://127.0.0.1:<port>`, what `COWPROOF_OPENROUTER_UPSTREAM` is set to.
+    pub fn base(&self) -> String {
+        format!("http://{}", self.addr)
+    }
+
+    pub fn host(&self) -> String {
+        self.addr.to_string()
+    }
+
+    /// Every request so far, oldest first.
+    pub fn seen(&self) -> Vec<Seen> {
+        self.state.lock().unwrap().seen.clone()
+    }
+
+    /// How many scripted replies were given.
+    pub fn replies_given(&self) -> usize {
+        self.state.lock().unwrap().next
+    }
+}
+
+impl Drop for FakeOpenRouter {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+/// Flatten a chat message's `content` (a string, or a list of `{type:text,text}` parts).
+fn flat_content(content: &Value) -> String {
+    match content {
+        Value::String(s) => s.clone(),
+        Value::Array(parts) => parts
+            .iter()
+            .filter_map(|p| p.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        other => other.to_string(),
+    }
+}
+
+fn fake_serve(
+    conn: std::net::TcpStream,
+    state: std::sync::Arc<Mutex<FakeState>>,
+) -> std::io::Result<()> {
+    use std::io::{BufRead, BufReader, Read, Write};
+    conn.set_nonblocking(false)?;
+    conn.set_read_timeout(Some(std::time::Duration::from_secs(120)))?;
+    let mut writer = conn.try_clone()?;
+    let mut reader = BufReader::new(conn);
+    loop {
+        // Request line and headers.
+        let mut line = String::new();
+        if reader.read_line(&mut line)? == 0 {
+            return Ok(());
+        }
+        let mut parts = line.split_whitespace();
+        let (method, path) = (
+            parts.next().unwrap_or("").to_string(),
+            parts.next().unwrap_or("").to_string(),
+        );
+        let mut headers: Vec<(String, String)> = Vec::new();
+        loop {
+            let mut h = String::new();
+            if reader.read_line(&mut h)? == 0 {
+                return Ok(());
+            }
+            let h = h.trim_end();
+            if h.is_empty() {
+                break;
+            }
+            if let Some((k, v)) = h.split_once(':') {
+                headers.push((k.trim().to_ascii_lowercase(), v.trim().to_string()));
+            }
+        }
+        let header = |name: &str| {
+            headers
+                .iter()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| v.clone())
+        };
+        // Body: Content-Length, or chunked.
+        let mut body = Vec::new();
+        if let Some(len) = header("content-length").and_then(|v| v.parse::<usize>().ok()) {
+            body.resize(len, 0);
+            reader.read_exact(&mut body)?;
+        } else if header("transfer-encoding").is_some_and(|v| v.contains("chunked")) {
+            loop {
+                let mut size_line = String::new();
+                reader.read_line(&mut size_line)?;
+                let size = usize::from_str_radix(size_line.trim(), 16).unwrap_or(0);
+                if size == 0 {
+                    let mut end = String::new();
+                    reader.read_line(&mut end)?;
+                    break;
+                }
+                let mut chunk = vec![0u8; size];
+                reader.read_exact(&mut chunk)?;
+                body.extend_from_slice(&chunk);
+                let mut crlf = String::new();
+                reader.read_line(&mut crlf)?;
+            }
+        }
+        let request: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+        let messages = request["messages"].as_array().cloned().unwrap_or_default();
+        let tool_names: Vec<String> = request["tools"]
+            .as_array()
+            .map(|tools| {
+                tools
+                    .iter()
+                    .filter_map(|t| t["function"]["name"].as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let system = messages
+            .iter()
+            .filter(|m| m["role"] == "system")
+            .map(|m| flat_content(&m["content"]))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let reply = {
+            let mut st = state.lock().unwrap();
+            st.seen.push(Seen {
+                method: method.clone(),
+                path: path.clone(),
+                authorization: header("authorization"),
+                host: header("host"),
+                model: request["model"].as_str().map(str::to_string),
+                tool_names: tool_names.clone(),
+                messages: messages.len(),
+                last_message: messages
+                    .last()
+                    .map(|m| flat_content(&m["content"]))
+                    .unwrap_or_default(),
+                system,
+                header_names: headers.iter().map(|(k, _)| k.clone()).collect(),
+            });
+            if method != "POST" || path != "/api/v1/chat/completions" {
+                None
+            } else if let Some(status) = st.fail_with {
+                let body =
+                    json!({"error": {"message": "No auth credentials found", "code": status}})
+                        .to_string();
+                drop(st);
+                write!(
+                    writer,
+                    "HTTP/1.1 {status} Error\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )?;
+                return Ok(());
+            } else if tool_names.is_empty() {
+                Some(Reply::text("Title"))
+            } else {
+                let i = st.next;
+                st.next += 1;
+                Some(
+                    st.script
+                        .get(i)
+                        .cloned()
+                        .unwrap_or_else(|| Reply::text("(the script is out of replies)")),
+                )
+            }
+        };
+        let Some(reply) = reply else {
+            writer.write_all(
+                b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            )?;
+            return Ok(());
+        };
+        if reply.delay_ms > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(reply.delay_ms));
+        }
+        writer.write_all(
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n",
+        )?;
+        let model = request["model"].as_str().unwrap_or("m").to_string();
+        let send = |writer: &mut std::net::TcpStream, data: &str| -> std::io::Result<()> {
+            let frame = format!("data: {data}\n\n");
+            write!(writer, "{:x}\r\n{frame}\r\n", frame.len())?;
+            writer.flush()
+        };
+        let chunk = |delta: Value, finish: Value| {
+            json!({"id":"gen-fake","object":"chat.completion.chunk","created":1,"model":model,
+                   "choices":[{"index":0,"delta":delta,"finish_reason":finish}]})
+            .to_string()
+        };
+        send(
+            &mut writer,
+            &chunk(json!({"role":"assistant","content":""}), Value::Null),
+        )?;
+        if let Some(text) = &reply.text {
+            send(&mut writer, &chunk(json!({"content": text}), Value::Null))?;
+        }
+        for (k, (name, args)) in reply.tools.iter().enumerate() {
+            send(
+                &mut writer,
+                &chunk(
+                    json!({"tool_calls":[{"index":k,"id":format!("call_{k}_{}", name.len()),"type":"function",
+                          "function":{"name":name,"arguments":args.to_string()}}]}),
+                    Value::Null,
+                ),
+            )?;
+        }
+        let finish = if reply.tools.is_empty() {
+            "stop"
+        } else {
+            "tool_calls"
+        };
+        send(&mut writer, &chunk(json!({}), json!(finish)))?;
+        send(
+            &mut writer,
+            &json!({"id":"gen-fake","object":"chat.completion.chunk","created":1,"model":model,"choices":[],
+                    "usage":{"prompt_tokens":100,"completion_tokens":20,"total_tokens":120,
+                             "prompt_tokens_details":{"cached_tokens":10}}})
+            .to_string(),
+        )?;
+        send(&mut writer, "[DONE]")?;
+        writer.write_all(b"0\r\n\r\n")?;
+        writer.flush()?;
+    }
+}
