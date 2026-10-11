@@ -2,6 +2,12 @@
 
 Work the crate port (2026-10-09) deferred or exposed. Newest first.
 
+- **Q-2: the legacy runner is gone (2026-10-11); what went with it.** `cowproof host run` now starts `cowproof run <packet> --repo <cwd> --lanes-root <root>` (`host_run_argv`), and `legacy-run` with its lane loop is deleted from `main.rs` (3,049 to 1,586 lines). Removed with it, and not yet provided by `cowproof run`:
+  - **Remote dispatch over SSH** (`legacy-run --host`, `remote_run`). `cowproof run` has no `--host`; the D24 remote path (sockets forwarded over SSH, the key staying with the director) is open, and O-1 depends on it.
+  - **Codex and OpenCode builders.** `cowproof run` drives Claude Code only (D2).
+  - **Class slots, port blocks and the disk floor** (step 3 gap, still open).
+  - **sccache and the Postgres scratch helpers**, which were project-specific; bring them back only as opt-in config if a real lane needs them.
+
 - **A bare `mktemp` fails in a macOS lane (2026-10-11).** Apple's `/usr/bin/mktemp` ignores `TMPDIR` when it gets no template (also with only `-t` or `-d`) and writes to the per-user `/var/folders/.../T`, which the write deny does not grant. Python, Rust, git and Claude Code honour `TMPDIR` and work. Granting the per-user temp dir would let a builder write where the director's own processes read, so it stays denied. A builder script needs `mktemp "$TMPDIR/name.XXXXXX"`. Say so in the builder preamble if real lanes trip on it.
 - **Resolved (lane/director-serve).** ~~The bridge READY wait is 5 s, and a freshly linked binary can miss it (2026-10-10).~~ `BRIDGE_READY_TIMEOUT` raised to 30 s with a comment citing the 10.4 s first launch observed on macOS.
 - **Director MCP server (`cowproof serve --director`): the Claude Code plugin's next step (2026-10-10).** *Status (lane/plugin-mcp): the plugin's `.mcp.json` declares the server, and the three skills prefer the MCP tools (`lanes`, `events`, `rule`, `note`) to shell commands. Tested: the binary accepts `serve --director`, serves exactly the four tools, and the skills name them. Still open: a tool that returns the open escalations' asks.* The plugin (`plugin/`, marketplace at `.claude-plugin/marketplace.json`) ships three skills and a session-start hook, and drives `cowproof` through the shell. The plugin declares the server in `plugin/.mcp.json`.
