@@ -78,16 +78,14 @@ pub fn sandbox_available() -> bool {
     false
 }
 
-/// `kill(-pgid, 0)` fails with ESRCH: no process is left in the process group `pgid`. (The
-/// shell's `kill` reports the errno as "No such process"; a permission error would not match.)
+/// `kill(-pgid, 0)` fails with ESRCH: no process is left in the process group `pgid`. A
+/// permission error or an unanswerable pgid is not "gone".
 #[allow(dead_code)] // `tests/host_agent.rs` and `tests/remote.rs` use it; the other test crates that share this module do not
 pub fn group_gone(pgid: &str) -> bool {
-    let _g = fork_lock();
-    let out = Command::new("/bin/sh")
-        .args(["-c", "kill -0 -- -$0 2>&1", pgid])
-        .output()
-        .unwrap();
-    !out.status.success() && String::from_utf8_lossy(&out.stdout).contains("No such process")
+    // kill(2), not the shell: dash's `kill` (Ubuntu's /bin/sh) rejects `--`, so a shell
+    // probe reads every group as alive there.
+    let pgid: u32 = pgid.parse().expect("a numeric pgid");
+    cowproof_prove::runner::group_exists(pgid) == Some(false)
 }
 
 /// A temporary directory under `/var/tmp`: not `/tmp` (bwrap hides it) and not the home
