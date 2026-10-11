@@ -10,3 +10,8 @@ anthropics/sandbox-runtime
   - Attribution: cowproof's sandbox policy design (SandboxPolicy type in crates/cowproof-run/src/lib.rs)
     follows the architecture and implementation patterns of sandbox-runtime's network sandbox
     and process isolation mechanisms for macOS (sandbox-exec Seatbelt profiles) and Linux (bubblewrap).
+
+portkit
+  - Location: crates/portkit/
+  - License: MIT OR Apache-2.0
+  - Licence files: crates/portkit/LICENSE-MIT, crates/portkit/LICENSE-APACHE

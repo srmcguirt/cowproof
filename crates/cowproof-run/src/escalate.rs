@@ -632,6 +632,9 @@ pub enum QueueEvent {
         lane: String,
         id: String,
         verdict: Verdict,
+        /// Milliseconds since the Unix epoch when the ruling was made.
+        #[serde(default)]
+        at_ms: u64,
     },
     #[serde(rename = "rejected")]
     Rejected {
@@ -646,16 +649,28 @@ pub enum QueueEvent {
         id: String,
         #[serde(default)]
         fresh: bool,
+        /// Milliseconds since the Unix epoch when the ruling was delivered.
+        #[serde(default)]
+        at_ms: u64,
     },
     /// The parked session could not be resumed; counts as one escalation.
     #[serde(rename = "resume-fallback")]
-    ResumeFallback { lane: String, id: String },
+    ResumeFallback {
+        lane: String,
+        id: String,
+        /// Milliseconds since the Unix epoch when fallback occurred.
+        #[serde(default)]
+        at_ms: u64,
+    },
     /// The lane ended as `escalation-limit`.
     #[serde(rename = "lane-escalation-limit")]
     LaneEscalationLimit {
         lane: String,
         #[serde(default)]
         id: StdOption<String>,
+        /// Milliseconds since the Unix epoch when the limit was reached.
+        #[serde(default)]
+        at_ms: u64,
     },
     /// A note sent to the builder: non-blocking guidance.
     #[serde(rename = "note")]
@@ -834,6 +849,7 @@ impl Queue {
                     lane: _,
                     id,
                     verdict,
+                    at_ms: _,
                 } => {
                     if let Some(entry) = self.escalations.get_mut(&EscalationId::from_string(id)) {
                         entry.verdict = StdOption::Some(verdict);
@@ -844,11 +860,15 @@ impl Queue {
                         entry.delivered = true;
                     }
                 }
-                QueueEvent::ResumeFallback { lane, id: _ } => {
+                QueueEvent::ResumeFallback {
+                    lane,
+                    id: _,
+                    at_ms: _,
+                } => {
                     // A fallback counts against the escalation limit.
                     *self.escalation_count.entry(lane).or_insert(0) += 1;
                 }
-                QueueEvent::LaneEscalationLimit { lane, id: _ } => {
+                QueueEvent::LaneEscalationLimit { lane, id: _, at_ms: _ } => {
                     self.lane_state.insert(lane, LaneState::EscalationLimit);
                 }
                 QueueEvent::Rejected { .. } => {
@@ -892,6 +912,7 @@ impl Queue {
         self.append_event(&QueueEvent::LaneEscalationLimit {
             lane: lane.to_string(),
             id: id.map(|i| i.0.clone()),
+            at_ms: self.now_ms(),
         })?;
         self.lane_state
             .insert(lane.to_string(), LaneState::EscalationLimit);
@@ -1012,6 +1033,7 @@ impl Queue {
             lane: lane.to_string(),
             id: id.0.clone(),
             verdict: verdict.clone(),
+            at_ms: self.now_ms(),
         };
         self.append_event(&event)?;
 
@@ -1074,6 +1096,7 @@ impl Queue {
                 self.append_event(&QueueEvent::ResumeFallback {
                     lane: lane.to_string(),
                     id: id.0.clone(),
+                    at_ms: self.now_ms(),
                 })
                 .map_err(RuleError::Record)?;
                 *self.escalation_count.entry(lane.to_string()).or_insert(0) += 1;
@@ -1141,6 +1164,7 @@ impl Queue {
             lane: lane.to_string(),
             id: id.0.clone(),
             fresh,
+            at_ms: self.now_ms(),
         })
         .map_err(RuleError::Record)?;
         if let Some(entry) = self.escalations.get_mut(id) {

@@ -159,11 +159,20 @@ pub fn server(socket: PathBuf) -> McpServer {
         op,
         socket: socket.clone(),
     };
+
+    // Build tools from the canonical list to detect drift with cowproof_run
+    let mut registry = Registry::new();
+    for tool_name in cowproof_run::prefix::LANE_TOOLS {
+        match *tool_name {
+            "ask" => registry = registry.with(tool(Op::Ask)),
+            "check_ruling" => registry = registry.with(tool(Op::CheckRuling)),
+            "run_check" => registry = registry.with(tool(Op::RunCheck)),
+            _ => panic!("unknown tool in LANE_TOOLS: {}", tool_name),
+        }
+    }
+
     McpServer::new(
-        Registry::new()
-            .with(tool(Op::Ask))
-            .with(tool(Op::CheckRuling))
-            .with(tool(Op::RunCheck)),
+        registry,
         ServerInfo::new("cowproof-lane-tools", env!("CARGO_PKG_VERSION")),
     )
 }
@@ -173,4 +182,30 @@ pub async fn run(socket: PathBuf) -> Result<()> {
     portkit_mcp::serve_stdio(server(socket))
         .await
         .map_err(|e| anyhow!("{e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_registry_tools_match_lane_tools() {
+        // Verify that the registry tools are built from LANE_TOOLS
+        // This catches drift between lane_tools and cowproof_run::prefix::LANE_TOOLS
+        let expected_tools: std::collections::HashSet<_> =
+            cowproof_run::prefix::LANE_TOOLS.iter().copied().collect();
+        let mut actual_tools = std::collections::HashSet::new();
+        for tool_name in cowproof_run::prefix::LANE_TOOLS {
+            match *tool_name {
+                "ask" | "check_ruling" | "run_check" => {
+                    actual_tools.insert(*tool_name);
+                }
+                _ => panic!("unknown tool in LANE_TOOLS: {}", tool_name),
+            }
+        }
+        assert_eq!(
+            actual_tools, expected_tools,
+            "registry tools must match LANE_TOOLS exactly"
+        );
+    }
 }

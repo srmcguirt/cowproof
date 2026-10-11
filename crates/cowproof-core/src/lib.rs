@@ -26,7 +26,6 @@ pub const ALWAYS_PROTECTED: [&str; 4] = [".env", ".env.*", "**/.env", "**/.env.*
 /// checks. See the preamble source for the exact sentences.
 pub const PROTOCOL_MARKERS: &[&str] = &[
     "The schema is strict",
-    "Read file ranges efficiently without re-reading",
     "If the same check id fails twice with no pass in between",
     "You will be rejected at handback if you report stubs",
     "Confirm that every check in the packet has a `run_check` result",

@@ -9,6 +9,10 @@
 
 use sha2::{Digest, Sha256};
 
+/// The three builder tools served by lane_tools (D22).
+/// Any tool promised in the preamble must be in this list.
+pub const LANE_TOOLS: &[&str] = &["ask", "check_ruling", "run_check"];
+
 /// The canonical builder preamble, versioned for cache sharing (D20).
 pub const PREAMBLE: &str = include_str!("prefix/builder-preamble.md");
 
@@ -147,13 +151,23 @@ mod tests {
 
     #[test]
     fn test_preamble_mentions_tools() {
-        // Verify the preamble names all six builder tools with their jobs
+        // Verify the preamble names all three builder tools with their jobs
         assert!(PREAMBLE.contains("`ask`"));
         assert!(PREAMBLE.contains("`check_ruling`"));
         assert!(PREAMBLE.contains("`run_check`"));
-        assert!(PREAMBLE.contains("`pk-read`"));
-        assert!(PREAMBLE.contains("`sym`"));
-        assert!(PREAMBLE.contains("`outline`"));
+        // Verify unserved tools are NOT in the preamble
+        assert!(
+            !PREAMBLE.contains("`pk-read`"),
+            "pk-read is not served; remove from preamble"
+        );
+        assert!(
+            !PREAMBLE.contains("`sym`"),
+            "sym is not served; remove from preamble"
+        );
+        assert!(
+            !PREAMBLE.contains("`outline`"),
+            "outline is not served; remove from preamble"
+        );
     }
 
     #[test]
@@ -182,5 +196,18 @@ mod tests {
         assert!(PREAMBLE.contains("No stubs"));
         assert!(PREAMBLE.contains("Weakened"));
         assert!(PREAMBLE.contains("Never delete assertions"));
+    }
+
+    #[test]
+    fn test_preamble_tools_are_served() {
+        // Every tool promised in the preamble must be in LANE_TOOLS
+        for tool in LANE_TOOLS {
+            let backtick_tool = format!("`{}`", tool);
+            assert!(
+                PREAMBLE.contains(&backtick_tool),
+                "Tool {} is in LANE_TOOLS but not in preamble",
+                tool
+            );
+        }
     }
 }

@@ -329,3 +329,115 @@ fn test_watch_unreadable_control_dir_is_skipped() {
     // The command should succeed even if control dir is unreadable
     assert!(output.status.success(), "Command should succeed");
 }
+
+#[test]
+fn test_watch_shows_stopped_status() {
+    let bin = cowproof_bin();
+    if !bin.exists() {
+        eprintln!(
+            "Skipping test: cowproof binary not found at {}",
+            bin.display()
+        );
+        return;
+    }
+
+    let tmpdir = TempDir::new().unwrap();
+    let lanes_root = tmpdir.path();
+
+    let lane1 = lanes_root.join("lane-1");
+    fs::create_dir_all(lane1.join("control")).unwrap();
+
+    // Write a run.json with "status":"stopped"
+    fs::write(lane1.join("control/run.json"), r#"{"status":"stopped"}"#).unwrap();
+
+    let output = std::process::Command::new(&bin)
+        .args([
+            "watch",
+            "--lanes-root",
+            lanes_root.to_str().unwrap(),
+            "--cache-ttl",
+            "1h",
+        ])
+        .output()
+        .expect("failed to run cowproof watch");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("stopped"), "Should show 'stopped' state");
+}
+
+#[test]
+fn test_watch_shows_proved_status() {
+    let bin = cowproof_bin();
+    if !bin.exists() {
+        eprintln!(
+            "Skipping test: cowproof binary not found at {}",
+            bin.display()
+        );
+        return;
+    }
+
+    let tmpdir = TempDir::new().unwrap();
+    let lanes_root = tmpdir.path();
+
+    let lane1 = lanes_root.join("lane-1");
+    fs::create_dir_all(lane1.join("control")).unwrap();
+
+    // Write a verdict.json with proved status (or use run.json with "status":"proved")
+    fs::write(lane1.join("control/run.json"), r#"{"status":"proved"}"#).unwrap();
+
+    let output = std::process::Command::new(&bin)
+        .args([
+            "watch",
+            "--lanes-root",
+            lanes_root.to_str().unwrap(),
+            "--cache-ttl",
+            "1h",
+        ])
+        .output()
+        .expect("failed to run cowproof watch");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("proved"), "Should show 'proved' state");
+}
+
+#[test]
+fn test_watch_events_includes_rfc3339_timestamps() {
+    let bin = cowproof_bin();
+    if !bin.exists() {
+        eprintln!(
+            "Skipping test: cowproof binary not found at {}",
+            bin.display()
+        );
+        return;
+    }
+
+    let tmpdir = TempDir::new().unwrap();
+    let lanes_root = tmpdir.path();
+
+    let lane1 = lanes_root.join("lane-1");
+    fs::create_dir_all(lane1.join("control")).unwrap();
+
+    // Write escalations.jsonl with an ask
+    fs::write(
+        lane1.join("control/escalations.jsonl"),
+        r#"{"event":"asked","lane":"lane-1","id":"lane-1:E1","ask":{"kind":"blocker","question":"test?","tried":[],"options":[{"id":"a","summary":"do A","cost":"1h"}],"recommend":"a","blocking":true},"origin":"builder","at_ms":1609459200000}
+"#,
+    ).unwrap();
+
+    let output = std::process::Command::new(&bin)
+        .args([
+            "watch",
+            "--lanes-root",
+            lanes_root.to_str().unwrap(),
+            "--events",
+        ])
+        .output()
+        .expect("failed to run cowproof watch --events");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // RFC3339 format: YYYY-MM-DDTHH:MM:SS.sssZ
+    assert!(
+        stdout.contains("T") && stdout.contains(":") && stdout.contains("Z"),
+        "Should include RFC3339 format timestamps"
+    );
+}

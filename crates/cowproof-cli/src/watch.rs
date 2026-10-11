@@ -101,10 +101,62 @@ fn now_ms() -> u64 {
 
 /// Convert milliseconds since epoch to RFC3339 string.
 fn ms_to_rfc3339(ms: u64) -> String {
-    // Simple UTC timestamp format: show seconds.milliseconds
-    let secs = ms / 1000;
-    let millis = ms % 1000;
-    format!("{}.{:03}Z", secs, millis)
+    if ms == 0 {
+        return "-".to_string();
+    }
+    // Convert ms to seconds and nanoseconds for RFC3339
+    let secs = (ms / 1000) as i64;
+    let nanos = ((ms % 1000) * 1_000_000) as u32;
+
+    // Simple UTC timestamp format without external dependencies
+    // Convert Unix timestamp to calendar date and time
+    let days_since_epoch = secs / 86400;
+    let secs_today = secs % 86400;
+
+    let hours = secs_today / 3600;
+    let minutes = (secs_today % 3600) / 60;
+    let seconds = secs_today % 60;
+    let millis = nanos / 1_000_000;
+
+    // Approximate year/month/day from days since epoch (1970-01-01)
+    // This is simplified; for a production implementation, use a proper date library
+    let mut year = 1970;
+    let mut remaining_days = days_since_epoch;
+
+    loop {
+        let days_in_year = if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) {
+            366
+        } else {
+            365
+        };
+        if remaining_days < days_in_year {
+            break;
+        }
+        remaining_days -= days_in_year;
+        year += 1;
+    }
+
+    let is_leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let days_in_months = if is_leap {
+        [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    } else {
+        [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    };
+
+    let mut month = 1;
+    let mut day = remaining_days + 1;
+    for &days in &days_in_months {
+        if day <= days as i64 {
+            break;
+        }
+        day -= days as i64;
+        month += 1;
+    }
+
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
+        year, month, day, hours, minutes, seconds, millis
+    )
 }
 
 /// Truncate a string to at most max_chars, preserving safety.
@@ -172,11 +224,19 @@ fn get_lane_state(lane_dir: &Path) -> String {
     match fs::read_to_string(&run_json) {
         Ok(content) => match serde_json::from_str::<serde_json::Value>(&content) {
             Ok(obj) => {
-                if let Some(exit_code) = obj.get("exit_code").and_then(|v| v.as_i64()) {
-                    format!("exit {}", exit_code)
-                } else {
-                    "finished".to_string()
+                // Check for status field (stopped, proved, refuted, incomplete, infrastructure)
+                if let Some(status) = obj.get("status").and_then(|v| v.as_str()) {
+                    return status.to_string();
                 }
+                // Fall back to exitCode (exit 0, exit 1, etc.)
+                if let Some(exit_code) = obj.get("exitCode").and_then(|v| v.as_i64()) {
+                    return format!("exit {}", exit_code);
+                }
+                // Legacy: exit_code field
+                if let Some(exit_code) = obj.get("exit_code").and_then(|v| v.as_i64()) {
+                    return format!("exit {}", exit_code);
+                }
+                "finished".to_string()
             }
             Err(_) => "finished".to_string(),
         },
@@ -499,5 +559,26 @@ mod tests {
         let s = "hello world this is a long string";
         let truncated = truncate_line(s, 10);
         assert!(truncated.len() <= 13);
+    }
+
+    #[test]
+    fn test_ms_to_rfc3339_known_epoch() {
+        // 1970-01-01T00:00:00.000Z (epoch)
+        let result = ms_to_rfc3339(0);
+        assert_eq!(result, "-");
+
+        // 1970-01-01T00:00:01.000Z (1 second after epoch)
+        let result = ms_to_rfc3339(1000);
+        assert!(result.starts_with("1970-01-01"));
+        assert!(result.contains("00:00:01"));
+        assert!(result.ends_with("Z"));
+
+        // Verify RFC3339 format: YYYY-MM-DDTHH:MM:SS.sssZ
+        assert!(result.contains("T"));
+        assert!(result.contains(":"));
+        assert!(result.contains("."));
+        let parts: Vec<&str> = result.split('.').collect();
+        assert_eq!(parts.len(), 2, "RFC3339 must have milliseconds");
+        assert!(parts[1].starts_with("0") && parts[1].ends_with("Z"));
     }
 }
