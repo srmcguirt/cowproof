@@ -18,6 +18,7 @@ use std::fs;
 use std::io::Write;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::os::unix::net::UnixListener;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
@@ -1417,6 +1418,231 @@ while :; do echo tick >> "$rec/marker"; printf 'line\n'; sleep 0.2; done
     assert_eq!(status.code(), Some(130), "an ended builder exits 130");
     assert!(agent.0.stdin.is_some());
     assert_builder_group_ended(&bfx);
+}
+
+// ---------------------------------------------------------------------------------------------
+// The recorded builder group (R-5)
+// ---------------------------------------------------------------------------------------------
+
+/// The record `host-agent builder` keeps of its group, once it is there.
+fn group_record(bfx: &Bfx) -> Value {
+    let path = bfx.lane().join("control/builder.group.json");
+    wait_for(&path);
+    serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap()
+}
+
+/// Kills the group named in a record file, by the pgid it holds, whatever the test did. The
+/// record is the host's own view of the number, so it is right on every platform.
+struct RecordReaper(PathBuf);
+
+impl Drop for RecordReaper {
+    fn drop(&mut self) {
+        if let Ok(text) = fs::read_to_string(&self.0)
+            && let Ok(record) = serde_json::from_str::<Value>(&text)
+            && let Some(pgid) = record["pgid"].as_u64()
+        {
+            signal_pid("-KILL", &format!("-{pgid}"));
+        }
+    }
+}
+
+/// Kills a group by the pgid read from its record, after the record itself may be gone.
+struct PgidReaper(u64);
+
+impl Drop for PgidReaper {
+    fn drop(&mut self) {
+        signal_pid("-KILL", &format!("-{}", self.0));
+    }
+}
+
+#[test]
+fn the_builder_records_its_group_and_removes_the_record_when_the_group_is_gone() {
+    if !sandbox_available() {
+        return;
+    }
+    let bfx = Bfx::new("echo up > \"$rec/up\"\nsleep 600\n");
+    let _reaper = RecordReaper(bfx.lane().join("control/builder.group.json"));
+    let mut agent = KillOnDrop(bfx.start(&["builder"], &bfx.spec()));
+    wait_for(&bfx.rec().join("up"));
+    let record = group_record(&bfx);
+    let pgid = record["pgid"].as_u64().unwrap();
+    assert!(pgid > 1);
+    assert_eq!(record["leader"].as_u64(), Some(pgid), "{record}");
+    assert!(
+        record["leader_start"]
+            .as_str()
+            .is_some_and(|s| !s.is_empty()),
+        "no start time: {record}"
+    );
+    assert!(!group_gone(&pgid.to_string()), "the group is not running");
+
+    drop(agent.0.stdin.take());
+    wait_exit(&mut agent.0, STOP_WITHIN);
+    assert!(group_gone(&pgid.to_string()));
+    assert!(
+        !bfx.lane().join("control/builder.group.json").exists(),
+        "the record outlived the group"
+    );
+}
+
+#[test]
+fn cleanup_ends_a_live_builder_group_before_removing_the_lane() {
+    if !sandbox_available() {
+        return;
+    }
+    // A leader that takes SIGTERM and carries on, and a child that ignores it: only the
+    // grace period and then SIGKILL end this group.
+    let bfx = Bfx::new(
+        r#"trap 'echo got-term >> "$rec/term"' TERM
+( trap '' TERM; while :; do echo tick >> "$rec/marker"; sleep 0.2; done ) >/dev/null 2>&1 &
+while :; do echo tick >> "$rec/marker"; sleep 0.2; done
+"#,
+    );
+    let _reaper = RecordReaper(bfx.lane().join("control/builder.group.json"));
+    let mut agent = KillOnDrop(bfx.start(&["builder"], &bfx.spec()));
+    wait_for(&bfx.rec().join("marker"));
+    let pgid = group_record(&bfx)["pgid"].as_u64().unwrap();
+    let _group = PgidReaper(pgid);
+    assert!(!group_gone(&pgid.to_string()));
+
+    // The director has let go and already asks for the lane to go: the host's builder is still
+    // in its grace period, writing.
+    let began = Instant::now();
+    let json = assert_ok(&bfx.fx.agent(&["cleanup", "--lane-id", &bfx.id], None));
+    assert!(began.elapsed() < Duration::from_secs(40));
+    assert_eq!(json["removed"], true, "{json}");
+    assert_eq!(json["group"]["pgid"].as_u64(), Some(pgid), "{json}");
+    assert_eq!(json["group"]["state"], "ended", "{json}");
+    assert_eq!(json["group"]["signals"], json!(["TERM", "KILL"]), "{json}");
+
+    assert!(group_gone(&pgid.to_string()), "the group is still alive");
+    assert!(!bfx.lane().exists(), "the lane is still there");
+    std::thread::sleep(Duration::from_secs(2));
+    assert!(!bfx.lane().exists(), "something put the lane back");
+    assert!(group_gone(&pgid.to_string()));
+    wait_exit(&mut agent.0, STOP_WITHIN);
+}
+
+#[test]
+fn a_recorded_group_whose_leader_was_replaced_is_not_signalled() {
+    let fx = Fx::new();
+    assert_ok(&fx.prepare("lane-r", &[]));
+    // An unrelated process that leads a group of its own, as a builder's leader would.
+    let stranger = {
+        let _g = fork_lock();
+        Command::new("sleep")
+            .arg("30")
+            .process_group(0)
+            .stdin(Stdio::null())
+            .spawn()
+            .unwrap()
+    };
+    let pid = stranger.id();
+    let _stranger = KillOnDrop(stranger);
+    fs::write(
+        fx.root.join("lane-r/control/builder.group.json"),
+        json!({"pgid": pid, "leader": pid, "leader_start": "proc:1-not-its-start"}).to_string(),
+    )
+    .unwrap();
+
+    let json = assert_ok(&fx.agent(&["cleanup", "--lane-id", "lane-r"], None));
+    assert_eq!(json["removed"], true, "{json}");
+    assert_eq!(json["group"]["state"], "replaced", "{json}");
+    assert_eq!(json["group"]["signals"], json!([]), "{json}");
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(
+        signal_pid("-0", &pid.to_string()),
+        "a process that only shares the recorded pid was signalled"
+    );
+    assert!(!group_gone(&pid.to_string()), "its group was signalled");
+}
+
+#[test]
+fn a_relaunch_ends_the_previous_group_first() {
+    if !sandbox_available() {
+        return;
+    }
+    // The first launch leaves a marker and waits; the second one, which finds the marker,
+    // records the moment it starts.
+    let bfx = Bfx::new(
+        r#"if [ -e "$rec/first" ]; then echo second > "$rec/second"; sleep 600; fi
+echo first > "$rec/first"
+sleep 600
+"#,
+    );
+    let _reaper = RecordReaper(bfx.lane().join("control/builder.group.json"));
+    let mut first = KillOnDrop(bfx.start(&["builder"], &bfx.spec()));
+    wait_for(&bfx.rec().join("first"));
+    let before = group_record(&bfx)["pgid"].as_u64().unwrap();
+    let _first_group = PgidReaper(before);
+    assert!(!group_gone(&before.to_string()));
+
+    // The first host-agent still holds its lifeline: the old group is alive when the second
+    // launch begins, and only that launch can end it.
+    let mut second = KillOnDrop(bfx.start(&["builder"], &bfx.spec()));
+    wait_for(&bfx.rec().join("second"));
+    assert!(
+        group_gone(&before.to_string()),
+        "the second builder started while the first group ({before}) was alive"
+    );
+    wait_exit(&mut first.0, STOP_WITHIN);
+
+    // The record is the second group's now, and the first host-agent's late exit left it be.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let after = loop {
+        let now = group_record(&bfx)["pgid"].as_u64().unwrap();
+        if now != before || Instant::now() > deadline {
+            break now;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    let _second_group = PgidReaper(after);
+    assert_ne!(after, before, "the new group was never recorded");
+    assert!(!group_gone(&after.to_string()));
+    drop(second.0.stdin.take());
+    wait_exit(&mut second.0, STOP_WITHIN);
+}
+
+#[test]
+fn patch_ends_a_group_that_is_still_stopping_before_it_takes_the_patch() {
+    if !sandbox_available() {
+        return;
+    }
+    let bfx = Bfx::new("echo up > \"$rec/up\"\nsleep 600\n");
+    let _reaper = RecordReaper(bfx.lane().join("control/builder.group.json"));
+    let _agent = KillOnDrop(bfx.start(&["builder"], &bfx.spec()));
+    wait_for(&bfx.rec().join("up"));
+    let pgid = group_record(&bfx)["pgid"].as_u64().unwrap();
+    let _group = PgidReaper(pgid);
+
+    let out = bfx.fx.agent(&["patch", "--lane-id", &bfx.id], None);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(
+        group_gone(&pgid.to_string()),
+        "patch left the group running"
+    );
+}
+
+#[test]
+fn a_garbage_record_names_nothing_to_signal() {
+    let fx = Fx::new();
+    assert_ok(&fx.prepare("lane-g", &[]));
+    for bad in [
+        "not json".to_string(),
+        json!({"pgid": 1, "leader": 1, "leader_start": "x"}).to_string(),
+        json!({"pgid": 0, "leader": 0, "leader_start": "x"}).to_string(),
+        json!({"pgid": 4242, "leader": 4243, "leader_start": "x"}).to_string(),
+    ] {
+        fs::write(fx.root.join("lane-g/control/builder.group.json"), &bad).unwrap();
+        let json = assert_ok(&fx.agent(&["cleanup", "--lane-id", "lane-g"], None));
+        assert_eq!(json["group"], Value::Null, "{bad}: {json}");
+        assert_ok(&fx.prepare("lane-g", &[]));
+    }
 }
 
 #[test]

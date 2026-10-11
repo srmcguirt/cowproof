@@ -2502,6 +2502,7 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
             launch_removed: &prepared.launch_removed,
             proxy_socket: &endpoint.socket,
             runner_socket: &socket,
+            lanes_root: &lanes_root,
         };
         let opened = tokio::select! {
             result = remote.open(&side) => Ok(result),

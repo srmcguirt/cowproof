@@ -25,13 +25,24 @@
 //!   (`host-agent stderr`), redacted again here, and appended to the lane's own, whatever the
 //!   outcome ([`RemoteLane::finish_blocking`]).
 //!
+//! - the director records itself and the master in the lane's `control/remote.json`
+//!   ([`RemoteRecord`]); a lane that ends normally marks it `finished`. If the director dies
+//!   without finishing (SIGKILL, a crash, power loss) its master and the host's lane are left,
+//!   and the next `cowproof run --host <alias>` on the same lanes root sweeps them
+//!   ([`RemoteLane::sweep`]): it never touches a lane whose director is alive or that finished.
+//!
 //! Every ssh argument list is built by [`ssh_argv`] and every remote command line by
 //! [`agent_command`], so the exact bytes are unit-tested here.
 
-use crate::host_agent::{HOST_PROTOCOL, MAX_STDERR_FETCH};
+use crate::host_agent::{
+    HOST_PROTOCOL, Identity, MAX_STDERR_FETCH, identity, process_start, signal_process,
+    write_json_atomic,
+};
 use anyhow::{Context, Result, anyhow, bail};
 use cowproof_core::redact;
+use cowproof_run::lane::validate_lane_id;
 use cowproof_run::tools::CheckOutcome;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::fs;
 use std::io::{Read as _, Write as _};
@@ -437,7 +448,43 @@ pub(crate) struct LocalSide<'a> {
     pub proxy_socket: &'a Path,
     /// The builder tools socket, `<lane>/sock/runner.sock`.
     pub runner_socket: &'a Path,
+    /// The directory that holds this lane and the director's other lanes: where orphans of
+    /// earlier runs are looked for.
+    pub lanes_root: &'a Path,
 }
+
+/// The lane's `control/remote.json`: who runs the connection and what it owns, so a later run
+/// can tell an orphan from a lane that is still going.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct RemoteRecord {
+    /// The hosts-config alias.
+    pub host: String,
+    /// The ssh destination the alias meant.
+    pub ssh: String,
+    /// The lane's id on the host.
+    pub lane_id: String,
+    /// `--root` of the host's `host-agent` (`None`: its default).
+    pub remote_root: Option<String>,
+    /// The lane directory on the host, once `prepare` reported it.
+    #[serde(default)]
+    pub remote_lane_dir: Option<String>,
+    /// The director's pid and start time (see `host_agent::process_start`).
+    pub director_pid: u32,
+    pub director_start: Option<String>,
+    /// The ssh control master's pid and start time, once it was started.
+    #[serde(default)]
+    pub master_pid: Option<u32>,
+    #[serde(default)]
+    pub master_start: Option<String>,
+    /// The lane ended its normal way: the host's lane is removed and the master stopped.
+    #[serde(default)]
+    pub finished: bool,
+    /// A later run found this lane orphaned and removed what it left.
+    #[serde(default)]
+    pub swept: bool,
+}
+
+const RECORD_FILE: &str = "remote.json";
 
 #[derive(Default)]
 struct State {
@@ -449,6 +496,8 @@ struct State {
     /// A builder was started there, so it has a `builder.stderr` worth fetching.
     builder_started: bool,
     finished: bool,
+    /// What `control/remote.json` holds.
+    record: RemoteRecord,
 }
 
 /// One lane's connection to its host.
@@ -476,13 +525,40 @@ impl RemoteLane {
                 ctl.display()
             );
         }
-        Ok(Arc::new(RemoteLane {
+        let record = RemoteRecord {
+            host: host.alias.clone(),
+            ssh: host.ssh.clone(),
+            lane_id: lane_id.to_string(),
+            remote_root: host.root.clone(),
+            director_pid: std::process::id(),
+            director_start: process_start(std::process::id()),
+            ..RemoteRecord::default()
+        };
+        let lane = Arc::new(RemoteLane {
             host,
             lane_id: lane_id.to_string(),
             ctl,
             control: control.to_path_buf(),
-            state: Mutex::new(State::default()),
-        }))
+            state: Mutex::new(State {
+                record,
+                ..State::default()
+            }),
+        });
+        lane.persist();
+        Ok(lane)
+    }
+
+    /// Write `control/remote.json` as it stands. Best effort: a lane without the record just
+    /// cannot be swept later, which is no reason to stop the run.
+    fn persist(&self) {
+        let record = self.lock().record.clone();
+        let path = self.control.join(RECORD_FILE);
+        if !self.control.is_dir() {
+            return;
+        }
+        if let Err(e) = write_json_atomic(&path, &record) {
+            eprintln!("[{}] warning: {e:#}", self.lane_id);
+        }
     }
 
     pub(crate) fn alias(&self) -> &str {
@@ -511,12 +587,16 @@ impl RemoteLane {
         vec!["--lane-id".to_string(), self.lane_id.clone()]
     }
 
-    /// The whole setup, in the order that matters: master, doctor, prepare, forwards. A failing
+    /// The whole setup, in the order that matters: master, doctor, sweep of orphans, prepare,
+    /// forwards. A failing
     /// doctor stops it before any lane exists on the host. On an error the caller calls
     /// [`RemoteLane::finish`].
     pub(crate) async fn open(&self, side: &LocalSide<'_>) -> Result<()> {
         self.start_master().await?;
         self.doctor().await?;
+        // After the doctor (the host speaks this protocol, so its `cleanup` ends a builder
+        // group), before this lane exists there.
+        self.sweep(side.lanes_root).await;
         self.prepare(side).await?;
         self.forward(side).await
     }
@@ -534,7 +614,14 @@ impl RemoteLane {
             .process_group(0)
             .spawn()
             .context("starting the ssh control master")?;
-        self.lock().master = Some(child);
+        {
+            let pid = child.id();
+            let mut state = self.lock();
+            state.record.master_pid = Some(pid);
+            state.record.master_start = process_start(pid);
+            state.master = Some(child);
+        }
+        self.persist();
         let deadline = Instant::now() + MASTER_READY;
         loop {
             let exited = self
@@ -745,7 +832,12 @@ impl RemoteLane {
                 side.launch_removed
             );
         }
-        self.lock().remote_dir = Some(PathBuf::from(dir));
+        {
+            let mut state = self.lock();
+            state.remote_dir = Some(PathBuf::from(dir));
+            state.record.remote_lane_dir = Some(dir.to_string());
+        }
+        self.persist();
         Ok(())
     }
 
@@ -896,8 +988,13 @@ impl RemoteLane {
             )
         };
         let Some(mut master) = master else {
+            // Nothing was started, so nothing is left anywhere.
+            self.mark_finished();
             return;
         };
+        // Whether the host's lane is certainly gone. If it is not (the link died), the lane is
+        // not marked finished, and a later run sweeps it once this director has exited.
+        let mut host_clean = true;
         if cleanup {
             if fetch {
                 self.fetch_stderr();
@@ -908,6 +1005,7 @@ impl RemoteLane {
                 args: &args,
             });
             if let Err(e) = self.blocking_ssh(&argv, CLEANUP_TIMEOUT) {
+                host_clean = false;
                 eprintln!(
                     "[{}] warning: removing the lane on {} did not finish: {e:#}",
                     self.lane_id, self.host.alias
@@ -924,6 +1022,115 @@ impl RemoteLane {
             }
             std::thread::sleep(Duration::from_millis(50));
         }
+        if host_clean {
+            self.mark_finished();
+        }
+    }
+
+    /// The lane ended its normal way: a later run must not sweep it.
+    fn mark_finished(&self) {
+        self.lock().record.finished = true;
+        self.persist();
+    }
+
+    /// Remove what earlier runs of this alias left when their director died without finishing
+    /// (SIGKILL, a crash, power loss): their ssh control master, still running with its
+    /// forwards, and their lane on the host. A lane is an orphan when its `control/remote.json`
+    /// names this alias, its director is gone (the pid is dead, or belongs to another process by
+    /// its start time), and it was not marked `finished`. A lane whose director is alive is
+    /// never touched, so two directors may share a lanes root, and neither is a lane of
+    /// another alias.
+    ///
+    /// The host's lane is removed over THIS lane's master, which `open` has just brought up
+    /// and checked with `doctor`: no second authentication, and the host is known to speak this
+    /// protocol, whose `cleanup` ends a builder group that is still stopping before it removes
+    /// the lane. A one-off connection made before the master would need its own login and could
+    /// reach an older `host-agent`. The local lane directory is kept, as evidence, and marked
+    /// `swept`. One line is printed per swept lane; a failure is a warning and the run goes on.
+    async fn sweep(&self, lanes_root: &Path) {
+        let names: Vec<String> = match fs::read_dir(lanes_root) {
+            Ok(entries) => entries
+                .flatten()
+                .filter_map(|e| e.file_name().into_string().ok())
+                .collect(),
+            Err(e) => {
+                eprintln!(
+                    "[{}] warning: looking for orphaned remote lanes in {}: {e}",
+                    self.lane_id,
+                    lanes_root.display()
+                );
+                return;
+            }
+        };
+        let mut names = names;
+        names.sort();
+        for name in names {
+            if name == self.lane_id || validate_lane_id(&name).is_err() {
+                continue;
+            }
+            let dir = lanes_root.join(&name);
+            let Some(record) = orphan_record(&dir, &name, &self.host.alias) else {
+                continue;
+            };
+            match self.sweep_one(&dir, record).await {
+                Ok(line) => eprintln!("[{}] {line}", self.lane_id),
+                Err(e) => eprintln!(
+                    "[{}] warning: sweeping the orphaned lane {name} on {}: {e:#}",
+                    self.lane_id, self.host.alias
+                ),
+            }
+        }
+    }
+
+    async fn sweep_one(&self, dir: &Path, mut record: RemoteRecord) -> Result<String> {
+        if record.ssh != self.host.ssh {
+            bail!(
+                "it ran on {}, and this connection is to {}: left alone",
+                record.ssh,
+                self.host.ssh
+            );
+        }
+        let master = {
+            let record = record.clone();
+            tokio::task::spawn_blocking(move || stop_master(&record))
+                .await
+                .context("stopping the old master")?
+        };
+        // Where that lane lives is the root it was made under, not today's configuration.
+        let mut host = self.host.clone();
+        host.root = record.remote_root.clone();
+        let args = vec!["--lane-id".to_string(), record.lane_id.clone()];
+        let ran = run_ssh(
+            &ssh_argv(
+                &host,
+                &self.ctl,
+                &Step::Agent {
+                    verb: "cleanup",
+                    args: &args,
+                },
+            ),
+            None,
+            CLEANUP_TIMEOUT,
+        )
+        .await?;
+        let reply = ran.verb_json("remote cleanup")?;
+        record.swept = true;
+        write_json_atomic(&dir.join("control").join(RECORD_FILE), &record)
+            .context("marking the lane swept")?;
+        let group = match reply["group"]["state"].as_str() {
+            Some(state) => format!(", builder group {state}"),
+            None => String::new(),
+        };
+        Ok(format!(
+            "swept the orphaned remote lane {} on {} (master {master}, host lane {}{group})",
+            record.lane_id,
+            self.host.alias,
+            if reply["removed"] == true {
+                "removed"
+            } else {
+                "already gone"
+            }
+        ))
     }
 
     /// Best effort, on every outcome: copy the host's `control/builder.stderr` (redacted there)
@@ -1052,6 +1259,76 @@ impl RemoteLane {
             }
             std::thread::sleep(Duration::from_millis(50));
         }
+    }
+}
+
+/// The record of an orphaned lane of `alias` in `dir`, or `None` for anything else: not a lane
+/// of ours, another alias, finished, already swept, or a director that is still alive.
+fn orphan_record(dir: &Path, name: &str, alias: &str) -> Option<RemoteRecord> {
+    if !fs::symlink_metadata(dir).ok()?.is_dir() {
+        return None;
+    }
+    let file = dir.join("control").join(RECORD_FILE);
+    if !fs::symlink_metadata(&file).ok()?.is_file() {
+        return None;
+    }
+    let record: RemoteRecord = serde_json::from_slice(&fs::read(&file).ok()?).ok()?;
+    let orphan = record.host == alias
+        && record.lane_id == name
+        && !record.finished
+        && !record.swept
+        && !director_alive(&record);
+    orphan.then_some(record)
+}
+
+/// Whether the director that wrote `record` still runs. Only a gone process, or a pid that
+/// another process has now, says no; a process that cannot be told apart counts as alive,
+/// because sweeping a live director's lane is the one mistake that cannot be undone.
+fn director_alive(record: &RemoteRecord) -> bool {
+    match identity(record.director_pid, record.director_start.as_deref()) {
+        Identity::Gone | Identity::Other => false,
+        Identity::Same | Identity::Unknown => true,
+    }
+}
+
+/// Whether `pid` has stopped being the process recorded with `start`, waiting at most `limit`.
+fn master_over(pid: u32, start: Option<&str>, limit: Duration) -> bool {
+    let deadline = Instant::now() + limit;
+    loop {
+        if identity(pid, start) != Identity::Same {
+            return true;
+        }
+        if Instant::now() > deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Stop an orphan's ssh control master with SIGTERM when it is still the recorded process (the
+/// same pid AND start time); a pid that another process has now is left alone. Returns a word
+/// for the sweep's line.
+fn stop_master(record: &RemoteRecord) -> &'static str {
+    let Some(pid) = record.master_pid else {
+        return "not recorded";
+    };
+    let start = record.master_start.as_deref();
+    match identity(pid, start) {
+        Identity::Gone | Identity::Other => return "already gone",
+        Identity::Unknown => return "not verified, left running",
+        Identity::Same => {}
+    }
+    signal_process("TERM", pid);
+    if master_over(pid, start, MASTER_EXIT_WAIT) {
+        return "stopped";
+    }
+    if identity(pid, start) == Identity::Same {
+        signal_process("KILL", pid);
+    }
+    if master_over(pid, start, MASTER_EXIT_WAIT) {
+        "stopped"
+    } else {
+        "would not stop"
     }
 }
 
@@ -1386,6 +1663,105 @@ mod tests {
         assert_eq!(last_json(out).unwrap()["lane_dir"], "/x");
         assert!(last_json(b"no json here\n").is_none());
         assert!(last_json(b"").is_none());
+    }
+
+    fn record_in(root: &Path, id: &str, edit: impl FnOnce(&mut RemoteRecord)) -> PathBuf {
+        let me = std::process::id();
+        let mut record = RemoteRecord {
+            host: "box".into(),
+            ssh: "me@box.example".into(),
+            lane_id: id.into(),
+            director_pid: me,
+            director_start: process_start(me),
+            ..RemoteRecord::default()
+        };
+        edit(&mut record);
+        let dir = root.join(id);
+        fs::create_dir_all(dir.join("control")).unwrap();
+        fs::write(
+            dir.join("control").join(RECORD_FILE),
+            serde_json::to_vec(&record).unwrap(),
+        )
+        .unwrap();
+        dir
+    }
+
+    #[test]
+    fn only_a_lane_of_this_alias_with_a_dead_director_and_no_finish_is_an_orphan() {
+        let tmp = tempfile::Builder::new()
+            .prefix("cp-orphans-")
+            .tempdir_in("/var/tmp")
+            .unwrap();
+        let root = tmp.path();
+        let mut ended = std::process::Command::new("true").spawn().unwrap();
+        let dead = ended.id();
+        ended.wait().unwrap();
+        let is_orphan = |dir: &Path, id: &str, alias: &str| orphan_record(dir, id, alias).is_some();
+
+        // The director is gone: an orphan.
+        let dir = record_in(root, "dead", |r| r.director_pid = dead);
+        assert!(is_orphan(&dir, "dead", "box"));
+        // Not another alias's, nor one whose directory name disagrees with its record.
+        assert!(!is_orphan(&dir, "dead", "other"));
+        assert!(!is_orphan(&dir, "renamed", "box"));
+        // A director that is alive (this process, with its real start time) is never one.
+        let dir = record_in(root, "alive", |_| {});
+        assert!(!is_orphan(&dir, "alive", "box"));
+        // A pid that another process has now (a different start time) is a dead director.
+        let dir = record_in(root, "reused", |r| r.director_start = Some("proc:1".into()));
+        assert!(is_orphan(&dir, "reused", "box"));
+        // An unreadable start time on a live pid cannot be told: left alone.
+        let dir = record_in(root, "unknown", |r| r.director_start = None);
+        assert!(!is_orphan(&dir, "unknown", "box"));
+        // Finished and swept lanes are done with.
+        let dir = record_in(root, "finished", |r| {
+            r.director_pid = dead;
+            r.finished = true;
+        });
+        assert!(!is_orphan(&dir, "finished", "box"));
+        let dir = record_in(root, "swept", |r| {
+            r.director_pid = dead;
+            r.swept = true;
+        });
+        assert!(!is_orphan(&dir, "swept", "box"));
+        // A lane with no record, a garbage record, or a link in its place is not ours.
+        fs::create_dir_all(root.join("plain/control")).unwrap();
+        assert!(!is_orphan(&root.join("plain"), "plain", "box"));
+        fs::write(root.join("plain/control").join(RECORD_FILE), "not json").unwrap();
+        assert!(!is_orphan(&root.join("plain"), "plain", "box"));
+        std::os::unix::fs::symlink(root.join("dead"), root.join("link")).unwrap();
+        assert!(!is_orphan(&root.join("link"), "link", "box"));
+    }
+
+    #[test]
+    fn a_master_is_stopped_only_when_it_is_still_the_recorded_process() {
+        let mut stranger = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let pid = stranger.id();
+        let real = process_start(pid).expect("start time");
+        let record = |pid: Option<u32>, start: Option<&str>| RemoteRecord {
+            master_pid: pid,
+            master_start: start.map(String::from),
+            ..RemoteRecord::default()
+        };
+        assert_eq!(stop_master(&record(None, None)), "not recorded");
+        // The pid is alive but is not the process that was recorded: it is not signalled.
+        assert_eq!(
+            stop_master(&record(Some(pid), Some("proc:1"))),
+            "already gone"
+        );
+        assert!(stranger.try_wait().unwrap().is_none());
+        assert_eq!(
+            stop_master(&record(Some(pid), None)),
+            "not verified, left running"
+        );
+        assert!(stranger.try_wait().unwrap().is_none());
+        // The recorded process is stopped.
+        assert_eq!(stop_master(&record(Some(pid), Some(&real))), "stopped");
+        let _ = stranger.wait();
+        assert_eq!(stop_master(&record(Some(pid), Some(&real))), "already gone");
     }
 
     #[test]

@@ -10,7 +10,7 @@ mod common;
 
 use common::{
     Lane, REAL_KEY, fork_lock, group_gone, output, run_checks, sandbox_available, spawn_to_file,
-    text, var_tmp,
+    text, unique_lane_id, var_tmp,
 };
 use cowproof_prove::Capsule;
 use serde_json::{Value, json};
@@ -104,6 +104,37 @@ impl Remote {
 
     fn remote_lane(&self) -> PathBuf {
         self.root.path().join(&self.lane.id)
+    }
+
+    /// `cowproof run --host fake` for a SECOND lane of the same repository, lanes root and
+    /// host: the first lane's packet with `id` in place of its id.
+    fn second_command(&self, id: &str) -> Command {
+        let text = fs::read_to_string(&self.lane.packet)
+            .unwrap()
+            .replace(&self.lane.id, id);
+        let packet = self.lane.packet.with_file_name(format!("packet-{id}.md"));
+        fs::write(&packet, text).unwrap();
+        let mut c = self.lane.cowproof_cmd();
+        c.arg("run")
+            .arg(&packet)
+            .arg("--repo")
+            .arg(&self.lane.repo)
+            .arg("--lanes-root")
+            .arg(self.lane.lanes.path())
+            .arg("--claude-bin")
+            .arg(self.lane.fake_claude())
+            .args(["--host", "fake"])
+            .env("ANTHROPIC_API_KEY", REAL_KEY);
+        c
+    }
+
+    /// The first lane's `control/remote.json`.
+    fn remote_json(&self) -> Value {
+        let p = self.lane.lane_dir().join("control/remote.json");
+        serde_json::from_str(
+            &fs::read_to_string(&p).unwrap_or_else(|e| panic!("{}: {e}", p.display())),
+        )
+        .unwrap()
     }
 
     fn log(&self) -> Vec<Value> {
@@ -1044,4 +1075,210 @@ fn the_hosts_file_comes_from_the_environment_then_the_user_config() {
         user_file.contains(user.join("hosts.json").to_str().unwrap()),
         "{user_file}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// A director that dies (R-5): the orphans it leaves are swept by the next run
+// ---------------------------------------------------------------------------
+
+/// A builder that waits (and says so) until `flag/proceed` exists, and then proves like
+/// [`proving_builder`]: the first run of a test hangs, the later ones prove.
+fn hang_until_proceed(flag: &Path) -> String {
+    format!(
+        "if [ -e '{flag}/proceed' ]; then\n{proving}\nelse\necho up > \"$HOME/started\"\nsleep 600\nfi\n",
+        flag = flag.display(),
+        proving = proving_builder(),
+    )
+}
+
+/// Kills what a failing test would leave: the fake master of the first lane, by the pid its
+/// log holds.
+struct MasterReaper(PathBuf);
+
+impl Drop for MasterReaper {
+    fn drop(&mut self) {
+        let Ok(log) = fs::read_to_string(&self.0) else {
+            return;
+        };
+        for line in log.lines() {
+            if let Ok(e) = serde_json::from_str::<Value>(line)
+                && e["event"] == "master-started"
+                && let Some(pid) = e["pid"].as_i64()
+            {
+                let _ = Command::new("kill")
+                    .args(["-KILL", &pid.to_string()])
+                    .stderr(std::process::Stdio::null())
+                    .status();
+            }
+        }
+    }
+}
+
+/// Start a run whose builder hangs, and wait until it does.
+fn start_hanging_run(remote: &Remote) -> (Child, PathBuf) {
+    let stderr = remote.ssh_dir.path().join("first.stderr");
+    let mut run = spawn_to_file(&mut remote.command(&[]), &stderr);
+    wait_for(&remote.remote_lane().join("home/started"), &mut run);
+    (run, stderr)
+}
+
+#[test]
+fn an_orphaned_remote_lane_is_swept_by_the_next_run() {
+    if !sandbox_available() {
+        return;
+    }
+    let flag = var_tmp("cp-remote-flag-");
+    let remote = Remote::new(&hang_until_proceed(flag.path()), checks());
+    let _reaper = MasterReaper(remote.ssh_dir.path().join("log.jsonl"));
+    let (mut run, _stderr) = start_hanging_run(&remote);
+    let (host_agent, _) = command_started(&remote, "builder");
+    let master = remote.master_pid();
+
+    // The director is killed with no chance to clean up. The host's builder still ends through
+    // its lifeline; the master and the lane do not.
+    run.kill().unwrap();
+    let _ = run.wait();
+    assert_pid_gone_within(host_agent, STOP_WITHIN);
+    assert!(pid_alive(master), "the master went with the director");
+    assert!(
+        remote.remote_lane().is_dir(),
+        "the host's lane went with the director"
+    );
+    let record = remote.remote_json();
+    assert_eq!(record["host"], "fake");
+    assert_eq!(record["lane_id"], remote.lane.id.as_str());
+    assert_eq!(record["director_pid"].as_u64(), Some(u64::from(run.id())));
+    assert_eq!(record["master_pid"].as_i64(), Some(master));
+    assert_eq!(record["remote_root"], remote.root.path().to_str().unwrap());
+    assert!(
+        record["director_start"]
+            .as_str()
+            .is_some_and(|s| !s.is_empty())
+    );
+    assert!(
+        record["master_start"]
+            .as_str()
+            .is_some_and(|s| !s.is_empty())
+    );
+    assert_eq!(record["finished"], false);
+
+    // The next run, for the same host and lanes root.
+    fs::write(flag.path().join("proceed"), "go\n").unwrap();
+    let second = unique_lane_id();
+    let out = finish(remote.second_command(&second));
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(
+        stderr.contains(&format!(
+            "swept the orphaned remote lane {}",
+            remote.lane.id
+        )),
+        "{stderr}"
+    );
+    assert_eq!(
+        stderr.matches("swept the orphaned remote lane").count(),
+        1,
+        "{stderr}"
+    );
+
+    assert_pid_gone(master);
+    assert!(
+        fs::symlink_metadata(remote.remote_lane()).is_err(),
+        "the orphan's lane is still on the host"
+    );
+    // The local lane is evidence: it stays, and says it was swept.
+    assert!(remote.lane.lane_dir().join("control").is_dir());
+    let record = remote.remote_json();
+    assert_eq!(record["swept"], true, "{record}");
+    assert_eq!(record["finished"], false, "{record}");
+    // And the second run proved.
+    let verdict: Value = serde_json::from_str(
+        &fs::read_to_string(
+            remote
+                .lane
+                .lanes
+                .path()
+                .canonicalize()
+                .unwrap()
+                .join(&second)
+                .join("control/verdict.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(verdict["verdict"], "proved", "{}", text(&out));
+}
+
+#[test]
+fn a_live_directors_lane_is_never_swept() {
+    if !sandbox_available() {
+        return;
+    }
+    let flag = var_tmp("cp-remote-flag-");
+    let remote = Remote::new(&hang_until_proceed(flag.path()), checks());
+    let _reaper = MasterReaper(remote.ssh_dir.path().join("log.jsonl"));
+    let (mut run, stderr) = start_hanging_run(&remote);
+    let master = remote.master_pid();
+
+    // A second director shares the lanes root while the first one is alive and busy.
+    fs::write(flag.path().join("proceed"), "go\n").unwrap();
+    let out = finish(remote.second_command(&unique_lane_id()));
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    assert!(
+        !String::from_utf8_lossy(&out.stderr).contains("swept"),
+        "{}",
+        text(&out)
+    );
+
+    assert!(run.try_wait().unwrap().is_none(), "the first run ended");
+    assert!(pid_alive(master), "the live director's master was stopped");
+    assert!(
+        remote.remote_lane().join("home/started").is_file(),
+        "the live director's lane was removed from the host"
+    );
+    assert_ne!(remote.remote_json()["swept"], true);
+
+    // End it the proper way; it cleans up after itself.
+    let out = output(Command::new("kill").args(["-TERM", &run.id().to_string()]));
+    assert!(out.status.success(), "{}", text(&out));
+    wait_run(&mut run, &stderr);
+    remote.assert_torn_down();
+}
+
+#[test]
+fn a_finished_lane_is_never_swept() {
+    if !sandbox_available() {
+        return;
+    }
+    let (remote, _out) = proved_run();
+    let record = remote.remote_json();
+    assert_eq!(record["finished"], true, "{record}");
+    assert_ne!(record["swept"], true);
+    let cleanups = |remote: &Remote| {
+        remote
+            .log()
+            .iter()
+            .filter(|e| {
+                e["event"] == "command-started"
+                    && e["command"].as_str().is_some_and(|c| {
+                        c.contains(" host-agent cleanup ") && c.contains(&remote.lane.id)
+                    })
+            })
+            .count()
+    };
+    assert_eq!(cleanups(&remote), 1, "the run's own cleanup");
+
+    let out = finish(remote.second_command(&unique_lane_id()));
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    assert!(
+        !String::from_utf8_lossy(&out.stderr).contains("swept"),
+        "{}",
+        text(&out)
+    );
+    assert_eq!(
+        cleanups(&remote),
+        1,
+        "a finished lane was cleaned up again by a sweep"
+    );
+    assert_ne!(remote.remote_json()["swept"], true);
 }

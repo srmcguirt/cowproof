@@ -153,7 +153,7 @@ pub struct Lane {
     /// The `HOME` of every cowproof child: the director store lives under it.
     pub home: TempDir,
     pub repo: PathBuf,
-    packet: PathBuf,
+    pub packet: PathBuf,
     fake: PathBuf,
     pub cowproof: PathBuf,
     /// Extra environment for every `cowproof` child (see [`Lane::set_env`]).
