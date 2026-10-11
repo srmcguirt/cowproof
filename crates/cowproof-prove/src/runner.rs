@@ -139,10 +139,67 @@ pub fn terminate_process_group(pgid: u32) {
 }
 
 fn signal_process_group(pgid: u32, signal: libc::c_int) {
-    // SAFETY: `kill(2)` takes two integers and touches no memory.
-    unsafe {
-        libc::kill(-(pgid as libc::pid_t), signal);
+    // A pgid of 0 would make `-pgid` the caller's own group.
+    if let Some(pgid) = positive_pid(pgid) {
+        // SAFETY: `kill(2)` takes two integers and touches no memory.
+        unsafe {
+            libc::kill(-pgid, signal);
+        }
     }
+}
+
+/// `id` as a positive `pid_t`, or `None` for 0 and anything too large. `kill(0, ..)` signals
+/// the caller's own group and `kill(-1, ..)` every process the caller may signal, so every
+/// function below goes through this before it reaches `kill(2)`.
+fn positive_pid(id: u32) -> Option<libc::pid_t> {
+    libc::pid_t::try_from(id).ok().filter(|p| *p > 0)
+}
+
+/// What `kill(target, 0)` says about `target` (a pid, or a negated pgid): EPERM means it
+/// exists and is not ours, ESRCH means it does not, and any other answer is unknown.
+fn target_exists(target: libc::pid_t) -> Option<bool> {
+    // SAFETY: signal 0 delivers nothing; `kill(2)` takes two integers and touches no memory.
+    let rc = unsafe { libc::kill(target, 0) };
+    if rc == 0 {
+        return Some(true);
+    }
+    match std::io::Error::last_os_error().raw_os_error() {
+        Some(libc::EPERM) => Some(true),
+        Some(libc::ESRCH) => Some(false),
+        _ => None,
+    }
+}
+
+/// Whether the process `pid` exists: `Some(false)` only when the system says there is no such
+/// process, `None` when it cannot be asked (including a pid that is 0 or not a valid pid). A
+/// zombie still exists.
+pub fn pid_exists(pid: u32) -> Option<bool> {
+    target_exists(positive_pid(pid)?)
+}
+
+/// Whether any process is left in the group `pgid`, answered like [`pid_exists`].
+pub fn group_exists(pgid: u32) -> Option<bool> {
+    target_exists(-positive_pid(pgid)?)
+}
+
+/// Send `signal` to the one process `pid`. Whether `kill(2)` accepted it; false, with nothing
+/// sent, for a pid that is 0 or not a valid pid.
+pub fn signal_pid(pid: u32, signal: libc::c_int) -> bool {
+    let Some(pid) = positive_pid(pid) else {
+        return false;
+    };
+    // SAFETY: `kill(2)` takes two integers and touches no memory; `pid` is positive.
+    unsafe { libc::kill(pid, signal) == 0 }
+}
+
+/// SIGTERM the one process `pid`: the polite first step before [`kill_pid`].
+pub fn terminate_pid(pid: u32) -> bool {
+    signal_pid(pid, libc::SIGTERM)
+}
+
+/// SIGKILL the one process `pid`.
+pub fn kill_pid(pid: u32) -> bool {
+    signal_pid(pid, libc::SIGKILL)
 }
 
 /// ProcessRunner executes checks by running `sh -c <command>` in the tree.
@@ -446,6 +503,57 @@ pub(crate) mod tests {
     use std::time::Instant;
 
     const LIMIT: Duration = Duration::from_secs(60);
+
+    #[test]
+    fn pid_and_group_exist_until_the_child_is_reaped() {
+        use std::os::unix::process::CommandExt;
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id();
+        assert_eq!(pid_exists(pid), Some(true));
+        assert_eq!(group_exists(pid), Some(true));
+        child.kill().expect("kill sleep");
+        child.wait().expect("reap sleep");
+        assert_eq!(pid_exists(pid), Some(false));
+        assert_eq!(group_exists(pid), Some(false));
+    }
+
+    #[test]
+    fn a_process_that_is_not_ours_exists() {
+        // Pid 1 answers EPERM (or 0 as root): it exists either way.
+        assert_eq!(pid_exists(1), Some(true));
+    }
+
+    #[test]
+    fn pid_zero_and_oversized_pids_are_refused_before_any_kill() {
+        assert_eq!(positive_pid(0), None);
+        assert_eq!(positive_pid(u32::MAX), None);
+        assert_eq!(positive_pid(1), Some(1));
+        assert_eq!(pid_exists(0), None);
+        assert_eq!(pid_exists(u32::MAX), None);
+        assert_eq!(group_exists(0), None);
+        assert_eq!(group_exists(u32::MAX), None);
+        // Signal 0 delivers nothing, so even a missing refusal cannot hurt this process
+        // (pid 0 is the caller's own group); the answer must still be false.
+        assert!(!signal_pid(0, 0));
+        assert!(!signal_pid(u32::MAX, 0));
+        // This process is still here and so is the test.
+        assert_eq!(pid_exists(std::process::id()), Some(true));
+    }
+
+    #[test]
+    fn signal_pid_signals_one_child_only() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+        assert!(kill_pid(child.id()));
+        let status = child.wait().expect("reap sleep");
+        assert!(!status.success());
+    }
 
     /// Poll until `kill(pid, 0)` reports ESRCH. A killed process is a zombie until its
     /// parent (or init, once reparented) reaps it, and `kill` still succeeds on a

@@ -35,11 +35,11 @@
 //! [`agent_command`], so the exact bytes are unit-tested here.
 
 use crate::host_agent::{
-    HOST_PROTOCOL, Identity, MAX_STDERR_FETCH, identity, process_start, signal_process,
-    write_json_atomic,
+    HOST_PROTOCOL, Identity, MAX_STDERR_FETCH, identity, process_start, write_json_atomic,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use cowproof_core::redact;
+use cowproof_prove::runner::{kill_pid, terminate_pid};
 use cowproof_run::lane::validate_lane_id;
 use cowproof_run::tools::CheckOutcome;
 use serde::{Deserialize, Serialize};
@@ -1318,12 +1318,12 @@ fn stop_master(record: &RemoteRecord) -> &'static str {
         Identity::Unknown => return "not verified, left running",
         Identity::Same => {}
     }
-    signal_process("TERM", pid);
+    terminate_pid(pid);
     if master_over(pid, start, MASTER_EXIT_WAIT) {
         return "stopped";
     }
     if identity(pid, start) == Identity::Same {
-        signal_process("KILL", pid);
+        kill_pid(pid);
     }
     if master_over(pid, start, MASTER_EXIT_WAIT) {
         "stopped"

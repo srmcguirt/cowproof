@@ -76,7 +76,9 @@ use crate::run::{
 };
 use anyhow::{Context, Result, anyhow, bail};
 use cowproof_core::{PORT_BASE, PORT_BLOCK_SIZE, redact};
-use cowproof_prove::runner::{kill_process_group, terminate_process_group};
+use cowproof_prove::runner::{
+    group_exists, kill_process_group, pid_exists, terminate_process_group,
+};
 use cowproof_run::bridge::bridge_port;
 use cowproof_run::lane::{LaneControl, PrepareOptions, prepare_lane, validate_lane_id};
 use cowproof_run::tools::MAX_OUTPUT;
@@ -934,31 +936,6 @@ pub(crate) fn write_json_atomic(path: &Path, value: &impl Serialize) -> Result<(
     Ok(())
 }
 
-/// Whether `kill -0 -- <target>` finds a process: `target` is a pid, or `-<pgid>` for a group.
-/// Only "No such process" means no; a permission error means something is there. The shell's
-/// own `kill` is used because this crate forbids `unsafe`, and its message is the same on the
-/// two platforms cowproof runs on.
-fn target_exists(target: &str) -> bool {
-    match Command::new("/bin/sh")
-        .args(["-c", r#"kill -0 -- "$0" 2>&1"#, target])
-        .output()
-    {
-        Ok(out) if out.status.success() => true,
-        Ok(out) => !String::from_utf8_lossy(&out.stdout).contains("No such process"),
-        // Cannot ask: assume it is there, which never leads to a signal.
-        Err(_) => true,
-    }
-}
-
-/// Send `signal` (`TERM`, `KILL`) to the one process `pid`; whether the shell accepted it.
-pub(crate) fn signal_process(signal: &str, pid: u32) -> bool {
-    Command::new("/bin/sh")
-        .args(["-c", r#"kill -"$0" -- "$1" 2>/dev/null"#, signal])
-        .arg(pid.to_string())
-        .status()
-        .is_ok_and(|s| s.success())
-}
-
 /// What is known about a process.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Proc {
@@ -1004,7 +981,8 @@ fn ps_info(pid: u32) -> Option<(char, String)> {
 
 /// Look at `pid` now.
 pub(crate) fn probe(pid: u32) -> Proc {
-    if !target_exists(&pid.to_string()) {
+    // `None` (cannot ask) is taken as there, which never leads to a signal.
+    if pid_exists(pid) == Some(false) {
         return Proc::Gone;
     }
     match proc_stat_info(pid).or_else(|| ps_info(pid)) {
@@ -1103,10 +1081,10 @@ fn group_state(record: &GroupRecord) -> GroupState {
         Identity::Other => GroupState::Replaced,
         Identity::Unknown => GroupState::Unverified,
         Identity::Gone => {
-            if target_exists(&format!("-{}", record.pgid)) {
-                GroupState::Orphans
-            } else {
+            if group_exists(record.pgid) == Some(false) {
                 GroupState::Gone
+            } else {
+                GroupState::Orphans
             }
         }
     }
@@ -1245,7 +1223,7 @@ impl Drop for Group {
             return;
         };
         let deadline = Instant::now() + GROUP_SETTLE;
-        while target_exists(&format!("-{}", self.pgid)) {
+        while group_exists(self.pgid) != Some(false) {
             if Instant::now() > deadline {
                 // Still there (a process that cannot be killed yet): the record stays, so
                 // `cleanup` finds the group.
@@ -1589,6 +1567,50 @@ mod tests {
         std::thread::sleep(Duration::from_millis(500));
         assert_eq!(identity(zombie.id(), Some(&start)), Identity::Gone);
         zombie.wait().unwrap();
+    }
+
+    #[test]
+    fn a_reaped_childs_pid_probes_as_gone_whatever_the_shell() {
+        let mut child = Command::new("true").spawn().unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        assert_eq!(probe(pid), Proc::Gone);
+        assert_eq!(identity(pid, Some("proc:1")), Identity::Gone);
+        assert_eq!(group_exists(pid), Some(false));
+    }
+
+    /// The shell line this crate used to ask "is it there" with. Its `--` is an error in dash
+    /// (Ubuntu's `/bin/sh`): the answer is "Illegal number", never "No such process", so every
+    /// dead pid read as alive. Run for the system `sh` (either message) and for `dash` itself
+    /// where it is installed.
+    #[test]
+    fn the_old_shell_line_cannot_tell_a_dead_pid_under_dash() {
+        let mut child = Command::new("true").spawn().unwrap();
+        let pid = child.id().to_string();
+        child.wait().unwrap();
+        let ask = |shell: &Path| -> String {
+            let out = Command::new(shell)
+                .args(["-c", r#"kill -0 -- "$0" 2>&1"#, &pid])
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+        let sh = ask(Path::new("/bin/sh"));
+        assert!(
+            sh.contains("No such process") || sh.contains("Illegal number"),
+            "unexpected /bin/sh answer: {sh:?}"
+        );
+        let dash = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+            .map(|d| d.join("dash"))
+            .find(|p| p.is_file());
+        match dash {
+            Some(dash) => {
+                let said = ask(&dash);
+                assert!(said.contains("Illegal number"), "dash said {said:?}");
+                assert!(!said.contains("No such process"), "dash said {said:?}");
+            }
+            None => eprintln!("note: dash is not on PATH, so its kill is not exercised"),
+        }
     }
 
     #[test]
