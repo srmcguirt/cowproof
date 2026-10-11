@@ -464,6 +464,7 @@ dependencies = [
  "async-trait",
  "portkit-core",
  "portkit-port",
+ "regex",
  "serde",
  "serde_json",
  "tempfile",

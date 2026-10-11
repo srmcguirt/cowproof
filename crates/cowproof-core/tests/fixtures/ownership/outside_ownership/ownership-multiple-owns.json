@@ -1,0 +1,23 @@
+{
+  "tool": "outside_ownership",
+  "id": "ownership-multiple-owns",
+  "input": {
+    "files": [
+      "a.txt",
+      "b.rs",
+      "c.md"
+    ],
+    "owns": [
+      "*.txt",
+      "*.rs"
+    ],
+    "protected": []
+  },
+  "expected": {
+    "outside": [
+      "c.md"
+    ]
+  },
+  "source": "node reference adapter (outsideOwnership of the Node lane runner with its always-protected .env globs; not distributed)",
+  "note": "several ownership globs"
+}

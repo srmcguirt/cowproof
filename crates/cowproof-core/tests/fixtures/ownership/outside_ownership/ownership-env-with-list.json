@@ -1,0 +1,26 @@
+{
+  "tool": "outside_ownership",
+  "id": "ownership-env-with-list",
+  "input": {
+    "files": [
+      ".env",
+      ".env.local",
+      "CLAUDE.md"
+    ],
+    "owns": [
+      "**"
+    ],
+    "protected": [
+      "CLAUDE.md"
+    ]
+  },
+  "expected": {
+    "outside": [
+      ".env",
+      ".env.local",
+      "CLAUDE.md"
+    ]
+  },
+  "source": "node reference adapter (outsideOwnership of the Node lane runner with its always-protected .env globs; not distributed)",
+  "note": "always-protected and listed globs together"
+}

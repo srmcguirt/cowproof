@@ -1,0 +1,23 @@
+{
+  "tool": "glob_matches",
+  "id": "glob-trailing-star-star-docs",
+  "input": {
+    "glob": "docs/**",
+    "probe": [
+      "docs/a",
+      "docs/a/b",
+      "docs",
+      "docs/"
+    ]
+  },
+  "expected": {
+    "matches": [
+      true,
+      true,
+      false,
+      true
+    ]
+  },
+  "source": "node reference adapter (globToRegExp of the Node lane runner, matched on probe paths; not distributed)",
+  "note": "docs/** matches everything below docs"
+}

@@ -1,0 +1,21 @@
+{
+  "tool": "glob_matches",
+  "id": "glob-space",
+  "input": {
+    "glob": "a b/*.md",
+    "probe": [
+      "a b/c.md",
+      "ab/c.md",
+      "a b/c/d.md"
+    ]
+  },
+  "expected": {
+    "matches": [
+      true,
+      false,
+      false
+    ]
+  },
+  "source": "node reference adapter (globToRegExp of the Node lane runner, matched on probe paths; not distributed)",
+  "note": "spaces are literal"
+}

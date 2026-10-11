@@ -1,0 +1,20 @@
+{
+  "tool": "outside_ownership",
+  "id": "ownership-star-star",
+  "input": {
+    "files": [
+      "a",
+      "a/b",
+      "a/b/c"
+    ],
+    "owns": [
+      "**"
+    ],
+    "protected": []
+  },
+  "expected": {
+    "outside": []
+  },
+  "source": "node reference adapter (outsideOwnership of the Node lane runner with its always-protected .env globs; not distributed)",
+  "note": "** owns everything"
+}

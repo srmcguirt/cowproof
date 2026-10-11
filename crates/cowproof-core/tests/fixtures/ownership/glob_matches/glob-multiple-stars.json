@@ -1,0 +1,23 @@
+{
+  "tool": "glob_matches",
+  "id": "glob-multiple-stars",
+  "input": {
+    "glob": "a*b*c",
+    "probe": [
+      "abc",
+      "aXbYc",
+      "a/b/c",
+      "aXb/c"
+    ]
+  },
+  "expected": {
+    "matches": [
+      true,
+      true,
+      false,
+      false
+    ]
+  },
+  "source": "node reference adapter (globToRegExp of the Node lane runner, matched on probe paths; not distributed)",
+  "note": "several single stars"
+}

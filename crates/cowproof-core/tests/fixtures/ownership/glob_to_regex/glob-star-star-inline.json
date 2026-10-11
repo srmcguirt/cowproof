@@ -1,0 +1,23 @@
+{
+  "tool": "glob_to_regex",
+  "id": "glob-star-star-inline",
+  "input": {
+    "glob": "a**b",
+    "probe": [
+      "ab",
+      "axb",
+      "a/x/b",
+      "a/b"
+    ]
+  },
+  "expected": {
+    "matches": [
+      true,
+      true,
+      true,
+      true
+    ]
+  },
+  "source": "node reference adapter (globToRegExp of the Node lane runner, matched on probe paths; not distributed)",
+  "note": "** without slashes is a greedy any-text"
+}

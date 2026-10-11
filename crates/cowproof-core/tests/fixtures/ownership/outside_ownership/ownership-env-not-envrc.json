@@ -1,0 +1,23 @@
+{
+  "tool": "outside_ownership",
+  "id": "ownership-env-not-envrc",
+  "input": {
+    "files": [
+      ".envrc",
+      "env",
+      ".environment",
+      "x.env"
+    ],
+    "owns": [
+      "**"
+    ],
+    "protected": []
+  },
+  "expected": {
+    "outside": [
+      "x.env"
+    ]
+  },
+  "source": "node reference adapter (outsideOwnership of the Node lane runner with its always-protected .env globs; not distributed)",
+  "note": "names that only resemble .env are not protected"
+}

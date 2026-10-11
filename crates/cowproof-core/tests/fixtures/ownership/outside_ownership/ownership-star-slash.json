@@ -1,0 +1,21 @@
+{
+  "tool": "outside_ownership",
+  "id": "ownership-star-slash",
+  "input": {
+    "files": [
+      "a/b.txt",
+      "c/d/e.txt"
+    ],
+    "owns": [
+      "*/b.txt"
+    ],
+    "protected": []
+  },
+  "expected": {
+    "outside": [
+      "c/d/e.txt"
+    ]
+  },
+  "source": "node reference adapter (outsideOwnership of the Node lane runner with its always-protected .env globs; not distributed)",
+  "note": "*/name"
+}

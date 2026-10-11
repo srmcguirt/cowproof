@@ -1,0 +1,13 @@
+{
+  "tool": "removed_lines",
+  "id": "removed-lines-preamble-dash-lines",
+  "input": {
+    "file": "test.txt",
+    "patch": "- not part of any file\n-- neither\ndiff --git a/test.txt b/test.txt\nindex 1234567..abcdefg 100644\n--- a/test.txt\n+++ b/test.txt\n@@ -1,2 +1,1 @@\n-a\n b"
+  },
+  "expected": {
+    "count": 1
+  },
+  "source": "node reference adapter (removedLines of the Node lane runner; not distributed)",
+  "note": "dash lines before the first diff block are ignored"
+}

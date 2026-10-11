@@ -1,0 +1,21 @@
+{
+  "tool": "glob_matches",
+  "id": "glob-trailing-slash",
+  "input": {
+    "glob": "a/",
+    "probe": [
+      "a/",
+      "a",
+      "a//"
+    ]
+  },
+  "expected": {
+    "matches": [
+      true,
+      false,
+      false
+    ]
+  },
+  "source": "node reference adapter (globToRegExp of the Node lane runner, matched on probe paths; not distributed)",
+  "note": "trailing slash is literal"
+}

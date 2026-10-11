@@ -1,0 +1,25 @@
+{
+  "tool": "glob_to_regex",
+  "id": "glob-question-pair",
+  "input": {
+    "glob": "a??b",
+    "probe": [
+      "aXYb",
+      "aXb",
+      "ab",
+      "aX/b",
+      "a/Xb"
+    ]
+  },
+  "expected": {
+    "matches": [
+      true,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "source": "node reference adapter (globToRegExp of the Node lane runner, matched on probe paths; not distributed)",
+  "note": "two ?"
+}

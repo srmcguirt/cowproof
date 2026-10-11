@@ -1,0 +1,24 @@
+{
+  "tool": "outside_ownership",
+  "id": "ownership-nested-src",
+  "input": {
+    "files": [
+      "src/a.rs",
+      "src/x/b.rs",
+      "src/x/c.txt",
+      "lib.rs"
+    ],
+    "owns": [
+      "src/**/*.rs"
+    ],
+    "protected": []
+  },
+  "expected": {
+    "outside": [
+      "src/x/c.txt",
+      "lib.rs"
+    ]
+  },
+  "source": "node reference adapter (outsideOwnership of the Node lane runner with its always-protected .env globs; not distributed)",
+  "note": "nested glob with an extension"
+}

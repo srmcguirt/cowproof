@@ -1,0 +1,21 @@
+{
+  "tool": "glob_matches",
+  "id": "glob-slash-only",
+  "input": {
+    "glob": "/",
+    "probe": [
+      "/",
+      "a/b",
+      "a"
+    ]
+  },
+  "expected": {
+    "matches": [
+      true,
+      false,
+      false
+    ]
+  },
+  "source": "node reference adapter (globToRegExp of the Node lane runner, matched on probe paths; not distributed)",
+  "note": "a lone slash"
+}

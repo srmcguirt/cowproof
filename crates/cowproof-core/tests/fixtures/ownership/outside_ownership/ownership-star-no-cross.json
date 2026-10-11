@@ -1,0 +1,21 @@
+{
+  "tool": "outside_ownership",
+  "id": "ownership-star-no-cross",
+  "input": {
+    "files": [
+      "a.txt",
+      "b/a.txt"
+    ],
+    "owns": [
+      "*.txt"
+    ],
+    "protected": []
+  },
+  "expected": {
+    "outside": [
+      "b/a.txt"
+    ]
+  },
+  "source": "node reference adapter (outsideOwnership of the Node lane runner with its always-protected .env globs; not distributed)",
+  "note": "* does not cross /"
+}

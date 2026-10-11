@@ -1,0 +1,21 @@
+{
+  "tool": "outside_ownership",
+  "id": "ownership-env-empty-protected",
+  "input": {
+    "files": [
+      ".env",
+      "src/main.rs"
+    ],
+    "owns": [
+      "src/**"
+    ],
+    "protected": []
+  },
+  "expected": {
+    "outside": [
+      ".env"
+    ]
+  },
+  "source": "node reference adapter (outsideOwnership of the Node lane runner with its always-protected .env globs; not distributed)",
+  "note": ".env is outside through ownership too"
+}

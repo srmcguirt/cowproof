@@ -1,0 +1,19 @@
+{
+  "tool": "removed_lines",
+  "id": "removed-lines-removed-text-starts-dashes",
+  "input": {
+    "file": "test.txt",
+    "patch": "diff --git a/test.txt b/test.txt\nindex 1234567..abcdefg 100644\n--- a/test.txt\n+++ b/test.txt\n@@ -1,3 +1,2 @@\n--- sql comment\n a\n b"
+  },
+  "expected": {
+    "count": 0
+  },
+  "source": "node reference adapter (removedLines of the Node lane runner; not distributed)",
+  "note": "a removed line whose text is \"-- sql comment\" gives a \"---\" line; Node counts 0, Rust counts 1 (accepted, ruling P4-R1)",
+  "accepted": [
+    {
+      "path": "/count",
+      "reason": "Node bug: treats an in-hunk removed line starting with `--` as a header; Rust is correct (ruling P4-R1)"
+    }
+  ]
+}

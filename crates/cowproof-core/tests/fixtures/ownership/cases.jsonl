@@ -1,0 +1,157 @@
+# Ownership parity cases. Capture against the Node reference with:
+#   PORTKIT_CAPTURE=1 PORTKIT_ADAPTER_CMD="node <adapter>" cargo test -p cowproof-core --test ownership_parity -- --ignored
+# Globs are compared by behaviour: each case lists probe paths and the result is one match flag per probe.
+# glob_to_regex runs the Rust regex source through the regex crate; glob_matches runs the matcher.
+# removed-lines-removed-text-starts-dashes carries an accepted difference on /count (Node bug, Rust correct; ruling P4-R1).
+# Not a case: the same file in two diff blocks (Node sums them, Rust counts the first). Not applicable, git never emits it (ruling P4-R1).
+{"tool":"glob_to_regex","id":"glob-star-star","input":{"glob":"**","probe":["a","b/c","d/e/f",".env",""]},"note":"** matches everything, including nested paths"}
+{"tool":"glob_to_regex","id":"glob-star-star-slash","input":{"glob":"**/test","probe":["test","a/test","a/b/test","test.md","atest"]},"note":"**/ matches zero or more directories; the slash is consumed so a bare suffix also matches"}
+{"tool":"glob_to_regex","id":"glob-star-star-slash-mid","input":{"glob":"a/**/b","probe":["a/b","a/x/b","a/x/y/b","a/xb","ab"]},"note":"**/ in the middle"}
+{"tool":"glob_to_regex","id":"glob-star-star-leading","input":{"glob":"**/test.rs","probe":["test.rs","a/test.rs","a/b/test.rs","atest.rs"]},"note":"** at start"}
+{"tool":"glob_to_regex","id":"glob-trailing-star-star","input":{"glob":"a/**","probe":["a","a/","a/b","a/b/c/d","ab","b/a/c"]},"note":"trailing /** needs the slash"}
+{"tool":"glob_to_regex","id":"glob-trailing-star-star-docs","input":{"glob":"docs/**","probe":["docs/a","docs/a/b","docs","docs/"]},"note":"docs/** matches everything below docs"}
+{"tool":"glob_to_regex","id":"glob-star-star-inline","input":{"glob":"a**b","probe":["ab","axb","a/x/b","a/b"]},"note":"** without slashes is a greedy any-text"}
+{"tool":"glob_to_regex","id":"glob-star-star-star","input":{"glob":"***","probe":["a","a/b"]},"note":"three stars: ** then *"}
+{"tool":"glob_to_regex","id":"glob-star-star-pair","input":{"glob":"**/**","probe":["a","a/b",""]},"note":"** pairs"}
+{"tool":"glob_to_regex","id":"glob-star-star-twice","input":{"glob":"a/**/**/b","probe":["a/b","a/x/b","a/x/y/b"]},"note":"two ** segments"}
+{"tool":"glob_to_regex","id":"glob-four-stars-slash","input":{"glob":"****/x","probe":["x","a/x","ax"]},"note":"four stars is two ** pairs"}
+{"tool":"glob_to_regex","id":"glob-single-star","input":{"glob":"*","probe":["a","a/b","",".hidden"]},"note":"* alone does not cross /"}
+{"tool":"glob_to_regex","id":"glob-star-ext","input":{"glob":"*.md","probe":["a.md","c/d.md",".md","md","a.mdx"]},"note":"* does not cross /"}
+{"tool":"glob_to_regex","id":"glob-star-start","input":{"glob":"*test.rs","probe":["test.rs","atest.rs","a/test.rs"]},"note":"* at start"}
+{"tool":"glob_to_regex","id":"glob-star-in-middle","input":{"glob":"a*/b","probe":["a/b","abc/b","a/b/c","a/x/b"]},"note":"* in the middle"}
+{"tool":"glob_to_regex","id":"glob-multiple-stars","input":{"glob":"a*b*c","probe":["abc","aXbYc","a/b/c","aXb/c"]},"note":"several single stars"}
+{"tool":"glob_to_regex","id":"glob-star-segment","input":{"glob":"src/*/test.rs","probe":["src/a/test.rs","src/a/b/test.rs","test.rs","src/test.rs"]},"note":"one directory level"}
+{"tool":"glob_to_regex","id":"glob-complex-docs","input":{"glob":"docs/**/*.md","probe":["docs/a.md","docs/a/b.md","docs/a/b/c.md","docs.md","a/docs/b.md","docs/a.txt"]},"note":"nested directories then an extension"}
+{"tool":"glob_to_regex","id":"glob-question","input":{"glob":"a?b","probe":["aXb","ab","a/b","acb","aXYb"]},"note":"? matches one character but not /"}
+{"tool":"glob_to_regex","id":"glob-question-only","input":{"glob":"?","probe":["a","/","ab",""]},"note":"single ? alone"}
+{"tool":"glob_to_regex","id":"glob-question-pair","input":{"glob":"a??b","probe":["aXYb","aXb","ab","aX/b","a/Xb"]},"note":"two ?"}
+{"tool":"glob_to_regex","id":"glob-question-slash","input":{"glob":"a?b","probe":["a/b"]},"note":"? never matches /"}
+{"tool":"glob_to_regex","id":"glob-dot-meta","input":{"glob":"a.b","probe":["a.b","axb","a/b"]},"note":". is literal"}
+{"tool":"glob_to_regex","id":"glob-plus-meta","input":{"glob":"a+b","probe":["a+b","aab","ab"]},"note":"+ is literal"}
+{"tool":"glob_to_regex","id":"glob-paren-meta","input":{"glob":"a(b)c","probe":["a(b)c","abc","a/b/c"]},"note":"() is literal"}
+{"tool":"glob_to_regex","id":"glob-bracket-meta","input":{"glob":"a[b]c","probe":["a[b]c","abc","a/b/c"]},"note":"[] is literal, not a character class"}
+{"tool":"glob_to_regex","id":"glob-brace-meta","input":{"glob":"a{1,2}b","probe":["a{1,2}b","a1b","a11b","ab"]},"note":"{} is literal, not a quantifier"}
+{"tool":"glob_to_regex","id":"glob-brace-alt","input":{"glob":"a{b,c}","probe":["a{b,c}","ab","ac"]},"note":"{a,b} is not alternation"}
+{"tool":"glob_to_regex","id":"glob-dollar-meta","input":{"glob":"a$b","probe":["a$b","ab"]},"note":"$ is literal"}
+{"tool":"glob_to_regex","id":"glob-caret-meta","input":{"glob":"a^b","probe":["a^b","ab"]},"note":"^ is literal"}
+{"tool":"glob_to_regex","id":"glob-pipe-meta","input":{"glob":"a|b","probe":["a|b","a","b","ab"]},"note":"| is literal, not alternation"}
+{"tool":"glob_to_regex","id":"glob-backslash-meta","input":{"glob":"a\\b","probe":["a\\b","ab","a/b"]},"note":"backslash is literal"}
+{"tool":"glob_to_regex","id":"glob-backslash-star","input":{"glob":"a\\*","probe":["a\\b","a\\","a*","a"]},"note":"backslash does not escape the star"}
+{"tool":"glob_to_regex","id":"glob-dollar-end","input":{"glob":"a.md$","probe":["a.md$","a.md","a.mdx"]},"note":"trailing $ is literal"}
+{"tool":"glob_to_regex","id":"glob-all-meta","input":{"glob":".+^${}()|[]\\/","probe":[".+^${}()|[]\\/","x"]},"note":"every escaped metacharacter together"}
+{"tool":"glob_to_regex","id":"glob-env-star","input":{"glob":".env*","probe":[".env",".env.local",".env.test","env","a/.env",".envrc"]},"note":".env* at the repository root"}
+{"tool":"glob_to_regex","id":"glob-env-dot-star","input":{"glob":".env.*","probe":[".env",".env.local",".envrc","a/.env.local"]},"note":".env.* needs the second dot"}
+{"tool":"glob_to_regex","id":"glob-env-nested","input":{"glob":"**/.env","probe":[".env","a/.env","a/b/.env","x.env","a/.env.local"]},"note":"**/.env at any depth"}
+{"tool":"glob_to_regex","id":"glob-empty","input":{"glob":"","probe":["","a","/"]},"note":"empty glob matches only the empty string"}
+{"tool":"glob_to_regex","id":"glob-slash-only","input":{"glob":"/","probe":["/","a/b","a"]},"note":"a lone slash"}
+{"tool":"glob_to_regex","id":"glob-leading-slash","input":{"glob":"/a","probe":["/a","a","//a"]},"note":"leading slash is literal"}
+{"tool":"glob_to_regex","id":"glob-trailing-slash","input":{"glob":"a/","probe":["a/","a","a//"]},"note":"trailing slash is literal"}
+{"tool":"glob_to_regex","id":"glob-double-slash","input":{"glob":"a//b","probe":["a/b","a//b"]},"note":"consecutive slashes are literal"}
+{"tool":"glob_to_regex","id":"glob-unicode-star","input":{"glob":"é*","probe":["éa","e","é","é/a"]},"note":"non-ASCII literal followed by *"}
+{"tool":"glob_to_regex","id":"glob-unicode-question","input":{"glob":"a?b","probe":["aéb","a/b"]},"note":"? matches one non-ASCII character"}
+{"tool":"glob_to_regex","id":"glob-space","input":{"glob":"a b/*.md","probe":["a b/c.md","ab/c.md","a b/c/d.md"]},"note":"spaces are literal"}
+{"tool":"glob_to_regex","id":"glob-dash-dot","input":{"glob":"a-b.c","probe":["a-b.c","a-bxc"]},"note":"hyphen and dot"}
+{"tool":"glob_to_regex","id":"glob-hash-amp","input":{"glob":"a#b&c~d","probe":["a#b&c~d","a#b&c","abc"]},"note":"characters that are special in some regex dialects"}
+{"tool":"glob_matches","id":"glob-star-star","input":{"glob":"**","probe":["a","b/c","d/e/f",".env",""]},"note":"** matches everything, including nested paths"}
+{"tool":"glob_matches","id":"glob-star-star-slash","input":{"glob":"**/test","probe":["test","a/test","a/b/test","test.md","atest"]},"note":"**/ matches zero or more directories; the slash is consumed so a bare suffix also matches"}
+{"tool":"glob_matches","id":"glob-star-star-slash-mid","input":{"glob":"a/**/b","probe":["a/b","a/x/b","a/x/y/b","a/xb","ab"]},"note":"**/ in the middle"}
+{"tool":"glob_matches","id":"glob-star-star-leading","input":{"glob":"**/test.rs","probe":["test.rs","a/test.rs","a/b/test.rs","atest.rs"]},"note":"** at start"}
+{"tool":"glob_matches","id":"glob-trailing-star-star","input":{"glob":"a/**","probe":["a","a/","a/b","a/b/c/d","ab","b/a/c"]},"note":"trailing /** needs the slash"}
+{"tool":"glob_matches","id":"glob-trailing-star-star-docs","input":{"glob":"docs/**","probe":["docs/a","docs/a/b","docs","docs/"]},"note":"docs/** matches everything below docs"}
+{"tool":"glob_matches","id":"glob-star-star-inline","input":{"glob":"a**b","probe":["ab","axb","a/x/b","a/b"]},"note":"** without slashes is a greedy any-text"}
+{"tool":"glob_matches","id":"glob-star-star-star","input":{"glob":"***","probe":["a","a/b"]},"note":"three stars: ** then *"}
+{"tool":"glob_matches","id":"glob-star-star-pair","input":{"glob":"**/**","probe":["a","a/b",""]},"note":"** pairs"}
+{"tool":"glob_matches","id":"glob-star-star-twice","input":{"glob":"a/**/**/b","probe":["a/b","a/x/b","a/x/y/b"]},"note":"two ** segments"}
+{"tool":"glob_matches","id":"glob-four-stars-slash","input":{"glob":"****/x","probe":["x","a/x","ax"]},"note":"four stars is two ** pairs"}
+{"tool":"glob_matches","id":"glob-single-star","input":{"glob":"*","probe":["a","a/b","",".hidden"]},"note":"* alone does not cross /"}
+{"tool":"glob_matches","id":"glob-star-ext","input":{"glob":"*.md","probe":["a.md","c/d.md",".md","md","a.mdx"]},"note":"* does not cross /"}
+{"tool":"glob_matches","id":"glob-star-start","input":{"glob":"*test.rs","probe":["test.rs","atest.rs","a/test.rs"]},"note":"* at start"}
+{"tool":"glob_matches","id":"glob-star-in-middle","input":{"glob":"a*/b","probe":["a/b","abc/b","a/b/c","a/x/b"]},"note":"* in the middle"}
+{"tool":"glob_matches","id":"glob-multiple-stars","input":{"glob":"a*b*c","probe":["abc","aXbYc","a/b/c","aXb/c"]},"note":"several single stars"}
+{"tool":"glob_matches","id":"glob-star-segment","input":{"glob":"src/*/test.rs","probe":["src/a/test.rs","src/a/b/test.rs","test.rs","src/test.rs"]},"note":"one directory level"}
+{"tool":"glob_matches","id":"glob-complex-docs","input":{"glob":"docs/**/*.md","probe":["docs/a.md","docs/a/b.md","docs/a/b/c.md","docs.md","a/docs/b.md","docs/a.txt"]},"note":"nested directories then an extension"}
+{"tool":"glob_matches","id":"glob-question","input":{"glob":"a?b","probe":["aXb","ab","a/b","acb","aXYb"]},"note":"? matches one character but not /"}
+{"tool":"glob_matches","id":"glob-question-only","input":{"glob":"?","probe":["a","/","ab",""]},"note":"single ? alone"}
+{"tool":"glob_matches","id":"glob-question-pair","input":{"glob":"a??b","probe":["aXYb","aXb","ab","aX/b","a/Xb"]},"note":"two ?"}
+{"tool":"glob_matches","id":"glob-question-slash","input":{"glob":"a?b","probe":["a/b"]},"note":"? never matches /"}
+{"tool":"glob_matches","id":"glob-dot-meta","input":{"glob":"a.b","probe":["a.b","axb","a/b"]},"note":". is literal"}
+{"tool":"glob_matches","id":"glob-plus-meta","input":{"glob":"a+b","probe":["a+b","aab","ab"]},"note":"+ is literal"}
+{"tool":"glob_matches","id":"glob-paren-meta","input":{"glob":"a(b)c","probe":["a(b)c","abc","a/b/c"]},"note":"() is literal"}
+{"tool":"glob_matches","id":"glob-bracket-meta","input":{"glob":"a[b]c","probe":["a[b]c","abc","a/b/c"]},"note":"[] is literal, not a character class"}
+{"tool":"glob_matches","id":"glob-brace-meta","input":{"glob":"a{1,2}b","probe":["a{1,2}b","a1b","a11b","ab"]},"note":"{} is literal, not a quantifier"}
+{"tool":"glob_matches","id":"glob-brace-alt","input":{"glob":"a{b,c}","probe":["a{b,c}","ab","ac"]},"note":"{a,b} is not alternation"}
+{"tool":"glob_matches","id":"glob-dollar-meta","input":{"glob":"a$b","probe":["a$b","ab"]},"note":"$ is literal"}
+{"tool":"glob_matches","id":"glob-caret-meta","input":{"glob":"a^b","probe":["a^b","ab"]},"note":"^ is literal"}
+{"tool":"glob_matches","id":"glob-pipe-meta","input":{"glob":"a|b","probe":["a|b","a","b","ab"]},"note":"| is literal, not alternation"}
+{"tool":"glob_matches","id":"glob-backslash-meta","input":{"glob":"a\\b","probe":["a\\b","ab","a/b"]},"note":"backslash is literal"}
+{"tool":"glob_matches","id":"glob-backslash-star","input":{"glob":"a\\*","probe":["a\\b","a\\","a*","a"]},"note":"backslash does not escape the star"}
+{"tool":"glob_matches","id":"glob-dollar-end","input":{"glob":"a.md$","probe":["a.md$","a.md","a.mdx"]},"note":"trailing $ is literal"}
+{"tool":"glob_matches","id":"glob-all-meta","input":{"glob":".+^${}()|[]\\/","probe":[".+^${}()|[]\\/","x"]},"note":"every escaped metacharacter together"}
+{"tool":"glob_matches","id":"glob-env-star","input":{"glob":".env*","probe":[".env",".env.local",".env.test","env","a/.env",".envrc"]},"note":".env* at the repository root"}
+{"tool":"glob_matches","id":"glob-env-dot-star","input":{"glob":".env.*","probe":[".env",".env.local",".envrc","a/.env.local"]},"note":".env.* needs the second dot"}
+{"tool":"glob_matches","id":"glob-env-nested","input":{"glob":"**/.env","probe":[".env","a/.env","a/b/.env","x.env","a/.env.local"]},"note":"**/.env at any depth"}
+{"tool":"glob_matches","id":"glob-empty","input":{"glob":"","probe":["","a","/"]},"note":"empty glob matches only the empty string"}
+{"tool":"glob_matches","id":"glob-slash-only","input":{"glob":"/","probe":["/","a/b","a"]},"note":"a lone slash"}
+{"tool":"glob_matches","id":"glob-leading-slash","input":{"glob":"/a","probe":["/a","a","//a"]},"note":"leading slash is literal"}
+{"tool":"glob_matches","id":"glob-trailing-slash","input":{"glob":"a/","probe":["a/","a","a//"]},"note":"trailing slash is literal"}
+{"tool":"glob_matches","id":"glob-double-slash","input":{"glob":"a//b","probe":["a/b","a//b"]},"note":"consecutive slashes are literal"}
+{"tool":"glob_matches","id":"glob-unicode-star","input":{"glob":"é*","probe":["éa","e","é","é/a"]},"note":"non-ASCII literal followed by *"}
+{"tool":"glob_matches","id":"glob-unicode-question","input":{"glob":"a?b","probe":["aéb","a/b"]},"note":"? matches one non-ASCII character"}
+{"tool":"glob_matches","id":"glob-space","input":{"glob":"a b/*.md","probe":["a b/c.md","ab/c.md","a b/c/d.md"]},"note":"spaces are literal"}
+{"tool":"glob_matches","id":"glob-dash-dot","input":{"glob":"a-b.c","probe":["a-b.c","a-bxc"]},"note":"hyphen and dot"}
+{"tool":"glob_matches","id":"glob-hash-amp","input":{"glob":"a#b&c~d","probe":["a#b&c~d","a#b&c","abc"]},"note":"characters that are special in some regex dialects"}
+{"tool":"removed_lines","id":"removed-lines-none","input":{"patch":"diff --git a/test.txt b/test.txt\nindex 1234567..abcdefg 100644\n--- a/test.txt\n+++ b/test.txt\n@@ -1,3 +1,3 @@\n a\n b\n c","file":"test.txt"},"note":"no removed lines"}
+{"tool":"removed_lines","id":"removed-lines-single","input":{"patch":"diff --git a/test.txt b/test.txt\nindex 1234567..abcdefg 100644\n--- a/test.txt\n+++ b/test.txt\n@@ -1,3 +1,2 @@\n-a\n b\n c","file":"test.txt"},"note":"one removed line"}
+{"tool":"removed_lines","id":"removed-lines-multiple","input":{"patch":"diff --git a/test.txt b/test.txt\nindex 1234567..abcdefg 100644\n--- a/test.txt\n+++ b/test.txt\n@@ -1,4 +1,2 @@\n-a\n-b\n c\n d","file":"test.txt"},"note":"two removed lines"}
+{"tool":"removed_lines","id":"removed-lines-header-not-counted","input":{"patch":"diff --git a/test.txt b/test.txt\nindex 1234567..abcdefg 100644\n--- a/test.txt\n+++ b/test.txt\n@@ -1 +1 @@\n-old\n+new","file":"test.txt"},"note":"the --- header is not counted; only the one hunk removal"}
+{"tool":"removed_lines","id":"removed-lines-header-only","input":{"patch":"diff --git a/test.txt b/test.txt\nindex 1234567..abcdefg 100644\n--- a/test.txt\n+++ b/test.txt\n","file":"test.txt"},"note":"headers and no hunks: the --- line is not a removal"}
+{"tool":"removed_lines","id":"removed-lines-multiple-hunks","input":{"patch":"diff --git a/test.txt b/test.txt\nindex 1234567..abcdefg 100644\n--- a/test.txt\n+++ b/test.txt\n@@ -1,2 +1,1 @@\n-a\n b\n@@ -5,2 +4,1 @@\n-c\n d","file":"test.txt"},"note":"counts across hunks"}
+{"tool":"removed_lines","id":"removed-lines-context-lines","input":{"patch":"diff --git a/test.txt b/test.txt\nindex 1234567..abcdefg 100644\n--- a/test.txt\n+++ b/test.txt\n@@ -1,5 +1,4 @@\n a\n-b\n c\n d\n e","file":"test.txt"},"note":"context lines are not removals"}
+{"tool":"removed_lines","id":"removed-lines-added-only","input":{"patch":"diff --git a/test.txt b/test.txt\nindex 1234567..abcdefg 100644\n--- a/test.txt\n+++ b/test.txt\n@@ -0,0 +1,2 @@\n+a\n+b","file":"test.txt"},"note":"an added file has no removals"}
+{"tool":"removed_lines","id":"removed-lines-deletion","input":{"patch":"diff --git a/test.txt b/test.txt\ndeleted file mode 100644\nindex 1234567..0000000\n--- a/test.txt\n+++ /dev/null\n@@ -1,3 +0,0 @@\n-a\n-b\n-c","file":"test.txt"},"note":"a deleted file counts every line"}
+{"tool":"removed_lines","id":"removed-lines-absent-file","input":{"patch":"diff --git a/foo.txt b/foo.txt\nindex 1234567..abcdefg 100644\n--- a/foo.txt\n+++ b/foo.txt\n@@ -1,2 +1,1 @@\n-a\n b","file":"missing.txt"},"note":"a file that is not in the patch"}
+{"tool":"removed_lines","id":"removed-lines-two-files-second","input":{"patch":"diff --git a/a.txt b/a.txt\nindex 1234567..abcdefg 100644\n--- a/a.txt\n+++ b/a.txt\n@@ -1,2 +1,1 @@\n-line1\n line2\ndiff --git a/b.txt b/b.txt\nindex 1234567..abcdefg 100644\n--- a/b.txt\n+++ b/b.txt\n@@ -1,2 +1,1 @@\n-removed\n kept","file":"b.txt"},"note":"two files: only the target is counted"}
+{"tool":"removed_lines","id":"removed-lines-two-files-first","input":{"patch":"diff --git a/a.txt b/a.txt\nindex 1234567..abcdefg 100644\n--- a/a.txt\n+++ b/a.txt\n@@ -1,3 +1,1 @@\n-line1\n-line2\n line3\ndiff --git a/b.txt b/b.txt\nindex 1234567..abcdefg 100644\n--- a/b.txt\n+++ b/b.txt\n@@ -1,2 +1,1 @@\n-removed\n kept","file":"a.txt"},"note":"two files, the first file"}
+{"tool":"removed_lines","id":"removed-lines-suffix-dir","input":{"patch":"diff --git a/x.txt b/x.txt\nindex 1234567..abcdefg 100644\n--- a/x.txt\n+++ b/x.txt\n@@ -1,2 +1,1 @@\n-a\n b\ndiff --git a/b/x.txt b/b/x.txt\nindex 1234567..abcdefg 100644\n--- a/b/x.txt\n+++ b/b/x.txt\n@@ -1,2 +1,1 @@\n-c\n-d\n e","file":"x.txt"},"note":"a file in another directory with the same name is not counted"}
+{"tool":"removed_lines","id":"removed-lines-suffix-name","input":{"patch":"diff --git a/ax b/ax\nindex 1234567..abcdefg 100644\n--- a/ax\n+++ b/ax\n@@ -1,2 +1,1 @@\n-a\n b","file":"x"},"note":"b/x versus b/ax: a longer name that ends the same way is not the file"}
+{"tool":"removed_lines","id":"removed-lines-suffix-name-hit","input":{"patch":"diff --git a/ax b/ax\nindex 1234567..abcdefg 100644\n--- a/ax\n+++ b/ax\n@@ -1,2 +1,1 @@\n-a\n b\ndiff --git a/x b/x\nindex 1234567..abcdefg 100644\n--- a/x\n+++ b/x\n@@ -1,2 +1,1 @@\n-c\n-d\n e","file":"x"},"note":"both b/ax and b/x present: only b/x counts"}
+{"tool":"removed_lines","id":"removed-lines-rename-pure","input":{"patch":"diff --git a/old.txt b/new.txt\nsimilarity index 100%\nrename from old.txt\nrename to new.txt","file":"new.txt"},"note":"a pure rename has no removed lines"}
+{"tool":"removed_lines","id":"removed-lines-rename-edit-new","input":{"patch":"diff --git a/old.txt b/new.txt\nsimilarity index 80%\nrename from old.txt\nrename to new.txt\nindex 1234567..abcdefg 100644\n--- a/old.txt\n+++ b/new.txt\n@@ -1,2 +1,2 @@\n-a\n+b\n c","file":"new.txt"},"note":"a rename with an edit is counted under the new name"}
+{"tool":"removed_lines","id":"removed-lines-rename-edit-old","input":{"patch":"diff --git a/old.txt b/new.txt\nsimilarity index 80%\nrename from old.txt\nrename to new.txt\nindex 1234567..abcdefg 100644\n--- a/old.txt\n+++ b/new.txt\n@@ -1,2 +1,2 @@\n-a\n+b\n c","file":"old.txt"},"note":"a rename is not counted under the old name"}
+{"tool":"removed_lines","id":"removed-lines-no-renames-pair","input":{"patch":"diff --git a/old.txt b/old.txt\nindex 1234567..abcdefg 100644\n--- a/old.txt\n+++ b/old.txt\n@@ -1,2 +0,0 @@\n-a\n-b\ndiff --git a/new.txt b/new.txt\nindex 1234567..abcdefg 100644\n--- a/new.txt\n+++ b/new.txt\n@@ -0,0 +1,2 @@\n+a\n+b","file":"old.txt"},"note":"no-renames form: delete half counts removals"}
+{"tool":"removed_lines","id":"removed-lines-binary","input":{"patch":"diff --git a/image.png b/image.png\nBinary files a/image.png and b/image.png differ","file":"image.png"},"note":"a binary file has no removals"}
+{"tool":"removed_lines","id":"removed-lines-empty-patch","input":{"patch":"","file":"test.txt"},"note":"empty patch"}
+{"tool":"removed_lines","id":"removed-lines-no-newline-marker","input":{"patch":"diff --git a/test.txt b/test.txt\nindex 1234567..abcdefg 100644\n--- a/test.txt\n+++ b/test.txt\n@@ -1,2 +1,2 @@\n-a\n\\ No newline at end of file\n+b\n\\ No newline at end of file","file":"test.txt"},"note":"the no-newline marker is not a removal"}
+{"tool":"removed_lines","id":"removed-lines-bare-minus","input":{"patch":"diff --git a/test.txt b/test.txt\nindex 1234567..abcdefg 100644\n--- a/test.txt\n+++ b/test.txt\n@@ -1,3 +1,1 @@\n-\n-\n a","file":"test.txt"},"note":"removing empty lines gives a bare - line"}
+{"tool":"removed_lines","id":"removed-lines-removed-single-dash-text","input":{"patch":"diff --git a/test.txt b/test.txt\nindex 1234567..abcdefg 100644\n--- a/test.txt\n+++ b/test.txt\n@@ -1,2 +1,1 @@\n--\n a","file":"test.txt"},"note":"removed text \"-\" gives a \"--\" line, which is not a header"}
+{"tool":"removed_lines","id":"removed-lines-preamble-dash-lines","input":{"patch":"- not part of any file\n-- neither\ndiff --git a/test.txt b/test.txt\nindex 1234567..abcdefg 100644\n--- a/test.txt\n+++ b/test.txt\n@@ -1,2 +1,1 @@\n-a\n b","file":"test.txt"},"note":"dash lines before the first diff block are ignored"}
+{"tool":"removed_lines","id":"removed-lines-context-starts-dashes","input":{"patch":"diff --git a/test.txt b/test.txt\nindex 1234567..abcdefg 100644\n--- a/test.txt\n+++ b/test.txt\n@@ -1,3 +1,2 @@\n-removed line\n --- markdown rule\n kept","file":"test.txt"},"note":"a context line with a leading space and --- is not a removal"}
+{"tool":"removed_lines","id":"removed-lines-added-starts-dashes","input":{"patch":"diff --git a/test.txt b/test.txt\nindex 1234567..abcdefg 100644\n--- a/test.txt\n+++ b/test.txt\n@@ -1,2 +1,3 @@\n a\n+--- added rule\n b","file":"test.txt"},"note":"an added line that starts with --- is not a removal"}
+{"tool":"removed_lines","id":"removed-lines-removed-text-starts-dashes","input":{"patch":"diff --git a/test.txt b/test.txt\nindex 1234567..abcdefg 100644\n--- a/test.txt\n+++ b/test.txt\n@@ -1,3 +1,2 @@\n--- sql comment\n a\n b","file":"test.txt"},"note":"a removed line whose text is \"-- sql comment\" gives a \"---\" line; Node counts 0, Rust counts 1 (accepted, ruling P4-R1)"}
+{"tool":"outside_ownership","id":"ownership-simple","input":{"files":["a.txt","b.txt"],"owns":["*.txt"],"protected":[]},"note":"all owned"}
+{"tool":"outside_ownership","id":"ownership-unowned","input":{"files":["a.rs","b.txt"],"owns":["*.txt"],"protected":[]},"note":"an unowned file is outside"}
+{"tool":"outside_ownership","id":"ownership-no-files","input":{"files":[],"owns":["**"],"protected":[]},"note":"no files"}
+{"tool":"outside_ownership","id":"ownership-empty-owns","input":{"files":["a.txt","b.rs"],"owns":[],"protected":[]},"note":"empty owns: nothing is owned"}
+{"tool":"outside_ownership","id":"ownership-multiple-owns","input":{"files":["a.txt","b.rs","c.md"],"owns":["*.txt","*.rs"],"protected":[]},"note":"several ownership globs"}
+{"tool":"outside_ownership","id":"ownership-star-star","input":{"files":["a","a/b","a/b/c"],"owns":["**"],"protected":[]},"note":"** owns everything"}
+{"tool":"outside_ownership","id":"ownership-nested-glob","input":{"files":["a/b.txt","a/c/d.txt","e.txt"],"owns":["a/**/*.txt"],"protected":[]},"note":"nested glob owns below a/"}
+{"tool":"outside_ownership","id":"ownership-nested-src","input":{"files":["src/a.rs","src/x/b.rs","src/x/c.txt","lib.rs"],"owns":["src/**/*.rs"],"protected":[]},"note":"nested glob with an extension"}
+{"tool":"outside_ownership","id":"ownership-star-no-cross","input":{"files":["a.txt","b/a.txt"],"owns":["*.txt"],"protected":[]},"note":"* does not cross /"}
+{"tool":"outside_ownership","id":"ownership-star-slash","input":{"files":["a/b.txt","c/d/e.txt"],"owns":["*/b.txt"],"protected":[]},"note":"*/name"}
+{"tool":"outside_ownership","id":"ownership-protected-wins","input":{"files":["docs/a.md","src/main.rs"],"owns":["**"],"protected":["docs/**"]},"note":"protected beats owns"}
+{"tool":"outside_ownership","id":"ownership-protected-only-unowned","input":{"files":["docs/a.md"],"owns":[],"protected":["docs/**"]},"note":"protected and unowned"}
+{"tool":"outside_ownership","id":"ownership-protected-exact","input":{"files":["CLAUDE.md","src/CLAUDE.md"],"owns":["**"],"protected":["CLAUDE.md"]},"note":"an exact protected name matches only the root file"}
+{"tool":"outside_ownership","id":"ownership-protected-deep","input":{"files":["a/secrets/k","a/b/secrets/k","a/k"],"owns":["**"],"protected":["**/secrets/**"]},"note":"protected at any depth"}
+{"tool":"outside_ownership","id":"ownership-protected-github","input":{"files":[".github/workflows/test.yml","src/lib.rs"],"owns":["src/**"],"protected":[".github/**"]},"note":"protected and unowned both outside"}
+{"tool":"outside_ownership","id":"ownership-readme","input":{"files":["README.md","docs/README.md"],"owns":["*.md"],"protected":["docs/**"]},"note":"README owned at the root, docs protected"}
+{"tool":"outside_ownership","id":"ownership-env-unlisted","input":{"files":[".env",".env.local","src/main.rs"],"owns":["**"],"protected":[]},"note":".env files are protected without being listed"}
+{"tool":"outside_ownership","id":"ownership-env-unlisted-nested","input":{"files":["config/.env","a/b/.env.production","a/.env"],"owns":["**"],"protected":[]},"note":".env files are protected at any depth"}
+{"tool":"outside_ownership","id":"ownership-env-not-envrc","input":{"files":[".envrc","env",".environment","x.env"],"owns":["**"],"protected":[]},"note":"names that only resemble .env are not protected"}
+{"tool":"outside_ownership","id":"ownership-env-with-list","input":{"files":[".env",".env.local","CLAUDE.md"],"owns":["**"],"protected":["CLAUDE.md"]},"note":"always-protected and listed globs together"}
+{"tool":"outside_ownership","id":"ownership-env-protected-wins","input":{"files":[".env"],"owns":["**"],"protected":[".env*"]},"note":".env is protected and owned"}
+{"tool":"outside_ownership","id":"ownership-env-empty-protected","input":{"files":[".env","src/main.rs"],"owns":["src/**"],"protected":[]},"note":".env is outside through ownership too"}
+{"tool":"outside_ownership","id":"ownership-mixed","input":{"files":[".env",".github/workflows/test.yml","src/lib.rs"],"owns":["src/**"],"protected":[".github/**"]},"note":"protected and unowned"}
+{"tool":"outside_ownership","id":"ownership-duplicates","input":{"files":["a.txt","a.txt","b.rs","b.rs"],"owns":["*.txt"],"protected":[]},"note":"duplicates are kept in order"}
+{"tool":"outside_ownership","id":"ownership-order","input":{"files":["z.rs","a.rs","m.txt","b.rs"],"owns":["*.txt"],"protected":[]},"note":"order is preserved"}
+{"tool":"outside_ownership","id":"ownership-case-sensitive","input":{"files":["A.TXT","a.txt"],"owns":["*.txt"],"protected":[]},"note":"matching is case sensitive"}
+{"tool":"outside_ownership","id":"ownership-dir-prefix","input":{"files":["src","src/a.rs","srcx/a.rs"],"owns":["src/**"],"protected":[]},"note":"src/** needs the slash"}

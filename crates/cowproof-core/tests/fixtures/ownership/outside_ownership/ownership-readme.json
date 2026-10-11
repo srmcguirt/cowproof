@@ -1,0 +1,23 @@
+{
+  "tool": "outside_ownership",
+  "id": "ownership-readme",
+  "input": {
+    "files": [
+      "README.md",
+      "docs/README.md"
+    ],
+    "owns": [
+      "*.md"
+    ],
+    "protected": [
+      "docs/**"
+    ]
+  },
+  "expected": {
+    "outside": [
+      "docs/README.md"
+    ]
+  },
+  "source": "node reference adapter (outsideOwnership of the Node lane runner with its always-protected .env globs; not distributed)",
+  "note": "README owned at the root, docs protected"
+}

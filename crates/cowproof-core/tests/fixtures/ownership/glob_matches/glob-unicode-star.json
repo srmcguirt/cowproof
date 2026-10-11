@@ -1,0 +1,23 @@
+{
+  "tool": "glob_matches",
+  "id": "glob-unicode-star",
+  "input": {
+    "glob": "é*",
+    "probe": [
+      "éa",
+      "e",
+      "é",
+      "é/a"
+    ]
+  },
+  "expected": {
+    "matches": [
+      true,
+      false,
+      true,
+      false
+    ]
+  },
+  "source": "node reference adapter (globToRegExp of the Node lane runner, matched on probe paths; not distributed)",
+  "note": "non-ASCII literal followed by *"
+}

@@ -1,0 +1,21 @@
+{
+  "tool": "glob_matches",
+  "id": "glob-empty",
+  "input": {
+    "glob": "",
+    "probe": [
+      "",
+      "a",
+      "/"
+    ]
+  },
+  "expected": {
+    "matches": [
+      true,
+      false,
+      false
+    ]
+  },
+  "source": "node reference adapter (globToRegExp of the Node lane runner, matched on probe paths; not distributed)",
+  "note": "empty glob matches only the empty string"
+}

@@ -1,0 +1,19 @@
+{
+  "tool": "glob_matches",
+  "id": "glob-caret-meta",
+  "input": {
+    "glob": "a^b",
+    "probe": [
+      "a^b",
+      "ab"
+    ]
+  },
+  "expected": {
+    "matches": [
+      true,
+      false
+    ]
+  },
+  "source": "node reference adapter (globToRegExp of the Node lane runner, matched on probe paths; not distributed)",
+  "note": "^ is literal"
+}

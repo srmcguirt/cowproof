@@ -1,0 +1,21 @@
+{
+  "tool": "glob_matches",
+  "id": "glob-star-star-twice",
+  "input": {
+    "glob": "a/**/**/b",
+    "probe": [
+      "a/b",
+      "a/x/b",
+      "a/x/y/b"
+    ]
+  },
+  "expected": {
+    "matches": [
+      true,
+      true,
+      true
+    ]
+  },
+  "source": "node reference adapter (globToRegExp of the Node lane runner, matched on probe paths; not distributed)",
+  "note": "two ** segments"
+}

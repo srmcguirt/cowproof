@@ -1,0 +1,13 @@
+{
+  "tool": "removed_lines",
+  "id": "removed-lines-rename-pure",
+  "input": {
+    "file": "new.txt",
+    "patch": "diff --git a/old.txt b/new.txt\nsimilarity index 100%\nrename from old.txt\nrename to new.txt"
+  },
+  "expected": {
+    "count": 0
+  },
+  "source": "node reference adapter (removedLines of the Node lane runner; not distributed)",
+  "note": "a pure rename has no removed lines"
+}

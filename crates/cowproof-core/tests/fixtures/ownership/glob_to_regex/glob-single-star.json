@@ -1,0 +1,23 @@
+{
+  "tool": "glob_to_regex",
+  "id": "glob-single-star",
+  "input": {
+    "glob": "*",
+    "probe": [
+      "a",
+      "a/b",
+      "",
+      ".hidden"
+    ]
+  },
+  "expected": {
+    "matches": [
+      true,
+      false,
+      true,
+      true
+    ]
+  },
+  "source": "node reference adapter (globToRegExp of the Node lane runner, matched on probe paths; not distributed)",
+  "note": "* alone does not cross /"
+}

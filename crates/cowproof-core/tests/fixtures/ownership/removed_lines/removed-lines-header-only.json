@@ -1,0 +1,13 @@
+{
+  "tool": "removed_lines",
+  "id": "removed-lines-header-only",
+  "input": {
+    "file": "test.txt",
+    "patch": "diff --git a/test.txt b/test.txt\nindex 1234567..abcdefg 100644\n--- a/test.txt\n+++ b/test.txt\n"
+  },
+  "expected": {
+    "count": 0
+  },
+  "source": "node reference adapter (removedLines of the Node lane runner; not distributed)",
+  "note": "headers and no hunks: the --- line is not a removal"
+}

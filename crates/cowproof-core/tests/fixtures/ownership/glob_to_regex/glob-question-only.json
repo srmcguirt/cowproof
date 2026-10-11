@@ -1,0 +1,23 @@
+{
+  "tool": "glob_to_regex",
+  "id": "glob-question-only",
+  "input": {
+    "glob": "?",
+    "probe": [
+      "a",
+      "/",
+      "ab",
+      ""
+    ]
+  },
+  "expected": {
+    "matches": [
+      true,
+      false,
+      false,
+      false
+    ]
+  },
+  "source": "node reference adapter (globToRegExp of the Node lane runner, matched on probe paths; not distributed)",
+  "note": "single ? alone"
+}

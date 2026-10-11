@@ -1,0 +1,19 @@
+{
+  "tool": "glob_matches",
+  "id": "glob-all-meta",
+  "input": {
+    "glob": ".+^${}()|[]\\/",
+    "probe": [
+      ".+^${}()|[]\\/",
+      "x"
+    ]
+  },
+  "expected": {
+    "matches": [
+      true,
+      false
+    ]
+  },
+  "source": "node reference adapter (globToRegExp of the Node lane runner, matched on probe paths; not distributed)",
+  "note": "every escaped metacharacter together"
+}

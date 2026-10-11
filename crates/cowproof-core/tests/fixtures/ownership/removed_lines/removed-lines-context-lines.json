@@ -1,0 +1,13 @@
+{
+  "tool": "removed_lines",
+  "id": "removed-lines-context-lines",
+  "input": {
+    "file": "test.txt",
+    "patch": "diff --git a/test.txt b/test.txt\nindex 1234567..abcdefg 100644\n--- a/test.txt\n+++ b/test.txt\n@@ -1,5 +1,4 @@\n a\n-b\n c\n d\n e"
+  },
+  "expected": {
+    "count": 1
+  },
+  "source": "node reference adapter (removedLines of the Node lane runner; not distributed)",
+  "note": "context lines are not removals"
+}

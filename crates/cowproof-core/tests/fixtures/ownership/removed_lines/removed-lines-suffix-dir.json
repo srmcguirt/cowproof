@@ -1,0 +1,13 @@
+{
+  "tool": "removed_lines",
+  "id": "removed-lines-suffix-dir",
+  "input": {
+    "file": "x.txt",
+    "patch": "diff --git a/x.txt b/x.txt\nindex 1234567..abcdefg 100644\n--- a/x.txt\n+++ b/x.txt\n@@ -1,2 +1,1 @@\n-a\n b\ndiff --git a/b/x.txt b/b/x.txt\nindex 1234567..abcdefg 100644\n--- a/b/x.txt\n+++ b/b/x.txt\n@@ -1,2 +1,1 @@\n-c\n-d\n e"
+  },
+  "expected": {
+    "count": 1
+  },
+  "source": "node reference adapter (removedLines of the Node lane runner; not distributed)",
+  "note": "a file in another directory with the same name is not counted"
+}

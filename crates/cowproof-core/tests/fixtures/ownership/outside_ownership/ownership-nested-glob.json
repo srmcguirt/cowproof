@@ -1,0 +1,22 @@
+{
+  "tool": "outside_ownership",
+  "id": "ownership-nested-glob",
+  "input": {
+    "files": [
+      "a/b.txt",
+      "a/c/d.txt",
+      "e.txt"
+    ],
+    "owns": [
+      "a/**/*.txt"
+    ],
+    "protected": []
+  },
+  "expected": {
+    "outside": [
+      "e.txt"
+    ]
+  },
+  "source": "node reference adapter (outsideOwnership of the Node lane runner with its always-protected .env globs; not distributed)",
+  "note": "nested glob owns below a/"
+}

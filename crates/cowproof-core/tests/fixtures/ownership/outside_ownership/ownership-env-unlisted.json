@@ -1,0 +1,23 @@
+{
+  "tool": "outside_ownership",
+  "id": "ownership-env-unlisted",
+  "input": {
+    "files": [
+      ".env",
+      ".env.local",
+      "src/main.rs"
+    ],
+    "owns": [
+      "**"
+    ],
+    "protected": []
+  },
+  "expected": {
+    "outside": [
+      ".env",
+      ".env.local"
+    ]
+  },
+  "source": "node reference adapter (outsideOwnership of the Node lane runner with its always-protected .env globs; not distributed)",
+  "note": ".env files are protected without being listed"
+}

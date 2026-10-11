@@ -1,0 +1,21 @@
+{
+  "tool": "glob_matches",
+  "id": "glob-backslash-meta",
+  "input": {
+    "glob": "a\\b",
+    "probe": [
+      "a\\b",
+      "ab",
+      "a/b"
+    ]
+  },
+  "expected": {
+    "matches": [
+      true,
+      false,
+      false
+    ]
+  },
+  "source": "node reference adapter (globToRegExp of the Node lane runner, matched on probe paths; not distributed)",
+  "note": "backslash is literal"
+}

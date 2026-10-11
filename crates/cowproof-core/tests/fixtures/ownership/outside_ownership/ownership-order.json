@@ -1,0 +1,25 @@
+{
+  "tool": "outside_ownership",
+  "id": "ownership-order",
+  "input": {
+    "files": [
+      "z.rs",
+      "a.rs",
+      "m.txt",
+      "b.rs"
+    ],
+    "owns": [
+      "*.txt"
+    ],
+    "protected": []
+  },
+  "expected": {
+    "outside": [
+      "z.rs",
+      "a.rs",
+      "b.rs"
+    ]
+  },
+  "source": "node reference adapter (outsideOwnership of the Node lane runner with its always-protected .env globs; not distributed)",
+  "note": "order is preserved"
+}

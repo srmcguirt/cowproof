@@ -1,0 +1,21 @@
+{
+  "tool": "outside_ownership",
+  "id": "ownership-case-sensitive",
+  "input": {
+    "files": [
+      "A.TXT",
+      "a.txt"
+    ],
+    "owns": [
+      "*.txt"
+    ],
+    "protected": []
+  },
+  "expected": {
+    "outside": [
+      "A.TXT"
+    ]
+  },
+  "source": "node reference adapter (outsideOwnership of the Node lane runner with its always-protected .env globs; not distributed)",
+  "note": "matching is case sensitive"
+}

@@ -1,0 +1,23 @@
+{
+  "tool": "glob_to_regex",
+  "id": "glob-env-dot-star",
+  "input": {
+    "glob": ".env.*",
+    "probe": [
+      ".env",
+      ".env.local",
+      ".envrc",
+      "a/.env.local"
+    ]
+  },
+  "expected": {
+    "matches": [
+      false,
+      true,
+      false,
+      false
+    ]
+  },
+  "source": "node reference adapter (globToRegExp of the Node lane runner, matched on probe paths; not distributed)",
+  "note": ".env.* needs the second dot"
+}

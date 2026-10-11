@@ -1,0 +1,27 @@
+{
+  "tool": "glob_matches",
+  "id": "glob-env-star",
+  "input": {
+    "glob": ".env*",
+    "probe": [
+      ".env",
+      ".env.local",
+      ".env.test",
+      "env",
+      "a/.env",
+      ".envrc"
+    ]
+  },
+  "expected": {
+    "matches": [
+      true,
+      true,
+      true,
+      false,
+      false,
+      true
+    ]
+  },
+  "source": "node reference adapter (globToRegExp of the Node lane runner, matched on probe paths; not distributed)",
+  "note": ".env* at the repository root"
+}

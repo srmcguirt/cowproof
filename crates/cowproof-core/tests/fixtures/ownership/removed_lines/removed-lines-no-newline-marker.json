@@ -1,0 +1,13 @@
+{
+  "tool": "removed_lines",
+  "id": "removed-lines-no-newline-marker",
+  "input": {
+    "file": "test.txt",
+    "patch": "diff --git a/test.txt b/test.txt\nindex 1234567..abcdefg 100644\n--- a/test.txt\n+++ b/test.txt\n@@ -1,2 +1,2 @@\n-a\n\\ No newline at end of file\n+b\n\\ No newline at end of file"
+  },
+  "expected": {
+    "count": 1
+  },
+  "source": "node reference adapter (removedLines of the Node lane runner; not distributed)",
+  "note": "the no-newline marker is not a removal"
+}

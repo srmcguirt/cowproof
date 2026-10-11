@@ -1,0 +1,21 @@
+{
+  "tool": "glob_to_regex",
+  "id": "glob-hash-amp",
+  "input": {
+    "glob": "a#b&c~d",
+    "probe": [
+      "a#b&c~d",
+      "a#b&c",
+      "abc"
+    ]
+  },
+  "expected": {
+    "matches": [
+      true,
+      false,
+      false
+    ]
+  },
+  "source": "node reference adapter (globToRegExp of the Node lane runner, matched on probe paths; not distributed)",
+  "note": "characters that are special in some regex dialects"
+}

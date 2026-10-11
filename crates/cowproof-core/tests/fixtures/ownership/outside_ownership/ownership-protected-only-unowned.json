@@ -1,0 +1,20 @@
+{
+  "tool": "outside_ownership",
+  "id": "ownership-protected-only-unowned",
+  "input": {
+    "files": [
+      "docs/a.md"
+    ],
+    "owns": [],
+    "protected": [
+      "docs/**"
+    ]
+  },
+  "expected": {
+    "outside": [
+      "docs/a.md"
+    ]
+  },
+  "source": "node reference adapter (outsideOwnership of the Node lane runner with its always-protected .env globs; not distributed)",
+  "note": "protected and unowned"
+}

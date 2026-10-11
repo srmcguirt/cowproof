@@ -1,0 +1,25 @@
+{
+  "tool": "glob_matches",
+  "id": "glob-env-nested",
+  "input": {
+    "glob": "**/.env",
+    "probe": [
+      ".env",
+      "a/.env",
+      "a/b/.env",
+      "x.env",
+      "a/.env.local"
+    ]
+  },
+  "expected": {
+    "matches": [
+      true,
+      true,
+      true,
+      true,
+      false
+    ]
+  },
+  "source": "node reference adapter (globToRegExp of the Node lane runner, matched on probe paths; not distributed)",
+  "note": "**/.env at any depth"
+}

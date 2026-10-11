@@ -1,0 +1,22 @@
+{
+  "tool": "outside_ownership",
+  "id": "ownership-env-protected-wins",
+  "input": {
+    "files": [
+      ".env"
+    ],
+    "owns": [
+      "**"
+    ],
+    "protected": [
+      ".env*"
+    ]
+  },
+  "expected": {
+    "outside": [
+      ".env"
+    ]
+  },
+  "source": "node reference adapter (outsideOwnership of the Node lane runner with its always-protected .env globs; not distributed)",
+  "note": ".env is protected and owned"
+}

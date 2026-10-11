@@ -1,0 +1,25 @@
+{
+  "tool": "glob_to_regex",
+  "id": "glob-star-star-slash",
+  "input": {
+    "glob": "**/test",
+    "probe": [
+      "test",
+      "a/test",
+      "a/b/test",
+      "test.md",
+      "atest"
+    ]
+  },
+  "expected": {
+    "matches": [
+      true,
+      true,
+      true,
+      false,
+      true
+    ]
+  },
+  "source": "node reference adapter (globToRegExp of the Node lane runner, matched on probe paths; not distributed)",
+  "note": "**/ matches zero or more directories; the slash is consumed so a bare suffix also matches"
+}

@@ -17,3 +17,4 @@ tempfile.workspace = true
 portkit-core = { path = "../portkit/core" }
 portkit-port = { path = "../portkit/port" }
 async-trait.workspace = true
+regex.workspace = true

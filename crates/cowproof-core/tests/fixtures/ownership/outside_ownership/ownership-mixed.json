@@ -1,0 +1,25 @@
+{
+  "tool": "outside_ownership",
+  "id": "ownership-mixed",
+  "input": {
+    "files": [
+      ".env",
+      ".github/workflows/test.yml",
+      "src/lib.rs"
+    ],
+    "owns": [
+      "src/**"
+    ],
+    "protected": [
+      ".github/**"
+    ]
+  },
+  "expected": {
+    "outside": [
+      ".env",
+      ".github/workflows/test.yml"
+    ]
+  },
+  "source": "node reference adapter (outsideOwnership of the Node lane runner with its always-protected .env globs; not distributed)",
+  "note": "protected and unowned"
+}

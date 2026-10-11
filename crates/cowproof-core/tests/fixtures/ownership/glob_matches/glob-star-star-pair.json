@@ -1,0 +1,21 @@
+{
+  "tool": "glob_matches",
+  "id": "glob-star-star-pair",
+  "input": {
+    "glob": "**/**",
+    "probe": [
+      "a",
+      "a/b",
+      ""
+    ]
+  },
+  "expected": {
+    "matches": [
+      true,
+      true,
+      true
+    ]
+  },
+  "source": "node reference adapter (globToRegExp of the Node lane runner, matched on probe paths; not distributed)",
+  "note": "** pairs"
+}

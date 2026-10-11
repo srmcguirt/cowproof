@@ -1,0 +1,23 @@
+{
+  "tool": "glob_matches",
+  "id": "glob-backslash-star",
+  "input": {
+    "glob": "a\\*",
+    "probe": [
+      "a\\b",
+      "a\\",
+      "a*",
+      "a"
+    ]
+  },
+  "expected": {
+    "matches": [
+      true,
+      true,
+      false,
+      false
+    ]
+  },
+  "source": "node reference adapter (globToRegExp of the Node lane runner, matched on probe paths; not distributed)",
+  "note": "backslash does not escape the star"
+}

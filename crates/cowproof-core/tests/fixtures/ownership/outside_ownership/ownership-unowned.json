@@ -1,0 +1,21 @@
+{
+  "tool": "outside_ownership",
+  "id": "ownership-unowned",
+  "input": {
+    "files": [
+      "a.rs",
+      "b.txt"
+    ],
+    "owns": [
+      "*.txt"
+    ],
+    "protected": []
+  },
+  "expected": {
+    "outside": [
+      "a.rs"
+    ]
+  },
+  "source": "node reference adapter (outsideOwnership of the Node lane runner with its always-protected .env globs; not distributed)",
+  "note": "an unowned file is outside"
+}

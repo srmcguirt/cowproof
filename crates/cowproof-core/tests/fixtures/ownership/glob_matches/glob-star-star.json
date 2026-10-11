@@ -1,0 +1,25 @@
+{
+  "tool": "glob_matches",
+  "id": "glob-star-star",
+  "input": {
+    "glob": "**",
+    "probe": [
+      "a",
+      "b/c",
+      "d/e/f",
+      ".env",
+      ""
+    ]
+  },
+  "expected": {
+    "matches": [
+      true,
+      true,
+      true,
+      true,
+      true
+    ]
+  },
+  "source": "node reference adapter (globToRegExp of the Node lane runner, matched on probe paths; not distributed)",
+  "note": "** matches everything, including nested paths"
+}

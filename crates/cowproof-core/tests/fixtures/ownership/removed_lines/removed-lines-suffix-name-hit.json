@@ -1,0 +1,13 @@
+{
+  "tool": "removed_lines",
+  "id": "removed-lines-suffix-name-hit",
+  "input": {
+    "file": "x",
+    "patch": "diff --git a/ax b/ax\nindex 1234567..abcdefg 100644\n--- a/ax\n+++ b/ax\n@@ -1,2 +1,1 @@\n-a\n b\ndiff --git a/x b/x\nindex 1234567..abcdefg 100644\n--- a/x\n+++ b/x\n@@ -1,2 +1,1 @@\n-c\n-d\n e"
+  },
+  "expected": {
+    "count": 2
+  },
+  "source": "node reference adapter (removedLines of the Node lane runner; not distributed)",
+  "note": "both b/ax and b/x present: only b/x counts"
+}

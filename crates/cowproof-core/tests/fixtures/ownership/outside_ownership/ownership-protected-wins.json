@@ -1,0 +1,23 @@
+{
+  "tool": "outside_ownership",
+  "id": "ownership-protected-wins",
+  "input": {
+    "files": [
+      "docs/a.md",
+      "src/main.rs"
+    ],
+    "owns": [
+      "**"
+    ],
+    "protected": [
+      "docs/**"
+    ]
+  },
+  "expected": {
+    "outside": [
+      "docs/a.md"
+    ]
+  },
+  "source": "node reference adapter (outsideOwnership of the Node lane runner with its always-protected .env globs; not distributed)",
+  "note": "protected beats owns"
+}

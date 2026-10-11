@@ -1,0 +1,27 @@
+{
+  "tool": "glob_to_regex",
+  "id": "glob-complex-docs",
+  "input": {
+    "glob": "docs/**/*.md",
+    "probe": [
+      "docs/a.md",
+      "docs/a/b.md",
+      "docs/a/b/c.md",
+      "docs.md",
+      "a/docs/b.md",
+      "docs/a.txt"
+    ]
+  },
+  "expected": {
+    "matches": [
+      true,
+      true,
+      true,
+      false,
+      false,
+      false
+    ]
+  },
+  "source": "node reference adapter (globToRegExp of the Node lane runner, matched on probe paths; not distributed)",
+  "note": "nested directories then an extension"
+}

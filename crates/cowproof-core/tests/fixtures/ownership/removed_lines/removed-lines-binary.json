@@ -1,0 +1,13 @@
+{
+  "tool": "removed_lines",
+  "id": "removed-lines-binary",
+  "input": {
+    "file": "image.png",
+    "patch": "diff --git a/image.png b/image.png\nBinary files a/image.png and b/image.png differ"
+  },
+  "expected": {
+    "count": 0
+  },
+  "source": "node reference adapter (removedLines of the Node lane runner; not distributed)",
+  "note": "a binary file has no removals"
+}

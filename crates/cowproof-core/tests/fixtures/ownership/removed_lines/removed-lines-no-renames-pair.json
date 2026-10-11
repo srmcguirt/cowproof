@@ -1,0 +1,13 @@
+{
+  "tool": "removed_lines",
+  "id": "removed-lines-no-renames-pair",
+  "input": {
+    "file": "old.txt",
+    "patch": "diff --git a/old.txt b/old.txt\nindex 1234567..abcdefg 100644\n--- a/old.txt\n+++ b/old.txt\n@@ -1,2 +0,0 @@\n-a\n-b\ndiff --git a/new.txt b/new.txt\nindex 1234567..abcdefg 100644\n--- a/new.txt\n+++ b/new.txt\n@@ -0,0 +1,2 @@\n+a\n+b"
+  },
+  "expected": {
+    "count": 2
+  },
+  "source": "node reference adapter (removedLines of the Node lane runner; not distributed)",
+  "note": "no-renames form: delete half counts removals"
+}

@@ -1,0 +1,13 @@
+{
+  "tool": "removed_lines",
+  "id": "removed-lines-two-files-first",
+  "input": {
+    "file": "a.txt",
+    "patch": "diff --git a/a.txt b/a.txt\nindex 1234567..abcdefg 100644\n--- a/a.txt\n+++ b/a.txt\n@@ -1,3 +1,1 @@\n-line1\n-line2\n line3\ndiff --git a/b.txt b/b.txt\nindex 1234567..abcdefg 100644\n--- a/b.txt\n+++ b/b.txt\n@@ -1,2 +1,1 @@\n-removed\n kept"
+  },
+  "expected": {
+    "count": 2
+  },
+  "source": "node reference adapter (removedLines of the Node lane runner; not distributed)",
+  "note": "two files, the first file"
+}

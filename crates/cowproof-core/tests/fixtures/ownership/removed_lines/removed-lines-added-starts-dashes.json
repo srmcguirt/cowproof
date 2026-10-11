@@ -1,0 +1,13 @@
+{
+  "tool": "removed_lines",
+  "id": "removed-lines-added-starts-dashes",
+  "input": {
+    "file": "test.txt",
+    "patch": "diff --git a/test.txt b/test.txt\nindex 1234567..abcdefg 100644\n--- a/test.txt\n+++ b/test.txt\n@@ -1,2 +1,3 @@\n a\n+--- added rule\n b"
+  },
+  "expected": {
+    "count": 0
+  },
+  "source": "node reference adapter (removedLines of the Node lane runner; not distributed)",
+  "note": "an added line that starts with --- is not a removal"
+}

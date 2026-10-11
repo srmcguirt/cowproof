@@ -1,0 +1,24 @@
+{
+  "tool": "outside_ownership",
+  "id": "ownership-env-unlisted-nested",
+  "input": {
+    "files": [
+      "config/.env",
+      "a/b/.env.production",
+      "a/.env"
+    ],
+    "owns": [
+      "**"
+    ],
+    "protected": []
+  },
+  "expected": {
+    "outside": [
+      "config/.env",
+      "a/b/.env.production",
+      "a/.env"
+    ]
+  },
+  "source": "node reference adapter (outsideOwnership of the Node lane runner with its always-protected .env globs; not distributed)",
+  "note": ".env files are protected at any depth"
+}

@@ -1,0 +1,23 @@
+{
+  "tool": "outside_ownership",
+  "id": "ownership-protected-exact",
+  "input": {
+    "files": [
+      "CLAUDE.md",
+      "src/CLAUDE.md"
+    ],
+    "owns": [
+      "**"
+    ],
+    "protected": [
+      "CLAUDE.md"
+    ]
+  },
+  "expected": {
+    "outside": [
+      "CLAUDE.md"
+    ]
+  },
+  "source": "node reference adapter (outsideOwnership of the Node lane runner with its always-protected .env globs; not distributed)",
+  "note": "an exact protected name matches only the root file"
+}

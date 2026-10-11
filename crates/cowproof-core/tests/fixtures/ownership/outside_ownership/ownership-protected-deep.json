@@ -1,0 +1,25 @@
+{
+  "tool": "outside_ownership",
+  "id": "ownership-protected-deep",
+  "input": {
+    "files": [
+      "a/secrets/k",
+      "a/b/secrets/k",
+      "a/k"
+    ],
+    "owns": [
+      "**"
+    ],
+    "protected": [
+      "**/secrets/**"
+    ]
+  },
+  "expected": {
+    "outside": [
+      "a/secrets/k",
+      "a/b/secrets/k"
+    ]
+  },
+  "source": "node reference adapter (outsideOwnership of the Node lane runner with its always-protected .env globs; not distributed)",
+  "note": "protected at any depth"
+}

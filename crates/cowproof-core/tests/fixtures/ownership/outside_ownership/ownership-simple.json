@@ -1,0 +1,19 @@
+{
+  "tool": "outside_ownership",
+  "id": "ownership-simple",
+  "input": {
+    "files": [
+      "a.txt",
+      "b.txt"
+    ],
+    "owns": [
+      "*.txt"
+    ],
+    "protected": []
+  },
+  "expected": {
+    "outside": []
+  },
+  "source": "node reference adapter (outsideOwnership of the Node lane runner with its always-protected .env globs; not distributed)",
+  "note": "all owned"
+}

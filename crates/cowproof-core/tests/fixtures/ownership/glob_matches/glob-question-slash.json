@@ -1,0 +1,17 @@
+{
+  "tool": "glob_matches",
+  "id": "glob-question-slash",
+  "input": {
+    "glob": "a?b",
+    "probe": [
+      "a/b"
+    ]
+  },
+  "expected": {
+    "matches": [
+      false
+    ]
+  },
+  "source": "node reference adapter (globToRegExp of the Node lane runner, matched on probe paths; not distributed)",
+  "note": "? never matches /"
+}

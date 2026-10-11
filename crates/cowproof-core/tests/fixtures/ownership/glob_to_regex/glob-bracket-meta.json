@@ -1,0 +1,21 @@
+{
+  "tool": "glob_to_regex",
+  "id": "glob-bracket-meta",
+  "input": {
+    "glob": "a[b]c",
+    "probe": [
+      "a[b]c",
+      "abc",
+      "a/b/c"
+    ]
+  },
+  "expected": {
+    "matches": [
+      true,
+      false,
+      false
+    ]
+  },
+  "source": "node reference adapter (globToRegExp of the Node lane runner, matched on probe paths; not distributed)",
+  "note": "[] is literal, not a character class"
+}

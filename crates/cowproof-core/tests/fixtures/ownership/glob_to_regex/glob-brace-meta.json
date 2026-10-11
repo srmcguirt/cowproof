@@ -1,0 +1,23 @@
+{
+  "tool": "glob_to_regex",
+  "id": "glob-brace-meta",
+  "input": {
+    "glob": "a{1,2}b",
+    "probe": [
+      "a{1,2}b",
+      "a1b",
+      "a11b",
+      "ab"
+    ]
+  },
+  "expected": {
+    "matches": [
+      true,
+      false,
+      false,
+      false
+    ]
+  },
+  "source": "node reference adapter (globToRegExp of the Node lane runner, matched on probe paths; not distributed)",
+  "note": "{} is literal, not a quantifier"
+}

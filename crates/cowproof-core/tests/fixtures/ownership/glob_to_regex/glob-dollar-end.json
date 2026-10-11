@@ -1,0 +1,21 @@
+{
+  "tool": "glob_to_regex",
+  "id": "glob-dollar-end",
+  "input": {
+    "glob": "a.md$",
+    "probe": [
+      "a.md$",
+      "a.md",
+      "a.mdx"
+    ]
+  },
+  "expected": {
+    "matches": [
+      true,
+      false,
+      false
+    ]
+  },
+  "source": "node reference adapter (globToRegExp of the Node lane runner, matched on probe paths; not distributed)",
+  "note": "trailing $ is literal"
+}

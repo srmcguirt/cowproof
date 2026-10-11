@@ -1,0 +1,23 @@
+{
+  "tool": "outside_ownership",
+  "id": "ownership-dir-prefix",
+  "input": {
+    "files": [
+      "src",
+      "src/a.rs",
+      "srcx/a.rs"
+    ],
+    "owns": [
+      "src/**"
+    ],
+    "protected": []
+  },
+  "expected": {
+    "outside": [
+      "src",
+      "srcx/a.rs"
+    ]
+  },
+  "source": "node reference adapter (outsideOwnership of the Node lane runner with its always-protected .env globs; not distributed)",
+  "note": "src/** needs the slash"
+}

@@ -1,0 +1,21 @@
+{
+  "tool": "glob_to_regex",
+  "id": "glob-star-start",
+  "input": {
+    "glob": "*test.rs",
+    "probe": [
+      "test.rs",
+      "atest.rs",
+      "a/test.rs"
+    ]
+  },
+  "expected": {
+    "matches": [
+      true,
+      true,
+      false
+    ]
+  },
+  "source": "node reference adapter (globToRegExp of the Node lane runner, matched on probe paths; not distributed)",
+  "note": "* at start"
+}

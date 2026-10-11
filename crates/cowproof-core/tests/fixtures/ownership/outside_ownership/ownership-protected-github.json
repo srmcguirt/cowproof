@@ -1,0 +1,23 @@
+{
+  "tool": "outside_ownership",
+  "id": "ownership-protected-github",
+  "input": {
+    "files": [
+      ".github/workflows/test.yml",
+      "src/lib.rs"
+    ],
+    "owns": [
+      "src/**"
+    ],
+    "protected": [
+      ".github/**"
+    ]
+  },
+  "expected": {
+    "outside": [
+      ".github/workflows/test.yml"
+    ]
+  },
+  "source": "node reference adapter (outsideOwnership of the Node lane runner with its always-protected .env globs; not distributed)",
+  "note": "protected and unowned both outside"
+}

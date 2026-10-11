@@ -1,0 +1,19 @@
+{
+  "tool": "glob_matches",
+  "id": "glob-unicode-question",
+  "input": {
+    "glob": "a?b",
+    "probe": [
+      "aéb",
+      "a/b"
+    ]
+  },
+  "expected": {
+    "matches": [
+      true,
+      false
+    ]
+  },
+  "source": "node reference adapter (globToRegExp of the Node lane runner, matched on probe paths; not distributed)",
+  "note": "? matches one non-ASCII character"
+}

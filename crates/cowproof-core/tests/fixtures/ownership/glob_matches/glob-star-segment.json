@@ -1,0 +1,23 @@
+{
+  "tool": "glob_matches",
+  "id": "glob-star-segment",
+  "input": {
+    "glob": "src/*/test.rs",
+    "probe": [
+      "src/a/test.rs",
+      "src/a/b/test.rs",
+      "test.rs",
+      "src/test.rs"
+    ]
+  },
+  "expected": {
+    "matches": [
+      true,
+      false,
+      false,
+      false
+    ]
+  },
+  "source": "node reference adapter (globToRegExp of the Node lane runner, matched on probe paths; not distributed)",
+  "note": "one directory level"
+}

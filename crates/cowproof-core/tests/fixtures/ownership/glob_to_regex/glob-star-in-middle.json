@@ -1,0 +1,23 @@
+{
+  "tool": "glob_to_regex",
+  "id": "glob-star-in-middle",
+  "input": {
+    "glob": "a*/b",
+    "probe": [
+      "a/b",
+      "abc/b",
+      "a/b/c",
+      "a/x/b"
+    ]
+  },
+  "expected": {
+    "matches": [
+      true,
+      true,
+      false,
+      false
+    ]
+  },
+  "source": "node reference adapter (globToRegExp of the Node lane runner, matched on probe paths; not distributed)",
+  "note": "* in the middle"
+}

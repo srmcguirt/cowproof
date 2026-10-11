@@ -1,0 +1,25 @@
+{
+  "tool": "glob_to_regex",
+  "id": "glob-question",
+  "input": {
+    "glob": "a?b",
+    "probe": [
+      "aXb",
+      "ab",
+      "a/b",
+      "acb",
+      "aXYb"
+    ]
+  },
+  "expected": {
+    "matches": [
+      true,
+      false,
+      false,
+      true,
+      false
+    ]
+  },
+  "source": "node reference adapter (globToRegExp of the Node lane runner, matched on probe paths; not distributed)",
+  "note": "? matches one character but not /"
+}

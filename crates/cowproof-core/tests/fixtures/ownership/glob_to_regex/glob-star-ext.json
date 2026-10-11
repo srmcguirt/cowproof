@@ -1,0 +1,25 @@
+{
+  "tool": "glob_to_regex",
+  "id": "glob-star-ext",
+  "input": {
+    "glob": "*.md",
+    "probe": [
+      "a.md",
+      "c/d.md",
+      ".md",
+      "md",
+      "a.mdx"
+    ]
+  },
+  "expected": {
+    "matches": [
+      true,
+      false,
+      true,
+      false,
+      false
+    ]
+  },
+  "source": "node reference adapter (globToRegExp of the Node lane runner, matched on probe paths; not distributed)",
+  "note": "* does not cross /"
+}

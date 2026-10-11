@@ -1,0 +1,24 @@
+{
+  "tool": "outside_ownership",
+  "id": "ownership-duplicates",
+  "input": {
+    "files": [
+      "a.txt",
+      "a.txt",
+      "b.rs",
+      "b.rs"
+    ],
+    "owns": [
+      "*.txt"
+    ],
+    "protected": []
+  },
+  "expected": {
+    "outside": [
+      "b.rs",
+      "b.rs"
+    ]
+  },
+  "source": "node reference adapter (outsideOwnership of the Node lane runner with its always-protected .env globs; not distributed)",
+  "note": "duplicates are kept in order"
+}

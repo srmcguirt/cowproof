@@ -1,0 +1,19 @@
+{
+  "tool": "glob_to_regex",
+  "id": "glob-double-slash",
+  "input": {
+    "glob": "a//b",
+    "probe": [
+      "a/b",
+      "a//b"
+    ]
+  },
+  "expected": {
+    "matches": [
+      false,
+      true
+    ]
+  },
+  "source": "node reference adapter (globToRegExp of the Node lane runner, matched on probe paths; not distributed)",
+  "note": "consecutive slashes are literal"
+}
