@@ -729,7 +729,9 @@ async fn idle_timeout_upstream_stalls_after_first_chunk() {
 
 #[tokio::test]
 async fn idle_timeout_not_an_overall_limit() {
-    // Fake upstream that sends 10 chunks 100ms apart (1s total, longer than 300ms idle limit)
+    const CHUNKS: usize = 21;
+    // Fake upstream that sends 21 chunks 100ms apart: 2s in all, twice the 1s idle limit, while
+    // each gap stays a tenth of it, so a slow runner cannot stretch a gap past the limit.
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let upstream_addr = listener.local_addr().unwrap();
     let seen = Arc::new(Mutex::new(Vec::new()));
@@ -756,11 +758,11 @@ async fn idle_timeout_not_an_overall_limit() {
                     body: Vec::new(),
                 });
 
-                // Send 10 chunks 100ms apart
+                // Send 21 chunks 100ms apart
                 let _ = stream.write_all(
                     b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n"
                 ).await;
-                for i in 0..10 {
+                for i in 0..CHUNKS {
                     if i > 0 {
                         tokio::time::sleep(Duration::from_millis(100)).await;
                     }
@@ -778,7 +780,7 @@ async fn idle_timeout_not_an_overall_limit() {
 
     let config = ProxyConfig::new(REAL_KEY, format!("http://{}", upstream_addr))
         .unwrap()
-        .with_idle_timeout(Duration::from_millis(300));
+        .with_idle_timeout(Duration::from_secs(1));
     let placeholder = config.placeholder_key().to_string();
 
     let server = ProxyServer::new(config);
@@ -798,14 +800,14 @@ async fn idle_timeout_not_an_overall_limit() {
         .unwrap();
 
     let mut received = Vec::new();
-    tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut received))
+    tokio::time::timeout(Duration::from_secs(10), stream.read_to_end(&mut received))
         .await
         .expect("response timed out")
         .expect("read failed");
 
     let text = String::from_utf8_lossy(&received);
-    // Should receive all 10 chunks even though they arrive over 1 second
-    for i in 0..10 {
+    // Should receive every chunk although the stream outlasts the idle limit
+    for i in 0..CHUNKS {
         assert!(
             text.contains(&format!("data: chunk{}", i)),
             "missing chunk{}: {}",
