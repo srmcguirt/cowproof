@@ -76,6 +76,23 @@ fn output(cmd: &mut Command) -> Output {
     child.wait_with_output().unwrap()
 }
 
+/// Run a freshly written executable once (`--version`, whatever it answers), so its first-run
+/// cost is paid here and not inside a clock the runner keeps. Only the spawn holds `FORK_LOCK`.
+fn warm_up(exe: &Path) {
+    let child = {
+        let _g = fork_lock();
+        Command::new(exe)
+            .arg("--version")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+    };
+    if let Ok(mut child) = child {
+        let _ = child.wait();
+    }
+}
+
 fn sandbox_available() -> bool {
     if cfg!(target_os = "macos") {
         return true;
@@ -272,6 +289,15 @@ exit 0
             let _g = fork_lock();
             fs::write(&fake, script).unwrap();
             fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        // The first run of a file that was just written costs macOS seconds, and on a host busy
+        // with other builds the scanner's queue made it 24 s for the fake's `--version` in the
+        // preflight, which gives up at 30 s. That is the host's cost, not the property under test,
+        // and it belongs outside every clock the runner keeps (the preflight's 30 s, the
+        // builder's wall-clock limit, `pk doctor`'s 30 s), so each executable runs once here.
+        for exe in [&fake, &cowproof, &work.path().join("pk")] {
+            warm_up(exe);
         }
 
         Harness {
@@ -2493,14 +2519,17 @@ fn a_non_blocking_ask_never_ends_the_session_and_the_builders_own_exit_is_record
 /// sandbox to wind down, and a fixed fifteen seconds failed twice in full workspace runs.
 const RULED_WITHIN: Duration = Duration::from_secs(90);
 
-/// A fake that, on its first launch, records its pid, asks NON-blocking and
-/// sleeps 120 s (in a background child, so the group has two members); later
-/// launches run the checks.
+/// A fake that, on its first launch, records its pid, starts a 120 s sleep in a background
+/// child (so the group has two members) and records that pid, then asks NON-blocking and waits
+/// for the sleep; later launches run the checks. Both pids are written before the ask, because
+/// the tests rule the moment the ask is recorded and the ruling sends SIGTERM to the group: a
+/// fake that wrote `sleeppid` after the ask could be ended before it got there, and the test
+/// then read a file that was never written (a failure seen under load).
 fn nonblocking_sleeper(question: &str) -> String {
     let mut ask = blocking_ask(question);
     ask["blocking"] = json!(false);
     let first = format!(
-        "{}echo $$ > \"$HOME/fakepid\"\n{}sleep 120 &\necho $! > \"$HOME/sleeppid\"\nwait\n",
+        "{}echo $$ > \"$HOME/fakepid\"\nsleep 120 &\necho $! > \"$HOME/sleeppid\"\n{}wait\n",
         init_line(),
         mcp_session("ask.out", &[(3, "ask", ask)])
     );
@@ -2575,7 +2604,11 @@ struct EndedAfterTerm {
 /// afterwards (the patch, `pk doctor`, `run.json`).
 fn ended_after_term(run: &mut Watched, within: Duration) -> EndedAfterTerm {
     run.wait_for_stderr("ms after SIGTERM", within);
-    let stderr = run.stderr();
+    ended_after_term_in(&run.stderr())
+}
+
+/// The same reading from the stderr of a run that has ended.
+fn ended_after_term_in(stderr: &str) -> EndedAfterTerm {
     let line = stderr
         .lines()
         .find(|l| l.contains("the builder ended "))
@@ -3569,6 +3602,9 @@ fn assert_not_proved(h: &Harness) {
     );
 }
 
+/// The wall-clock limit of the timeout test, in seconds.
+const TIMEOUT_TEST_LIMIT_SECS: u64 = 8;
+
 #[test]
 fn the_timeout_ends_a_silent_builder_and_a_child_that_ignores_sigterm_and_nothing_is_proved() {
     if !sandbox_available() {
@@ -3583,11 +3619,10 @@ fn the_timeout_ends_a_silent_builder_and_a_child_that_ignores_sigterm_and_nothin
     // host takes longer than the delay.
     let first = "( trap '' TERM; while :; do echo . >> \"$HOME/beat\"; sleep 0.5; done ) &\necho $! > \"$HOME/bgpid\"\nsleep 120\n";
     let h = owned_packet(first);
-    let began = Instant::now();
     let child = {
         let _g = fork_lock();
         h.command(h.lanes.path())
-            .args(["--timeout-secs", "8"])
+            .args(["--timeout-secs", &TIMEOUT_TEST_LIMIT_SECS.to_string()])
             .env("ANTHROPIC_API_KEY", REAL_KEY)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -3596,13 +3631,31 @@ fn the_timeout_ends_a_silent_builder_and_a_child_that_ignores_sigterm_and_nothin
             .unwrap()
     };
     let out = finish(child);
-    let took = began.elapsed();
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
     assert_eq!(out.status.code(), Some(5), "{}\n{stderr}", stdout_of(&out));
     assert!(stderr.contains("wall-clock timeout"), "{stderr}");
+    // The runner ended the builder when the limit came, not when the 120 s sleep did. What is
+    // measured is the runner's own account: the builder's time from its spawn to the exit
+    // status being read (`durationMs`), which cannot be less than the limit and has to be
+    // within the SIGTERM grace of it, and the runner's own line for how long the leader took
+    // to go after SIGTERM. The test's wall clock is not used: it includes the copy of
+    // `cowproof` and `pk` running for the first time, the preflight and the proof, which took
+    // 52 and 90 seconds on a host busy with other builds while the builder lived 8.
+    let limit = Duration::from_secs(TIMEOUT_TEST_LIMIT_SECS);
+    let grace = term_grace();
+    let segs = segments(&h);
+    let lived = Duration::from_millis(segs[0]["durationMs"].as_u64().unwrap());
     assert!(
-        took < Duration::from_secs(45),
-        "the 120 s sleep was cut short: {took:?}"
+        lived >= limit && lived < limit + grace,
+        "the builder lived {lived:?}, not the {limit:?} limit plus less than a {grace:?} grace \
+         (the 120 s sleep was not cut short at the limit):\n{stderr}"
+    );
+    let ended = ended_after_term_in(&stderr);
+    assert!(
+        !ended.after_sigkill && ended.took < grace * 3 / 4,
+        "the leader needed {:?} after SIGTERM (SIGKILL needed: {}):\n{stderr}",
+        ended.took,
+        ended.after_sigkill
     );
     assert_eq!(
         stdout_of(&out)
@@ -3617,8 +3670,7 @@ fn the_timeout_ends_a_silent_builder_and_a_child_that_ignores_sigterm_and_nothin
 
     let run = h.run_json();
     assert_eq!(run["status"], "timeout");
-    assert_eq!(run["timeoutSecs"], 8);
-    let segs = segments(&h);
+    assert_eq!(run["timeoutSecs"], TIMEOUT_TEST_LIMIT_SECS);
     assert_eq!(segs.len(), 1, "no relaunch: {segs:?}");
     assert_eq!(h.launches(), 1);
     assert_eq!(segs[0]["sessionEnd"], "timeout", "{segs:?}");
@@ -4452,9 +4504,9 @@ impl Harness {
 
 /// The lane reached a verdict, whatever it was (exit 0, 2 or 3).
 ///
-/// The failure's first line carries the exit code and the line of stderr that says why (a
-/// preflight failure, an infrastructure error), because a gate that keeps only the panic's first
-/// line used to lose both.
+/// The failure's first line carries the exit code and the end of stderr (where the runner says
+/// why: a preflight failure, an infrastructure error), because a gate that keeps only the
+/// panic's first line used to lose both.
 fn reached_a_verdict(out: &Output) {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
@@ -4466,16 +4518,20 @@ fn reached_a_verdict(out: &Output) {
     );
 }
 
-/// The line of a failed run's stderr that names the failure: the first preflight failure or
-/// error line, else the last non-empty line.
+/// The last three non-empty lines of a failed run's stderr, on one line: the runner puts its
+/// reason just before "nothing was started" or the error exit.
 fn why_a_run_failed(stderr: &str) -> String {
-    let named = stderr
+    let mut last: Vec<&str> = stderr
         .lines()
-        .find(|l| l.contains("preflight failed") || l.starts_with("error"));
-    let last = stderr.lines().rev().find(|l| !l.trim().is_empty());
-    match named.or(last) {
-        Some(line) => format!("stderr: {line:?}"),
-        None => "stderr empty".to_string(),
+        .rev()
+        .filter(|l| !l.trim().is_empty())
+        .take(3)
+        .collect();
+    last.reverse();
+    if last.is_empty() {
+        "stderr empty".to_string()
+    } else {
+        format!("stderr ends: {}", last.join(" | "))
     }
 }
 
@@ -5535,7 +5591,11 @@ fn a_check_is_ended_when_the_builder_exits_and_the_lane_parks_before_any_ruling(
     // Release the parked lane.
     let id = wait_for_ask(&h, &mut run.child, 1);
     rule(&h, &id, &["--stop"]);
-    let status = exit_within(&mut run, SESSION_END_WITHIN);
+    // Only a hang guard: the exit after a stop also waits for the patch and `pk doctor`, which
+    // took longer than the 20 s of `SESSION_END_WITHIN` once in a full run on a busy host. The
+    // property of this test (the check is gone while the lane is still parked) was asserted
+    // above.
+    let status = exit_within(&mut run, RULED_WITHIN);
     assert_eq!(status.code(), Some(7), "{}", run.stderr());
 }
 
