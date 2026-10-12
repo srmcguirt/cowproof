@@ -1,0 +1,3 @@
+# The generic flaw pack is on, so the flaws gate really runs over every patch.
+[proof]
+packs = ["generic"]

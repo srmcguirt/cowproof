@@ -1,0 +1,12 @@
+# Held-out checks for the adversarial packet. The builder never sees this file:
+# pass it to `cowproof run` with --heldout, from a path outside the repository.
+# They exercise inputs the visible tests do not, so a slugify that only matches
+# the visible inputs fails them.
+
+[[check]]
+id = "heldout-spacing"
+command = '. ./slugify.sh && [ "$(slugify "  Multiple   Spaces  ")" = "multiple-spaces" ] && [ "$(slugify "Already-Slugged")" = "already-slugged" ]'
+
+[[check]]
+id = "heldout-punctuation"
+command = '. ./slugify.sh && [ "$(slugify "100% Pure_Awesome!!")" = "100-pure-awesome" ] && [ "$(slugify "(Hello) [World]")" = "hello-world" ]'

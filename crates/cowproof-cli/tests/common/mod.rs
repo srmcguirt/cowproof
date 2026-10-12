@@ -301,6 +301,66 @@ exit 0
         }
     }
 
+    /// A lane over a committed copy of the project directory `project` (every file in it,
+    /// recursively), with the packet text `packet(lane_id)` gives. Unlike [`Lane::new`], the
+    /// fake changes nothing by itself: it runs `fake_body` in the clone, so the lane's patch
+    /// is exactly what `fake_body` does to the project.
+    #[allow(dead_code)] // `tests/adversarial.rs` uses it; the other test crates that share this module do not
+    pub fn from_project(fake_body: &str, project: &Path, packet: &dyn Fn(&str) -> String) -> Self {
+        let id = unique_lane_id();
+        let work = var_tmp("cp-ver-work-");
+        let lanes = var_tmp("cp-ver-lanes-");
+        let home = var_tmp("cp-ver-home-");
+        let repo = work.path().join("repo");
+        copy_tree(project, &repo);
+        git(&repo, &["init", "-q"]);
+        git(&repo, &["config", "user.email", "t@example.com"]);
+        git(&repo, &["config", "user.name", "T"]);
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-q", "-m", "base"]);
+
+        let packet_path = work.path().join("packet.md");
+        fs::write(&packet_path, packet(&id)).unwrap();
+
+        let cowproof = work.path().join("cowproof");
+        {
+            let _g = fork_lock();
+            fs::copy(env!("CARGO_BIN_EXE_cowproof"), &cowproof).unwrap();
+        }
+        let fake = work.path().join("fake-claude");
+        let script = format!(
+            r#"#!/bin/sh
+# The preflight runs `claude --version`; answer it before the lane's body.
+if [ "$1" = "--version" ]; then echo "fake-claude 0.0.0"; exit 0; fi
+rec="$HOME/fake"
+mkdir -p "$rec"
+sock="$(dirname "$HOME")/sock/runner.sock"
+cp_bin='{cowproof}'
+{fake_body}
+printf '%s' '{stream}'
+exit 0
+"#,
+            cowproof = cowproof.display(),
+            stream = FAKE_STREAM,
+        );
+        {
+            let _g = fork_lock();
+            fs::write(&fake, script).unwrap();
+            fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        Lane {
+            id,
+            _work: work,
+            lanes,
+            home,
+            repo,
+            packet: packet_path,
+            fake,
+            cowproof,
+            envs: Vec::new(),
+        }
+    }
+
     /// The fake `claude`, for a hosts config that names it as the host's `claude`.
     #[allow(dead_code)] // `tests/remote.rs` uses it; the other test crates that share this module do not
     pub fn fake_claude(&self) -> &Path {
@@ -375,6 +435,22 @@ exit 0
             &fs::read_to_string(&p).unwrap_or_else(|e| panic!("{}: {e}", p.display())),
         )
         .unwrap()
+    }
+}
+
+/// Copy the directory `from` to `to`, recursively (regular files and directories only).
+#[allow(dead_code)] // `Lane::from_project` uses it; the other test crates that share this module do not
+fn copy_tree(from: &Path, to: &Path) {
+    fs::create_dir_all(to).unwrap();
+    for entry in fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        let dest = to.join(entry.file_name());
+        let kind = entry.file_type().unwrap();
+        if kind.is_dir() {
+            copy_tree(&entry.path(), &dest);
+        } else if kind.is_file() {
+            fs::copy(entry.path(), &dest).unwrap();
+        }
     }
 }
 
