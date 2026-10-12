@@ -541,6 +541,7 @@ dependencies = [
  "anyhow",
  "cowproof-core",
  "cowproof-prove",
+ "portkit-core",
  "regex",
  "serde",
  "serde_json",

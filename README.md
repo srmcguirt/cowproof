@@ -162,6 +162,42 @@ What it reads and how it counts:
 
 `--json` prints the same numbers as one document (`counts`, `groups`, `climbed`, and one `lanes` row per counted lane with its first and final rung, class, cost, turns, reassigns, `host` and `unsandboxed`). Exit 0 when it prints; exit 1 when a root is not a directory. The plain table is at most 80 columns wide.
 
+## Find what to port: `cowproof report port-candidates`
+
+Lanes run the same few shell commands again and again, and every run puts its output into context. `cowproof report port-candidates <lanes-root>...` (the design, D23, also spells it `cowproof report --port-candidates`) reads the portkit traces of every lane one level under each root and ranks those commands by how often they ran, how many bytes they delivered into context and how long they took. The numbers below come from synthetic traces made by hand, not from real runs:
+
+```text
+$ cowproof report port-candidates ~/.cache/cowproof/lanes
+Port candidates: 5 of 5 commands run 2+ times; 3 of 4 lanes traced (1 root)
+
+ # command                      calls lanes    time  median     bytes  score
+ 1 cargo test                      11     3       -       - 213.9 KiB 0.6471
+ 2 node gate.mjs                    7     2       -       -  64.9 KiB 0.1250
+ 3 rg TODO                          4     2       -       -  24.2 KiB 0.0266
+ 4 git status                      17     3       -       -   5.0 KiB 0.0233
+ 5 sed -n                           3     1       -       -   7.0 KiB 0.0058
+
+calls is how often the command ran; bytes is what reached context
+  (delivered_bytes); time is wall time. score = calls x bytes x time, each
+  divided by the largest among the candidates.
+A command is its program and stable arguments (the first two words the trace
+  keeps): paths, temp dirs, ids and numbers are collapsed, and values after =
+  are dropped.
+Time is not in these traces (the hook records duration_ms 0.0 for a Bash call),
+  so time is left out and score = calls x bytes.
+Left out: untraced lane 1.
+```
+
+`--top N` shows more or fewer than 10, `--min-calls N` changes how many runs make a command a candidate (default 2), and `--json` prints the same numbers as one document. With `--draft DIR` it also writes one DRAFT `kind: port` packet per shown candidate (`port-cargo-test.md` and so on): the header in the packet format, the observed command with its call statistics and a few redacted example invocations, the compact `pk` tool to port it to, and a `## Checks` section that says the fixtures must be recorded first with `cowproof pk port capture`. A draft is marked DRAFT, is never dispatched by anything, and never overwrites a file. Its placeholders are `FILL-` names, so `cowproof lint` on an unedited draft reports only the paths that still have to be filled in (the crate's source file, the cases file and the fixtures directory), and a draft with them filled lints clean.
+
+What it reads and how it counts:
+
+- **Only the traces:** `<lane>/portkit/traces/*.jsonl`, the lane's `PORTKIT_STATE_DIR` being `<lane>/portkit`. No symlink is followed: a lane directory, its `portkit` or `traces` directory or a trace file that is a link is skipped and counted. A lane with no trace (a Codex or OpenRouter lane is untraced) is counted, and a line that is not a record is counted as `malformed line`; neither stops the report.
+- **A command is a `Bash` call seen by the hook.** The hook stores no arguments: a record's `target` is the first two words of the command, cut at 60 characters, so that head is all there is to fingerprint. The fingerprint is the program and its stable arguments: environment assignments are dropped whole, a value after `=` is never kept, a quoted word or a URL is masked, a path keeps its last component (a path under a temp directory is `<tmp>`), and ids and numbers are collapsed. `cargo test --workspace` and `cargo test -p x` are both `cargo test`; a command that starts with `cd dir && ...` is `cd dir`, which the trace cannot see past.
+- **Bytes into context** is the record's `delivered_bytes`, what actually reached the caller; for a hook record it equals the bytes the tool produced. **Wall time** is `duration_ms`, which the hook cannot measure (it sees the result, not the call), so it is `0.0` today and the report leaves time out of the score and says so. When a trace does carry times, a call counts for at least 1 ms.
+- **Score** = (calls / most calls) x (bytes / most bytes) x (time / most time), each maximum over all candidates, so no unit dominates. Ties go to more calls, more bytes, then the name.
+- **Nothing sensitive is printed or written:** the head is redacted (`cowproof_core::redact`) and its control characters turned into spaces before anything else is done with it, and a word naming `.env`, an SSH key or `credentials.json` is masked. Example invocations are those redacted heads.
+
 ## Run a lane on another machine
 
 `cowproof run packet.md --host buildbox` runs the builder, and the checks it asks for, on another machine over SSH. Your machine stays the director: it keeps the escalation queue and your rulings, the egress proxy and so the API key, the held-out checks, the proof and the capsule. The host runs only what runs sandboxed. The key never leaves the director: no argument, spec, bundle or environment sent to the host holds it, and the builder on the host presents the lane's own `placeholder-...` key, which only your proxy accepts, through two sockets that SSH forwards from the host back to you.

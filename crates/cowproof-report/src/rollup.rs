@@ -263,7 +263,7 @@ fn group(rung: &str, class: &str, lanes: &[&LaneRow]) -> Group {
     }
 }
 
-fn median(mut values: Vec<f64>) -> Option<f64> {
+pub(crate) fn median(mut values: Vec<f64>) -> Option<f64> {
     if values.is_empty() {
         return None;
     }
@@ -726,7 +726,7 @@ fn number(v: f64) -> String {
 }
 
 /// `s` cut to `width` characters, a `~` marking the cut.
-fn clip(s: &str, width: usize) -> String {
+pub(crate) fn clip(s: &str, width: usize) -> String {
     if s.chars().count() <= width {
         return s.to_string();
     }
@@ -736,7 +736,7 @@ fn clip(s: &str, width: usize) -> String {
 }
 
 /// `text` wrapped to `width` columns, continuation lines indented two spaces.
-fn wrap(text: &str, width: usize) -> String {
+pub(crate) fn wrap(text: &str, width: usize) -> String {
     let mut out = String::new();
     let mut line = String::new();
     for word in text.split_whitespace() {
