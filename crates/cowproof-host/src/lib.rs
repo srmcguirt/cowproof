@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 use anyhow::{Context, Result, anyhow, bail};
+use cowproof_prove::runner::{GroupEnd, run_probe_blocking};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fs;
@@ -104,17 +105,37 @@ pub trait CommandRunner {
     fn output(&self, program: &str, args: &[&str]) -> Result<(bool, String, String)>;
 }
 pub struct SystemRunner;
-impl CommandRunner for SystemRunner {
-    fn output(&self, program: &str, args: &[&str]) -> Result<(bool, String, String)> {
-        let out = Command::new(program)
-            .args(args)
-            .output()
-            .with_context(|| format!("starting {program}"))?;
+
+/// How long one probe (`codex --version`, `docker info`, `df`, `systemctl`) may take. It runs in
+/// its own process group ([`run_probe_blocking`]), ended whole when the time is up.
+const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+impl SystemRunner {
+    /// [`CommandRunner::output`] with the time the program may take. It runs as the leader of
+    /// its own process group; when the time is up the whole group is ended and this is an error.
+    fn output_within(
+        program: &str,
+        args: &[&str],
+        limit: std::time::Duration,
+    ) -> Result<(bool, String, String)> {
+        let mut command = Command::new(program);
+        command.args(args);
+        let out =
+            run_probe_blocking(command, limit).map_err(|e| anyhow!("starting {program}: {e}"))?;
+        let GroupEnd::Exited(status) = out.end else {
+            bail!("{program} did not finish in {limit:?}");
+        };
         Ok((
-            out.status.success(),
+            status.success(),
             String::from_utf8_lossy(&out.stdout).trim().to_owned(),
             String::from_utf8_lossy(&out.stderr).trim().to_owned(),
         ))
+    }
+}
+
+impl CommandRunner for SystemRunner {
+    fn output(&self, program: &str, args: &[&str]) -> Result<(bool, String, String)> {
+        Self::output_within(program, args, PROBE_TIMEOUT)
     }
 }
 
@@ -904,5 +925,74 @@ mod tests {
 
     fn test_dir(label: &str) -> PathBuf {
         std::env::temp_dir().join(format!("lanes-host-{label}-{}", std::process::id()))
+    }
+
+    /// The host facts' command runner ends a probe that times out, whole: a fake `codex` whose
+    /// `--version` backgrounds a child and sleeps leaves neither running once `output_within`
+    /// has returned its error.
+    #[test]
+    fn a_host_probe_that_times_out_ends_its_whole_group() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{Duration, Instant};
+        static FORK_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = FORK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = PathBuf::from(format!("/var/tmp/cp-host-probe-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let (leader_file, child_file) = (dir.join("leader.pid"), dir.join("child.pid"));
+        let bin = dir.join("codex");
+        fs::write(
+            &bin,
+            format!(
+                "#!/bin/sh\n\
+                 [ \"$1\" = \"--version\" ] || exit 0\n\
+                 echo $$ > '{leader}.tmp' && mv '{leader}.tmp' '{leader}'\n\
+                 sleep 120 &\n\
+                 echo $! > '{child}.tmp' && mv '{child}.tmp' '{child}'\n\
+                 sleep 120\n",
+                leader = leader_file.display(),
+                child = child_file.display(),
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+        // The first run of a new executable can take seconds (macOS scans it); run it once,
+        // harmlessly, so the timed probe below measures the probe and not the scan.
+        assert!(Command::new(&bin).arg("warm").status().unwrap().success());
+
+        let err = SystemRunner::output_within(
+            bin.to_str().unwrap(),
+            &["--version"],
+            Duration::from_secs(3),
+        )
+        .unwrap_err();
+        let pid =
+            |file: &Path| -> Option<u32> { fs::read_to_string(file).ok()?.trim().parse().ok() };
+        let (leader, child) = (pid(&leader_file), pid(&child_file));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let ended = |leader: u32, child: u32| {
+            cowproof_prove::runner::group_exists(leader) == Some(false)
+                && cowproof_prove::runner::pid_exists(child) == Some(false)
+        };
+        while !leader.zip(child).is_some_and(|(l, c)| ended(l, c)) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let still_running = leader.zip(child).is_none_or(|(l, c)| !ended(l, c));
+        if still_running {
+            // Only a failing run gets here, a few seconds after the fake wrote these pids.
+            if let Some(l) = leader {
+                cowproof_prove::runner::signal_group(l, libc::SIGKILL);
+            }
+            if let Some(c) = child {
+                cowproof_prove::runner::signal_pid(c, libc::SIGKILL);
+            }
+        }
+        let _ = fs::remove_dir_all(&dir);
+        assert!(err.to_string().contains("did not finish"), "{err}");
+        assert!(leader.is_some() && child.is_some(), "the fake ran");
+        assert!(
+            !still_running,
+            "the probe's group or its child outlived the probe"
+        );
     }
 }

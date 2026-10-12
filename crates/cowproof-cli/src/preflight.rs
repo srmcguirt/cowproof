@@ -14,6 +14,7 @@
 
 use crate::root::resolve_executable;
 use crate::run::{builder_path, sandboxed_command};
+use cowproof_prove::runner::{GroupEnd, run_probe};
 use cowproof_run::{LaneLayout, SandboxPolicy, lane::probe_clone_method};
 use serde::Serialize;
 use std::fs;
@@ -235,7 +236,7 @@ async fn check_sandbox(probe: &Probe, opts: &PreflightOptions<'_>) -> Check {
         "PATH".to_string(),
         builder_path(opts.director_path, opts.real_home),
     )];
-    let mut command = match sandboxed_command(
+    let command = match sandboxed_command(
         &policy,
         &layout.control.join("preflight.sb"),
         &[program.to_string()],
@@ -251,14 +252,16 @@ async fn check_sandbox(probe: &Probe, opts: &PreflightOptions<'_>) -> Check {
             );
         }
     };
-    let launch = match tokio::time::timeout(LAUNCH_TIMEOUT, command.output()).await {
-        Err(_) => SandboxLaunch::TimedOut,
-        Ok(Err(e)) => SandboxLaunch::CouldNotStart(format!(
+    let launch = match run_probe(command, LAUNCH_TIMEOUT).await {
+        Err(e) => SandboxLaunch::CouldNotStart(format!(
             "cannot start {launcher} on the builder's PATH: {e}"
         )),
-        Ok(Ok(out)) => SandboxLaunch::Ran {
-            code: out.status.code(),
-            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        Ok(out) => match out.end {
+            GroupEnd::TimedOut => SandboxLaunch::TimedOut,
+            GroupEnd::Exited(status) => SandboxLaunch::Ran {
+                code: status.code(),
+                stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+            },
         },
     };
     sandbox_verdict(launch, program, launcher)
@@ -344,41 +347,43 @@ fn check_disk(dir: &Path, floor_gb: f64) -> Check {
 /// The builder resolves on the director's `PATH` and `--version` runs. The key is not
 /// passed to it.
 async fn check_claude(opts: &PreflightOptions<'_>) -> Check {
+    check_claude_within(opts, LAUNCH_TIMEOUT).await
+}
+
+/// [`check_claude`] with the time the probe may take. The probe runs in its own process group
+/// ([`run_probe`]), so a `claude` that hangs, or that started something, is ended whole when
+/// the time is up.
+async fn check_claude_within(opts: &PreflightOptions<'_>, limit: Duration) -> Check {
     let path = match resolve_executable(opts.claude_bin, opts.director_path, opts.cwd) {
         Ok(path) => path,
         Err(e) => return Check::fail("claude", format!("{e}")),
     };
     let mut command = tokio::process::Command::new(&path);
-    command
-        .arg("--version")
-        .env_remove("ANTHROPIC_API_KEY")
-        .stdin(Stdio::null())
-        .kill_on_drop(true);
-    match tokio::time::timeout(LAUNCH_TIMEOUT, command.output()).await {
-        Err(_) => Check::fail(
-            "claude",
-            format!(
-                "{} --version did not finish in {LAUNCH_TIMEOUT:?}",
-                path.display()
+    command.arg("--version").env_remove("ANTHROPIC_API_KEY");
+    match run_probe(command, limit).await {
+        Err(e) => Check::fail("claude", format!("cannot run {}: {e}", path.display())),
+        Ok(out) => match out.end {
+            GroupEnd::TimedOut => Check::fail(
+                "claude",
+                format!("{} --version did not finish in {limit:?}", path.display()),
             ),
-        ),
-        Ok(Err(e)) => Check::fail("claude", format!("cannot run {}: {e}", path.display())),
-        Ok(Ok(out)) if !out.status.success() => Check::fail(
-            "claude",
-            format!("{} --version ended with {}", path.display(), out.status),
-        ),
-        Ok(Ok(out)) => {
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            let version: String = stdout
-                .lines()
-                .map(str::trim)
-                .find(|l| !l.is_empty())
-                .unwrap_or("no version printed")
-                .chars()
-                .take(60)
-                .collect();
-            Check::ok("claude", format!("{version} ({})", path.display()))
-        }
+            GroupEnd::Exited(status) if !status.success() => Check::fail(
+                "claude",
+                format!("{} --version ended with {status}", path.display()),
+            ),
+            GroupEnd::Exited(_) => {
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                let version: String = stdout
+                    .lines()
+                    .map(str::trim)
+                    .find(|l| !l.is_empty())
+                    .unwrap_or("no version printed")
+                    .chars()
+                    .take(60)
+                    .collect();
+                Check::ok("claude", format!("{version} ({})", path.display()))
+            }
+        },
     }
 }
 
@@ -549,5 +554,28 @@ mod tests {
     fn check_statuses_serialize_in_lower_case() {
         let json = serde_json::to_string(&Check::warn("key", "x")).unwrap();
         assert_eq!(json, r#"{"name":"key","status":"warn","detail":"x"}"#);
+    }
+
+    /// The `claude` probe that times out leaves nothing behind: the fake's `--version` starts
+    /// a background child and sleeps, and once the check has failed neither is running.
+    #[tokio::test]
+    async fn a_claude_version_probe_that_times_out_ends_its_whole_group() {
+        let tool = crate::probe_fixture::HangingTool::new("claude");
+        let cwd = tool.dir().to_path_buf();
+        let opts = PreflightOptions {
+            repo: &cwd,
+            lanes_root: &cwd,
+            disk_floor_gb: 0.0,
+            claude_bin: tool.bin().to_str().unwrap(),
+            director_path: "/usr/bin:/bin",
+            cwd: &cwd,
+            real_home: &cwd,
+            for_run: false,
+        };
+        // Long enough for the fake to write both pid files, short against its 120 s sleep.
+        let check = check_claude_within(&opts, Duration::from_secs(3)).await;
+        assert_eq!(check.status, CheckStatus::Fail);
+        assert!(check.detail.contains("did not finish"), "{}", check.detail);
+        tool.assert_all_ended(Duration::from_secs(10));
     }
 }

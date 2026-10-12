@@ -18,6 +18,7 @@ use crate::root::resolve_executable;
 use crate::run::{RuntimeProcess, RuntimeSandbox, runtime_command};
 use anyhow::{Context, Result, anyhow, bail};
 use cowproof_core::{Routing, Rung, Runtime};
+use cowproof_prove::runner::{GroupEnd, run_probe};
 use cowproof_run::{
     LaneLayout, NetworkMode,
     models::{DEFAULT_TIMEOUT, ModelPrice},
@@ -26,7 +27,6 @@ use cowproof_run::{
     proxy::{Provider, ProxyConfig},
 };
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::time::Duration;
 use tokio::process::Command;
 
@@ -135,6 +135,17 @@ pub(crate) async fn locate(
     director_path: &str,
     cwd: &Path,
 ) -> Result<Opencode, String> {
+    locate_within(name, director_path, cwd, VERSION_TIMEOUT).await
+}
+
+/// [`locate`] with the time `--version` may take. The probe runs in its own process group
+/// ([`run_probe`]), ended whole when the time is up.
+async fn locate_within(
+    name: &str,
+    director_path: &str,
+    cwd: &Path,
+    limit: Duration,
+) -> Result<Opencode, String> {
     let found = resolve_executable(name, director_path, cwd).map_err(|e| format!("{e}"))?;
     let bin = found
         .canonicalize()
@@ -143,35 +154,33 @@ pub(crate) async fn locate(
     command
         .arg("--version")
         .env_clear()
-        .env("PATH", director_path)
-        .stdin(Stdio::null())
-        .kill_on_drop(true);
+        .env("PATH", director_path);
     if let Some(home) = std::env::var_os("HOME") {
         command.env("HOME", home);
     }
-    match tokio::time::timeout(VERSION_TIMEOUT, command.output()).await {
-        Err(_) => Err(format!(
-            "{} --version did not finish in {VERSION_TIMEOUT:?}",
-            bin.display()
-        )),
-        Ok(Err(e)) => Err(format!("cannot run {}: {e}", bin.display())),
-        Ok(Ok(out)) if !out.status.success() => Err(format!(
-            "{} --version ended with {}",
-            bin.display(),
-            out.status
-        )),
-        Ok(Ok(out)) => {
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            let version: String = stdout
-                .lines()
-                .map(str::trim)
-                .find(|l| !l.is_empty())
-                .unwrap_or("no version printed")
-                .chars()
-                .take(60)
-                .collect();
-            Ok(Opencode { bin, version })
-        }
+    match run_probe(command, limit).await {
+        Err(e) => Err(format!("cannot run {}: {e}", bin.display())),
+        Ok(out) => match out.end {
+            GroupEnd::TimedOut => Err(format!(
+                "{} --version did not finish in {limit:?}",
+                bin.display()
+            )),
+            GroupEnd::Exited(status) if !status.success() => {
+                Err(format!("{} --version ended with {status}", bin.display()))
+            }
+            GroupEnd::Exited(_) => {
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                let version: String = stdout
+                    .lines()
+                    .map(str::trim)
+                    .find(|l| !l.is_empty())
+                    .unwrap_or("no version printed")
+                    .chars()
+                    .take(60)
+                    .collect();
+                Ok(Opencode { bin, version })
+            }
+        },
     }
 }
 
@@ -316,5 +325,22 @@ mod tests {
             assert!(parse_timeout(bad).is_err(), "{bad:?}");
         }
         assert_eq!(DEFAULT_TIMEOUT, Duration::from_secs(15));
+    }
+
+    /// The `opencode` probe that times out leaves nothing behind: the fake's `--version` starts
+    /// a background child and sleeps, and once the probe has failed neither is running.
+    #[tokio::test]
+    async fn an_opencode_version_probe_that_times_out_ends_its_whole_group() {
+        let tool = crate::probe_fixture::HangingTool::new("opencode");
+        let err = locate_within(
+            tool.bin().to_str().unwrap(),
+            "/usr/bin:/bin",
+            tool.dir(),
+            Duration::from_secs(3),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("did not finish"), "{err}");
+        tool.assert_all_ended(Duration::from_secs(10));
     }
 }

@@ -33,6 +33,7 @@ use crate::root::resolve_executable;
 use crate::run::{RuntimeProcess, RuntimeSandbox, runtime_command};
 use anyhow::{Context, Result, anyhow, bail};
 use cowproof_core::{Routing, Rung, Runtime, git_show_optional, valid_model_name};
+use cowproof_prove::runner::{GroupEnd, run_probe};
 use cowproof_run::{
     LaneLayout, NetworkMode,
     codex::{CodexPrice, CodexSpec, codex_command, write_lane_files},
@@ -42,7 +43,6 @@ use cowproof_run::{
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::time::Duration;
 use tokio::process::Command;
 
@@ -299,9 +299,7 @@ fn version_command(bin: &Path, director_path: &str, home: &Path) -> Command {
         .env_clear()
         .env("PATH", director_path)
         .env("HOME", home)
-        .env("CODEX_HOME", home)
-        .stdin(Stdio::null())
-        .kill_on_drop(true);
+        .env("CODEX_HOME", home);
     command
 }
 
@@ -309,6 +307,17 @@ fn version_command(bin: &Path, director_path: &str, home: &Path) -> Command {
 /// The error is a line for the preflight to print. The environment is cleared first, so no key
 /// reaches the process, and Codex runs with a throwaway home (see [`version_command`]).
 pub(crate) async fn locate(name: &str, director_path: &str, cwd: &Path) -> Result<Codex, String> {
+    locate_within(name, director_path, cwd, VERSION_TIMEOUT).await
+}
+
+/// [`locate`] with the time `--version` may take. The probe runs in its own process group
+/// ([`run_probe`]), ended whole when the time is up.
+async fn locate_within(
+    name: &str,
+    director_path: &str,
+    cwd: &Path,
+    limit: Duration,
+) -> Result<Codex, String> {
     let found = resolve_executable(name, director_path, cwd).map_err(|e| format!("{e}"))?;
     let mut bin = found
         .canonicalize()
@@ -325,30 +334,30 @@ pub(crate) async fn locate(name: &str, director_path: &str, cwd: &Path) -> Resul
     }
     let home = tempfile::TempDir::new()
         .map_err(|e| format!("cannot make a throwaway home for {}: {e}", bin.display()))?;
-    let mut command = version_command(&bin, director_path, home.path());
-    match tokio::time::timeout(VERSION_TIMEOUT, command.output()).await {
-        Err(_) => Err(format!(
-            "{} --version did not finish in {VERSION_TIMEOUT:?}",
-            bin.display()
-        )),
-        Ok(Err(e)) => Err(format!("cannot run {}: {e}", bin.display())),
-        Ok(Ok(out)) if !out.status.success() => Err(format!(
-            "{} --version ended with {}",
-            bin.display(),
-            out.status
-        )),
-        Ok(Ok(out)) => {
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            let version: String = stdout
-                .lines()
-                .map(str::trim)
-                .find(|l| !l.is_empty())
-                .unwrap_or("no version printed")
-                .chars()
-                .take(60)
-                .collect();
-            Ok(Codex { bin, version })
-        }
+    let command = version_command(&bin, director_path, home.path());
+    match run_probe(command, limit).await {
+        Err(e) => Err(format!("cannot run {}: {e}", bin.display())),
+        Ok(out) => match out.end {
+            GroupEnd::TimedOut => Err(format!(
+                "{} --version did not finish in {limit:?}",
+                bin.display()
+            )),
+            GroupEnd::Exited(status) if !status.success() => {
+                Err(format!("{} --version ended with {status}", bin.display()))
+            }
+            GroupEnd::Exited(_) => {
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                let version: String = stdout
+                    .lines()
+                    .map(str::trim)
+                    .find(|l| !l.is_empty())
+                    .unwrap_or("no version printed")
+                    .chars()
+                    .take(60)
+                    .collect();
+                Ok(Codex { bin, version })
+            }
+        },
     }
 }
 

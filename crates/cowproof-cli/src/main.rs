@@ -31,6 +31,8 @@ mod lane_tools;
 mod openrouter;
 mod plan;
 mod preflight;
+#[cfg(test)]
+mod probe_fixture;
 mod remote;
 mod report;
 mod root;

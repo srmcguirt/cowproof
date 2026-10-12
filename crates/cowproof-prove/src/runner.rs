@@ -319,6 +319,41 @@ pub async fn run_in_group(
     }
 }
 
+/// Run a short probe (`<tool> --version`, a sandboxed `true`) in its own process group and
+/// end the whole group when it is over: the one way every probe is run. It is
+/// [`run_in_group`] with SIGKILL on expiry and no [`GroupSet`]; the group is also ended when
+/// the future is dropped, and a probe that hangs or backgrounds work cannot outlive the
+/// caller. The caller sets the environment on `cmd`; stdin is null and both outputs are
+/// collected.
+pub async fn run_probe(cmd: Command, timeout: Duration) -> Result<GroupOutput, GroupError> {
+    run_in_group(cmd, timeout, Duration::ZERO, None).await
+}
+
+/// [`run_probe`] for a caller that is not async (the host facts). It drives the probe on a
+/// current-thread runtime of its own, on a scoped thread, so it is safe to call from inside
+/// another tokio runtime, which `block_on` on the calling thread would not be.
+pub fn run_probe_blocking(
+    cmd: std::process::Command,
+    timeout: Duration,
+) -> Result<GroupOutput, GroupError> {
+    std::thread::scope(|scope| {
+        scope
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(GroupError::Spawn)?;
+                runtime.block_on(run_probe(Command::from(cmd), timeout))
+            })
+            .join()
+            .unwrap_or_else(|_| {
+                Err(GroupError::Wait(std::io::Error::other(
+                    "the probe thread panicked",
+                )))
+            })
+    })
+}
+
 /// Wait, up to [`GROUP_GONE`], until no process is left in the group `pgid`.
 async fn wait_group_gone(pgid: u32) {
     let deadline = tokio::time::Instant::now() + GROUP_GONE;
@@ -1112,6 +1147,52 @@ pub(crate) mod tests {
         let _ = running.await;
         assert!(set.live().is_empty());
         assert_process_gone(pid);
+    }
+
+    /// A probe that outlives its limit is ended with everything it started, and reports the
+    /// timeout rather than an exit.
+    #[tokio::test]
+    async fn a_probe_that_times_out_ends_its_whole_group() {
+        let tmp = group_tmp();
+        let command = with_grandchild("sleep 300");
+        let ran = run_probe(sh(tmp.path(), &command), Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert!(matches!(ran.end, GroupEnd::TimedOut), "{ran:?}");
+        assert_process_gone(recorded_pid(tmp.path()).await);
+    }
+
+    /// Dropping a probe's future (the preflight was abandoned) ends its group, not only the
+    /// leader that `kill_on_drop` reaches.
+    #[tokio::test]
+    async fn dropping_a_probe_ends_its_whole_group() {
+        let tmp = group_tmp();
+        let command = with_grandchild("sleep 300");
+        let running = tokio::spawn({
+            let tree = tmp.path().to_path_buf();
+            async move {
+                let _ = run_probe(sh(&tree, &command), Duration::from_secs(120)).await;
+            }
+        });
+        let pid = recorded_pid(tmp.path()).await;
+        running.abort();
+        let _ = running.await;
+        assert_process_gone(pid);
+    }
+
+    /// The blocking probe works from inside a running tokio runtime (the host facts are
+    /// collected from `main`, which is async) and ends the group on timeout.
+    #[tokio::test]
+    async fn a_blocking_probe_inside_a_runtime_ends_its_whole_group_on_timeout() {
+        let tmp = group_tmp();
+        let mut command = std::process::Command::new("sh");
+        command
+            .arg("-c")
+            .arg(with_grandchild("sleep 300"))
+            .current_dir(tmp.path());
+        let ran = run_probe_blocking(command, Duration::from_secs(2)).unwrap();
+        assert!(matches!(ran.end, GroupEnd::TimedOut), "{ran:?}");
+        assert_process_gone(recorded_pid(tmp.path()).await);
     }
 
     /// The set signals only what it lists: a group started outside it is left alone.

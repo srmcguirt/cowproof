@@ -5034,16 +5034,20 @@ async fn git_stdout(repo: &Path, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
-/// First line of `<tool> --version`, when the tool runs.
+/// How long `<tool> --version` may take for the capsule's tool list.
+const TOOL_VERSION_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// First line of `<tool> --version`, when the tool runs (in its own process group, ended whole
+/// at the timeout).
 async fn tool_version(tool: &str) -> Option<String> {
-    let out = Command::new(tool)
-        .arg("--version")
-        .stdin(Stdio::null())
-        .output()
+    let mut command = Command::new(tool);
+    command.arg("--version");
+    let out = cowproof_prove::runner::run_probe(command, TOOL_VERSION_TIMEOUT)
         .await
         .ok()?;
-    if !out.status.success() {
-        return None;
+    match out.end {
+        cowproof_prove::runner::GroupEnd::Exited(status) if status.success() => {}
+        _ => return None,
     }
     String::from_utf8_lossy(&out.stdout)
         .lines()
