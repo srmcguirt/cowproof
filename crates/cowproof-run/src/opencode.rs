@@ -21,7 +21,8 @@
 //! * The provider is OpenCode's built-in `openrouter`, with `options.baseURL` at the bridge
 //!   (`<bridge>/api/v1`) and `options.apiKey` the placeholder. OpenCode's bundled model catalog
 //!   has no `openrouter` provider when its network fetch is off, so the config defines the one
-//!   model it runs, with the limits and the price from this module's table.
+//!   model it runs, with the limits and the price the director fetched from OpenRouter's own
+//!   model list at preflight ([`crate::models`]). There is no table of guessed prices.
 //! * Permissions are `OPENCODE_PERMISSION` (default deny, then an allowlist), never `--auto`.
 //!   The environment variable is applied after every config file. The same JSON is in the config
 //!   file as well, for the record.
@@ -37,6 +38,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::LaneLayout;
+pub use crate::models::ModelPrice;
 
 /// OpenCode's provider id for OpenRouter, and so the first half of `-m <provider>/<model>`.
 pub const PROVIDER: &str = "openrouter";
@@ -46,11 +48,6 @@ pub const API_PREFIX: &str = "/api/v1";
 /// names its tools `<server>_<tool>`, so `run_check` is `cowproof-tools_run_check`.
 pub const MCP_SERVER: &str = "cowproof-tools";
 
-/// What a context window and an output limit are when the price table has no entry. OpenCode
-/// needs both to schedule compaction; they are conservative.
-const DEFAULT_CONTEXT: u64 = 128_000;
-const DEFAULT_OUTPUT: u64 = 16_000;
-
 /// The shape of an OpenCode session id, which `-s` takes.
 pub fn valid_session_id(id: &str) -> bool {
     id.strip_prefix("ses_").is_some_and(|rest| {
@@ -58,91 +55,20 @@ pub fn valid_session_id(id: &str) -> bool {
     })
 }
 
-/// Token prices in USD per million tokens. An ESTIMATE, never a bill: written by hand, matched
-/// by a substring of the model name, and unverified against OpenRouter's live list. A model
-/// that matches no entry is priced as [`DEFAULT_PRICE`], which is dear on purpose, so an
-/// unknown model escalates and hits its cost cap early rather than late.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct ModelPrice {
-    pub input: f64,
-    pub output: f64,
-    pub cache_read: f64,
-    pub context: u64,
-    pub output_limit: u64,
-}
-
-/// The price of a model nobody wrote down.
-pub const DEFAULT_PRICE: ModelPrice = ModelPrice {
-    input: 3.0,
-    output: 15.0,
-    cache_read: 0.3,
-    context: DEFAULT_CONTEXT,
-    output_limit: DEFAULT_OUTPUT,
-};
-
-/// Written from memory of OpenRouter's list prices; update from its `/models` before relying
-/// on the figures. Entries are tried in order and the first substring match wins.
-const PRICES: [(&str, ModelPrice); 3] = [
-    (
-        "glm",
-        ModelPrice {
-            input: 0.6,
-            output: 2.2,
-            cache_read: 0.11,
-            context: 200_000,
-            output_limit: 16_000,
-        },
-    ),
-    (
-        "deepseek",
-        ModelPrice {
-            input: 0.3,
-            output: 1.2,
-            cache_read: 0.03,
-            context: 128_000,
-            output_limit: 16_000,
-        },
-    ),
-    (
-        "qwen",
-        ModelPrice {
-            input: 0.4,
-            output: 1.6,
-            cache_read: 0.04,
-            context: 128_000,
-            output_limit: 16_000,
-        },
-    ),
-];
-
-/// The table entry for `model` (a name or an `vendor/name` id, case-insensitive), if any.
-pub fn known_price(model: &str) -> Option<ModelPrice> {
-    let lower = model.to_ascii_lowercase();
-    PRICES
-        .iter()
-        .find(|(family, _)| lower.contains(family))
-        .map(|(_, price)| *price)
-}
-
-/// The price used to estimate `model`: its entry, else [`DEFAULT_PRICE`].
-pub fn price_for(model: &str) -> ModelPrice {
-    known_price(model).unwrap_or(DEFAULT_PRICE)
-}
-
-/// Estimated cost in USD of one model call. Cache writes are priced as plain input: the
-/// OpenAI-style providers behind OpenRouter do not charge more for them.
+/// Estimated cost in USD of one model call at `price` (USD per million tokens), for a turn
+/// whose cost OpenCode did not report. Cache writes are priced at the model's listed cache-write
+/// price, which is its plain input price when the list gives none.
 pub fn estimate_cost_usd(
-    model: &str,
+    price: &ModelPrice,
     input: u64,
     output: u64,
     cache_read: u64,
     cache_write: u64,
 ) -> f64 {
-    let p = price_for(model);
-    (input as f64 * p.input
-        + output as f64 * p.output
-        + cache_read as f64 * p.cache_read
-        + cache_write as f64 * p.input)
+    (input as f64 * price.input
+        + output as f64 * price.output
+        + cache_read as f64 * price.cache_read
+        + cache_write as f64 * price.cache_write)
         / 1_000_000.0
 }
 
@@ -152,6 +78,8 @@ pub struct OpencodeSpec {
     pub lane: LaneLayout,
     /// The OpenRouter model id, `vendor/name`.
     pub model: String,
+    /// What OpenRouter's model list says the model costs and allows, fetched at preflight.
+    pub price: ModelPrice,
     /// The in-sandbox bridge, `http://127.0.0.1:<port>`, without the API prefix.
     pub proxy_base_url: String,
     /// The lane's placeholder credential.
@@ -219,23 +147,23 @@ pub fn permission_json(lane: &LaneLayout) -> Value {
 
 /// The OpenCode config for one launch.
 pub fn config_json(spec: &OpencodeSpec) -> Value {
-    let mut model = json!({
+    let price = &spec.price;
+    let model = json!({
         "name": spec.model,
         "tool_call": true,
         "attachment": false,
         "limit": {
-            "context": price_for(&spec.model).context,
-            "output": price_for(&spec.model).output_limit,
+            "context": price.context,
+            "output": price.output_limit,
         },
-    });
-    if let Some(price) = known_price(&spec.model) {
-        model["cost"] = json!({
+        // USD per million tokens, OpenCode's unit.
+        "cost": {
             "input": price.input,
             "output": price.output,
             "cache_read": price.cache_read,
-            "cache_write": price.input,
-        });
-    }
+            "cache_write": price.cache_write,
+        },
+    });
     let full_model = format!("{PROVIDER}/{}", spec.model);
     json!({
         "$schema": "https://opencode.ai/config.json",
@@ -629,10 +557,22 @@ mod tests {
         }
     }
 
+    fn price() -> ModelPrice {
+        ModelPrice {
+            input: 1.23,
+            output: 4.56,
+            cache_read: 0.11,
+            cache_write: 0.75,
+            context: 202_752,
+            output_limit: 65_535,
+        }
+    }
+
     fn spec() -> OpencodeSpec {
         OpencodeSpec {
             lane: lane(),
             model: "z-ai/glm-5.3-flash".to_string(),
+            price: price(),
             proxy_base_url: "http://127.0.0.1:41000".to_string(),
             placeholder_key: "placeholder-abc".to_string(),
             config_file: PathBuf::from("/nonexistent-cp/lanes/l1/home/opencode.json"),
@@ -749,18 +689,21 @@ mod tests {
     }
 
     #[test]
-    fn the_model_is_defined_with_its_price_only_when_the_table_knows_it() {
-        let known = config_json(&spec());
-        let model = &known["provider"]["openrouter"]["models"]["z-ai/glm-5.3-flash"];
+    fn the_model_is_defined_with_the_fetched_price_and_limits_per_million() {
+        let config = config_json(&spec());
+        let model = &config["provider"]["openrouter"]["models"]["z-ai/glm-5.3-flash"];
         assert_eq!(model["tool_call"], true);
-        assert_eq!(model["cost"]["input"], 0.6);
-        assert_eq!(model["limit"]["context"], 200_000);
-        let mut s = spec();
-        s.model = "acme/mystery-9".to_string();
-        let unknown = config_json(&s);
-        let model = &unknown["provider"]["openrouter"]["models"]["acme/mystery-9"];
-        assert!(model.get("cost").is_none(), "{model}");
-        assert_eq!(model["limit"]["context"], DEFAULT_CONTEXT);
+        assert_eq!(model["cost"]["input"], 1.23);
+        assert_eq!(model["cost"]["output"], 4.56);
+        assert_eq!(model["cost"]["cache_read"], 0.11);
+        assert_eq!(model["cost"]["cache_write"], 0.75);
+        assert_eq!(model["limit"]["context"], 202_752);
+        assert_eq!(model["limit"]["output"], 65_535);
+        // The same JSON is what OpenCode reads from the environment.
+        let inv = opencode_command(&spec()).unwrap();
+        let from_env: Value =
+            serde_json::from_str(&env_of(&inv, "OPENCODE_CONFIG_CONTENT")).unwrap();
+        assert_eq!(from_env, config);
     }
 
     #[test]
@@ -826,19 +769,11 @@ mod tests {
     }
 
     #[test]
-    fn the_price_table_matches_by_name_and_prices_the_unknown_dear() {
-        assert_eq!(known_price("z-ai/GLM-5.3-flash").unwrap().input, 0.6);
-        assert!(known_price("acme/mystery-9").is_none());
-        assert_eq!(price_for("acme/mystery-9"), DEFAULT_PRICE);
-        // 1M input + 1M output + 1M cache read + 1M cache write on glm.
-        let cost = estimate_cost_usd(
-            "z-ai/glm-5.3-flash",
-            1_000_000,
-            1_000_000,
-            1_000_000,
-            1_000_000,
-        );
-        assert!((cost - (0.6 + 2.2 + 0.11 + 0.6)).abs() < 1e-9, "{cost}");
+    fn a_turns_estimate_is_priced_from_the_fetched_figures() {
+        // 1M input + 1M output + 1M cache read + 1M cache write.
+        let cost = estimate_cost_usd(&price(), 1_000_000, 1_000_000, 1_000_000, 1_000_000);
+        assert!((cost - (1.23 + 4.56 + 0.11 + 0.75)).abs() < 1e-9, "{cost}");
+        assert_eq!(estimate_cost_usd(&price(), 0, 0, 0, 0), 0.0);
     }
 
     fn event(line: &str) -> Event {

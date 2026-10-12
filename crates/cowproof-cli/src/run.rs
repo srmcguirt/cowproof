@@ -67,6 +67,7 @@ use cowproof_run::{
     },
     lane::{PrepareOptions, prepare_lane},
     lane_tmp,
+    models::{ModelPrice, PriceRecord},
     prefix::{assemble_prompt, prefix_version},
     proxy::{Provider, ProxyConfig, ProxyServer},
     render_macos_profile, sandbox_command,
@@ -777,6 +778,10 @@ struct Launcher {
     /// these only say which rungs can run.
     has_anthropic_key: bool,
     has_openrouter_key: bool,
+    /// The price and limits of every OpenRouter model the lane may run, by exact model id,
+    /// fetched from OpenRouter's model list at preflight. A launch on an `openrouter` rung with
+    /// no entry here is refused: the cost cap cannot act without a price.
+    prices: BTreeMap<String, PriceRecord>,
     cowproof_exe: PathBuf,
     /// The portkit CLI `pk`, the sibling of the running `cowproof` executable
     /// (G8). Without it the builder gets no hooks and the lane is `untraced` (D5).
@@ -878,6 +883,13 @@ impl Launcher {
         }
     }
 
+    /// The fetched price of `model` when `runtime` is `openrouter`; `None` for any other runtime.
+    fn openrouter_price(&self, runtime: Runtime, model: &str) -> Option<&PriceRecord> {
+        (runtime == Runtime::Openrouter)
+            .then(|| self.prices.get(model))
+            .flatten()
+    }
+
     /// The version string the runner read from the runtime's executable, if it read one.
     fn runtime_version(&self, runtime: Runtime) -> Option<&str> {
         match runtime {
@@ -936,7 +948,23 @@ impl Launcher {
         }
         let layout = &self.layout;
         let assembled = assemble_prompt(self.project_instructions.as_deref(), &launch.packet);
-        let (mut child_cmd, spec) = if launch.runtime == Runtime::Openrouter {
+        // An `openrouter` launch runs at the price OpenRouter listed for this exact model.
+        let price: Option<ModelPrice> = if launch.runtime == Runtime::Openrouter {
+            let record = self.openrouter_price(launch.runtime, &launch.model);
+            Some(
+                record
+                    .with_context(|| {
+                        format!(
+                            "no price was fetched for openrouter model {:?}, so the cost cap cannot act on it",
+                            launch.model
+                        )
+                    })?
+                    .price,
+            )
+        } else {
+            None
+        };
+        let (mut child_cmd, spec) = if let Some(price) = price {
             // OpenCode, in the same sandbox, behind the same bridge. The refusal above has
             // made sure it exists and that the lane is local.
             let opencode = self.opencode.as_ref().context("opencode was not located")?;
@@ -954,6 +982,7 @@ impl Launcher {
                 runner_socket: &self.socket,
                 port_base: self.port_base,
                 model: &launch.model,
+                price,
                 packet: &launch.packet,
                 project_instructions: self.project_instructions.as_deref(),
                 prompt: &launch.prompt,
@@ -1063,10 +1092,9 @@ impl Launcher {
         // Text read but not yet written (a line still waiting for its newline).
         let mut stderr_pending: Vec<u8> = Vec::new();
 
-        let mut meter = if launch.runtime == Runtime::Openrouter {
-            StreamMeter::opencode(launch.resume.is_some(), &launch.model)
-        } else {
-            StreamMeter::new(launch.resume.is_some())
+        let mut meter = match price {
+            Some(price) => StreamMeter::opencode(launch.resume.is_some(), price),
+            None => StreamMeter::new(launch.resume.is_some()),
         };
         let mut stream = tokio::fs::OpenOptions::new()
             .create(true)
@@ -1500,10 +1528,14 @@ impl Drive<'_> {
         launch: &Launch,
         seg: &SegmentRun,
         runtime_version: Option<&str>,
+        price: Option<&PriceRecord>,
     ) -> serde_json::Value {
         json!({
             "index": index,
             "runtime": launch.runtime.name(),
+            // What OpenRouter's model list said the model costs, fetched at preflight and the
+            // figures the lane's cost was computed at (null for any other runtime).
+            "price": price.map(PriceRecord::to_json),
             // The version the runtime's executable reported (`opencode --version`), when the
             // runner read one.
             "runtimeVersion": runtime_version,
@@ -1594,6 +1626,8 @@ impl Drive<'_> {
                 &launch,
                 &seg,
                 self.launcher.runtime_version(launch.runtime),
+                self.launcher
+                    .openrouter_price(launch.runtime, &launch.model),
             );
             // A hard limit ended the launch: no fallback, no relaunch, no proof.
             let hard_end = match seg.session_end {
@@ -1765,6 +1799,21 @@ impl Drive<'_> {
                         break (
                             LaneEnd::Refused(format!(
                                 "reassign for {id} refused: {to} is the next rung, but {refusal}"
+                            )),
+                            status,
+                        );
+                    }
+                    // An `openrouter` rung the preflight did not price (a model the ruling
+                    // named, off the ladder) has no price, so the cost cap could not act on it.
+                    if to.runtime == Runtime::Openrouter
+                        && self
+                            .launcher
+                            .openrouter_price(to.runtime, &to.model)
+                            .is_none()
+                    {
+                        break (
+                            LaneEnd::Refused(format!(
+                                "reassign for {id} refused: {to} was not priced at preflight (OpenRouter's model list is read once, for the rungs on the ladder), so the cost cap cannot act on it; add it to the ladder"
                             )),
                             status,
                         );
@@ -2592,6 +2641,33 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
             return Ok(INFRASTRUCTURE_EXIT_CODE);
         }
     }
+    // 2c. The price of every OpenRouter model the lane could run: the start rung and each
+    // OpenRouter rung above it. One request to OpenRouter's own model list, with the real key,
+    // made here by the director and not by the lane. A model that is not listed, a list that
+    // cannot be read and a price that cannot be used all stop the run (exit 4): the cost cap
+    // acts on this price, so there is no guessed one to fall back to. A remote lane runs Claude
+    // only, so it fetches nothing; without a key no `openrouter` rung can run, so nothing either.
+    let mut prices: BTreeMap<String, PriceRecord> = BTreeMap::new();
+    if remote_host.is_none()
+        && let Some(key) = openrouter_key.as_deref()
+    {
+        let models = openrouter::priced_models(&first_rung, &routing);
+        if !models.is_empty() {
+            let timeout = openrouter::models_timeout()?;
+            match cowproof_run::models::fetch_prices(&openrouter_upstream, key, &models, timeout)
+                .await
+            {
+                Ok(found) => prices = found,
+                Err(errors) => {
+                    for error in errors {
+                        eprintln!("preflight failed: openrouter price: {error}");
+                    }
+                    eprintln!("nothing was started");
+                    return Ok(INFRASTRUCTURE_EXIT_CODE);
+                }
+            }
+        }
+    }
     let claude_bin: Option<PathBuf> = match &remote_host {
         Some(host) => Some(PathBuf::from(&host.claude)),
         None => match resolve_executable(&args.claude_bin, &director_path, &cwd) {
@@ -2903,6 +2979,7 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
         opencode: opencode.clone(),
         has_anthropic_key,
         has_openrouter_key,
+        prices,
         cowproof_exe: cowproof_exe.clone(),
         pk_exe: pk_exe.clone(),
         portkit_dir: portkit_dir.clone(),
@@ -3202,6 +3279,9 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
             header: &header,
             runtime: lane_run.runtime.name(),
             runtime_version: launcher.runtime_version(lane_run.runtime),
+            openrouter_price: launcher
+                .openrouter_price(lane_run.runtime, &lane_run.model)
+                .map(PriceRecord::to_json),
             model: &lane_run.model,
             rung_source: rung_source.name(),
             cost_usd: total_cost_usd,
@@ -3379,6 +3459,8 @@ struct ProofInput<'a> {
     runtime: &'a str,
     /// The version the last segment's runtime executable reported, when it was read.
     runtime_version: Option<&'a str>,
+    /// What OpenRouter's model list said the last segment's model costs (`openrouter` lanes).
+    openrouter_price: Option<serde_json::Value>,
     model: &'a str,
     rung_source: &'a str,
     cost_usd: f64,
@@ -3604,6 +3686,7 @@ async fn replay_and_gate(
     );
     capsule.builder_runtime = input.runtime.to_string();
     capsule.builder_runtime_version = input.runtime_version.map(str::to_string);
+    capsule.openrouter_price = input.openrouter_price.clone();
     capsule.rung_source = Some(input.rung_source.to_string());
     capsule.estimated_cost_usd = input.cost_usd;
     capsule.estimated_tokens = input.tokens;

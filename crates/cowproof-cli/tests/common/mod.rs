@@ -467,6 +467,90 @@ struct FakeState {
     seen: Vec<Seen>,
     /// Answer every chat completion with this status and a JSON error body.
     fail_with: Option<u16>,
+    /// What `GET /api/v1/models` answers (see [`FakeOpenRouter::set_models`]).
+    models: ModelsMode,
+    /// The key `GET /api/v1/models` requires as `Authorization: Bearer <key>`; 403 otherwise.
+    expected_key: String,
+}
+
+/// The lettered synthetic key the OpenRouter tests give the director, and the one the fake's
+/// model list requires. Not a real key and not shaped like one a scanner would flag.
+pub fn openrouter_test_key() -> String {
+    format!("sk-or-v1-{}", "abcdefghij".repeat(6))
+}
+
+/// One entry of the fake's model list, in the shape of OpenRouter's `GET /models`. Prices are
+/// the strings OpenRouter sends: USD per token.
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+pub struct FakeModel {
+    pub id: String,
+    pub prompt: String,
+    pub completion: String,
+    pub cache_read: Option<String>,
+    pub cache_write: Option<String>,
+    pub context_length: Option<u64>,
+    pub max_completion_tokens: Option<u64>,
+}
+
+#[allow(dead_code)]
+impl FakeModel {
+    /// A model with only a prompt and a completion price, and no limits.
+    pub fn new(id: &str, prompt: &str, completion: &str) -> Self {
+        FakeModel {
+            id: id.to_string(),
+            prompt: prompt.to_string(),
+            completion: completion.to_string(),
+            cache_read: None,
+            cache_write: None,
+            context_length: None,
+            max_completion_tokens: None,
+        }
+    }
+
+    pub fn cache_read(mut self, price: &str) -> Self {
+        self.cache_read = Some(price.to_string());
+        self
+    }
+
+    pub fn limits(mut self, context_length: u64, max_completion_tokens: u64) -> Self {
+        self.context_length = Some(context_length);
+        self.max_completion_tokens = Some(max_completion_tokens);
+        self
+    }
+
+    fn to_json(&self) -> Value {
+        let mut pricing = json!({"prompt": self.prompt, "completion": self.completion});
+        if let Some(p) = &self.cache_read {
+            pricing["input_cache_read"] = json!(p);
+        }
+        if let Some(p) = &self.cache_write {
+            pricing["input_cache_write"] = json!(p);
+        }
+        json!({
+            "id": self.id,
+            "name": self.id,
+            "context_length": self.context_length,
+            "top_provider": {"max_completion_tokens": self.max_completion_tokens},
+            "pricing": pricing,
+        })
+    }
+}
+
+/// How the fake answers `GET /api/v1/models`.
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+pub enum ModelsMode {
+    /// 200 with these models.
+    List(Vec<FakeModel>),
+    /// This status and a JSON error body.
+    Status(u16),
+    /// 200 with a body that is not JSON.
+    Garbage,
+    /// Accept the request and never answer.
+    Hang,
+    /// 200 with a valid JSON body larger than the director's 8 MiB cap.
+    Oversize,
 }
 
 /// A small HTTP server on 127.0.0.1 that answers OpenAI-style streaming chat completions
@@ -492,6 +576,28 @@ impl FakeOpenRouter {
         Self::start_with(Vec::new(), Some(status))
     }
 
+    /// Change what `GET /api/v1/models` answers. Until it is called the list holds one model,
+    /// `z-ai/glm-5.3-flash`, at the prices the old hand-written table gave.
+    pub fn set_models(&self, mode: ModelsMode) {
+        self.state.lock().unwrap().models = mode;
+    }
+
+    /// The requests for the model list, oldest first.
+    pub fn models_requests(&self) -> Vec<Seen> {
+        self.seen()
+            .into_iter()
+            .filter(|r| r.path == "/api/v1/models")
+            .collect()
+    }
+
+    /// Every request that is not for the model list, oldest first.
+    pub fn other_requests(&self) -> Vec<Seen> {
+        self.seen()
+            .into_iter()
+            .filter(|r| r.path != "/api/v1/models")
+            .collect()
+    }
+
     fn start_with(script: Vec<Reply>, fail_with: Option<u16>) -> Self {
         use std::sync::atomic::Ordering;
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
@@ -502,6 +608,12 @@ impl FakeOpenRouter {
             next: 0,
             seen: Vec::new(),
             fail_with,
+            models: ModelsMode::List(vec![
+                FakeModel::new("z-ai/glm-5.3-flash", "0.0000006", "0.0000022")
+                    .cache_read("0.00000011")
+                    .limits(200_000, 16_000),
+            ]),
+            expected_key: openrouter_test_key(),
         }));
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (st, sp) = (state.clone(), stop.clone());
@@ -569,6 +681,53 @@ fn flat_content(content: &Value) -> String {
             .join("\n"),
         other => other.to_string(),
     }
+}
+
+/// Answer `GET /api/v1/models`, then close the connection.
+fn fake_models(
+    writer: &mut std::net::TcpStream,
+    authorized: bool,
+    mode: ModelsMode,
+) -> std::io::Result<()> {
+    use std::io::Write;
+    let (status, body) = if !authorized {
+        (
+            403,
+            json!({"error": {"message": "invalid key", "code": 403}}).to_string(),
+        )
+    } else {
+        match mode {
+            ModelsMode::List(models) => (
+                200,
+                json!({"data": models.iter().map(FakeModel::to_json).collect::<Vec<_>>()})
+                    .to_string(),
+            ),
+            ModelsMode::Status(status) => (
+                status,
+                json!({"error": {"message": "models are down", "code": status}}).to_string(),
+            ),
+            ModelsMode::Garbage => (200, "this is { not json".to_string()),
+            ModelsMode::Hang => {
+                std::thread::sleep(std::time::Duration::from_secs(120));
+                return Ok(());
+            }
+            ModelsMode::Oversize => (
+                200,
+                format!(
+                    r#"{{"data":[],"pad":"{}"}}"#,
+                    "x".repeat(8 * 1024 * 1024 + 16)
+                ),
+            ),
+        }
+    };
+    // The client may stop reading an oversize body; a broken pipe is not the fake's problem.
+    let _ = write!(
+        writer,
+        "HTTP/1.1 {status} Status\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let _ = writer.flush();
+    Ok(())
 }
 
 fn fake_serve(
@@ -667,7 +826,13 @@ fn fake_serve(
                 system,
                 header_names: headers.iter().map(|(k, _)| k.clone()).collect(),
             });
-            if method != "POST" || path != "/api/v1/chat/completions" {
+            if method == "GET" && path == "/api/v1/models" {
+                let authorized = header("authorization").as_deref()
+                    == Some(format!("Bearer {}", st.expected_key).as_str());
+                let mode = st.models.clone();
+                drop(st);
+                return fake_models(&mut writer, authorized, mode);
+            } else if method != "POST" || path != "/api/v1/chat/completions" {
                 None
             } else if let Some(status) = st.fail_with {
                 let body =

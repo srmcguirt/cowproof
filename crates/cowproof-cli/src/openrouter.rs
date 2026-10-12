@@ -9,13 +9,18 @@
 //! with `COWPROOF_OPENROUTER_UPSTREAM` (a test server, a self-hosted gateway). It is read from
 //! the environment and never from `cowproof.toml`, because repository content must not be able
 //! to redirect the key, and it is written to `run.json` whenever it is set.
+//!
+//! The same upstream and key serve one more request, the director's own: at preflight,
+//! `GET <upstream>/api/v1/models` gives the exact price of every OpenRouter model the lane could
+//! run ([`cowproof_run::models`]). That request does not go through the lane's proxy.
 
 use crate::root::resolve_executable;
 use crate::run::{builder_argv, sandboxed_command};
 use anyhow::{Context, Result, anyhow, bail};
-use cowproof_core::port_block_env;
+use cowproof_core::{Routing, Rung, Runtime, port_block_env};
 use cowproof_run::{
     LaneLayout, NetworkMode, SandboxPolicy,
+    models::{DEFAULT_TIMEOUT, ModelPrice},
     opencode::{OpencodeSpec, opencode_command, write_lane_files},
     prefix::assemble_prompt,
     proxy::{Provider, ProxyConfig},
@@ -32,6 +37,11 @@ pub(crate) const KEY_ENV: &str = "OPENROUTER_API_KEY";
 pub(crate) const UPSTREAM_ENV: &str = "COWPROOF_OPENROUTER_UPSTREAM";
 /// OpenRouter's API host.
 pub(crate) const DEFAULT_UPSTREAM: &str = "https://openrouter.ai";
+
+/// TEST-ONLY: the director's environment variable that replaces the 15 s limit on the model-list
+/// request, in milliseconds, so a test of a hanging upstream does not take 15 s. Nothing
+/// documented for users sets it.
+pub(crate) const MODELS_TIMEOUT_ENV: &str = "COWPROOF_OPENROUTER_MODELS_TIMEOUT_MS";
 
 /// How long `opencode --version` may take.
 const VERSION_TIMEOUT: Duration = Duration::from_secs(30);
@@ -64,6 +74,43 @@ pub(crate) fn upstream() -> Result<(String, bool)> {
         }
         _ => Ok((DEFAULT_UPSTREAM.to_string(), false)),
     }
+}
+
+/// How long the model-list request may take: 15 s, or [`MODELS_TIMEOUT_ENV`] (test-only).
+pub(crate) fn models_timeout() -> Result<Duration> {
+    match std::env::var_os(MODELS_TIMEOUT_ENV) {
+        Some(v) if !v.is_empty() => {
+            let text = v
+                .into_string()
+                .map_err(|_| anyhow!("{MODELS_TIMEOUT_ENV} is not valid UTF-8"))?;
+            parse_timeout(&text)
+        }
+        _ => Ok(DEFAULT_TIMEOUT),
+    }
+}
+
+fn parse_timeout(text: &str) -> Result<Duration> {
+    match text.parse::<u64>() {
+        Ok(ms) if ms > 0 => Ok(Duration::from_millis(ms)),
+        _ => bail!("{MODELS_TIMEOUT_ENV} must be a positive number of milliseconds"),
+    }
+}
+
+/// The OpenRouter model ids a lane that starts on `first` could run: `first` itself and every
+/// rung above it on the ladder, where a `reassign` can land. Each id once, in ladder order.
+/// A rung off the ladder is followed by nothing (`reassign` without a model has nowhere to go).
+pub(crate) fn priced_models(first: &Rung, routing: &Routing) -> Vec<String> {
+    let mut rungs = vec![first];
+    if let Some(at) = routing.position(first) {
+        rungs.extend(&routing.rungs[at + 1..]);
+    }
+    let mut models: Vec<String> = Vec::new();
+    for rung in rungs {
+        if rung.runtime == Runtime::Openrouter && !models.contains(&rung.model) {
+            models.push(rung.model.clone());
+        }
+    }
+    models
 }
 
 /// An OpenCode executable the runner can launch.
@@ -141,6 +188,8 @@ pub(crate) struct OpencodeLaunch<'a> {
     pub port_base: u16,
     /// The OpenRouter model id.
     pub model: &'a str,
+    /// Its price and limits from OpenRouter's model list.
+    pub price: ModelPrice,
     /// The packet this session works from; the preamble and the project instructions are
     /// assembled with it, as for Claude.
     pub packet: &'a str,
@@ -164,6 +213,7 @@ pub(crate) fn opencode_builder_command(l: &OpencodeLaunch<'_>) -> Result<Command
     let spec = OpencodeSpec {
         lane: l.layout.clone(),
         model: l.model.to_string(),
+        price: l.price,
         proxy_base_url: l.base_url.to_string(),
         placeholder_key: l.placeholder_key.to_string(),
         config_file: home.join("opencode.json"),
@@ -220,4 +270,67 @@ pub(crate) fn opencode_builder_command(l: &OpencodeLaunch<'_>) -> Result<Command
     command.stdin(Stdio::from(stdin));
     command.process_group(0);
     Ok(command)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn routing(rungs: &[&str]) -> Routing {
+        let list = rungs
+            .iter()
+            .map(|r| format!("{r:?}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        Routing::parse(Some(&format!("[ladder]\nrungs = [{list}]\n"))).unwrap()
+    }
+
+    fn models(first: &str, rungs: &[&str]) -> Vec<String> {
+        priced_models(&Rung::parse(first).unwrap(), &routing(rungs))
+    }
+
+    #[test]
+    fn the_models_to_price_are_the_start_rung_and_every_openrouter_rung_above_it() {
+        let ladder = [
+            "openrouter:acme/low",
+            "claude:haiku",
+            "openrouter:acme/mid",
+            "claude:sonnet",
+            "openrouter:acme/low-2",
+        ];
+        assert_eq!(
+            models("openrouter:acme/low", &ladder),
+            ["acme/low", "acme/mid", "acme/low-2"]
+        );
+        // A rung below the start is not reachable by reassign.
+        assert_eq!(models("claude:haiku", &ladder), ["acme/mid", "acme/low-2"]);
+        assert_eq!(models("claude:sonnet", &ladder), ["acme/low-2"]);
+        // The top has nothing above it; a Claude lane on a ladder with no OpenRouter rung needs
+        // no price at all.
+        assert!(models("claude:haiku", &["claude:haiku", "claude:sonnet"]).is_empty());
+        assert!(models("claude:opus", &["claude:haiku", "openrouter:acme/low"]).is_empty());
+    }
+
+    #[test]
+    fn a_start_rung_off_the_ladder_is_priced_alone_and_a_model_is_listed_once() {
+        let ladder = ["claude:haiku", "openrouter:acme/low", "claude:sonnet"];
+        assert_eq!(models("openrouter:acme/other", &ladder), ["acme/other"]);
+        // The same model twice (on the flag and as the rung above): one id.
+        assert_eq!(
+            models(
+                "openrouter:acme/low",
+                &["openrouter:acme/low", "openrouter:acme/hi"]
+            ),
+            ["acme/low", "acme/hi"]
+        );
+    }
+
+    #[test]
+    fn the_models_timeout_is_a_positive_number_of_milliseconds() {
+        assert_eq!(parse_timeout("1500").unwrap(), Duration::from_millis(1500));
+        for bad in ["0", "-5", "soon", "1.5", ""] {
+            assert!(parse_timeout(bad).is_err(), "{bad:?}");
+        }
+        assert_eq!(DEFAULT_TIMEOUT, Duration::from_secs(15));
+    }
 }

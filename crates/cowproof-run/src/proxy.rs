@@ -253,7 +253,7 @@ impl fmt::Debug for ProxyConfig {
 }
 
 /// The parsed upstream base. Request targets are built from this and the request's path only.
-struct Upstream {
+pub(crate) struct Upstream {
     scheme: Scheme,
     authority: Authority,
     prefix: String,
@@ -261,7 +261,7 @@ struct Upstream {
 }
 
 impl Upstream {
-    fn parse(base: &str) -> Result<Self> {
+    pub(crate) fn parse(base: &str) -> Result<Self> {
         let uri: Uri = base
             .parse()
             .map_err(|_| anyhow::anyhow!("upstream base URL is not a valid URL"))?;
@@ -291,7 +291,7 @@ impl Upstream {
         })
     }
 
-    fn target(&self, path_and_query: &str) -> Result<Uri> {
+    pub(crate) fn target(&self, path_and_query: &str) -> Result<Uri> {
         Uri::builder()
             .scheme(self.scheme.clone())
             .authority(self.authority.clone())
@@ -347,6 +347,28 @@ struct State {
     metrics: MetricsLog,
 }
 
+/// The HTTPS client for the providers: webpki roots, a connect timeout, HTTP/1. The proxy
+/// forwards the builder's requests with it, and the director's own model-list request
+/// ([`crate::models`]) uses the same one, so there is one client to audit.
+pub(crate) fn https_client<B>() -> Client<HttpsConnector<HttpConnector>, B>
+where
+    B: Body + Send + 'static,
+    B::Data: Send,
+{
+    let mut http = HttpConnector::new();
+    http.enforce_http(false);
+    http.set_connect_timeout(Some(CONNECT_TIMEOUT));
+    http.set_nodelay(true);
+    let https = HttpsConnectorBuilder::new()
+        .with_webpki_roots()
+        .https_or_http()
+        .enable_http1()
+        .wrap_connector(http);
+    Client::builder(TokioExecutor::new())
+        .pool_idle_timeout(Duration::from_secs(30))
+        .build(https)
+}
+
 /// The proxy server.
 pub struct ProxyServer {
     state: Arc<State>,
@@ -355,18 +377,7 @@ pub struct ProxyServer {
 impl ProxyServer {
     /// Create a proxy server from a configuration.
     pub fn new(config: ProxyConfig) -> Self {
-        let mut http = HttpConnector::new();
-        http.enforce_http(false);
-        http.set_connect_timeout(Some(CONNECT_TIMEOUT));
-        http.set_nodelay(true);
-        let https = HttpsConnectorBuilder::new()
-            .with_webpki_roots()
-            .https_or_http()
-            .enable_http1()
-            .wrap_connector(http);
-        let client = Client::builder(TokioExecutor::new())
-            .pool_idle_timeout(Duration::from_secs(30))
-            .build(https);
+        let client = https_client();
         Self {
             state: Arc::new(State {
                 config,

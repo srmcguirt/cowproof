@@ -168,6 +168,14 @@ pub struct Capsule {
     /// and in lanes whose runtime version is not recorded, which read as null.
     #[serde(default)]
     pub builder_runtime_version: Option<String>,
+    /// What OpenRouter's model list said the last segment's model costs, fetched at preflight
+    /// and the figures the lane's cost was computed at (`openrouter` lanes only; null for any
+    /// other runtime): `inputPerMillion`, `outputPerMillion`, `cacheReadPerMillion` and
+    /// `cacheWritePerMillion` in USD, `contextLength`, `maxOutput`, `defaulted` (the fields the
+    /// list did not give), `source` (the path fetched, never the key) and `fetchedAt` (UTC).
+    /// Sealed in `capsule.json`; absent in older capsules, which read as null.
+    #[serde(default)]
+    pub openrouter_price: Option<serde_json::Value>,
     /// Where the lane's starting rung came from (D28): `flag`, `header`, `class` or
     /// `default`. Sealed in `capsule.json`; absent in older capsules, which read as null.
     #[serde(default)]
@@ -249,6 +257,7 @@ impl Capsule {
             builder_model,
             builder_runtime: default_runtime(),
             builder_runtime_version: None,
+            openrouter_price: None,
             rung_source: None,
             auth_mode,
             estimated_cost_usd: 0.0,

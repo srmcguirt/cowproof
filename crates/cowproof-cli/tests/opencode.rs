@@ -12,7 +12,10 @@
 #[allow(dead_code)]
 mod common;
 
-use common::{FakeOpenRouter, Lane, Reply, fork_lock, output, sandbox_available, text, var_tmp};
+use common::{
+    FakeModel, FakeOpenRouter, Lane, ModelsMode, Reply, fork_lock, output, sandbox_available, text,
+    var_tmp,
+};
 use cowproof_prove::Capsule;
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
@@ -22,9 +25,10 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
-/// A lettered synthetic key. Not a real one, and not shaped like one a scanner would flag.
+/// A lettered synthetic key. Not a real one, and not shaped like one a scanner would flag. The
+/// fake's model list requires this one.
 fn real_key() -> String {
-    format!("sk-or-v1-{}", "abcdefghij".repeat(6))
+    common::openrouter_test_key()
 }
 
 const MODEL: &str = "z-ai/glm-5.3-flash";
@@ -339,10 +343,19 @@ fn a_proved_lane_on_an_openrouter_rung_holds_the_real_key_nowhere_but_the_proxy(
         "no portkit hooks in OpenCode"
     );
 
-    // The fake upstream saw the REAL key, only on the one path, and never the placeholder.
-    let seen = fake.seen();
-    assert!(seen.len() >= 4, "{seen:#?}");
+    // The director's own request for the price came first and carried the real key; the lane's
+    // proxy never forwards a model-list request.
     let want = format!("Bearer {}", real_key());
+    let all = fake.seen();
+    assert_eq!(all[0].path, "/api/v1/models", "{all:#?}");
+    let models = fake.models_requests();
+    assert_eq!(models.len(), 1, "{models:#?}");
+    assert_eq!(models[0].method, "GET");
+    assert_eq!(models[0].authorization.as_deref(), Some(want.as_str()));
+    assert_eq!(models[0].host.as_deref(), Some(fake.host().as_str()));
+    // The lane's requests: the REAL key, only on the one path, and never the placeholder.
+    let seen = fake.other_requests();
+    assert!(seen.len() >= 4, "{seen:#?}");
     for request in &seen {
         assert_eq!(request.method, "POST", "{request:?}");
         assert_eq!(request.path, "/api/v1/chat/completions", "{request:?}");
@@ -471,7 +484,7 @@ fn a_ruling_resumes_the_same_opencode_session_with_s() {
     );
     // And the model saw the history: the second launch's first request holds the first
     // launch's conversation and then the ruling.
-    let seen = fake.seen();
+    let seen = fake.other_requests();
     let resumed = seen
         .iter()
         .find(|r| r.last_message.contains("Director ruling on"))
@@ -526,7 +539,7 @@ fn a_webfetch_is_denied_by_the_config_and_blocked_by_the_sandbox_and_the_proxy()
 
     // Denied by the config: the model was never offered the web tools, and its call to
     // `webfetch` came back as an error ("unavailable tool"), not as a fetch.
-    let seen = fake.seen();
+    let seen = fake.other_requests();
     for request in &seen {
         assert!(
             !request.tool_names.iter().any(|t| t.contains("web")),
@@ -559,8 +572,10 @@ fn a_webfetch_is_denied_by_the_config_and_blocked_by_the_sandbox_and_the_proxy()
         "curl must not get through the sandbox"
     );
     assert_eq!(decoy.connections(), 0, "nothing reached another host");
-    // Blocked by the proxy: everything the upstream saw is the one allowed request, to the
-    // one host the director named.
+    // Blocked by the proxy: everything the upstream saw from the lane is the one allowed
+    // request, to the one host the director named. (The director's own price request is the
+    // only other, and it is not the lane's.)
+    assert_eq!(fake.models_requests().len(), 1);
     assert!(!seen.is_empty());
     for request in &seen {
         assert_eq!(
@@ -659,7 +674,7 @@ fn the_cost_cap_ends_an_openrouter_lane_on_the_runtimes_own_figure() {
         Reply::text("Slow.").delayed(60_000),
     ]);
     // One model call is reported at about $0.0001 (100 input and 20 output tokens at the
-    // table's price for the model); the cap is a fifth of that.
+    // price the fake lists for the model); the cap is a fifth of that.
     let mut cmd = run_command(&lane, &fake, &opencode_bin);
     cmd.args(["--cost-cap-usd", "0.00002"]);
     let out = finish(spawn(&mut cmd));
@@ -676,6 +691,136 @@ fn the_cost_cap_ends_an_openrouter_lane_on_the_runtimes_own_figure() {
     assert!(
         !lane.lane_dir().join("control/verdict.json").exists(),
         "nothing is proved"
+    );
+}
+
+/// Seconds-resolution UTC timestamp, `YYYY-MM-DDThh:mm:ssZ`.
+fn is_utc_stamp(text: &str) -> bool {
+    let b = text.as_bytes();
+    b.len() == 20
+        && b[19] == b'Z'
+        && b[4] == b'-'
+        && b[7] == b'-'
+        && b[10] == b'T'
+        && b[13] == b':'
+        && b[16] == b':'
+        && b.iter()
+            .enumerate()
+            .all(|(i, c)| matches!(i, 4 | 7 | 10 | 13 | 16 | 19) || c.is_ascii_digit())
+}
+
+#[test]
+fn the_lane_runs_at_the_price_openrouter_listed_and_the_record_says_where_it_came_from() {
+    let Some(opencode_bin) = opencode() else {
+        return;
+    };
+    if !sandbox_available() {
+        return;
+    }
+    let lane = Lane::new("", checks());
+    let fake = FakeOpenRouter::start(edit_and_check(vec![]));
+    // Distinctive per-token prices: 1.23 and 4.56 USD per million. No cache price is listed, and
+    // the limits are not the old defaults.
+    fake.set_models(ModelsMode::List(vec![
+        FakeModel::new(MODEL, "0.00000123", "0.00000456").limits(131_072, 32_768),
+        // Other models in the list change nothing about this one.
+        FakeModel::new("acme/other", "0.5", "0.5"),
+    ]));
+    let out = finish(spawn(&mut run_command(&lane, &fake, &opencode_bin)));
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    assert_eq!(lane.verdict()["verdict"], "proved");
+
+    // The config OpenCode read: exactly the listed figures, per million, and the listed limits.
+    let config: Value = serde_json::from_str(
+        &fs::read_to_string(lane.lane_dir().join("home/opencode.json")).unwrap(),
+    )
+    .unwrap();
+    let model = &config["provider"]["openrouter"]["models"][MODEL];
+    assert_eq!(model["cost"]["input"], 1.23, "{model}");
+    assert_eq!(model["cost"]["output"], 4.56, "{model}");
+    assert_eq!(model["cost"]["cache_read"], 1.23, "{model}");
+    assert_eq!(model["cost"]["cache_write"], 1.23, "{model}");
+    assert_eq!(model["limit"]["context"], 131_072);
+    assert_eq!(model["limit"]["output"], 32_768);
+
+    // run.json records the price on the segment, with where and when it was fetched.
+    let run = run_json(&lane);
+    let price = &run["segments"][0]["price"];
+    assert_eq!(price["inputPerMillion"], 1.23, "{price}");
+    assert_eq!(price["outputPerMillion"], 4.56, "{price}");
+    assert_eq!(price["cacheReadPerMillion"], 1.23);
+    assert_eq!(price["cacheWritePerMillion"], 1.23);
+    assert_eq!(price["contextLength"], 131_072);
+    assert_eq!(price["maxOutput"], 32_768);
+    assert_eq!(price["defaulted"], json!(["cacheRead", "cacheWrite"]));
+    assert_eq!(price["source"], "/api/v1/models");
+    let fetched_at = price["fetchedAt"].as_str().unwrap();
+    assert!(is_utc_stamp(fetched_at), "{fetched_at}");
+    assert!(fetched_at.starts_with("20"), "{fetched_at}");
+    // The record holds no key and no host.
+    let record = price.to_string();
+    assert!(!record.contains(&real_key()), "{record}");
+    assert!(!record.contains(&fake.host()), "{record}");
+
+    // The capsule carries the same record, sealed; the verifier still reads it.
+    let capsule = Capsule::read(&lane.capsule_dir()).unwrap();
+    assert_eq!(capsule.openrouter_price.as_ref(), Some(price));
+
+    // And the cost OpenCode reported was computed at that price: each of the fake's calls is
+    // 90 input + 10 cache read + 20 output tokens.
+    let segment = &run["segments"][0];
+    assert_eq!(segment["costSource"], "reported", "{segment}");
+    let calls = segment["turns"].as_u64().unwrap() as f64;
+    let per_call = (100.0 * 1.23 + 20.0 * 4.56) / 1_000_000.0;
+    let reported = segment["reportedCostUsd"].as_f64().unwrap();
+    assert!(
+        (reported - calls * per_call).abs() < 1e-9,
+        "{calls} calls at {per_call} each, reported {reported}"
+    );
+}
+
+/// A lane whose every model call costs about 1.8e-4 USD at `(prompt, completion)` prices of
+/// `0.000001` and `0.000004`, run with a cost cap of 2e-5: the same tokens, the same cap.
+fn run_at_prices(prompt: &str, completion: &str) -> (Lane, Output) {
+    let Some(opencode_bin) = opencode() else {
+        unreachable!("callers check for opencode first");
+    };
+    let lane = Lane::new("", checks());
+    let fake = FakeOpenRouter::start(edit_and_check(vec![]));
+    fake.set_models(ModelsMode::List(vec![FakeModel::new(
+        MODEL, prompt, completion,
+    )]));
+    let mut cmd = run_command(&lane, &fake, &opencode_bin);
+    cmd.args(["--cost-cap-usd", "0.00002"]);
+    let out = finish(spawn(&mut cmd));
+    (lane, out)
+}
+
+#[test]
+fn the_cost_cap_acts_on_the_fetched_price_not_on_the_tokens_alone() {
+    if opencode().is_none() || !sandbox_available() {
+        return;
+    }
+    // Dear: a call costs about 1.8e-4, nine times the cap. The lane ends as a cost-cap end.
+    let (dear, out) = run_at_prices("0.000001", "0.000004");
+    assert_eq!(out.status.code(), Some(6), "{}", text(&out));
+    let run = run_json(&dear);
+    assert_eq!(run["status"], "cost-cap", "{run}");
+    assert_eq!(run["segments"][0]["sessionEnd"], "cost-cap");
+    assert_eq!(run["segments"][0]["price"]["inputPerMillion"], 1.0);
+    assert!(!dear.lane_dir().join("control/verdict.json").exists());
+
+    // Cheap: the very same tokens at a thousandth of the price cost about 1.8e-7 a call, and the
+    // lane runs to the end and is proved under the same cap.
+    let (cheap, out) = run_at_prices("0.000000001", "0.000000004");
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    assert_eq!(cheap.verdict()["verdict"], "proved");
+    let run = run_json(&cheap);
+    assert_eq!(run["segments"][0]["price"]["inputPerMillion"], 0.001);
+    assert!(
+        run["estimatedCostUsd"].as_f64().unwrap() < 0.00002,
+        "{}",
+        run["estimatedCostUsd"]
     );
 }
 
@@ -810,6 +955,238 @@ fn a_broken_upstream_override_is_refused_before_anything_starts() {
         );
         assert!(!lane.lane_dir().exists(), "{bad}");
     }
+}
+
+/// Run the preflight against a fake whose model list is `mode`, with a fake `opencode`, and
+/// check that it ends as exit 4 with nothing started, saying `needles`. The fake saw exactly
+/// one request, the director's own request for the list.
+fn refused_by_the_list(mode: ModelsMode, extra_env: &[(&str, &str)], needles: &[&str]) {
+    if !sandbox_available() {
+        return;
+    }
+    let lane = Lane::new("", checks());
+    let fake = FakeOpenRouter::start(vec![]);
+    fake.set_models(mode);
+    let dir = var_tmp("cp-oc-price-");
+    let bin = fake_opencode(dir.path());
+    let mut cmd = run_command(&lane, &fake, &bin);
+    for (k, v) in extra_env {
+        cmd.env(k, v);
+    }
+    let started = Instant::now();
+    let out = output(&mut cmd);
+    refused(&lane, &out, "preflight failed: openrouter price");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    for needle in needles {
+        assert!(stderr.contains(needle), "{needle}: {stderr}");
+    }
+    assert!(
+        stderr.contains("cost cap cannot be enforced without a price"),
+        "{stderr}"
+    );
+    assert!(started.elapsed() < Duration::from_secs(30), "took too long");
+    assert!(!stderr.contains(&real_key()), "{stderr}");
+    assert_eq!(fake.seen().len(), 1, "{:#?}", fake.seen());
+    assert_eq!(fake.models_requests().len(), 1);
+}
+
+#[test]
+fn a_model_that_is_not_listed_is_refused_naming_the_id() {
+    refused_by_the_list(
+        ModelsMode::List(vec![FakeModel::new("acme/other", "0.000001", "0.000002")]),
+        &[],
+        &[&format!("{MODEL:?} is not in OpenRouter's model list")],
+    );
+}
+
+#[test]
+fn a_listed_family_member_is_not_the_model_no_substring_match() {
+    // The rung says z-ai/glm-5.3-flash; the list has the shorter and the longer ids, and a
+    // differently cased one. None of them is it.
+    refused_by_the_list(
+        ModelsMode::List(vec![
+            FakeModel::new("z-ai/glm-5.3", "0.000001", "0.000002"),
+            FakeModel::new("z-ai/glm-5.3-flash-lite", "0.000001", "0.000002"),
+            FakeModel::new("Z-AI/GLM-5.3-FLASH", "0.000001", "0.000002"),
+        ]),
+        &[],
+        &[&format!("{MODEL:?} is not in OpenRouter's model list")],
+    );
+}
+
+#[test]
+fn a_model_list_that_fails_is_refused_without_a_fallback_price() {
+    refused_by_the_list(ModelsMode::Status(500), &[], &["HTTP status 500"]);
+}
+
+#[test]
+fn a_model_list_that_is_not_json_is_refused() {
+    refused_by_the_list(ModelsMode::Garbage, &[], &["is not JSON"]);
+}
+
+#[test]
+fn a_model_list_that_never_answers_is_refused_at_the_timeout() {
+    refused_by_the_list(
+        ModelsMode::Hang,
+        &[("COWPROOF_OPENROUTER_MODELS_TIMEOUT_MS", "1500")],
+        &["no complete response within 1500 ms"],
+    );
+}
+
+#[test]
+fn a_model_list_over_the_size_cap_is_refused() {
+    refused_by_the_list(ModelsMode::Oversize, &[], &["larger than 8388608 bytes"]);
+}
+
+#[test]
+fn a_negative_price_is_refused_naming_the_field() {
+    refused_by_the_list(
+        ModelsMode::List(vec![FakeModel::new(MODEL, "-0.000001", "0.000002")]),
+        &[],
+        &["pricing.prompt", "negative", MODEL],
+    );
+}
+
+#[test]
+fn a_key_the_list_refuses_is_a_refused_run() {
+    // The fake answers 403 to any key but the one the director holds.
+    refused_by_the_list(
+        ModelsMode::List(vec![FakeModel::new(MODEL, "0.000001", "0.000002")]),
+        &[("OPENROUTER_API_KEY", "sk-or-v1-other")],
+        &["HTTP status 403"],
+    );
+}
+
+/// The fake `claude`'s lane: it runs both checks, so the lane is proved.
+fn claude_lane() -> Lane {
+    Lane::new(&common::run_checks(&["edit", "made"]), checks())
+}
+
+/// A repository whose base commit has a ladder: a Claude rung, then an OpenRouter rung that only
+/// a `reassign` can reach.
+fn claude_then_openrouter(model: &str) -> (Lane, FakeOpenRouter) {
+    let lane = claude_lane();
+    lane.commit_files(&[(
+        "cowproof.toml",
+        &format!("[ladder]\nrungs = [\"claude:haiku\", \"openrouter:{model}\"]\n"),
+    )]);
+    let fake = FakeOpenRouter::start(vec![]);
+    (lane, fake)
+}
+
+/// `cowproof run` on the Claude rung of that ladder (the fake `claude`), with the OpenRouter
+/// director setup in the environment.
+fn run_claude_rung(lane: &Lane, fake: &FakeOpenRouter) -> Output {
+    let mut cmd = lane.run_command(&[]);
+    cmd.env("OPENROUTER_API_KEY", real_key())
+        .env("COWPROOF_OPENROUTER_UPSTREAM", fake.base());
+    output(&mut cmd)
+}
+
+#[test]
+fn a_rung_only_a_reassign_reaches_is_priced_at_preflight_too() {
+    if !sandbox_available() {
+        return;
+    }
+    // The ladder names an OpenRouter model the list does not have: refused before the lane
+    // starts on its Claude rung.
+    let (lane, fake) = claude_then_openrouter("acme/unknown-1");
+    let out = run_claude_rung(&lane, &fake);
+    refused(
+        &lane,
+        &out,
+        "\"acme/unknown-1\" is not in OpenRouter's model list",
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("cost cap cannot be enforced"),
+        "{}",
+        text(&out)
+    );
+    assert_eq!(fake.models_requests().len(), 1);
+
+    // The same ladder with the model listed starts, and the fetch happened once. The lane
+    // itself runs on Claude, so its segment has no OpenRouter price.
+    let (lane, fake) = claude_then_openrouter("acme/known-1");
+    fake.set_models(ModelsMode::List(vec![FakeModel::new(
+        "acme/known-1",
+        "0.000001",
+        "0.000002",
+    )]));
+    let out = run_claude_rung(&lane, &fake);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    assert_eq!(fake.seen().len(), 1, "{:#?}", fake.seen());
+    let run = run_json(&lane);
+    assert_eq!(run["segments"][0]["runtime"], "claude");
+    assert!(
+        run["segments"][0]["price"].is_null(),
+        "{}",
+        run["segments"][0]
+    );
+    let capsule = Capsule::read(&lane.capsule_dir()).unwrap();
+    assert_eq!(capsule.openrouter_price, None);
+}
+
+#[test]
+fn a_reassign_onto_a_model_nobody_priced_ends_the_lane_with_the_work_kept() {
+    if !sandbox_available() {
+        return;
+    }
+    // A Claude lane asks a blocking question; the director rules `reassign` onto an OpenRouter
+    // model that is on no ladder, so preflight never read its price.
+    let ask = json!({
+        "kind": "blocker",
+        "question": "Which design?",
+        "tried": ["read the packet"],
+        "options": [{"id": "a", "summary": "Option A", "cost": "low"}],
+        "recommend": "a",
+        "blocking": true,
+    });
+    let lane = Lane::new(
+        &common::mcp_session("mcp.out", &[(3, "ask", ask)]),
+        checks(),
+    );
+    let fake = FakeOpenRouter::start(vec![]);
+    let dir = var_tmp("cp-oc-reassign-");
+    let bin = fake_opencode(dir.path());
+    let mut cmd = lane.run_command(&[Path::new("--opencode-bin"), bin.as_path()]);
+    cmd.env("OPENROUTER_API_KEY", real_key())
+        .env("COWPROOF_OPENROUTER_UPSTREAM", fake.base());
+    let mut child = spawn(&mut cmd);
+    let id = wait_for_ask(&lane, &mut child);
+    rule(
+        &lane,
+        &id,
+        &["--reassign", "--model", "openrouter:acme/unpriced"],
+    );
+    let out = finish(child);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("openrouter:acme/unpriced was not priced at preflight"),
+        "{stderr}"
+    );
+    // Nothing launched on the new rung; the work is kept and the ruling is left undelivered.
+    let run = run_json(&lane);
+    assert_eq!(run["segments"].as_array().unwrap().len(), 1, "{run}");
+    assert!(queue_events(&lane, "delivered").is_empty());
+    assert!(
+        fs::read_to_string(lane.lane_dir().join("control/lane.patch"))
+            .unwrap()
+            .contains("+edited")
+    );
+    assert!(fake.seen().is_empty(), "nothing priced and nothing asked");
+}
+
+#[test]
+fn a_claude_only_ladder_never_asks_openrouter_for_a_price() {
+    if !sandbox_available() {
+        return;
+    }
+    let lane = claude_lane();
+    let fake = FakeOpenRouter::start(vec![]);
+    let out = run_claude_rung(&lane, &fake);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    assert!(fake.seen().is_empty(), "{:#?}", fake.seen());
 }
 
 #[test]

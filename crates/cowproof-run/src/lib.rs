@@ -16,6 +16,7 @@ pub mod claude;
 pub mod deps;
 pub mod director;
 pub mod lane;
+pub mod models;
 pub mod opencode;
 pub mod prefix;
 pub mod proxy;

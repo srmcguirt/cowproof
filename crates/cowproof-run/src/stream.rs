@@ -205,8 +205,9 @@ pub enum Dialect {
 /// Meter for consuming stream-json lines and accumulating metrics.
 pub struct StreamMeter {
     dialect: Dialect,
-    /// The model the OpenCode estimate is priced for (unused for Claude).
-    model: String,
+    /// What the OpenCode estimate is priced at: the figures fetched from OpenRouter for the
+    /// model (unused for Claude, whose price table is [`price_for`]).
+    opencode_price: Option<crate::models::ModelPrice>,
     /// For OpenCode: the cost it reported for each turn, when it did.
     turn_reported_cost: Vec<Option<f64>>,
     /// For OpenCode: the `reason` of the last finished step.
@@ -280,7 +281,7 @@ impl StreamMeter {
     pub fn new(resumed: bool) -> Self {
         Self {
             dialect: Dialect::Claude,
-            model: String::new(),
+            opencode_price: None,
             turn_reported_cost: Vec::new(),
             last_reason: None,
             error: None,
@@ -308,11 +309,12 @@ impl StreamMeter {
         }
     }
 
-    /// A meter for OpenCode's event stream, pricing its estimate for `model`.
-    pub fn opencode(resumed: bool, model: &str) -> Self {
+    /// A meter for OpenCode's event stream, pricing its estimate at `price` (the model's
+    /// figures from OpenRouter's list, the same ones written into the lane's config).
+    pub fn opencode(resumed: bool, price: crate::models::ModelPrice) -> Self {
         Self {
             dialect: Dialect::Opencode,
-            model: model.to_string(),
+            opencode_price: Some(price),
             ..Self::new(resumed)
         }
     }
@@ -482,10 +484,13 @@ impl StreamMeter {
         }]
     }
 
-    /// OpenCode: the cost of each turn (the runtime's figure when it gave one, else this
-    /// crate's estimate for `model`), and whether every turn's came from the runtime.
-    fn opencode_cost(&self, model: &str) -> (f64, bool) {
+    /// OpenCode: the cost of each turn (the runtime's figure when it gave one, else the
+    /// estimate at the fetched price), and whether every turn's came from the runtime.
+    fn opencode_cost(&self) -> (f64, bool) {
         let mut all_reported = true;
+        let price = self
+            .opencode_price
+            .expect("an OpenCode meter is built with a price");
         let total =
             self.turns
                 .iter()
@@ -496,7 +501,7 @@ impl StreamMeter {
                         all_reported = false;
                         total
                             + crate::opencode::estimate_cost_usd(
-                                model,
+                                &price,
                                 turn.input_tokens,
                                 turn.output_tokens,
                                 turn.cache_read_input_tokens,
@@ -613,10 +618,11 @@ impl StreamMeter {
 
     /// The running cost ESTIMATE in USD of the turns seen so far on `model`
     /// (see [`price_for`]). The `result` event's own cost arrives only when the
-    /// session ends, too late for escalate-early.
+    /// session ends, too late for escalate-early. An OpenCode meter ignores `model`: it was
+    /// built with the model's fetched price.
     pub fn estimated_cost_usd(&self, model: &str) -> f64 {
         if self.dialect == Dialect::Opencode {
-            return self.opencode_cost(model).0;
+            return self.opencode_cost().0;
         }
         // A fold, not `sum`: the sum of nothing is -0.0, which prints as "-0.0".
         self.turns.iter().fold(0.0, |total, turn| {
@@ -698,7 +704,7 @@ impl StreamMeter {
             })
         };
         if !self.turns.is_empty() {
-            let (cost, all_reported) = self.opencode_cost(&self.model);
+            let (cost, all_reported) = self.opencode_cost();
             summary.total_cost_usd = Some(cost);
             summary.cost_source =
                 Some(if all_reported { "reported" } else { "estimate" }.to_string());
@@ -1014,8 +1020,20 @@ mod tests {
     const OC_MODEL: &str = "z-ai/glm-5.3-flash";
     const OC_SESSION: &str = "ses_ed3705d81ffe1sp5mFq5BXc7s2";
 
+    /// The glm figures the old hand-written table held, so the estimate tests keep their sums.
+    fn oc_price() -> crate::models::ModelPrice {
+        crate::models::ModelPrice {
+            input: 0.6,
+            output: 2.2,
+            cache_read: 0.11,
+            cache_write: 0.6,
+            context: 200_000,
+            output_limit: 16_000,
+        }
+    }
+
     fn oc_meter(resumed: bool, text: &str) -> StreamMeter {
-        let mut meter = StreamMeter::opencode(resumed, OC_MODEL);
+        let mut meter = StreamMeter::opencode(resumed, oc_price());
         for line in text.lines().filter(|l| !l.is_empty()) {
             meter.feed(line).expect("line should parse");
         }
@@ -1097,26 +1115,27 @@ mod tests {
     }
 
     #[test]
-    fn opencode_cost_is_priced_from_the_table_and_marked_an_estimate_when_none_was_reported() {
+    fn opencode_cost_is_priced_at_the_fetched_figures_and_marked_an_estimate_when_none_was_reported()
+     {
         let line = |cost: &str| {
             format!(
                 r#"{{"type":"step_finish","sessionID":"ses_abcdefgh1","part":{{"messageID":"m1","reason":"stop","tokens":{{"input":1000000,"output":1000000,"reasoning":0,"cache":{{"write":0,"read":1000000}}}},"cost":{cost}}}}}"#
             )
         };
-        let mut meter = StreamMeter::opencode(false, OC_MODEL);
+        let mut meter = StreamMeter::opencode(false, oc_price());
         meter.feed(&line("0")).unwrap();
         let summary = meter.summary();
-        // glm: 0.6 in + 2.2 out + 0.11 cache read, per million.
+        // 0.6 in + 2.2 out + 0.11 cache read, per million.
         assert!(
             (summary.total_cost_usd.unwrap() - 2.91).abs() < 1e-9,
             "{summary:?}"
         );
         assert_eq!(summary.cost_source.as_deref(), Some("estimate"));
         assert!((meter.estimated_cost_usd(OC_MODEL) - 2.91).abs() < 1e-9);
-        // A model the table does not know is priced dear: 3 + 15 + 0.3.
-        assert!((meter.estimated_cost_usd("acme/mystery-9") - 18.3).abs() < 1e-9);
+        // The meter prices at the figures it was built with, whatever model name it is asked for.
+        assert!((meter.estimated_cost_usd("acme/mystery-9") - 2.91).abs() < 1e-9);
         // One reported step and one not: the sum, marked an estimate.
-        let mut mixed = StreamMeter::opencode(false, OC_MODEL);
+        let mut mixed = StreamMeter::opencode(false, oc_price());
         mixed.feed(&line("1.5")).unwrap();
         mixed
             .feed(&line("0").replace(r#""messageID":"m1""#, r#""messageID":"m2""#))
@@ -1133,7 +1152,7 @@ mod tests {
                 r#"{{"type":"step_finish","sessionID":"ses_abcdefgh1","part":{{"messageID":"m1","reason":"stop","tokens":{{"input":5,"output":{output},"reasoning":0,"cache":{{"write":0,"read":0}}}},"cost":0}}}}"#
             )
         };
-        let mut meter = StreamMeter::opencode(false, OC_MODEL);
+        let mut meter = StreamMeter::opencode(false, oc_price());
         meter.feed(&finish(7)).unwrap();
         meter.feed(&finish(9)).unwrap();
         assert_eq!(meter.turn_count(), 1);
@@ -1176,7 +1195,7 @@ mod tests {
 
     #[test]
     fn opencode_an_unknown_event_is_counted_and_a_non_json_line_is_refused() {
-        let mut meter = StreamMeter::opencode(false, OC_MODEL);
+        let mut meter = StreamMeter::opencode(false, oc_price());
         meter
             .feed(r#"{"type":"something_new","sessionID":"ses_abcdefgh1"}"#)
             .unwrap();
