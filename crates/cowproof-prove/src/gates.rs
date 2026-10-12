@@ -165,11 +165,88 @@ pub fn record_verify_results(
     report.any_failed = report.gates.iter().any(|g| !g.passed);
 }
 
-/// The protected globs from `lanes.config.json` as committed at `base_commit`, or the
-/// defaults when the base has none. Never the working tree: a patch could edit that.
-fn load_protected_from_base(base_repo: &Path, base_commit: &str) -> Result<Vec<String>> {
-    let text = git_show_optional(base_repo, base_commit, "lanes.config.json")?;
-    Ok(cowproof_core::repo_rules_from_config(text.as_deref()).0)
+/// The extra protected globs a repository declares at `base_commit`.
+struct BaseProtected {
+    /// The union of what `cowproof.toml` `[proof] protected` and `lanes.config.json`
+    /// declare, with the defaults when `lanes.config.json` names no list of its own.
+    globs: Vec<String>,
+    /// `lanes.config.json` at the base named at least one glob.
+    from_lanes_config: bool,
+}
+
+/// The evidence line that says the old config file contributed protected globs.
+const LANES_CONFIG_NOTE: &str =
+    "protected globs read from lanes.config.json; move them to [proof] protected in cowproof.toml";
+
+/// The protected globs a repository declares, from the base commit only, never the
+/// working tree: a patch could edit that. The base `cowproof.toml` `[proof] protected`
+/// is the current home; `lanes.config.json` `protected` is still read. When both exist
+/// the gate protects the union, so a rename never shrinks protection. A value that is
+/// not a list of strings, or a file that does not parse, is an error, never "no globs".
+fn load_protected_from_base(base_repo: &Path, base_commit: &str) -> Result<BaseProtected> {
+    let mut globs = Vec::new();
+    let mut from_lanes_config = false;
+
+    let lanes_text = git_show_optional(base_repo, base_commit, "lanes.config.json")?;
+    match lanes_text.as_deref() {
+        None => globs.extend(cowproof_core::repo_rules_from_config(None).0),
+        Some(text) => {
+            let config: serde_json::Value = serde_json::from_str(text)
+                .context("lanes.config.json in the base does not parse")?;
+            let Some(object) = config.as_object() else {
+                bail!("lanes.config.json in the base must be a JSON object");
+            };
+            match object.get("protected") {
+                // No list of its own: the defaults, as before.
+                None => globs.extend(cowproof_core::repo_rules_from_config(None).0),
+                Some(value) => {
+                    let listed = value
+                        .as_array()
+                        .and_then(|a| {
+                            a.iter()
+                                .map(|g| g.as_str().map(str::to_owned))
+                                .collect::<Option<Vec<_>>>()
+                        })
+                        .context(
+                            "\"protected\" in the base lanes.config.json must be a list of strings",
+                        )?;
+                    from_lanes_config = !listed.is_empty();
+                    globs.extend(listed);
+                }
+            }
+        }
+    }
+
+    if let Some(text) = git_show_optional(base_repo, base_commit, "cowproof.toml")? {
+        let config: toml::Table =
+            toml::from_str(&text).context("cowproof.toml in the base does not parse")?;
+        if let Some(proof) = config.get("proof") {
+            let Some(proof) = proof.as_table() else {
+                bail!("[proof] in the base cowproof.toml must be a table");
+            };
+            if let Some(value) = proof.get("protected") {
+                let listed = value
+                    .as_array()
+                    .and_then(|a| {
+                        a.iter()
+                            .map(|g| g.as_str().map(str::to_owned))
+                            .collect::<Option<Vec<_>>>()
+                    })
+                    .context(
+                        "[proof] protected in the base cowproof.toml must be a list of strings",
+                    )?;
+                for glob in listed {
+                    if !globs.contains(&glob) {
+                        globs.push(glob);
+                    }
+                }
+            }
+        }
+    }
+    Ok(BaseProtected {
+        globs,
+        from_lanes_config,
+    })
 }
 
 /// Whether the base `cowproof.toml` sets `[proof] require_heldout = true`: a lane
@@ -286,7 +363,7 @@ fn check_protected_paths(
     packet: &GatePacket,
 ) -> Result<GateResult> {
     // Load protected list from repo config in the base commit, not the working tree
-    let repo_protected = load_protected_from_base(base_repo, base_commit)?;
+    let base_protected = load_protected_from_base(base_repo, base_commit)?;
 
     // Build complete protected list
     let mut protected = Vec::new();
@@ -295,7 +372,7 @@ fn check_protected_paths(
             .iter()
             .map(|s| s.to_string()),
     );
-    protected.extend(repo_protected);
+    protected.extend(base_protected.globs);
     protected.extend(packet.protected.clone());
 
     // Add defaults from design
@@ -309,6 +386,8 @@ fn check_protected_paths(
         "Makefile".into(),
         "justfile".into(),
         "cowproof.toml".into(),
+        // Both config files are gate inputs, whatever list `lanes.config.json` names.
+        "lanes.config.json".into(),
         "cowproof/**".into(),
     ]);
 
@@ -359,6 +438,9 @@ fn check_protected_paths(
         ));
     }
     evidence.extend(protected_warnings);
+    if base_protected.from_lanes_config {
+        evidence.push(LANES_CONFIG_NOTE.to_string());
+    }
 
     Ok(GateResult {
         name: "protected_paths".to_string(),
@@ -896,8 +978,193 @@ diff --git a/AGENTS.md b/AGENTS.md
         assert!(!result.passed);
         assert_eq!(
             result.evidence,
+            vec![
+                "Protected paths touched: secret/key.txt".to_string(),
+                LANES_CONFIG_NOTE.to_string(),
+            ]
+        );
+        assert!(
+            LANES_CONFIG_NOTE.contains("lanes.config.json")
+                && LANES_CONFIG_NOTE.contains("[proof] protected in cowproof.toml")
+        );
+        assert!(!result.warned, "the note is not a warning");
+        Ok(())
+    }
+
+    const TOML_PROTECT_SECRET: &str = "[proof]\nprotected = [\"secret/**\"]\n";
+
+    /// A hand-written patch touching every path in `paths`.
+    fn touching_all(paths: &[&str]) -> String {
+        paths.iter().map(|p| touching(p)).collect()
+    }
+
+    #[test]
+    fn a_protected_rule_in_cowproof_toml_applies_without_a_note() -> Result<()> {
+        let repo = TestRepo::new(&[("cowproof.toml", TOML_PROTECT_SECRET)])?;
+        let result = check_protected_paths(
+            repo.path(),
+            &repo.base,
+            &touching("secret/key.txt"),
+            &packet(&["docs/**"]),
+        )?;
+        assert!(!result.passed);
+        assert_eq!(
+            result.evidence,
             vec!["Protected paths touched: secret/key.txt".to_string()]
         );
+        // The extra globs add to the defaults: they do not replace them.
+        let defaults = check_protected_paths(
+            repo.path(),
+            &repo.base,
+            &touching("AGENTS.md"),
+            &packet(&["**"]),
+        )?;
+        assert!(
+            defaults.passed && defaults.warned,
+            "{:?}",
+            defaults.evidence
+        );
+        let outside = check_protected_paths(
+            repo.path(),
+            &repo.base,
+            &touching("AGENTS.md"),
+            &packet(&["docs/**"]),
+        )?;
+        assert!(!outside.passed);
+        Ok(())
+    }
+
+    #[test]
+    fn both_config_files_protect_the_union() -> Result<()> {
+        let repo = TestRepo::new(&[
+            ("cowproof.toml", "[proof]\nprotected = [\"from_toml/**\"]\n"),
+            ("lanes.config.json", "{\"protected\": [\"from_json/**\"]}"),
+        ])?;
+        let result = check_protected_paths(
+            repo.path(),
+            &repo.base,
+            &touching_all(&["from_toml/a.txt", "from_json/b.txt", "free/c.txt"]),
+            &packet(&["docs/**"]),
+        )?;
+        assert!(!result.passed);
+        // Protected files are violations; the unprotected one is not this gate's concern.
+        assert_eq!(
+            result.evidence[0],
+            "Protected paths touched: from_toml/a.txt, from_json/b.txt"
+        );
+        // Each glob alone protects.
+        for path in ["from_toml/a.txt", "from_json/b.txt"] {
+            let only = check_protected_paths(
+                repo.path(),
+                &repo.base,
+                &touching(path),
+                &packet(&["docs/**"]),
+            )?;
+            assert!(!only.passed, "{path} must be protected");
+        }
+        // Owned, so the only thing left is the protected-path warning: both globs fire.
+        let owned = check_protected_paths(
+            repo.path(),
+            &repo.base,
+            &touching_all(&["from_toml/a.txt", "from_json/b.txt"]),
+            &packet(&["from_toml/**", "from_json/**"]),
+        )?;
+        assert!(owned.passed && owned.warned);
+        assert_eq!(
+            owned
+                .evidence
+                .iter()
+                .filter(|l| l.contains("check harness changed"))
+                .count(),
+            2,
+            "{:?}",
+            owned.evidence
+        );
+        assert_eq!(
+            owned
+                .evidence
+                .iter()
+                .filter(|l| *l == LANES_CONFIG_NOTE)
+                .count(),
+            1,
+            "the note appears once: {:?}",
+            owned.evidence
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_patch_that_drops_a_glob_from_cowproof_toml_is_judged_by_the_base() -> Result<()> {
+        let repo = TestRepo::new(&[("cowproof.toml", TOML_PROTECT_SECRET)])?;
+        // The lane empties the list in its working tree and touches a file it protected.
+        repo.write("cowproof.toml", "[proof]\nprotected = []\n")?;
+        let result = check_protected_paths(
+            repo.path(),
+            &repo.base,
+            &touching_all(&["cowproof.toml", "secret/key.txt"]),
+            &packet(&["docs/**"]),
+        )?;
+        assert!(!result.passed);
+        assert_eq!(
+            result.evidence,
+            vec!["Protected paths touched: cowproof.toml, secret/key.txt".to_string()]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn both_config_files_are_protected_even_when_a_list_omits_them() -> Result<()> {
+        let repo = TestRepo::new(&[("lanes.config.json", "{\"protected\": [\"secret/**\"]}")])?;
+        for path in ["lanes.config.json", "cowproof.toml"] {
+            let result = check_protected_paths(
+                repo.path(),
+                &repo.base,
+                &touching(path),
+                &packet(&["docs/**"]),
+            )?;
+            assert!(!result.passed, "{path} must be protected");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_malformed_protected_value_is_an_error_not_no_globs() -> Result<()> {
+        let cases: [(&str, &str, &str); 6] = [
+            (
+                "cowproof.toml",
+                "[proof]\nprotected = \"secret/**\"\n",
+                "list of strings",
+            ),
+            (
+                "cowproof.toml",
+                "[proof]\nprotected = [1]\n",
+                "list of strings",
+            ),
+            ("cowproof.toml", "proof = \"x\"\n", "must be a table"),
+            (
+                "lanes.config.json",
+                "{\"protected\": \"secret/**\"}",
+                "list of strings",
+            ),
+            (
+                "lanes.config.json",
+                "{\"protected\": [\"a\", 2]}",
+                "list of strings",
+            ),
+            ("lanes.config.json", "{not json", "does not parse"),
+        ];
+        for (file, text, expect) in cases {
+            let repo = TestRepo::new(&[(file, text)])?;
+            let err = check_protected_paths(
+                repo.path(),
+                &repo.base,
+                &touching("secret/key.txt"),
+                &packet(&["docs/**"]),
+            )
+            .expect_err(&format!("{file}: {text}"));
+            let message = format!("{err:#}");
+            assert!(message.contains(expect), "{file}: {message}");
+        }
         Ok(())
     }
 

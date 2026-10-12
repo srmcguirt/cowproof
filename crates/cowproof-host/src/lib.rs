@@ -130,6 +130,17 @@ pub fn parse_windows_base_path(output: &str) -> Result<PathBuf> {
     Ok(PathBuf::from(path))
 }
 
+/// The WSL distribution to ask about the Windows drive. `WSL_DISTRO_NAME` (set inside a
+/// WSL shell) wins; SSH sessions into WSL do not carry it, so then `COWPROOF_WSL_DISTRO`
+/// is read, then the older `LANES_WSL_DISTRO`. An empty value counts as unset, and no name
+/// at all means "the default distribution". `lookup` stands in for the environment.
+fn wsl_distro_name(lookup: impl Fn(&str) -> Option<String>) -> String {
+    ["WSL_DISTRO_NAME", "COWPROOF_WSL_DISTRO", "LANES_WSL_DISTRO"]
+        .into_iter()
+        .find_map(|name| lookup(name).filter(|n| !n.is_empty()))
+        .unwrap_or_default()
+}
+
 pub fn collect_facts(root: &Path, runner: &impl CommandRunner) -> HostFacts {
     let hostname = runner
         .output("hostname", &[])
@@ -203,15 +214,7 @@ pub fn collect_facts(root: &Path, runner: &impl CommandRunner) -> HostFacts {
         .and_then(|x| parse_df_free(&x.1));
     let windows_drive_free_bytes = if wsl {
         // SSH sessions into WSL (systemd sshd) do not carry WSL_DISTRO_NAME; an empty name means "the default".
-        let distro = std::env::var("WSL_DISTRO_NAME")
-            .ok()
-            .filter(|n| !n.is_empty())
-            .or_else(|| {
-                std::env::var("LANES_WSL_DISTRO")
-                    .ok()
-                    .filter(|n| !n.is_empty())
-            })
-            .unwrap_or_default();
+        let distro = wsl_distro_name(|name| std::env::var(name).ok());
         windows_drive_free(&distro, runner)
     } else {
         None
@@ -618,6 +621,31 @@ mod tests {
 
     use super::*;
     use std::cell::RefCell;
+
+    /// `wsl_distro_name` over a fixed set of variables instead of the process environment.
+    fn distro_from(pairs: &[(&str, &str)]) -> String {
+        wsl_distro_name(|name| {
+            pairs
+                .iter()
+                .find(|(k, _)| *k == name)
+                .map(|(_, v)| (*v).to_string())
+        })
+    }
+
+    #[test]
+    fn the_wsl_distro_is_read_from_the_new_name_first() {
+        let both = [("COWPROOF_WSL_DISTRO", "new"), ("LANES_WSL_DISTRO", "old")];
+        assert_eq!(distro_from(&both), "new");
+        assert_eq!(distro_from(&[("LANES_WSL_DISTRO", "old")]), "old");
+        // An empty new name falls through to the old one.
+        let empty_new = [("COWPROOF_WSL_DISTRO", ""), ("LANES_WSL_DISTRO", "old")];
+        assert_eq!(distro_from(&empty_new), "old");
+        // WSL_DISTRO_NAME, set by WSL itself, still comes first.
+        let with_wsl = [("WSL_DISTRO_NAME", "wsl"), ("COWPROOF_WSL_DISTRO", "new")];
+        assert_eq!(distro_from(&with_wsl), "wsl");
+        assert_eq!(distro_from(&[]), "");
+    }
+
     struct Fake {
         calls: RefCell<Vec<(String, Vec<String>)>>,
         answers: Vec<(bool, String, String)>,
