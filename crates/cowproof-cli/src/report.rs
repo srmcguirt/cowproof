@@ -72,6 +72,12 @@ pub struct HandbackArgs {
     /// A migration file name; flaw rules about new migrations skip it
     #[arg(long, value_name = "FILE")]
     pub baseline: Option<String>,
+    /// A flaw pack to load beside the generic one: `example-supabase` or a path to a pack file
+    ///
+    /// Repeatable. The generic pack always loads; a pack named in `[proof] packs` of the
+    /// repository's `cowproof.toml` (under `--repo`) loads too.
+    #[arg(long = "pack", value_name = "NAME|FILE")]
+    pub packs: Vec<String>,
     /// Print one JSON document instead of the text report
     #[arg(long)]
     pub json: bool,
@@ -117,6 +123,7 @@ pub fn run(args: ReportArgs) -> Result<()> {
                 repo: args.repo,
                 packet: args.packet,
                 baseline: args.baseline,
+                packs: args.packs,
             });
             match report {
                 Ok(report) if args.json => {

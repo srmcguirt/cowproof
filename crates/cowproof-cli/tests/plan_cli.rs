@@ -200,7 +200,7 @@ fn board_prints_a_tab_separated_table_and_json() {
 }
 
 #[test]
-fn brief_summarizes_running_held_ready_and_founder_waiting_lanes() {
+fn brief_summarizes_running_held_ready_and_approval_waiting_lanes() {
     let repo = repo_with_plan(
         r#"{"version":1,"plan":"work","lanes":[
         {"id":"going","title":"going","priority":1,"status":"running"},
@@ -218,7 +218,7 @@ fn brief_summarizes_running_held_ready_and_founder_waiting_lanes() {
             "Awaiting review: -",
             "Held: parked",
             "Ready next: ready",
-            "Waiting on founder: -",
+            "Waiting on approval: -",
         ]
     );
 
@@ -229,6 +229,48 @@ fn brief_summarizes_running_held_ready_and_founder_waiting_lanes() {
     assert_eq!(doc["held"][0], "parked");
     assert_eq!(doc["readyNext"][0], "ready");
     assert_eq!(doc["lines"].as_array().unwrap().len(), 5);
+}
+
+#[test]
+fn brief_reports_the_founder_alias_and_named_approver_roles() {
+    let founder = repo_with_plan(
+        r#"{"version":1,"plan":"work","lanes":[
+        {"id":"asks","title":"asks","priority":1,"status":"held","notes":"Waiting on the founder"}
+      ]}"#,
+    );
+    let out = plan(founder.path(), &["brief"]);
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(
+        stdout(&out)
+            .lines()
+            .any(|l| l == "Waiting on approval: asks (founder)"),
+        "{}",
+        stdout(&out)
+    );
+    let out = plan(founder.path(), &["brief", "--json"]);
+    let doc: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(doc["waitingOnFounder"][0], "asks");
+    assert_eq!(doc["waitingOnApprovers"][0]["role"], "founder");
+
+    let legal = repo_with_plan(
+        r#"{"version":1,"plan":"work","approvers":["legal"],"lanes":[
+        {"id":"asks","title":"asks","priority":1,"status":"held","notes":"Need legal sign-off"}
+      ]}"#,
+    );
+    let out = plan(legal.path(), &["brief"]);
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(
+        stdout(&out)
+            .lines()
+            .any(|l| l == "Waiting on approval: asks (legal)"),
+        "{}",
+        stdout(&out)
+    );
+    let out = plan(legal.path(), &["brief", "--json"]);
+    let doc: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(doc["waitingOnFounder"].as_array().unwrap().len(), 0);
+    assert_eq!(doc["waitingOnApprovers"][0]["lane"], "asks");
+    assert_eq!(doc["waitingOnApprovers"][0]["role"], "legal");
 }
 
 #[test]

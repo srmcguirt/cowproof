@@ -6,7 +6,7 @@
 use anyhow::{Context, Result};
 use cowproof_plan::{
     blocked_by, check_plans, lane_dir_belongs_to, lanes, load_plans, ready_next, set_status,
-    waiting_on_founder,
+    waiting_on_approvers, waiting_on_founder,
 };
 use serde_json::{Value, json};
 use std::fs;
@@ -58,7 +58,12 @@ enum PlanAction {
         #[arg(long)]
         json: bool,
     },
-    /// Running, awaiting review, held, ready and waiting-on-founder lanes in five lines
+    /// Running, awaiting review, held, ready and waiting-on-approval lanes in five lines
+    ///
+    /// A lane waits on approval when its `decision` or `notes` say it waits on, needs or
+    /// must ask an approver role. The roles are the plan's `approvers` array; a plan that
+    /// names none gets `founder`. `--json` keeps `waitingOnFounder` (the lanes waiting on
+    /// `founder`) and adds `waitingOnApprovers` (`{lane, role}` for every role).
     Brief {
         #[arg(long, default_value = ".")]
         repo: PathBuf,
@@ -350,6 +355,7 @@ fn brief(repo: &Path, root: Option<&Path>, as_json: bool) -> Result<()> {
         }
     }
     let waiting = waiting_on_founder(&all);
+    let approvals = waiting_on_approvers(&all);
     running.sort();
     running.dedup();
     awaiting.sort();
@@ -363,12 +369,20 @@ fn brief(repo: &Path, root: Option<&Path>, as_json: bool) -> Result<()> {
         "Ready next: {}",
         dash(&ready.iter().map(|l| l.id.clone()).collect::<Vec<_>>())
     ));
-    lines.push(format!("Waiting on founder: {}", dash(&waiting)));
+    lines.push(format!(
+        "Waiting on approval: {}",
+        dash(
+            &approvals
+                .iter()
+                .map(|w| format!("{} ({})", w.lane, w.role))
+                .collect::<Vec<_>>()
+        )
+    ));
     if as_json {
         println!(
             "{}",
             serde_json::to_string_pretty(
-                &json!({"running":running,"awaitingReview":awaiting,"held":held,"readyNext":ready.iter().map(|l|l.id.clone()).collect::<Vec<_>>(),"waitingOnFounder":waiting,"lines":lines})
+                &json!({"running":running,"awaitingReview":awaiting,"held":held,"readyNext":ready.iter().map(|l|l.id.clone()).collect::<Vec<_>>(),"waitingOnFounder":waiting,"waitingOnApprovers":approvals.iter().map(|w| json!({"lane":w.lane,"role":w.role})).collect::<Vec<_>>(),"lines":lines})
             )?
         );
     } else {

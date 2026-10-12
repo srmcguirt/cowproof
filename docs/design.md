@@ -171,7 +171,7 @@ The builder is untrusted. It may have read hostile content in the repository, an
 | Protected paths | edits to tests, fixtures or policies the packet must not touch | new |
 | Verifier re-run | checks the builder claimed but that fail when run independently | new |
 | Held-out checks | work that satisfies only the visible checks (idea: EvilGenie, SpecBench). A packet without held-out checks gets a warning, not a failure, unless the repository sets `require_heldout = true` (which also refuses a port lane whose held-out cases were skipped for want of the reference runtime) | new |
-| Flaw rules | known gaming patterns: swallowed exceptions in assertions, always-true policies, test-only code in production paths, secrets in URLs | exists as `lanes-report` `flaws.toml`; split into a generic pack and project packs |
+| Flaw rules | known gaming patterns: swallowed exceptions in assertions, always-true policies, test-only code in production paths, secrets in URLs | exists: `crates/cowproof-report/rules/flaws.toml` is the generic pack and loads by default; `example-supabase.toml` is the example project pack and loads only when asked (`cowproof report handback --pack example-supabase`, or `packs` under `[proof]` in `cowproof.toml`) |
 | Claimed vs. run | handoff checks the verifier never saw | exists in part |
 
 A gate verdict is a triage signal; the director still rules. Each new flaw found at handback becomes a rule.
@@ -299,7 +299,7 @@ packs = ["generic", "./cowproof/flaws.toml"]
 
 ### Skills
 
-Shipped in the repository, installable as a Claude Code plugin, with an `.agents/skills` copy for Codex: `cowproof-dispatch` (write, lint, preflight, dispatch as a tracked background run), `cowproof-rule` (answer an escalation), `cowproof-handback` (read the capsule and gate report, apply, gate, commit) and `cowproof-escalate` (the director's own design questions). The Everydom flaw checklist seeds the generic pack; Everydom-only items move to an example project pack.
+Shipped in the repository, installable as a Claude Code plugin, with an `.agents/skills` copy for Codex: `cowproof-dispatch` (write, lint, preflight, dispatch as a tracked background run), `cowproof-rule` (answer an escalation), `cowproof-handback` (read the capsule and gate report, apply, gate, commit) and `cowproof-escalate` (the director's own design questions). The Everydom flaw checklist seeds the generic pack; Everydom-only items move to an example project pack. The split is done: `cowproof report handback` always loads the generic pack, then every pack named in `[proof] packs` of the repository's `cowproof.toml` (`--repo`) and every `--pack NAME|FILE` (a built-in name, `generic` or `example-supabase`, or a path; a pack named twice loads once; a missing or malformed pack is an error, never an empty pack). The report lists the packs that ran (`packs` in `--json`, shown only when something beyond `generic` ran). Plan files name who can hold a lane up with an optional top-level `approvers` array of role names (for example `["legal", "product"]`); `cowproof plan brief` reports a held, planned or packeted lane whose `decision` or `notes` say it waits on, needs or must ask one of them. A plan that names none gets the default alias `founder`.
 
 ## Open Questions
 

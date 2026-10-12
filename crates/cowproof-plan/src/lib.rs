@@ -32,7 +32,14 @@ pub struct LaneRef {
     pub notes: Option<String>,
     pub commit: Option<String>,
     pub release: Option<String>,
+    /// Roles whose approval a lane can wait on, from the plan's `approvers` (lowercase,
+    /// unique). A plan that names none gets `["founder"]`, the default alias.
+    pub approvers: Vec<String>,
 }
+
+/// The approver role a plan that names no `approvers` gets, so plans written before the
+/// field existed still report lanes waiting on "the founder".
+pub const DEFAULT_APPROVER: &str = "founder";
 
 #[derive(Clone, Debug)]
 pub struct Problem {
@@ -96,6 +103,7 @@ fn schema_problems(plan: &Plan) -> Vec<Problem> {
         "plan",
         "goal",
         "owner",
+        "approvers",
         "baseline",
         "numbering",
         "stage",
@@ -139,6 +147,30 @@ fn schema_problems(plan: &Plan) -> Vec<Problem> {
             && (!v.is_string() || string(Some(v)).is_some_and(|s| s.chars().count() > max))
         {
             add("<plan>", format!("schema: {key} must be a string"));
+        }
+    }
+    if let Some(v) = get(&plan.document, "approvers") {
+        match v.as_array() {
+            Some(a) if a.is_empty() => {
+                add("<plan>", "schema: approvers must not be empty".into());
+            }
+            Some(a) => {
+                let mut seen = HashSet::new();
+                for role in a {
+                    match role.as_str().map(str::trim) {
+                        Some(r) if !r.is_empty() => {
+                            if !seen.insert(r.to_lowercase()) {
+                                add("<plan>", "schema: approvers entries must be unique".into());
+                            }
+                        }
+                        _ => add(
+                            "<plan>",
+                            "schema: approvers entries must be non-empty strings".into(),
+                        ),
+                    }
+                }
+            }
+            None => add("<plan>", "schema: approvers must be an array".into()),
         }
     }
     for (key, props) in [
@@ -383,12 +415,35 @@ pub fn load_plans(repo: &Path, explicit: &[PathBuf]) -> Result<Vec<Plan>> {
         .collect()
 }
 
+/// The approver roles a plan names, lowercase and unique, or the default alias when it
+/// names none (or none that are usable; `check` reports those).
+fn plan_approvers(document: &Value) -> Vec<String> {
+    let mut roles: Vec<String> = Vec::new();
+    for role in get(document, "approvers")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(|r| r.trim().to_lowercase())
+        .filter(|r| !r.is_empty())
+    {
+        if !roles.contains(&role) {
+            roles.push(role);
+        }
+    }
+    if roles.is_empty() {
+        roles.push(DEFAULT_APPROVER.into());
+    }
+    roles
+}
+
 pub fn lanes(plans: &[Plan]) -> Vec<LaneRef> {
     let mut out = Vec::new();
     for plan in plans {
         let plan_name = string(get(&plan.document, "plan"))
             .unwrap_or("<unknown>")
             .to_owned();
+        let approvers = plan_approvers(&plan.document);
         for lane in get(&plan.document, "lanes")
             .and_then(Value::as_array)
             .into_iter()
@@ -425,6 +480,7 @@ pub fn lanes(plans: &[Plan]) -> Vec<LaneRef> {
                 notes: nonnull_string(get(lane, "notes")),
                 commit: nonnull_string(get(lane, "commit")),
                 release: nonnull_string(get(lane, "release")),
+                approvers: approvers.clone(),
             });
         }
     }
@@ -924,23 +980,68 @@ pub fn blocked_by(lane: &LaneRef, all: &[LaneRef]) -> Vec<String> {
         .collect()
 }
 
-pub fn waiting_on_founder(all: &[LaneRef]) -> Vec<String> {
-    let mut waiting: Vec<String> = all
+/// A lane that is waiting on one approver role.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Waiting {
+    pub lane: String,
+    pub role: String,
+}
+
+/// Whether `text` (already lowercase) names `role` as a word. A plural or possessive
+/// ("founders", "founder's") counts; a longer word ("pump" for "pm") does not.
+fn names_role(text: &str, role: &str) -> bool {
+    text.match_indices(role).any(|(at, _)| {
+        let before = text[..at].chars().next_back();
+        let after = &text[at + role.len()..];
+        let after = after
+            .strip_prefix("'s")
+            .or_else(|| after.strip_prefix('s'))
+            .filter(|rest| !rest.starts_with(|c: char| c.is_alphanumeric()))
+            .unwrap_or(after);
+        !before.is_some_and(char::is_alphanumeric) && !after.starts_with(char::is_alphanumeric)
+    })
+}
+
+/// Lanes that are not started or finished and whose `decision` or `notes` say they wait on
+/// (or need, or must ask) one of the plan's approver roles. One row per lane and role,
+/// sorted. A plan names its roles in `approvers`; without that, the role is `founder`.
+pub fn waiting_on_approvers(all: &[LaneRef]) -> Vec<Waiting> {
+    let mut waiting: Vec<Waiting> = Vec::new();
+    for lane in all
         .iter()
         .filter(|lane| ["idea", "planned", "packet", "held"].contains(&lane.status.as_str()))
-        .filter(|lane| {
-            [lane.decision.as_deref(), lane.notes.as_deref()]
-                .into_iter()
-                .flatten()
-                .any(|text| {
-                    let words = text.to_lowercase();
-                    words.contains("founder")
-                        && ["wait", "await", "need", "ask"]
-                            .iter()
-                            .any(|needle| words.contains(needle))
-                })
-        })
-        .map(|lane| lane.id.clone())
+    {
+        for field in [lane.decision.as_deref(), lane.notes.as_deref()]
+            .into_iter()
+            .flatten()
+        {
+            let words = field.to_lowercase();
+            if !["wait", "await", "need", "ask"]
+                .iter()
+                .any(|needle| words.contains(needle))
+            {
+                continue;
+            }
+            for role in lane.approvers.iter().filter(|r| names_role(&words, r)) {
+                waiting.push(Waiting {
+                    lane: lane.id.clone(),
+                    role: role.clone(),
+                });
+            }
+        }
+    }
+    waiting.sort();
+    waiting.dedup();
+    waiting
+}
+
+/// The lanes waiting on the `founder` role. Kept for callers of the old name; the brief's
+/// `waitingOnFounder` field is this list. Use [`waiting_on_approvers`] for every role.
+pub fn waiting_on_founder(all: &[LaneRef]) -> Vec<String> {
+    let mut waiting: Vec<String> = waiting_on_approvers(all)
+        .into_iter()
+        .filter(|w| w.role == DEFAULT_APPROVER)
+        .map(|w| w.lane)
         .collect();
     waiting.sort();
     waiting.dedup();

@@ -1,0 +1,48 @@
+# Example project pack: the rules one Postgres/Supabase project added after real
+# handbacks (row-level security, migration locks, a login-role guard, one client's
+# fetch binding). It is NOT loaded by default. Ask for it with
+# `cowproof report handback <lane> --pack example-supabase`, or list
+# `example-supabase` under `packs` in `[proof]` of `cowproof.toml`. Copy it as the
+# starting point for your own project pack.
+
+[[rules]]
+pattern = "(?i)\\bUSING\\s*\\(\\s*true\\s*\\)|\\bWITH\\s+CHECK\\s*\\(\\s*true\\s*\\)|\\bTO\\s+PUBLIC\\b"
+files = ["**/*"]
+explanation = "Placeholder or public policy broadens access."
+
+[[rules]]
+pattern = "(?i)\\bcurrent_user\\s*=\\s*'[^']*'"
+files = ["**/*policy*", "**/*migration*", "**/*.sql"]
+explanation = "A current_user equality inside policy SQL may be disguised always-true logic."
+
+[[rules]]
+pattern = "(?i)\\bGRANT\\b"
+files = ["**/fixtures/**", "fixtures/**"]
+explanation = "A fixture grants a privilege."
+
+[[rules]]
+pattern = "(?i)NO\\s+FORCE\\s+ROW\\s+LEVEL\\s+SECURITY|DISABLE\\s+ROW\\s+LEVEL\\s+SECURITY|\\bBYPASSRLS\\b|OWNER\\s+TO\\s+postgres"
+files = ["**/*"]
+explanation = "This weakens a row-level security or ownership boundary."
+
+[[rules]]
+pattern = "(?i)\\bCONCURRENTLY\\b"
+files = ["**/migrations/**", "**/migration*", "**/*.sql"]
+explanation = "CONCURRENTLY may fail inside a transactional migration."
+requires = "--\\s*transactional"
+
+[[rules]]
+pattern = "this\\.fetchImpl\\s*\\("
+files = ["**/*"]
+explanation = "The stored fetch implementation is called as a method, which can bind the wrong receiver."
+
+[[rules]]
+pattern = "(?i)supabase/migrations\\.lock"
+files = ["**/*"]
+explanation = "The applied migrations lock file was edited."
+path_only = true
+
+[[rules]]
+pattern = "(?i)current_setting\\s*\\(\\s*'role'"
+files = ["**/migrations/**", "**/*.sql"]
+explanation = "current_setting('role') is 'none' under a real login; a runtime-role guard built on it refuses every real call. Use ops.caller_is(role) (migration 481). 485 reintroduced it on 2026-09-26."

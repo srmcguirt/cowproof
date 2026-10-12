@@ -6,7 +6,7 @@
 //! [--baseline FILE] [--json]`, wired in `crates/cowproof-cli/src/report.rs`.
 
 use anyhow::{Context, Result, bail};
-use cowproof_prove::flaws::{PatchDelta, check_rules, parse_patch, parse_rules};
+use cowproof_prove::flaws::{FlawRule, PatchDelta, check_rules, parse_patch, parse_rules};
 use regex::Regex;
 use serde::Serialize;
 use serde_json::Value;
@@ -56,6 +56,10 @@ pub struct Report {
     checks: Vec<Check>,
     packet_commands_unreported: Vec<String>,
     unparsed: Vec<UnparsedLine>,
+    /// The flaw packs that ran, in load order (`generic` always first). Left out of the JSON
+    /// when only `generic` ran, so a default report is byte for byte what it was before packs.
+    #[serde(skip_serializing_if = "only_generic")]
+    packs: Vec<String>,
     flaws: Vec<Finding>,
     removed_assertions: Vec<AssertionChange>,
     limits: Vec<String>,
@@ -64,6 +68,9 @@ pub struct Report {
     verdict_hint: String,
     verdict_reasons: Vec<String>,
     sample_handoff: Option<String>,
+}
+fn only_generic(packs: &[String]) -> bool {
+    packs.len() <= 1
 }
 fn value_str(v: &Value, keys: &[&str]) -> Option<String> {
     keys.iter()
@@ -596,6 +603,90 @@ pub struct Options {
     pub packet: Option<PathBuf>,
     /// A migration file name: rules that only apply to new migrations skip this one.
     pub baseline: Option<String>,
+    /// Flaw packs to load beside the generic one: a built-in name (`example-supabase`) or
+    /// a path to a pack file (relative to the working directory). Also read from
+    /// `[proof] packs` in `<repo>/cowproof.toml`.
+    pub packs: Vec<String>,
+}
+
+/// The generic flaw pack: gaming patterns for any stack. It is the only pack that loads
+/// when nothing asks for another.
+pub const GENERIC_PACK: &str = include_str!("../rules/flaws.toml");
+/// The example project pack: rules one Postgres/Supabase project added. Never loaded by
+/// default.
+pub const EXAMPLE_SUPABASE_PACK: &str = include_str!("../rules/example-supabase.toml");
+
+/// The built-in pack called `name`, if there is one.
+pub fn builtin_pack(name: &str) -> Option<&'static str> {
+    match name {
+        "generic" => Some(GENERIC_PACK),
+        "example-supabase" => Some(EXAMPLE_SUPABASE_PACK),
+        _ => None,
+    }
+}
+
+/// `[proof] packs` from `<repo>/cowproof.toml`, as written. A missing file is no packs; a
+/// file that does not parse is an error, not an empty list.
+fn configured_packs(repo: &Path) -> Result<Vec<String>> {
+    let Ok(text) = fs::read_to_string(repo.join("cowproof.toml")) else {
+        return Ok(Vec::new());
+    };
+    let config: toml::Table = toml::from_str(&text).context("parse cowproof.toml")?;
+    Ok(config
+        .get("proof")
+        .and_then(|p| p.as_table())
+        .and_then(|p| p.get("packs"))
+        .and_then(|p| p.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|p| p.as_str().map(str::to_owned))
+        .collect())
+}
+
+/// Load the rules to run: the generic pack, then every pack named by `[proof] packs` in
+/// the repository's `cowproof.toml`, then every `--pack`. Each name is a built-in pack or a
+/// file (a `cowproof.toml` path is relative to the repository and may not leave it; a
+/// `--pack` path is relative to the working directory). A pack named twice loads once;
+/// a missing or malformed pack is an error.
+fn load_packs(options: &Options) -> Result<(Vec<FlawRule>, Vec<String>)> {
+    let mut wanted: Vec<(String, Option<PathBuf>)> = vec![("generic".into(), None)];
+    if let Some(repo) = options.repo.as_deref() {
+        for name in configured_packs(repo)? {
+            wanted.push((name, Some(repo.to_path_buf())));
+        }
+    }
+    for name in &options.packs {
+        wanted.push((name.clone(), None));
+    }
+    let mut names = Vec::new();
+    let mut rules = Vec::new();
+    for (name, base) in wanted {
+        let key = name.trim_start_matches("./").to_string();
+        if names.contains(&key) {
+            continue;
+        }
+        let text = match builtin_pack(&key) {
+            Some(text) => text.to_string(),
+            None => {
+                let path = Path::new(&name);
+                if base.is_some()
+                    && (path.is_absolute()
+                        || path
+                            .components()
+                            .any(|c| matches!(c, std::path::Component::ParentDir)))
+                {
+                    bail!("flaw pack {name} in cowproof.toml must be a path inside the repository");
+                }
+                let full = base.map_or_else(|| path.to_path_buf(), |b| b.join(path));
+                fs::read_to_string(&full)
+                    .with_context(|| format!("read flaw pack {name} ({})", full.display()))?
+            }
+        };
+        let file = parse_rules(&text).map_err(|e| anyhow::anyhow!("flaw pack {name}: {e}"))?;
+        rules.extend(file.rules);
+        names.push(key);
+    }
+    Ok((rules, names))
 }
 
 /// Build the report for one lane.
@@ -654,8 +745,8 @@ pub fn handback(options: &Options) -> Result<Report> {
         .filter(|c| !reported.contains(c.as_str()))
         .collect();
     // One matcher for the whole workspace: cowproof_prove::flaws.
-    let rules = parse_rules(include_str!("../rules/flaws.toml")).map_err(anyhow::Error::msg)?;
-    let (found, errors) = check_rules(&rules.rules, &deltas, baseline.as_deref());
+    let (rules, packs) = load_packs(options)?;
+    let (found, errors) = check_rules(&rules, &deltas, baseline.as_deref());
     if !errors.is_empty() {
         bail!("bad flaw rule: {}", errors.join("; "));
     }
@@ -745,6 +836,7 @@ pub fn handback(options: &Options) -> Result<Report> {
         checks,
         packet_commands_unreported: missing,
         unparsed,
+        packs,
         flaws,
         removed_assertions,
         limits: extract_sections(&handoff, "limits"),
@@ -784,7 +876,11 @@ pub fn print_report(r: &Report) {
         "Packet commands unreported: {}",
         r.packet_commands_unreported.len()
     );
-    println!("Flaws: {}", r.flaws.len());
+    if r.packs.len() > 1 {
+        println!("Flaws: {} (packs: {})", r.flaws.len(), r.packs.join(", "));
+    } else {
+        println!("Flaws: {}", r.flaws.len());
+    }
     for f in &r.flaws {
         println!(
             "- {}:{} {}",
@@ -840,7 +936,12 @@ mod tests {
     }
     #[test]
     fn flaw_rules_cover_seeded_classes_and_detect_hits() {
-        let rules = parse_rules(include_str!("../rules/flaws.toml")).unwrap();
+        let generic = parse_rules(GENERIC_PACK).unwrap();
+        let example = parse_rules(EXAMPLE_SUPABASE_PACK).unwrap();
+        assert_eq!(generic.rules.len(), 5);
+        assert_eq!(example.rules.len(), 8);
+        let mut rules = generic;
+        rules.rules.extend(example.rules);
         assert_eq!(rules.rules.len(), 13);
         let patch = fs::read_to_string(
             Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/flaw-classes.patch"),
@@ -864,15 +965,170 @@ mod tests {
             "tests/fixtures/access.sql"
         ));
     }
+    /// Words that tie a rule to one stack or project. None may appear in the generic pack.
+    const STACK_WORDS: [&str; 10] = [
+        "supabase",
+        "postgres",
+        "policy",
+        "row level",
+        "fetchimpl",
+        "current_setting",
+        "current_user",
+        "grant",
+        "concurrently",
+        "migrations.lock",
+    ];
+    fn flaw_lane() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/flaws")
+    }
+    fn explanations(report: &Report) -> BTreeSet<String> {
+        report.flaws.iter().map(|f| f.explanation.clone()).collect()
+    }
+
+    #[test]
+    fn the_default_load_has_no_stack_specific_rule() {
+        let generic = parse_rules(GENERIC_PACK).unwrap();
+        for rule in &generic.rules {
+            let text =
+                format!("{} {} {:?}", rule.pattern, rule.explanation, rule.files).to_lowercase();
+            for word in STACK_WORDS {
+                assert!(!text.contains(word), "generic rule names {word}: {text}");
+            }
+        }
+        let report = handback(&Options {
+            lane: flaw_lane(),
+            baseline: Some("20260401_existing.sql".into()),
+            ..Options::default()
+        })
+        .unwrap();
+        assert_eq!(report.packs, vec!["generic"]);
+        assert!(!report.flaws.is_empty(), "the generic rules still fire");
+        for f in &report.flaws {
+            let text = f.explanation.to_lowercase();
+            for word in STACK_WORDS {
+                assert!(!text.contains(word), "default load reported {text}");
+            }
+        }
+        assert!(
+            !report
+                .flaws
+                .iter()
+                .any(|f| f.file == "supabase/migrations.lock"),
+            "the lock-file rule belongs to the example pack"
+        );
+    }
+
+    #[test]
+    fn the_example_pack_loads_when_asked_and_adds_its_rules() {
+        let base = Options {
+            lane: flaw_lane(),
+            baseline: Some("20260401_existing.sql".into()),
+            ..Options::default()
+        };
+        let default = handback(&base).unwrap();
+        let with_pack = handback(&Options {
+            packs: vec!["example-supabase".into()],
+            ..base.clone()
+        })
+        .unwrap();
+        assert_eq!(with_pack.packs, vec!["generic", "example-supabase"]);
+        let extra: Vec<_> = explanations(&with_pack)
+            .difference(&explanations(&default))
+            .cloned()
+            .collect();
+        for expected in [
+            "Placeholder or public policy broadens access.",
+            "This weakens a row-level security or ownership boundary.",
+            "The applied migrations lock file was edited.",
+            "A fixture grants a privilege.",
+        ] {
+            assert!(extra.iter().any(|e| e == expected), "{expected}: {extra:?}");
+        }
+        assert!(
+            with_pack
+                .flaws
+                .iter()
+                .any(|f| f.file == "supabase/migrations.lock")
+        );
+        assert!(with_pack.flaws.len() > default.flaws.len());
+    }
+
+    #[test]
+    fn a_pack_in_cowproof_toml_loads_and_a_pack_named_twice_loads_once() {
+        let repo = tempfile::tempdir_in("/var/tmp").unwrap();
+        fs::write(
+            repo.path().join("cowproof.toml"),
+            "[proof]\npacks = [\"generic\", \"example-supabase\", \"./mine.toml\"]\n",
+        )
+        .unwrap();
+        fs::write(
+            repo.path().join("mine.toml"),
+            "[[rules]]\npattern = \"TODO_MARKER\"\nfiles = [\"**/*\"]\nexplanation = \"My own rule.\"\n",
+        )
+        .unwrap();
+        let report = handback(&Options {
+            lane: flaw_lane(),
+            repo: Some(repo.path().to_path_buf()),
+            packs: vec!["example-supabase".into()],
+            ..Options::default()
+        })
+        .unwrap();
+        assert_eq!(
+            report.packs,
+            vec!["generic", "example-supabase", "mine.toml"]
+        );
+        assert!(explanations(&report).contains("The applied migrations lock file was edited."));
+    }
+
+    #[test]
+    fn a_missing_malformed_or_escaping_pack_is_an_error_not_an_empty_pack() {
+        let lane = flaw_lane();
+        let err = handback(&Options {
+            lane: lane.clone(),
+            packs: vec!["/var/tmp/fr1-no-such-pack.toml".into()],
+            ..Options::default()
+        })
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("read flaw pack"), "{err:#}");
+
+        let dir = tempfile::tempdir_in("/var/tmp").unwrap();
+        let bad = dir.path().join("bad.toml");
+        fs::write(&bad, "[[rules]]\npattern = \n").unwrap();
+        let err = handback(&Options {
+            lane: lane.clone(),
+            packs: vec![bad.to_str().unwrap().into()],
+            ..Options::default()
+        })
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("does not parse"), "{err:#}");
+
+        fs::write(
+            dir.path().join("cowproof.toml"),
+            "[proof]\npacks = [\"../outside.toml\"]\n",
+        )
+        .unwrap();
+        let err = handback(&Options {
+            lane,
+            repo: Some(dir.path().to_path_buf()),
+            ..Options::default()
+        })
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("inside the repository"),
+            "{err:#}"
+        );
+    }
     #[test]
     fn flaw_lane_fixture_runs_all_rules_including_baseline() {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/flaws");
         let options = Options {
             lane: dir.clone(),
             baseline: Some("20260401_existing.sql".into()),
+            packs: vec!["example-supabase".into()],
             ..Options::default()
         };
         let report = handback(&options).unwrap();
+        assert_eq!(report.packs, vec!["generic", "example-supabase"]);
         assert!(
             report.flaws.len() >= 18,
             "reported {} flaws",

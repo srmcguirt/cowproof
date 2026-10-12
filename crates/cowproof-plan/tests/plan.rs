@@ -1,8 +1,9 @@
 use anyhow::Result;
 use cowproof_host::LaneStatus;
 use cowproof_plan::{
-    HostCapacity, Plan, PlanHostRunner, check_plans, choose_host, collect_running,
-    duplicate_running_id, lanes, ready_next, waiting_on_founder,
+    DEFAULT_APPROVER, HostCapacity, Plan, PlanHostRunner, Waiting, check_plans, choose_host,
+    collect_running, duplicate_running_id, lanes, ready_next, waiting_on_approvers,
+    waiting_on_founder,
 };
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -145,6 +146,89 @@ fn founder_waiting_brief_excludes_completed_and_dropped_lanes() {
         waiting,
         vec!["held-waits", "idea-waits", "packet-waits", "planned-waits"]
     );
+}
+
+fn waiting(lane: &str, role: &str) -> Waiting {
+    Waiting {
+        lane: lane.into(),
+        role: role.into(),
+    }
+}
+
+#[test]
+fn a_plan_without_approvers_still_reports_founder_waits_under_the_default_alias() {
+    let p = plan(
+        "p",
+        r#"{"version":1,"plan":"p","lanes":[
+      {"id":"idea-waits","title":"idea","priority":1,"status":"idea","decision":"Waiting on the founder"},
+      {"id":"held-waits","title":"held","priority":1,"status":"held","decision":"Await founder"},
+      {"id":"legal-waits","title":"legal","priority":1,"status":"held","notes":"Waiting on legal"}
+    ]}"#,
+    );
+    let all = lanes(&[p]);
+    assert_eq!(all[0].approvers, vec![DEFAULT_APPROVER]);
+    assert_eq!(
+        waiting_on_approvers(&all),
+        vec![
+            waiting("held-waits", "founder"),
+            waiting("idea-waits", "founder")
+        ]
+    );
+    assert_eq!(waiting_on_founder(&all), vec!["held-waits", "idea-waits"]);
+}
+
+#[test]
+fn a_plan_naming_other_approver_roles_reports_those_roles() {
+    let p = plan(
+        "p",
+        r#"{"version":1,"plan":"p","approvers":["Legal","product-owner"],"lanes":[
+      {"id":"needs-legal","title":"a","priority":1,"status":"held","notes":"Waiting on legal sign-off"},
+      {"id":"asks-po","title":"b","priority":1,"status":"planned","decision":"Ask the product-owner's view"},
+      {"id":"both","title":"c","priority":1,"status":"packet","decision":"Need Legal","notes":"Await the product-owner"},
+      {"id":"founder-only","title":"d","priority":1,"status":"held","notes":"Waiting on the founder"},
+      {"id":"no-wait-word","title":"e","priority":1,"status":"held","notes":"Legal reviewed it"},
+      {"id":"longer-word","title":"f","priority":1,"status":"held","notes":"Waiting on illegally filed forms"},
+      {"id":"done","title":"g","priority":1,"status":"shipped","notes":"Waiting on legal"}
+    ]}"#,
+    );
+    let all = lanes(&[p]);
+    assert_eq!(all[0].approvers, vec!["legal", "product-owner"]);
+    assert_eq!(
+        waiting_on_approvers(&all),
+        vec![
+            waiting("asks-po", "product-owner"),
+            waiting("both", "legal"),
+            waiting("both", "product-owner"),
+            waiting("needs-legal", "legal"),
+        ]
+    );
+    // The old name reports only the founder role, which this plan does not name.
+    assert!(waiting_on_founder(&all).is_empty());
+}
+
+#[test]
+fn approvers_are_checked_and_the_default_alias_needs_no_declaration() {
+    let ok = plan(
+        "p",
+        r#"{"version":1,"plan":"p","approvers":["legal","finance"],"lanes":[]}"#,
+    );
+    assert!(check_plans(std::path::Path::new("."), &[ok]).is_empty());
+    for (bad, expect) in [
+        (r#""approvers":[]"#, "approvers must not be empty"),
+        (r#""approvers":"legal""#, "approvers must be an array"),
+        (r#""approvers":["legal",""]"#, "must be non-empty strings"),
+        (r#""approvers":["legal","Legal"]"#, "must be unique"),
+    ] {
+        let p = plan(
+            "p",
+            &format!(r#"{{"version":1,"plan":"p",{bad},"lanes":[]}}"#),
+        );
+        let errors = check_plans(std::path::Path::new("."), &[p]);
+        assert!(
+            errors.iter().any(|e| e.rule.contains(expect)),
+            "{bad}: {errors:?}"
+        );
+    }
 }
 
 #[test]

@@ -103,7 +103,17 @@ fn the_flaw_lane_fixture_runs_all_rules_including_the_baseline() {
         return;
     }
     let dir = fixture("flaws");
-    let (r, _) = json_report(&[dir.to_str().unwrap(), "--baseline", "20260401_existing.sql"]);
+    let (r, _) = json_report(&[
+        dir.to_str().unwrap(),
+        "--baseline",
+        "20260401_existing.sql",
+        "--pack",
+        "example-supabase",
+    ]);
+    assert_eq!(
+        r["packs"],
+        serde_json::json!(["generic", "example-supabase"])
+    );
     let flaws = r["flaws"].as_array().unwrap();
     assert!(flaws.len() >= 18, "reported {} flaws", flaws.len());
     assert!(flaws.iter().any(|f| {
@@ -119,6 +129,57 @@ fn the_flaw_lane_fixture_runs_all_rules_including_the_baseline() {
         f["file"] == "supabase/migrations/20260402_new.sql"
             && f["pattern"].as_str().unwrap().starts_with("--baseline")
     }));
+}
+
+#[test]
+fn the_flaw_lane_fixture_gets_no_stack_rule_unless_the_pack_is_requested() {
+    if workspace::skipped("the_flaw_lane_fixture_gets_no_stack_rule_unless_the_pack_is_requested") {
+        return;
+    }
+    let dir = fixture("flaws");
+    let lane = dir.to_str().unwrap();
+    let (default, _) = json_report(&[lane, "--baseline", "20260401_existing.sql"]);
+    assert!(
+        default.get("packs").is_none(),
+        "a default report is unchanged"
+    );
+    let lock_hit = |r: &Value| {
+        r["flaws"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["file"] == "supabase/migrations.lock")
+    };
+    assert!(!lock_hit(&default));
+    let (asked, _) = json_report(&[
+        lane,
+        "--baseline",
+        "20260401_existing.sql",
+        "--pack",
+        "example-supabase",
+    ]);
+    assert_eq!(
+        asked["packs"],
+        serde_json::json!(["generic", "example-supabase"])
+    );
+    assert!(lock_hit(&asked));
+    assert!(asked["flaws"].as_array().unwrap().len() > default["flaws"].as_array().unwrap().len());
+}
+
+#[test]
+fn an_unreadable_flaw_pack_exits_2() {
+    if workspace::skipped("an_unreadable_flaw_pack_exits_2") {
+        return;
+    }
+    let dir = fixture("flaws");
+    let out = handback(&[
+        dir.to_str().unwrap(),
+        "--pack",
+        "/var/tmp/fr1-no-such-pack.toml",
+    ]);
+    assert_eq!(out.status.code(), Some(2), "{}", text(&out));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("read flaw pack"), "{stderr}");
 }
 
 #[test]
