@@ -55,72 +55,287 @@ pub trait CheckRunner: Send + Sync {
     ) -> Result<CheckOutcome, InfraError>;
 }
 
-/// Spawn `cmd` as the leader of its own process group, collect its output and wait for
-/// it, all on tokio (nothing blocks the executor).
+/// How long the output pipes may stay open after a command's leader has exited and its group
+/// has been killed. A process that escaped the group (its own session) could hold a pipe
+/// open for ever; the read is abandoned after this and what was read stands.
+const GROUP_DRAIN: Duration = Duration::from_millis(2_000);
+
+/// The process groups one runner started and has not finished with.
 ///
-/// On expiry the whole group gets SIGKILL, not only the direct child: a check that
-/// backgrounds work (`sleep 30 &`, a test server) must not outlive its limit. The child
-/// is then awaited, so no zombie is left, and `InfraError::Timeout` names `command`.
-async fn run_with_timeout(
+/// A command run through [`run_in_group`] is its own group leader, and its group is listed
+/// here from the spawn until the command is over. The runner that owns the set can end
+/// exactly those groups ([`GroupSet::end_all`]) when it is interrupted or its lane stops, and
+/// nothing else: a group that is not listed is never signalled through the set.
+#[derive(Debug, Default)]
+pub struct GroupSet {
+    groups: std::sync::Mutex<std::collections::BTreeSet<u32>>,
+}
+
+impl GroupSet {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, std::collections::BTreeSet<u32>> {
+        self.groups.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The listed groups, in order.
+    pub fn live(&self) -> Vec<u32> {
+        self.lock().iter().copied().collect()
+    }
+
+    /// SIGTERM every listed group.
+    pub fn terminate_all(&self) {
+        for pgid in self.live() {
+            terminate_process_group(pgid);
+        }
+    }
+
+    /// SIGKILL every listed group.
+    pub fn kill_all(&self) {
+        for pgid in self.live() {
+            kill_process_group(pgid);
+        }
+    }
+
+    /// End the groups listed now the polite way: SIGTERM, up to `grace` for their commands to
+    /// finish (each one leaves the set when it does), then SIGKILL to those still listed.
+    /// Groups listed after the call starts are not touched, so a command started meanwhile
+    /// (a resumed builder's first check) is safe. Returns at once when nothing is listed.
+    pub async fn end_all(&self, grace: Duration) {
+        let targets = self.live();
+        if targets.is_empty() {
+            return;
+        }
+        for pgid in &targets {
+            terminate_process_group(*pgid);
+        }
+        let still_listed = |targets: &[u32]| -> Vec<u32> {
+            let live = self.lock();
+            targets
+                .iter()
+                .copied()
+                .filter(|g| live.contains(g))
+                .collect()
+        };
+        let deadline = tokio::time::Instant::now() + grace;
+        while !still_listed(&targets).is_empty() && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        for pgid in still_listed(&targets) {
+            kill_process_group(pgid);
+        }
+    }
+}
+
+/// Lists a group in a [`GroupSet`] while it lives, and SIGKILLs it if dropped before
+/// [`LiveGroup::finish`]: a command whose future is dropped (the lane stopped, the task was
+/// aborted) must not leave its group behind, and `kill_on_drop` reaches only the leader.
+struct LiveGroup<'a> {
+    pgid: u32,
+    set: Option<&'a GroupSet>,
+    armed: bool,
+}
+
+impl<'a> LiveGroup<'a> {
+    fn new(pgid: u32, set: Option<&'a GroupSet>) -> Self {
+        if let Some(set) = set {
+            set.lock().insert(pgid);
+        }
+        LiveGroup {
+            pgid,
+            set,
+            armed: true,
+        }
+    }
+
+    /// The group has been ended and its leader reaped: delist it and do not signal it again
+    /// (its id could have been reused by now).
+    fn finish(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for LiveGroup<'_> {
+    fn drop(&mut self) {
+        if let Some(set) = self.set {
+            set.lock().remove(&self.pgid);
+        }
+        if self.armed {
+            kill_process_group(self.pgid);
+        }
+    }
+}
+
+/// How a command run by [`run_in_group`] ended.
+#[derive(Debug)]
+pub enum GroupEnd {
+    /// The leader exited by itself; the rest of its group was killed.
+    Exited(std::process::ExitStatus),
+    /// It did not finish within the limit: SIGTERM to its group (when a grace was given),
+    /// then SIGKILL.
+    TimedOut,
+}
+
+/// Why [`run_in_group`] could not report an end.
+#[derive(Debug)]
+pub enum GroupError {
+    /// The command did not start (or its pipes could not be taken).
+    Spawn(std::io::Error),
+    /// Reading its output or waiting for it failed.
+    Wait(std::io::Error),
+}
+
+impl std::fmt::Display for GroupError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            GroupError::Spawn(e) => write!(f, "spawn failed: {e}"),
+            GroupError::Wait(e) => write!(f, "waiting for the check failed: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for GroupError {}
+
+/// What [`run_in_group`] collected.
+#[derive(Debug)]
+pub struct GroupOutput {
+    pub end: GroupEnd,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+}
+
+/// Spawn `cmd` as the leader of its own process group, collect its output and wait for
+/// it, all on tokio (nothing blocks the executor). stdin is null.
+///
+/// The group is listed in `set` (if any) from the spawn to the end. When the leader exits,
+/// whatever it left running is SIGKILLed (the pipes then close; a process that escaped the
+/// group holds them for at most [`GROUP_DRAIN`]). On expiry the whole group gets SIGTERM
+/// when `term_grace` is not zero, the leader gets `term_grace` to exit, and the group then
+/// gets SIGKILL, not only the direct child: a check that backgrounds work (`sleep 30 &`, a
+/// test server) must not outlive its limit. The child is awaited, so no zombie is left.
+/// Dropping the future SIGKILLs the group.
+pub async fn run_in_group(
     mut cmd: Command,
-    command: &str,
     timeout: Duration,
-) -> Result<CheckOutcome, InfraError> {
+    term_grace: Duration,
+    set: Option<&GroupSet>,
+) -> Result<GroupOutput, GroupError> {
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .process_group(0)
         .kill_on_drop(true);
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| InfraError::SpawnError(format!("spawn failed: {e}")))?;
+    let mut child = cmd.spawn().map_err(GroupError::Spawn)?;
+    let bad = |what: &str| GroupError::Spawn(std::io::Error::other(what.to_string()));
     // process_group(0) makes the child its own group leader, so its pid is the pgid.
     let pgid = child
         .id()
-        .ok_or_else(|| InfraError::SpawnError("could not get child process ID".to_string()))?;
+        .ok_or_else(|| bad("could not get child process ID"))?;
+    let live = LiveGroup::new(pgid, set);
     let mut stdout = child
         .stdout
         .take()
-        .ok_or_else(|| InfraError::SpawnError("child stdout was not piped".to_string()))?;
+        .ok_or_else(|| bad("child stdout was not piped"))?;
     let mut stderr = child
         .stderr
         .take()
-        .ok_or_else(|| InfraError::SpawnError("child stderr was not piped".to_string()))?;
+        .ok_or_else(|| bad("child stderr was not piped"))?;
     let (mut out, mut err) = (Vec::new(), Vec::new());
 
     let finished = tokio::time::timeout(timeout, async {
-        let (o, e, status) = tokio::join!(
-            stdout.read_to_end(&mut out),
-            stderr.read_to_end(&mut err),
-            child.wait()
-        );
-        o?;
-        e?;
-        status
+        let (mut buf_out, mut buf_err) = ([0u8; 8192], [0u8; 8192]);
+        let (mut out_open, mut err_open) = (true, true);
+        let mut status = None;
+        let mut drain_until: Option<tokio::time::Instant> = None;
+        loop {
+            if status.is_some() && !out_open && !err_open {
+                break;
+            }
+            tokio::select! {
+                n = stdout.read(&mut buf_out), if out_open => match n? {
+                    0 => out_open = false,
+                    n => out.extend_from_slice(&buf_out[..n]),
+                },
+                n = stderr.read(&mut buf_err), if err_open => match n? {
+                    0 => err_open = false,
+                    n => err.extend_from_slice(&buf_err[..n]),
+                },
+                waited = child.wait(), if status.is_none() => {
+                    status = Some(waited?);
+                    // The leader is gone: end whatever it left running, so no background
+                    // child outlives the command or holds its pipes open.
+                    kill_process_group(pgid);
+                    drain_until = Some(tokio::time::Instant::now() + GROUP_DRAIN);
+                }
+                _ = tokio::time::sleep_until(drain_until.unwrap_or_else(tokio::time::Instant::now)),
+                    if drain_until.is_some() => break,
+            }
+        }
+        Ok::<_, std::io::Error>(status)
     })
     .await;
 
     match finished {
-        Ok(Ok(status)) => {
-            let mut output = String::from_utf8_lossy(&out).to_string();
-            output.push_str(&String::from_utf8_lossy(&err));
+        Ok(Ok(Some(status))) => {
+            live.finish();
+            Ok(GroupOutput {
+                end: GroupEnd::Exited(status),
+                stdout: out,
+                stderr: err,
+            })
+        }
+        // The loop only ends with the leader's status; a missing one is a wait that failed.
+        Ok(Ok(None)) => Err(GroupError::Wait(std::io::Error::other(
+            "the leader's exit status was never read",
+        ))),
+        Ok(Err(e)) => Err(GroupError::Wait(e)),
+        Err(_) => {
+            if !term_grace.is_zero() {
+                terminate_process_group(pgid);
+                let _ = tokio::time::timeout(term_grace, child.wait()).await;
+            }
+            kill_process_group(pgid);
+            let _ = child.wait().await;
+            live.finish();
+            Ok(GroupOutput {
+                end: GroupEnd::TimedOut,
+                stdout: out,
+                stderr: err,
+            })
+        }
+    }
+}
+
+/// The verifier's use of [`run_in_group`]: SIGKILL on expiry (no grace), `InfraError`s.
+async fn run_with_timeout(
+    cmd: Command,
+    command: &str,
+    timeout: Duration,
+) -> Result<CheckOutcome, InfraError> {
+    let ran = run_in_group(cmd, timeout, Duration::ZERO, None)
+        .await
+        .map_err(|e| match e {
+            GroupError::Spawn(e) => InfraError::SpawnError(format!("spawn failed: {e}")),
+            GroupError::Wait(e) => {
+                InfraError::Interrupted(format!("waiting for the check failed: {e}"))
+            }
+        })?;
+    match ran.end {
+        GroupEnd::Exited(status) => {
+            let mut output = String::from_utf8_lossy(&ran.stdout).to_string();
+            output.push_str(&String::from_utf8_lossy(&ran.stderr));
             Ok(CheckOutcome {
                 exit_status: status.code().unwrap_or(-1),
                 output,
                 attempts: 1,
             })
         }
-        Ok(Err(e)) => Err(InfraError::Interrupted(format!(
-            "waiting for the check failed: {e}"
+        GroupEnd::TimedOut => Err(InfraError::Timeout(format!(
+            "'{command}' after {:.1}s",
+            timeout.as_secs_f64()
         ))),
-        Err(_) => {
-            kill_process_group(pgid);
-            let _ = child.wait().await;
-            Err(InfraError::Timeout(format!(
-                "'{command}' after {:.1}s",
-                timeout.as_secs_f64()
-            )))
-        }
     }
 }
 
@@ -726,6 +941,162 @@ pub(crate) mod tests {
         let pid = run_backgrounding_check(&ProcessRunner::new(), tmp.path()).await;
 
         assert_process_gone(pid);
+    }
+
+    fn group_tmp() -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix("cp-group-")
+            .tempdir_in("/var/tmp")
+            .unwrap()
+    }
+
+    /// A shell command that backgrounds a long sleep, records its pid in `pid` and then
+    /// runs `rest`.
+    fn with_grandchild(rest: &str) -> String {
+        format!("sleep 300 & echo $! > pid; {rest}")
+    }
+
+    fn sh(tree: &Path, command: &str) -> Command {
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg(command).current_dir(tree);
+        cmd
+    }
+
+    async fn recorded_pid(tree: &Path) -> libc::pid_t {
+        for _ in 0..200 {
+            if let Some(pid) = std::fs::read_to_string(tree.join("pid"))
+                .ok()
+                .and_then(|t| t.trim().parse().ok())
+            {
+                return pid;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("the check never recorded its background pid");
+    }
+
+    /// A timeout with a grace: SIGTERM first, then SIGKILL; the grandchild goes too, even
+    /// when the leader and the grandchild both ignore SIGTERM.
+    #[tokio::test]
+    async fn timeout_with_a_grace_ends_a_group_that_ignores_sigterm() {
+        let tmp = group_tmp();
+        let command = with_grandchild("trap '' TERM; while :; do sleep 1; done");
+        let set = GroupSet::new();
+        let start = Instant::now();
+        let ran = run_in_group(
+            sh(tmp.path(), &command),
+            Duration::from_millis(500),
+            Duration::from_millis(500),
+            Some(&set),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(ran.end, GroupEnd::TimedOut), "{ran:?}");
+        assert!(start.elapsed() < Duration::from_secs(5));
+        assert!(set.live().is_empty(), "the group is still listed");
+        assert_process_gone(recorded_pid(tmp.path()).await);
+    }
+
+    /// The shell exits by itself and leaves the grandchild holding the output pipes: the
+    /// call returns at once (not at the timeout) and the grandchild is gone.
+    #[tokio::test]
+    async fn a_leader_that_exits_takes_its_leftovers_with_it() {
+        let tmp = group_tmp();
+        let command = with_grandchild("echo done");
+        let start = Instant::now();
+        let ran = run_in_group(
+            sh(tmp.path(), &command),
+            Duration::from_secs(60),
+            Duration::ZERO,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "{:?}",
+            start.elapsed()
+        );
+        match ran.end {
+            GroupEnd::Exited(status) => assert!(status.success()),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(String::from_utf8_lossy(&ran.stdout).trim(), "done");
+        assert_process_gone(recorded_pid(tmp.path()).await);
+    }
+
+    /// `end_all` ends exactly the listed groups, politely, while the call still runs.
+    #[tokio::test]
+    async fn end_all_ends_the_listed_groups_and_the_call_returns() {
+        let tmp = group_tmp();
+        let command = with_grandchild("sleep 300");
+        let set = std::sync::Arc::new(GroupSet::new());
+        let running = tokio::spawn({
+            let (set, tree) = (set.clone(), tmp.path().to_path_buf());
+            async move {
+                run_in_group(
+                    sh(&tree, &command),
+                    Duration::from_secs(120),
+                    Duration::from_secs(5),
+                    Some(&set),
+                )
+                .await
+            }
+        });
+        let pid = recorded_pid(tmp.path()).await;
+        assert_eq!(set.live().len(), 1);
+        let start = Instant::now();
+        set.end_all(Duration::from_secs(5)).await;
+        let ran = running.await.unwrap().unwrap();
+        // The call was not ended by its own timeout, and the group was not waited out.
+        assert!(matches!(ran.end, GroupEnd::Exited(_)), "{ran:?}");
+        assert!(start.elapsed() < Duration::from_secs(5));
+        assert!(set.live().is_empty());
+        assert_process_gone(pid);
+    }
+
+    /// Dropping the future (the lane stopped; the task was aborted) SIGKILLs the group.
+    #[tokio::test]
+    async fn dropping_the_call_kills_the_group_and_delists_it() {
+        let tmp = group_tmp();
+        let command = with_grandchild("sleep 300");
+        let set = std::sync::Arc::new(GroupSet::new());
+        let running = tokio::spawn({
+            let (set, tree) = (set.clone(), tmp.path().to_path_buf());
+            async move {
+                let _ = run_in_group(
+                    sh(&tree, &command),
+                    Duration::from_secs(120),
+                    Duration::from_secs(5),
+                    Some(&set),
+                )
+                .await;
+            }
+        });
+        let pid = recorded_pid(tmp.path()).await;
+        assert_eq!(set.live().len(), 1);
+        running.abort();
+        let _ = running.await;
+        assert!(set.live().is_empty());
+        assert_process_gone(pid);
+    }
+
+    /// The set signals only what it lists: a group started outside it is left alone.
+    #[tokio::test]
+    async fn end_all_leaves_a_group_it_did_not_start() {
+        let tmp = group_tmp();
+        let mut outsider = sh(tmp.path(), "sleep 300");
+        outsider.process_group(0).kill_on_drop(true);
+        let mut child = outsider.spawn().unwrap();
+        let pgid = child.id().unwrap();
+        GroupSet::new().end_all(Duration::from_millis(100)).await;
+        assert_eq!(
+            group_exists(pgid),
+            Some(true),
+            "an unlisted group was signalled"
+        );
+        kill_process_group(pgid);
+        let _ = child.wait().await;
     }
 
     #[test]

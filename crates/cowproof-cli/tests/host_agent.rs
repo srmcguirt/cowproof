@@ -11,7 +11,7 @@ mod common;
 
 use common::{
     REAL_KEY, fork_lock, git, group_gone, output, pid_alive, sandbox_available, signal_group,
-    signal_pid, unique_lane_id, var_tmp,
+    signal_pid, unique_lane_id, var_tmp, wait_group_gone,
 };
 use cowproof_run::bridge::bridge_port;
 use serde_json::{Value, json};
@@ -26,6 +26,9 @@ use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+/// How long a group whose leader has exited may still be listed: the kernel reaps its members
+/// late on a loaded host, so a "gone" assertion polls this long (a "still alive" one looks once).
+const GROUP_GONE_WITHIN: Duration = Duration::from_secs(10);
 /// The host-agent protocol this build speaks (`HOST_PROTOCOL` in `src/host_agent.rs`).
 const PROTOCOL: &str = "2";
 
@@ -1365,7 +1368,7 @@ fn assert_builder_group_ended(bfx: &Bfx) {
     if cfg!(target_os = "macos") {
         let pgid = fs::read_to_string(bfx.rec().join("pgid")).unwrap();
         assert!(
-            group_gone(pgid.trim()),
+            wait_group_gone(pgid.trim(), GROUP_GONE_WITHIN),
             "process group {} is still alive",
             pgid.trim()
         );
@@ -1483,7 +1486,7 @@ fn the_builder_records_its_group_and_removes_the_record_when_the_group_is_gone()
 
     drop(agent.0.stdin.take());
     wait_exit(&mut agent.0, STOP_WITHIN);
-    assert!(group_gone(&pgid.to_string()));
+    assert!(wait_group_gone(&pgid.to_string(), GROUP_GONE_WITHIN));
     assert!(
         !bfx.lane().join("control/builder.group.json").exists(),
         "the record outlived the group"
@@ -1525,11 +1528,14 @@ while :; do echo tick >> "$rec/marker"; sleep 0.2; done
     #[cfg(target_os = "macos")]
     assert_eq!(json["group"]["signals"], json!(["TERM", "KILL"]), "{json}");
 
-    assert!(group_gone(&pgid.to_string()), "the group is still alive");
+    assert!(
+        wait_group_gone(&pgid.to_string(), GROUP_GONE_WITHIN),
+        "the group is still alive"
+    );
     assert!(!bfx.lane().exists(), "the lane is still there");
     std::thread::sleep(Duration::from_secs(2));
     assert!(!bfx.lane().exists(), "something put the lane back");
-    assert!(group_gone(&pgid.to_string()));
+    assert!(wait_group_gone(&pgid.to_string(), GROUP_GONE_WITHIN));
     wait_exit(&mut agent.0, STOP_WITHIN);
 }
 
@@ -1592,7 +1598,7 @@ sleep 600
     let mut second = KillOnDrop(bfx.start(&["builder"], &bfx.spec()));
     wait_for(&bfx.rec().join("second"));
     assert!(
-        group_gone(&before.to_string()),
+        wait_group_gone(&before.to_string(), GROUP_GONE_WITHIN),
         "the second builder started while the first group ({before}) was alive"
     );
     wait_exit(&mut first.0, STOP_WITHIN);
@@ -1633,7 +1639,7 @@ fn patch_ends_a_group_that_is_still_stopping_before_it_takes_the_patch() {
         String::from_utf8_lossy(&out.stdout)
     );
     assert!(
-        group_gone(&pgid.to_string()),
+        wait_group_gone(&pgid.to_string(), GROUP_GONE_WITHIN),
         "patch left the group running"
     );
 }
@@ -1795,6 +1801,76 @@ fn check_kills_a_command_that_runs_past_its_timeout() {
     assert_eq!(json["timed_out"], true);
     assert_eq!(json["exit_code"], -1);
     assert!(json["output_tail"].as_str().unwrap().contains("timed out"));
+}
+
+/// A check that leaves a background subshell: it records its pid and writes a marker after
+/// 12 s. A check that was not ended as a whole group lets the marker appear.
+const BG_CHECK: &str = "( sleep 12; echo alive > survived ) & echo $! > bgpid; sleep 300";
+
+/// The background subshell is gone: by pid where the sandbox shares the host's pid space
+/// (macOS), and by effect everywhere (the marker never appears).
+fn assert_check_leftover_ended(clone: &Path, seen_at: Instant) {
+    if cfg!(target_os = "macos") {
+        let pid: u32 = fs::read_to_string(clone.join("bgpid"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while pid_alive(pid) {
+            assert!(
+                Instant::now() < deadline,
+                "the check's child {pid} is alive"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+    std::thread::sleep(Duration::from_secs(15).saturating_sub(seen_at.elapsed()));
+    assert!(
+        !clone.join("survived").exists(),
+        "the check's background process outlived the check and wrote its marker"
+    );
+}
+
+#[test]
+fn check_timeout_ends_the_background_process_the_shell_left_behind() {
+    if !sandbox_available() {
+        return;
+    }
+    let bfx = Bfx::new("exit 0");
+    let clone = bfx.fx.clone_of(&bfx.id);
+    let child = bfx.start(&["check", "--check-id", "c-bg"], &check_spec(BG_CHECK, 1));
+    let seen_at = Instant::now();
+    let out = child.wait_with_output().unwrap();
+    let json = json_of(&out);
+    assert_eq!(json["timed_out"], true, "{json}");
+    assert_check_leftover_ended(&clone, seen_at);
+}
+
+#[test]
+fn check_ends_its_group_when_the_host_agent_is_signalled() {
+    if !sandbox_available() {
+        return;
+    }
+    for signal in ["TERM", "INT"] {
+        let bfx = Bfx::new("exit 0");
+        let clone = bfx.fx.clone_of(&bfx.id);
+        let mut agent = bfx.start(
+            &["check", "--check-id", "c-sig"],
+            &check_spec(BG_CHECK, 600),
+        );
+        // `check` reads its spec to the end of its input.
+        drop(agent.stdin.take());
+        wait_for(&clone.join("bgpid"));
+        let seen_at = Instant::now();
+        assert!(signal_pid(signal, agent.id()), "could not signal {signal}");
+        wait_exit(&mut agent, STOP_WITHIN);
+        let out = agent.wait_with_output().unwrap();
+        let json = json_of(&out);
+        assert_eq!(json["ok"], false, "{signal}: {json}");
+        assert_eq!(json["timed_out"], false, "{signal}: {json}");
+        assert_check_leftover_ended(&clone, seen_at);
+    }
 }
 
 #[test]

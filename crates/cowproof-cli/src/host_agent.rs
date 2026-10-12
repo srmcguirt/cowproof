@@ -94,14 +94,15 @@ use self::config::{HostConfig, Loaded};
 use crate::preflight::{Check, CheckStatus, PreflightOptions, preflight};
 use crate::remote::is_bare_char;
 use crate::run::{
-    BuilderLaunch, CHECK_TIMEOUT, INTERRUPTED_EXIT_CODE, MAX_STDERR_LINE, PUMP_DRAIN, TERM_GRACE,
-    builder_command, builder_path, capture_patch, pump_stderr, redact_ready, resumable,
-    run_check_command, sibling_pk, sleep_until_opt, valid_model, write_lane_files,
+    BuilderLaunch, CHECK_TERM_GRACE, CHECK_TIMEOUT, INTERRUPTED_EXIT_CODE, MAX_STDERR_LINE,
+    PUMP_DRAIN, TERM_GRACE, builder_command, builder_path, capture_patch, pump_stderr,
+    redact_ready, resumable, run_check_command, sibling_pk, sleep_until_opt, valid_model,
+    write_lane_files,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use cowproof_core::{PORT_BASE, PORT_BLOCK_SIZE, redact};
 use cowproof_prove::runner::{
-    group_exists, kill_process_group, pid_exists, terminate_process_group,
+    GroupSet, group_exists, kill_process_group, pid_exists, terminate_process_group,
 };
 use cowproof_run::bridge::bridge_port;
 use cowproof_run::lane::{LaneControl, PrepareOptions, prepare_lane, validate_lane_id};
@@ -1861,21 +1862,44 @@ async fn check(lane_id: &str, check_id: &str, root: &Path) -> Result<Value> {
     }
     fs::create_dir_all(lane_tmp(&layout.scratch)).context("creating the lane's temp directory")?;
     let path = builder_path(&std::env::var("PATH").unwrap_or_default(), &home);
-    let run = run_check_command(
+    // Handlers first, so a signal between here and the spawn is not lost to the default.
+    let mut sigint = signal(SignalKind::interrupt()).context("installing the SIGINT handler")?;
+    let mut sigterm = signal(SignalKind::terminate()).context("installing the SIGTERM handler")?;
+    let mut sighup = signal(SignalKind::hangup()).context("installing the SIGHUP handler")?;
+    // The check is the leader of its own process group, so a signal to this process does not
+    // reach it: the group set lets this process end exactly the group it started.
+    let groups = GroupSet::new();
+    let ran = run_check_command(
         &layout,
         &path,
         &spec.command,
         spec.port_base,
         Duration::from_secs(spec.timeout_secs),
         check_id,
-    )
-    .await;
+        &groups,
+    );
+    tokio::pin!(ran);
+    let mut interrupted = false;
+    let run = tokio::select! {
+        run = &mut ran => run,
+        _ = stop_signal(&mut sigint, &mut sigterm, &mut sighup) => {
+            // SIGTERM to the check's group, the grace, SIGKILL; the check's own future ends
+            // once its shell is gone.
+            interrupted = true;
+            let (_, run) = tokio::join!(groups.end_all(CHECK_TERM_GRACE), &mut ran);
+            run
+        }
+    };
     let exit_code = run.outcome.exit_status;
+    let mut output = redact(&run.outcome.output);
+    if interrupted {
+        output.push_str("\n[the host agent was signalled: the check was ended]\n");
+    }
     Ok(json!({
-        "ok": exit_code == 0 && !run.timed_out,
+        "ok": exit_code == 0 && !run.timed_out && !interrupted,
         "exit_code": exit_code,
         "timed_out": run.timed_out,
-        "output_tail": tail(&redact(&run.outcome.output), MAX_OUTPUT),
+        "output_tail": tail(&output, MAX_OUTPUT),
     }))
 }
 

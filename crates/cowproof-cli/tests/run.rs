@@ -4831,3 +4831,138 @@ fn an_untraced_lane_records_no_trace_totals_and_is_still_proved() {
     let capsule = Capsule::read(&h.lane().join("control/capsule")).unwrap();
     assert_eq!(capsule.trace_totals, None);
 }
+
+// ---- `run_check` commands run in their own process group ---------------------
+//
+// A check is its own group leader, so a terminal Ctrl-C does not reach it and the runner ends
+// it itself: on the check's timeout (`host_agent.rs` tests the shared code with a one-second
+// limit), when the builder is gone (a stop ruling), and on SIGINT or SIGTERM. The check below
+// leaves a background subshell that writes a marker after 14 s and records its pid; a check
+// that was not ended as a group lets the marker appear.
+
+/// How long after the check started the marker would appear.
+const BG_MARKER_AFTER: Duration = Duration::from_secs(14);
+
+const BG_CHECK: &str =
+    "( sleep 14; echo alive > ../scratch/survived ) & echo $! > ../scratch/bgpid; sleep 300";
+
+fn bg_check_harness(fake_body: &str) -> Harness {
+    Harness::with_packet(
+        fake_body,
+        json!(["README.md", "created.txt"]),
+        json!([{"id": "bg", "command": BG_CHECK}]),
+    )
+}
+
+/// Shell: start `run_check bg` in the background (it blocks for 300 s) and wait until the
+/// check has recorded its background pid.
+fn start_bg_check() -> String {
+    format!(
+        "( {} ) &\nwhile [ ! -e \"$(dirname \"$HOME\")/scratch/bgpid\" ]; do sleep 0.1; done\n",
+        mcp_session("bg.out", &[(3, "run_check", json!({"id": "bg"}))])
+    )
+}
+
+/// The check's background subshell is gone: by pid where the sandbox shares the host's pid
+/// space (macOS), and by effect everywhere (its marker never appears).
+fn assert_bg_check_ended(h: &Harness, seen_at: Instant) {
+    if cfg!(target_os = "macos") {
+        assert_pid_gone(
+            fs::read_to_string(h.lane().join("scratch/bgpid"))
+                .unwrap()
+                .trim(),
+        );
+    }
+    std::thread::sleep(
+        (BG_MARKER_AFTER + Duration::from_secs(3)).saturating_sub(seen_at.elapsed()),
+    );
+    assert!(
+        !h.lane().join("scratch/survived").exists(),
+        "the check's background process outlived the lane's end and wrote its marker"
+    );
+}
+
+fn a_signal_ends_a_running_check_group(signal: &str) {
+    let h = bg_check_harness(&format!("{}{}sleep 120\n", init_line(), start_bg_check()));
+    let mut run = start_watched(&h, &[]);
+    wait_for_file(&mut run, &h.lane().join("scratch/bgpid"));
+    let seen_at = Instant::now();
+    send_signal(signal, &run.child);
+    let status = exit_within(&mut run, INTERRUPT_EXIT_WITHIN);
+    assert_interrupted_cleanly(&h, status, &run);
+    assert_bg_check_ended(&h, seen_at);
+}
+
+#[test]
+fn sigint_ends_a_running_checks_whole_group() {
+    if !sandbox_available() {
+        return;
+    }
+    a_signal_ends_a_running_check_group("INT");
+}
+
+#[test]
+fn sigterm_ends_a_running_checks_whole_group() {
+    if !sandbox_available() {
+        return;
+    }
+    a_signal_ends_a_running_check_group("TERM");
+}
+
+#[test]
+fn a_stop_ruling_ends_the_check_the_parked_builder_left_running() {
+    if !sandbox_available() {
+        return;
+    }
+    let ask = mcp_session("ask.out", &[(4, "ask", blocking_ask("Quit?"))]);
+    let h = bg_check_harness(&format!(
+        "{}{}{ask}sleep 120\n",
+        init_line(),
+        start_bg_check()
+    ));
+    let mut child = start(&h);
+    let id = wait_for_ask(&h, &mut child, 1);
+    let seen_at = Instant::now();
+    rule(&h, &id, &["--stop"]);
+    let out = finish(child);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(h.run_json()["status"], "stopped");
+    assert_bg_check_ended(&h, seen_at);
+}
+
+#[test]
+fn a_check_is_ended_when_the_builder_exits_and_the_lane_parks_before_any_ruling() {
+    if !sandbox_available() {
+        return;
+    }
+    let ask = mcp_session("ask.out", &[(4, "ask", blocking_ask("Which way?"))]);
+    let h = bg_check_harness(&format!(
+        "{}{}{ask}sleep 120\n",
+        init_line(),
+        start_bg_check()
+    ));
+    let mut run = start_watched(&h, &[]);
+    wait_for_file(&mut run, &h.lane().join("scratch/bgpid"));
+    let seen_at = Instant::now();
+    // The ask parks the session: the runner ends the builder and waits for a ruling. Nothing
+    // is ruled here, so only the builder's exit can end the check it left running.
+    run.wait_for_stderr(WAITING, SESSION_END_WITHIN);
+    assert_eq!(h.launches(), 1);
+    // The lane is still parked, no ruling given, when the check must be gone.
+    assert_bg_check_ended(&h, seen_at);
+    assert!(
+        run.child.try_wait().unwrap().is_none(),
+        "the run ended by itself while parked:\n{}",
+        run.stderr()
+    );
+    // Release the parked lane.
+    let id = wait_for_ask(&h, &mut run.child, 1);
+    rule(&h, &id, &["--stop"]);
+    let status = exit_within(&mut run, SESSION_END_WITHIN);
+    assert_eq!(status.code(), Some(1), "{}", run.stderr());
+}

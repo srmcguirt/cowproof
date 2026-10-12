@@ -53,7 +53,10 @@ use cowproof_prove::{
     capsule::HELDOUT_FILE,
     capsule::{Capsule, CheckResult, EnvironmentFingerprint, TraceTotals},
     gates::{GatePacket, base_requires_heldout, run_gates},
-    runner::{acquire_slot_notifying, kill_process_group, terminate_process_group},
+    runner::{
+        GroupEnd, GroupSet, acquire_slot_notifying, kill_process_group, run_in_group,
+        terminate_process_group,
+    },
     verify::{VerifyOptions, verify},
 };
 use cowproof_run::{
@@ -148,6 +151,10 @@ impl CredentialArg {
 
 /// The longest one `run_check` may run before it is killed.
 pub(crate) const CHECK_TIMEOUT: Duration = Duration::from_secs(20 * 60);
+
+/// A check that has run out of time, or whose lane is ending, gets SIGTERM to its process
+/// group; the group gets this long to finish before it is sent SIGKILL.
+pub(crate) const CHECK_TERM_GRACE: Duration = Duration::from_secs(5);
 
 /// The longest builder stdout line the meter will parse, in bytes. A longer
 /// line is still written to `stream.jsonl`, whole, but is not metered.
@@ -993,6 +1000,8 @@ struct Launcher {
     end_rx: tokio::sync::Mutex<UnboundedReceiver<SessionEnd>>,
     /// The signal handler's side: the builder's group, and the order to end it.
     interrupt: Arc<Interrupt>,
+    /// The checks running now: when the builder is gone they are its orphans and are ended.
+    checks: Arc<GroupSet>,
     /// The version of the builder preamble (sha256 hash of PREAMBLE bytes),
     /// recorded in the capsule and run.json.
     prefix_version: String,
@@ -1333,8 +1342,9 @@ impl Launcher {
         while end_rx.try_recv().is_ok() {}
 
         // Only the builder gets its own process group (so the runner can end it whole;
-        // `builder_command` sets it); `run_check` and the git steps keep the runner's group,
-        // so a terminal Ctrl-C still reaches them.
+        // `builder_command` sets it) and each `run_check` command (`run_in_group`); the git
+        // steps keep the runner's group, so a terminal Ctrl-C still reaches them. The check
+        // groups are ended by the runner itself, from `CheckContext::groups`.
         let mut child = child_cmd
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -1444,6 +1454,10 @@ impl Launcher {
                         // The leader is gone: end whatever it left running, so
                         // no background child survives or holds the stream open.
                         kill_process_group(pgid);
+                        // A `run_check` the builder had running is an orphan now (its own
+                        // group, so the kill above did not reach it): end it, politely first.
+                        let checks = self.checks.clone();
+                        tokio::spawn(async move { checks.end_all(CHECK_TERM_GRACE).await });
                         term_at = None;
                         kill_at = None;
                         drain_until = Some(TokioInstant::now() + PUMP_DRAIN);
@@ -2356,6 +2370,10 @@ struct CheckContext {
     /// For a remote lane the checks run on the host, in the clone the builder works in
     /// (`host-agent check`), not here.
     remote: Option<Arc<RemoteLane>>,
+    /// The process groups of the checks running now (each check is its own group leader, so a
+    /// terminal Ctrl-C does not reach it): the runner ends exactly these when the lane stops
+    /// or the runner is signalled.
+    groups: Arc<GroupSet>,
 }
 
 fn refused(output: impl Into<String>) -> CheckOutcome {
@@ -2386,6 +2404,7 @@ async fn run_declared_check(ctx: Arc<CheckContext>, id: String) -> CheckOutcome 
         Some(ctx.port_base),
         CHECK_TIMEOUT,
         &id,
+        &ctx.groups,
     )
     .await
     .outcome
@@ -2402,6 +2421,13 @@ pub(crate) struct CheckRun {
 /// sandbox, with `timeout`, and report what it did. `label` names the check in messages.
 /// Fails closed: if the sandbox cannot be built, nothing runs. The one place a declared check
 /// runs, for the local `run_check` tool and for `host-agent check` (D27).
+///
+/// The command is the leader of its own process group, listed in `groups` while it runs
+/// (`cowproof_prove::runner::run_in_group`, the code the verifier runs its checks with). On
+/// the timeout the group gets SIGTERM, [`CHECK_TERM_GRACE`] and then SIGKILL, so a background
+/// process the shell left behind goes with it; when the shell exits by itself its leftovers are
+/// SIGKILLed. Dropping the future (the lane stopped) SIGKILLs the group. A terminal Ctrl-C no
+/// longer reaches the check, so the caller ends `groups` itself when it is signalled.
 pub(crate) async fn run_check_command(
     layout: &LaneLayout,
     path: &str,
@@ -2409,6 +2435,7 @@ pub(crate) async fn run_check_command(
     port_base: Option<u16>,
     timeout: Duration,
     label: &str,
+    groups: &GroupSet,
 ) -> CheckRun {
     let done = |outcome| CheckRun {
         outcome,
@@ -2424,7 +2451,7 @@ pub(crate) async fn run_check_command(
         ),
     ];
     env.extend(port_base.into_iter().flat_map(port_block_env));
-    let mut child = match sandboxed_command(
+    let child = match sandboxed_command(
         &policy,
         &layout.control.join("run_check.sb"),
         &argv,
@@ -2434,20 +2461,22 @@ pub(crate) async fn run_check_command(
         Ok(c) => c,
         Err(e) => return done(refused(format!("sandbox unavailable: {e:#}"))),
     };
-    match tokio::time::timeout(timeout, child.output()).await {
-        Err(_) => CheckRun {
-            outcome: refused(format!("check {label:?} timed out after {timeout:?}")),
-            timed_out: true,
+    match run_in_group(child, timeout, CHECK_TERM_GRACE, Some(groups)).await {
+        Ok(ran) => match ran.end {
+            GroupEnd::TimedOut => CheckRun {
+                outcome: refused(format!("check {label:?} timed out after {timeout:?}")),
+                timed_out: true,
+            },
+            GroupEnd::Exited(status) => {
+                let mut output = String::from_utf8_lossy(&ran.stdout).into_owned();
+                output.push_str(&String::from_utf8_lossy(&ran.stderr));
+                done(CheckOutcome {
+                    exit_status: status.code().unwrap_or(-1),
+                    output,
+                })
+            }
         },
-        Ok(Err(e)) => done(refused(format!("could not start check {label:?}: {e}"))),
-        Ok(Ok(out)) => {
-            let mut output = String::from_utf8_lossy(&out.stdout).into_owned();
-            output.push_str(&String::from_utf8_lossy(&out.stderr));
-            done(CheckOutcome {
-                exit_status: out.status.code().unwrap_or(-1),
-                output,
-            })
-        }
+        Err(e) => done(refused(format!("could not start check {label:?}: {e}"))),
     }
 }
 
@@ -3429,6 +3458,7 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
         .transpose()?;
     let tools_queue = queue.clone();
     let table: CheckTable = checks.iter().map(|c| c.id.clone()).collect();
+    let check_groups = Arc::new(GroupSet::new());
     let context = Arc::new(CheckContext {
         layout: layout.clone(),
         path: path.clone(),
@@ -3439,6 +3469,7 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
         slot: Semaphore::new(1),
         port_base,
         remote: remote.clone(),
+        groups: check_groups.clone(),
     });
     let run_check: RunCheck =
         Arc::new(move |id: &str| Box::pin(run_declared_check(context.clone(), id.to_string())));
@@ -3607,6 +3638,7 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
         end_tx,
         end_rx: tokio::sync::Mutex::new(end_rx),
         interrupt: interrupt.clone(),
+        checks: check_groups.clone(),
         prefix_version: preamble_version.clone(),
         project_instructions: project_instructions_content.clone(),
         project_instructions_sha256: project_instructions_hash.clone(),
@@ -3657,6 +3689,15 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
                     }
                 }
             }
+            // A check the builder had running is in a group of its own and did not get the
+            // signal: end it the polite way, or at once on a second signal.
+            tokio::select! {
+                _ = check_groups.end_all(CHECK_TERM_GRACE) => {}
+                second = next_signal(&mut sigint, &mut sigterm) => {
+                    eprintln!("[{}] {second} again: not waiting", header.id);
+                    check_groups.kill_all();
+                }
+            }
             drop(_tools);
             drop(_director);
             drop(_proxy);
@@ -3682,8 +3723,11 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
     // Past the builder, a signal ends the process at once, as it did before
     // the handlers existed (the tokio handlers would otherwise swallow it).
     let exit_remote = remote.clone();
+    let exit_checks = check_groups.clone();
     tokio::spawn(async move {
         next_signal(&mut sigint, &mut sigterm).await;
+        // `exit` runs no destructors, and the group guards are destructors.
+        exit_checks.kill_all();
         // `exit` runs no destructors: give both slots back first, and remove the host's lane.
         for slot_path in &slot_paths {
             release_slot(Some(slot_path));
@@ -3698,7 +3742,9 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
     let end = &lane_run.end;
     let status_name = end.name(status.success());
 
-    // 6. The lane is over: stop serving, then capture.
+    // 6. The lane is over (finished, stopped, out of time or cost): end any check still
+    // running, then stop serving, then capture.
+    check_groups.end_all(CHECK_TERM_GRACE).await;
     drop(_tools);
     drop(_proxy);
     // A remote lane's patch comes from the host (`host-agent patch`, the very same
