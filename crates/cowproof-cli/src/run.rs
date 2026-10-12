@@ -1651,6 +1651,19 @@ fn ended_after_term_line(took: Duration, after_sigkill: bool) -> String {
     )
 }
 
+/// The runner's own account of how long ending an interrupted run took, measured from the
+/// moment the runner read the signal to `run.json` being written (the builder's group ended,
+/// the check groups ended, the servers stopped, the sockets removed). A run with nothing left
+/// to end takes milliseconds; one that waited out a grace shows about [`CHECK_TERM_GRACE`] or
+/// [`TERM_GRACE`]. It does not include the signal reaching the runner or the process exiting
+/// afterwards, which are the host's. The tests read this line.
+fn interrupt_recorded_line(signal_name: &str, took: Duration) -> String {
+    format!(
+        "the interrupted run was recorded {} ms after the {signal_name}",
+        took.as_millis()
+    )
+}
+
 /// How the lane's builder launches ended.
 #[derive(Debug, PartialEq, Eq)]
 enum LaneEnd {
@@ -3862,6 +3875,7 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
         Ok(run) => run,
         Err(signal_name) => {
             eprintln!("[{}] {signal_name}: ending the run", header.id);
+            let signalled = Instant::now();
             interrupt.raise();
             // A builder is running: the launcher ends its group and returns.
             // With none (waiting for a ruling, say) there is nothing to wait for.
@@ -3902,6 +3916,11 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
                     credential,
                     host: remote.as_ref().map(|r| r.alias()),
                 },
+            );
+            eprintln!(
+                "[{}] {}",
+                header.id,
+                interrupt_recorded_line(signal_name, signalled.elapsed())
             );
             return Ok(INTERRUPTED_EXIT_CODE);
         }

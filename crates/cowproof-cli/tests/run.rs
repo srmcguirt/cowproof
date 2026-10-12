@@ -2307,6 +2307,8 @@ const WAITING: &str = "waiting for the director";
 struct Watched {
     child: Child,
     stderr: std::sync::Arc<Mutex<String>>,
+    /// When each stderr line reached this test, so a failure can say where the time went.
+    arrivals: std::sync::Arc<Mutex<Vec<(Instant, String)>>>,
 }
 
 fn start_watched(h: &Harness, extra: &[&str]) -> Watched {
@@ -2324,15 +2326,25 @@ fn start_watched(h: &Harness, extra: &[&str]) -> Watched {
     let pipe = child.stderr.take().unwrap();
     let stderr = std::sync::Arc::new(Mutex::new(String::new()));
     let sink = stderr.clone();
+    let arrivals = std::sync::Arc::new(Mutex::new(Vec::new()));
+    let arrived = arrivals.clone();
     std::thread::spawn(move || {
         use std::io::BufRead;
         for line in std::io::BufReader::new(pipe).lines().map_while(Result::ok) {
+            arrived
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push((Instant::now(), line.clone()));
             let mut text = sink.lock().unwrap_or_else(|e| e.into_inner());
             text.push_str(&line);
             text.push('\n');
         }
     });
-    Watched { child, stderr }
+    Watched {
+        child,
+        stderr,
+        arrivals,
+    }
 }
 
 impl Watched {
@@ -2341,6 +2353,16 @@ impl Watched {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
+    }
+
+    /// When the first stderr line containing `needle` reached this test.
+    fn arrival_of(&self, needle: &str) -> Option<Instant> {
+        self.arrivals
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .find(|(_, line)| line.contains(needle))
+            .map(|(at, _)| *at)
     }
 
     /// Wait until the runner's stderr contains `needle`, at most `within`. A
@@ -3270,19 +3292,61 @@ fn sigterm_ends_the_builders_whole_group_removes_the_sockets_and_exits_130() {
     a_signal_ends_the_builder_its_children_and_the_servers("TERM");
 }
 
+/// What the runner's own line "the interrupted run was recorded N ms after the SIGINT" says:
+/// how long the runner took from reading the signal to having ended the run. Not the signal
+/// reaching the runner and not the process exiting after that: those are the host's.
+fn interrupt_recorded_in(stderr: &str) -> Duration {
+    let line = stderr
+        .lines()
+        .find(|l| l.contains("the interrupted run was recorded "))
+        .unwrap_or_else(|| panic!("no 'the interrupted run was recorded' line:\n{stderr}"));
+    let ms = line
+        .split("the interrupted run was recorded ")
+        .nth(1)
+        .and_then(|rest| rest.split(" ms").next())
+        .and_then(|n| n.parse::<u64>().ok())
+        .unwrap_or_else(|| panic!("cannot read the time from {line:?}"));
+    Duration::from_millis(ms)
+}
+
 #[test]
 fn a_signal_while_the_lane_waits_for_a_ruling_ends_the_run_without_a_builder() {
     if !sandbox_available() {
         return;
     }
+    // Nothing is left to end: the builder went at the park, and no check group is running. So
+    // the runner must not wait for a grace, and the property is the runner's own account of
+    // how long it took from reading the signal to recording the run, against three quarters
+    // of the shorter grace (`CHECK_TERM_GRACE`). The whole exit is not timed against a
+    // clock picked for an idle host: on a loaded Linux host it twice went past 20 s with the
+    // runner's stderr ending at the "ending the run" line, and the time before and after
+    // that line (the signal reaching the runner, the process exiting) is the host's. The
+    // exit wait is a hang guard, and a failure says where the time went.
+    let bound = check_term_grace() * 3 / 4;
     let ask = mcp_session("ask.out", &[(3, "ask", blocking_ask("Choose A or B?"))]);
     let h = owned_packet(&format!("{}{ask}sleep 120\n", init_line()));
     let mut run = start_watched(&h, &[]);
     wait_for_ask(&h, &mut run.child, 1);
     run.wait_for_stderr(WAITING, SESSION_END_WITHIN);
 
+    let sent = Instant::now();
     send_signal("INT", &run.child);
-    let status = exit_within(&mut run, INTERRUPT_EXIT_WITHIN);
+    let status = exit_within(&mut run, RULED_WITHIN);
+    let exited = Instant::now();
+    let stderr = run.stderr();
+    let timeline = match run.arrival_of("SIGINT: ending the run") {
+        Some(line) => format!(
+            "signal sent to the line: {:?}; line to exit seen: {:?}",
+            line.saturating_duration_since(sent),
+            exited.saturating_duration_since(line)
+        ),
+        None => "the 'ending the run' line never arrived".to_string(),
+    };
+    let took = interrupt_recorded_in(&stderr);
+    assert!(
+        took < bound,
+        "the interrupted run took {took:?} to end after the signal, bound {bound:?}; {timeline}:\n{stderr}"
+    );
     assert_interrupted_cleanly(&h, status, &run);
     assert_eq!(h.launches(), 1);
 }
