@@ -157,7 +157,7 @@ The builder is untrusted. It may have read hostile content in the repository, an
 ### Verifier
 
 - The verifier builds a fresh clone of the base (commit plus base patch), applies the lane patch, and runs the packet's visible checks and then the held-out checks, inside a sandbox with no network and no credentials. It runs as a separate process the builder never started.
-- **The patch cannot quietly change what the checks run or what the gates look for.** Gates load the flaw packs and all gate configuration from the base revision, never from the patched tree. Check and gate infrastructure is protected by default: test configuration, build scripts, package manifests and their scripts, CI files, `cowproof.toml`, `cowproof/**`, every path named in `[proof] packs`, and any file a declared check command references. A patch that touches one fails the protected-path gate unless the packet owns that path explicitly, and then the gate still reports "check harness changed" for the director.
+- **The patch cannot quietly change what the checks run or what the gates look for.** Gates load the flaw packs and all gate configuration from the base revision, never from the patched tree. Check and gate infrastructure is protected by default: test configuration, build scripts, package manifests and their scripts, CI files, `cowproof.toml`, `cowproof/**`, every path named in `[proof] packs`, every glob in `[proof] protected` (and in the older `lanes.config.json` `protected` list, which is still read; when both exist the gate protects the union and notes once that the old file contributed), `lanes.config.json` itself, and any file a declared check command references. A patch that touches one fails the protected-path gate unless the packet owns that path explicitly, and then the gate still reports "check harness changed" for the director.
 - Held-out checks are copied in from the control directory at verify time, so their files are never in the builder's clone. Held-out checks are written per packet and never reused, so a shared capsule cannot leak them to a later builder.
 - An `--unsandboxed` lane can reach `finished` but never `proved`; the verifier always runs sandboxed.
 - The builder's own reported results are informational only.
@@ -286,7 +286,6 @@ subscription_builders = 2
 
 [paths]
 handoffs = "docs/handoffs"   # inside the clone; reaches the real tree only in the lane patch
-protected = [".env*", ".github/**", "cowproof.toml"]
 
 [classes]
 light = 6
@@ -295,6 +294,7 @@ pg = 3
 
 [proof]
 packs = ["generic", "./cowproof/flaws.toml"]
+protected = [".env*", "secret/**"]   # extra protected globs; read from the base commit (the older lanes.config.json list is still read, and the gate protects the union)
 migration_baseline = "20261012_last_applied.sql"   # file name of the last applied migration; read from the base commit
 ```
 
