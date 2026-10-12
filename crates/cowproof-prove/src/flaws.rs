@@ -1,15 +1,35 @@
-//! Flaw rule types and the single rule matcher shared by the gates and
-//! `cowproof-report`.
+//! Flaw rule types, the single rule matcher and the single pack loader shared by the
+//! gates and `cowproof-report`.
 //!
-//! This is the only implementation of flaw rule matching in the workspace.
-//! Rule globs use `cowproof_core::glob_matches`, the same matcher as the
-//! ownership and protected-path gates, so `**/*` matches a root-level file.
+//! This is the only implementation of flaw rule matching in the workspace, and the only
+//! place the built-in packs are embedded and `[proof] packs` is resolved. Rule globs use
+//! `cowproof_core::glob_matches`, the same matcher as the ownership and protected-path
+//! gates, so `**/*` matches a root-level file.
 
-use cowproof_core::glob_matches;
+use anyhow::{Context, Result, bail};
+use cowproof_core::{git_show_optional, glob_matches};
 use regex::Regex;
 use serde::Deserialize;
+use std::fs;
+use std::path::{Component, Path};
 
 pub use cowproof_core::{PatchDelta, parse_patch};
+
+/// The generic flaw pack: gaming patterns that apply to any stack. It is embedded here, the
+/// only copy, and loads first in every run of the gates and of `cowproof report handback`.
+pub const GENERIC_PACK: &str = include_str!("../rules/generic.toml");
+/// The example project pack: rules one Postgres/Supabase project added. Loaded only when
+/// `[proof] packs` or `--pack` names `example-supabase`.
+pub const EXAMPLE_SUPABASE_PACK: &str = include_str!("../rules/example-supabase.toml");
+
+/// The built-in pack called `name`, if there is one.
+pub fn builtin_pack(name: &str) -> Option<&'static str> {
+    match name {
+        "generic" => Some(GENERIC_PACK),
+        "example-supabase" => Some(EXAMPLE_SUPABASE_PACK),
+        _ => None,
+    }
+}
 
 /// A flaw rule as defined in a flaws.toml file.
 #[derive(Clone, Debug, Deserialize)]
@@ -183,6 +203,187 @@ pub fn check_rule(
         }
     }
     Ok(findings)
+}
+
+/// Where the files a repository names are read from. The gates read the base commit and
+/// never the working tree; the report reads the repository the director names.
+pub trait PackFiles {
+    /// The text of the repository file `rel` (a relative path with no `..`), or `Ok(None)`
+    /// when the file is not there. A file that cannot be used (a link out of the
+    /// repository, a directory, text that is not UTF-8) is an error, not `None`.
+    fn read(&self, rel: &str) -> Result<Option<String>>;
+    /// How an error names the place: "the base" or "the repository".
+    fn describe(&self) -> &'static str;
+}
+
+/// Files as they are in a commit (`git show <commit>:<path>`). A symlink, a directory or
+/// a submodule at that path is refused.
+pub struct BaseCommitFiles<'a> {
+    pub repo: &'a Path,
+    pub commit: &'a str,
+}
+
+impl PackFiles for BaseCommitFiles<'_> {
+    fn read(&self, rel: &str) -> Result<Option<String>> {
+        git_show_optional(self.repo, self.commit, rel)
+    }
+    fn describe(&self) -> &'static str {
+        "the base"
+    }
+}
+
+/// Files in a working tree. The real path, symlinks resolved, must stay inside the root:
+/// a parse error quotes the file, so a link out of the repository would print part of a
+/// file from outside it into the report.
+pub struct WorkingTreeFiles<'a> {
+    pub root: &'a Path,
+}
+
+impl PackFiles for WorkingTreeFiles<'_> {
+    fn read(&self, rel: &str) -> Result<Option<String>> {
+        let full = self.root.join(rel);
+        let real = match full.canonicalize() {
+            Ok(real) => real,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e).with_context(|| format!("resolve {}", full.display())),
+        };
+        let root = self
+            .root
+            .canonicalize()
+            .with_context(|| format!("resolve the repository {}", self.root.display()))?;
+        if !real.starts_with(&root) {
+            bail!("{rel} must be a path inside the repository");
+        }
+        fs::read_to_string(&real)
+            .map(Some)
+            .with_context(|| format!("read {rel} ({})", full.display()))
+    }
+    fn describe(&self) -> &'static str {
+        "the repository"
+    }
+}
+
+/// No repository to read from: only the built-in packs resolve.
+pub struct NoFiles;
+
+impl PackFiles for NoFiles {
+    fn read(&self, _rel: &str) -> Result<Option<String>> {
+        Ok(None)
+    }
+    fn describe(&self) -> &'static str {
+        "the repository"
+    }
+}
+
+/// A pack name as written in `[proof] packs`, without a leading `./`: the key a pack is
+/// loaded, deduplicated and protected by.
+pub fn normalize_pack_name(name: &str) -> String {
+    name.trim_start_matches("./").to_string()
+}
+
+/// The repository paths among `names`: the packs that are files, not built-in names.
+/// These are the gate inputs a patch may not touch.
+pub fn pack_file_paths(names: &[String]) -> Vec<String> {
+    names
+        .iter()
+        .filter(|n| builtin_pack(n).is_none())
+        .cloned()
+        .collect()
+}
+
+/// A pack named by `cowproof.toml` is a path inside the repository: not empty, not
+/// absolute and with no `..`. Symlinks are checked when the file is read.
+fn check_pack_path(name: &str) -> Result<()> {
+    let path = Path::new(name);
+    if name.is_empty()
+        || path.is_absolute()
+        || path.components().any(|c| matches!(c, Component::ParentDir))
+    {
+        bail!("flaw pack {name:?} in cowproof.toml must be a path inside the repository");
+    }
+    Ok(())
+}
+
+/// `[proof] packs` from the `cowproof.toml` that `files` holds, each name normalized. A
+/// missing file is no packs; a file that does not parse, or a value that is not a list of
+/// strings, is an error, never an empty list.
+pub fn configured_packs(files: &dyn PackFiles) -> Result<Vec<String>> {
+    let Some(text) = files.read("cowproof.toml")? else {
+        return Ok(Vec::new());
+    };
+    let config: toml::Table =
+        toml::from_str(&text).with_context(|| "cowproof.toml does not parse".to_string())?;
+    let Some(proof) = config.get("proof") else {
+        return Ok(Vec::new());
+    };
+    let Some(proof) = proof.as_table() else {
+        bail!("[proof] in cowproof.toml must be a table");
+    };
+    let Some(packs) = proof.get("packs") else {
+        return Ok(Vec::new());
+    };
+    packs
+        .as_array()
+        .and_then(|a| {
+            a.iter()
+                .map(|p| p.as_str().map(normalize_pack_name))
+                .collect::<Option<Vec<_>>>()
+        })
+        .context("[proof] packs in cowproof.toml must be a list of strings")
+}
+
+/// The rules to run and the packs they came from, in load order.
+#[derive(Debug, Default)]
+pub struct LoadedPacks {
+    pub rules: Vec<FlawRule>,
+    pub names: Vec<String>,
+}
+
+impl LoadedPacks {
+    /// Parse `text` as the pack `name` and add its rules. A pack already loaded under that
+    /// name is skipped. A pack that does not parse is an error, never an empty pack.
+    pub fn add(&mut self, name: &str, text: &str) -> Result<()> {
+        let key = normalize_pack_name(name);
+        if self.names.contains(&key) {
+            return Ok(());
+        }
+        let file = parse_rules(text).map_err(|e| anyhow::anyhow!("flaw pack {name}: {e}"))?;
+        self.rules.extend(file.rules);
+        self.names.push(key);
+        Ok(())
+    }
+}
+
+/// Load the packs to run: the generic pack first, then each of `configured` (the names
+/// `configured_packs` returned) in order. A built-in name resolves to its embedded pack;
+/// anything else is a path inside the repository that `files` holds. A pack named twice
+/// loads once. A path that escapes the repository, a pack that is missing and a pack that
+/// does not parse are errors, never an empty pack.
+pub fn load_flaw_packs(files: &dyn PackFiles, configured: &[String]) -> Result<LoadedPacks> {
+    let mut loaded = LoadedPacks::default();
+    loaded.add("generic", GENERIC_PACK)?;
+    for name in configured {
+        let key = normalize_pack_name(name);
+        if loaded.names.contains(&key) {
+            continue;
+        }
+        if let Some(text) = builtin_pack(&key) {
+            loaded.add(&key, text)?;
+            continue;
+        }
+        check_pack_path(&key)?;
+        let text = files
+            .read(&key)
+            .with_context(|| format!("read flaw pack {key} from {}", files.describe()))?
+            .with_context(|| {
+                format!(
+                    "flaw pack {key} is named in cowproof.toml but missing from {}",
+                    files.describe()
+                )
+            })?;
+        loaded.add(&key, &text)?;
+    }
+    Ok(loaded)
 }
 
 /// Run every rule over every delta. Returns the findings and one error string

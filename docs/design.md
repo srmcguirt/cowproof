@@ -171,7 +171,7 @@ The builder is untrusted. It may have read hostile content in the repository, an
 | Protected paths | edits to tests, fixtures or policies the packet must not touch | new |
 | Verifier re-run | checks the builder claimed but that fail when run independently | new |
 | Held-out checks | work that satisfies only the visible checks (idea: EvilGenie, SpecBench). A packet without held-out checks gets a warning, not a failure, unless the repository sets `require_heldout = true` (which also refuses a port lane whose held-out cases were skipped for want of the reference runtime) | new |
-| Flaw rules | known gaming patterns: swallowed exceptions in assertions, always-true policies, test-only code in production paths, secrets in URLs, and edits to an applied migration (`[proof] migration_baseline` in the base `cowproof.toml` names the last applied one; with none, that rule is skipped, and a patch that touches a migration gets a warning saying so) | exists: `crates/cowproof-report/rules/flaws.toml` is the generic pack and loads by default; `example-supabase.toml` is the example project pack and loads only when asked (`cowproof report handback --pack example-supabase`, or `packs` under `[proof]` in `cowproof.toml`) |
+| Flaw rules | known gaming patterns: swallowed exceptions in assertions, always-true policies, test-only code in production paths, secrets in URLs, and edits to an applied migration (`[proof] migration_baseline` in the base `cowproof.toml` names the last applied one; with none, that rule is skipped, and a patch that touches a migration gets a warning saying so) | exists: `crates/cowproof-prove/rules/generic.toml` is the generic pack, embedded once in `cowproof_prove::flaws` (`GENERIC_PACK`); it loads first and always, in the gates and in `cowproof report handback`, through one loader (`load_flaw_packs`) that resolves `[proof] packs` (built-in names, then paths inside the repository) from the base commit for the gates and from the named repository for the report. `example-supabase.toml`, beside it, is the example project pack and loads only when asked (`packs` under `[proof]` in `cowproof.toml`, or `cowproof report handback --pack example-supabase`) |
 | Claimed vs. run | handoff checks the verifier never saw | exists in part |
 
 A gate verdict is a triage signal; the director still rules. Each new flaw found at handback becomes a rule.
@@ -285,7 +285,7 @@ api_key_builders = 6
 subscription_builders = 2
 
 [paths]
-handoffs = "docs/handoffs"   # inside the clone; reaches the real tree only in the lane patch
+handoffs = "docs/handoffs"   # inside the clone; reaches the real tree only in the lane patch. Also where the report looks for the handoff; wins over the older lanes.config.json handoffDir (the report warns when they differ)
 
 [classes]
 light = 6

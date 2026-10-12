@@ -1,9 +1,9 @@
 # Example project pack: the rules one Postgres/Supabase project added after real
 # handbacks (row-level security, migration locks, a login-role guard, one client's
-# fetch binding). It is NOT loaded by default. Ask for it with
-# `cowproof report handback <lane> --pack example-supabase`, or list
-# `example-supabase` under `packs` in `[proof]` of `cowproof.toml`. Copy it as the
-# starting point for your own project pack.
+# fetch binding). It is NOT loaded by default. List `example-supabase` under `packs` in
+# `[proof]` of `cowproof.toml` (the gates and the report then both apply it), or ask for it
+# on one report with `cowproof report handback <lane> --pack example-supabase`. Copy it as
+# the starting point for your own project pack.
 
 [[rules]]
 pattern = "(?i)\\bUSING\\s*\\(\\s*true\\s*\\)|\\bWITH\\s+CHECK\\s*\\(\\s*true\\s*\\)|\\bTO\\s+PUBLIC\\b"

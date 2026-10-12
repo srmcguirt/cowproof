@@ -395,11 +395,139 @@ pub fn repo_rules_from_config(text: Option<&str>) -> (Vec<String>, String) {
     (protected, handoff)
 }
 
-/// `repo_rules_from_config` over the working tree's `lanes.config.json`. Proof gates
-/// must not use this: a lane's patch could edit the file they would read.
-pub fn repo_rules(root: &Path) -> (Vec<String>, String) {
-    let text = fs::read_to_string(root.join("lanes.config.json")).ok();
-    repo_rules_from_config(text.as_deref())
+/// The repository rules both config files declare: the protected globs and the handoff
+/// directory. `cowproof.toml` is the current home and `lanes.config.json` is still read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepoRules {
+    /// The protected globs: the union of `lanes.config.json` `protected` (the defaults when
+    /// it names no list) and `cowproof.toml` `[proof] protected`. A rename between the two
+    /// files never shrinks protection, so unlike the handoff directory this is not
+    /// overridden.
+    pub protected: Vec<String>,
+    /// `lanes.config.json` named at least one protected glob.
+    pub protected_from_lanes_config: bool,
+    /// Where handoffs live: `cowproof.toml` `[paths] handoffs`, else `lanes.config.json`
+    /// `handoffDir`, else [`DEFAULT_HANDOFF_DIR`].
+    pub handoff_dir: String,
+    /// Things a reader should be told: both files set the handoff directory and differ.
+    pub notes: Vec<String>,
+}
+
+fn string_list(value: &Value, what: &str) -> Result<Vec<String>> {
+    value
+        .as_array()
+        .and_then(|a| {
+            a.iter()
+                .map(|g| g.as_str().map(str::to_owned))
+                .collect::<Option<Vec<_>>>()
+        })
+        .with_context(|| format!("{what} must be a list of strings"))
+}
+
+/// Read both config files' text into one [`RepoRules`]. The one parser behind the gates
+/// (which pass the files as they are in the base commit), the handback report and
+/// [`repo_rules`] (which pass the working tree's).
+///
+/// Order: `cowproof.toml` first, then `lanes.config.json`, then the defaults. When both set
+/// the handoff directory and the values differ, `cowproof.toml` wins and `notes` says so.
+/// A file that does not parse, or a value of the wrong type, is an error, never "unset".
+pub fn repo_rules_from_texts(
+    lanes_config: Option<&str>,
+    cowproof_toml: Option<&str>,
+) -> Result<RepoRules> {
+    let defaults = repo_rules_from_config(None);
+    let mut protected = Vec::new();
+    let mut protected_from_lanes_config = false;
+    let mut lanes_handoff: Option<String> = None;
+    match lanes_config {
+        None => protected.extend(defaults.0),
+        Some(text) => {
+            let config: Value =
+                serde_json::from_str(text).context("lanes.config.json does not parse")?;
+            let Some(object) = config.as_object() else {
+                bail!("lanes.config.json must be a JSON object");
+            };
+            match object.get("protected") {
+                None => protected.extend(defaults.0),
+                Some(value) => {
+                    let listed = string_list(value, "\"protected\" in lanes.config.json")?;
+                    protected_from_lanes_config = !listed.is_empty();
+                    protected.extend(listed);
+                }
+            }
+            if let Some(value) = object.get("handoffDir") {
+                let dir = value
+                    .as_str()
+                    .context("\"handoffDir\" in lanes.config.json must be a string")?;
+                lanes_handoff = Some(dir.to_owned());
+            }
+        }
+    }
+
+    let mut toml_handoff: Option<String> = None;
+    if let Some(text) = cowproof_toml {
+        let config: toml::Table = toml::from_str(text).context("cowproof.toml does not parse")?;
+        if let Some(proof) = config.get("proof") {
+            let Some(proof) = proof.as_table() else {
+                bail!("[proof] in cowproof.toml must be a table");
+            };
+            if let Some(value) = proof.get("protected") {
+                let toml_value = serde_json::to_value(value).context("[proof] protected")?;
+                let listed = string_list(&toml_value, "[proof] protected in cowproof.toml")?;
+                for glob in listed {
+                    if !protected.contains(&glob) {
+                        protected.push(glob);
+                    }
+                }
+            }
+        }
+        if let Some(paths) = config.get("paths") {
+            let Some(paths) = paths.as_table() else {
+                bail!("[paths] in cowproof.toml must be a table");
+            };
+            if let Some(value) = paths.get("handoffs") {
+                let dir = value
+                    .as_str()
+                    .context("[paths] handoffs in cowproof.toml must be a string")?;
+                toml_handoff = Some(dir.to_owned());
+            }
+        }
+    }
+
+    let mut notes = Vec::new();
+    if let (Some(from_toml), Some(from_json)) = (&toml_handoff, &lanes_handoff)
+        && from_toml != from_json
+    {
+        notes.push(format!(
+            "handoff directory: cowproof.toml [paths] handoffs ({from_toml}) wins over \
+             lanes.config.json handoffDir ({from_json})"
+        ));
+    }
+    let handoff_dir = toml_handoff
+        .or(lanes_handoff)
+        .unwrap_or_else(|| DEFAULT_HANDOFF_DIR.to_owned());
+    Ok(RepoRules {
+        protected,
+        protected_from_lanes_config,
+        handoff_dir,
+        notes,
+    })
+}
+
+/// `repo_rules_from_texts` over the working tree's two config files. Proof gates must not
+/// use this: a lane's patch could edit the files they would read.
+pub fn repo_rules(root: &Path) -> Result<RepoRules> {
+    fn read(root: &Path, name: &str) -> Result<Option<String>> {
+        match fs::read_to_string(root.join(name)) {
+            Ok(text) => Ok(Some(text)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e).with_context(|| format!("read {name} in {}", root.display())),
+        }
+    }
+    repo_rules_from_texts(
+        read(root, "lanes.config.json")?.as_deref(),
+        read(root, "cowproof.toml")?.as_deref(),
+    )
 }
 
 pub fn outside_ownership(files: &[String], owns: &[String], protected: &[String]) -> Vec<String> {
@@ -680,6 +808,71 @@ mod tests {
             repo_rules_from_config(Some(r#"{"protected":["secret/**"],"handoffDir":"h"}"#));
         assert_eq!(custom, vec!["secret/**".to_string()]);
         assert_eq!(handoff, "h");
+    }
+
+    #[test]
+    fn handoff_dir_reads_cowproof_toml_then_lanes_config_then_the_default() {
+        let json = r#"{"handoffDir":"from_json"}"#;
+        let toml = "[paths]\nhandoffs = \"from_toml\"\n";
+        // Neither file: the default.
+        assert_eq!(
+            repo_rules_from_texts(None, None).unwrap().handoff_dir,
+            DEFAULT_HANDOFF_DIR
+        );
+        // One file alone.
+        let only_json = repo_rules_from_texts(Some(json), None).unwrap();
+        assert_eq!(only_json.handoff_dir, "from_json");
+        assert!(only_json.notes.is_empty());
+        let only_toml = repo_rules_from_texts(None, Some(toml)).unwrap();
+        assert_eq!(only_toml.handoff_dir, "from_toml");
+        assert!(only_toml.notes.is_empty());
+        // Both, different: cowproof.toml wins and the note says so.
+        let both = repo_rules_from_texts(Some(json), Some(toml)).unwrap();
+        assert_eq!(both.handoff_dir, "from_toml");
+        assert_eq!(both.notes.len(), 1, "{:?}", both.notes);
+        assert!(both.notes[0].contains("from_toml") && both.notes[0].contains("from_json"));
+        // Both, the same: no note.
+        let same = repo_rules_from_texts(
+            Some(r#"{"handoffDir":"h"}"#),
+            Some("[paths]\nhandoffs = \"h\"\n"),
+        )
+        .unwrap();
+        assert_eq!(same.handoff_dir, "h");
+        assert!(same.notes.is_empty());
+    }
+
+    #[test]
+    fn protected_globs_are_the_union_and_a_wrong_type_is_an_error() {
+        let rules = repo_rules_from_texts(
+            Some(r#"{"protected":["from_json/**"]}"#),
+            Some("[proof]\nprotected = [\"from_toml/**\", \"from_json/**\"]\n"),
+        )
+        .unwrap();
+        assert_eq!(rules.protected, vec!["from_json/**", "from_toml/**"]);
+        assert!(rules.protected_from_lanes_config);
+        // No list in lanes.config.json: the defaults, plus the toml list.
+        let defaults =
+            repo_rules_from_texts(Some("{}"), Some("[proof]\nprotected = [\"x/**\"]\n")).unwrap();
+        assert!(defaults.protected.contains(&"AGENTS.md".to_string()));
+        assert!(defaults.protected.contains(&"x/**".to_string()));
+        assert!(!defaults.protected_from_lanes_config);
+        for (json, toml, expect) in [
+            (Some("{not json"), None, "does not parse"),
+            (Some("[]"), None, "JSON object"),
+            (Some(r#"{"protected":"x"}"#), None, "list of strings"),
+            (Some(r#"{"handoffDir":3}"#), None, "must be a string"),
+            (None, Some("[proof"), "does not parse"),
+            (None, Some("proof = 1"), "must be a table"),
+            (None, Some("[proof]\nprotected = [1]"), "list of strings"),
+            (None, Some("paths = 1"), "must be a table"),
+            (None, Some("[paths]\nhandoffs = 1"), "must be a string"),
+        ] {
+            let err = repo_rules_from_texts(json, toml).unwrap_err();
+            assert!(
+                format!("{err:#}").contains(expect),
+                "{json:?} {toml:?}: {err:#}"
+            );
+        }
     }
 
     #[test]

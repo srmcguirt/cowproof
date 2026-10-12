@@ -3,7 +3,9 @@
 //! Gates load configuration from the base revision, never the patched tree.
 //! This prevents a patch from weakening its own checks.
 
-use crate::flaws::{check_rules, parse_rules};
+use crate::flaws::{
+    BaseCommitFiles, check_rules, configured_packs, load_flaw_packs, pack_file_paths,
+};
 use crate::port::PortOutcome;
 use crate::verify::HeldOutOutcome;
 use anyhow::{Context, Result, bail};
@@ -14,10 +16,6 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-
-/// Where the default flaw pack lives in the base revision. It is loaded from
-/// the base and protected by default.
-pub const DEFAULT_FLAW_PACK: &str = "crates/cowproof-report/rules/flaws.toml";
 
 /// Configuration for a single gate execution.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -165,88 +163,21 @@ pub fn record_verify_results(
     report.any_failed = report.gates.iter().any(|g| !g.passed);
 }
 
-/// The extra protected globs a repository declares at `base_commit`.
-struct BaseProtected {
-    /// The union of what `cowproof.toml` `[proof] protected` and `lanes.config.json`
-    /// declare, with the defaults when `lanes.config.json` names no list of its own.
-    globs: Vec<String>,
-    /// `lanes.config.json` at the base named at least one glob.
-    from_lanes_config: bool,
-}
-
 /// The evidence line that says the old config file contributed protected globs.
 const LANES_CONFIG_NOTE: &str =
     "protected globs read from lanes.config.json; move them to [proof] protected in cowproof.toml";
 
-/// The protected globs a repository declares, from the base commit only, never the
-/// working tree: a patch could edit that. The base `cowproof.toml` `[proof] protected`
-/// is the current home; `lanes.config.json` `protected` is still read. When both exist
-/// the gate protects the union, so a rename never shrinks protection. A value that is
-/// not a list of strings, or a file that does not parse, is an error, never "no globs".
-fn load_protected_from_base(base_repo: &Path, base_commit: &str) -> Result<BaseProtected> {
-    let mut globs = Vec::new();
-    let mut from_lanes_config = false;
-
-    let lanes_text = git_show_optional(base_repo, base_commit, "lanes.config.json")?;
-    match lanes_text.as_deref() {
-        None => globs.extend(cowproof_core::repo_rules_from_config(None).0),
-        Some(text) => {
-            let config: serde_json::Value = serde_json::from_str(text)
-                .context("lanes.config.json in the base does not parse")?;
-            let Some(object) = config.as_object() else {
-                bail!("lanes.config.json in the base must be a JSON object");
-            };
-            match object.get("protected") {
-                // No list of its own: the defaults, as before.
-                None => globs.extend(cowproof_core::repo_rules_from_config(None).0),
-                Some(value) => {
-                    let listed = value
-                        .as_array()
-                        .and_then(|a| {
-                            a.iter()
-                                .map(|g| g.as_str().map(str::to_owned))
-                                .collect::<Option<Vec<_>>>()
-                        })
-                        .context(
-                            "\"protected\" in the base lanes.config.json must be a list of strings",
-                        )?;
-                    from_lanes_config = !listed.is_empty();
-                    globs.extend(listed);
-                }
-            }
-        }
-    }
-
-    if let Some(text) = git_show_optional(base_repo, base_commit, "cowproof.toml")? {
-        let config: toml::Table =
-            toml::from_str(&text).context("cowproof.toml in the base does not parse")?;
-        if let Some(proof) = config.get("proof") {
-            let Some(proof) = proof.as_table() else {
-                bail!("[proof] in the base cowproof.toml must be a table");
-            };
-            if let Some(value) = proof.get("protected") {
-                let listed = value
-                    .as_array()
-                    .and_then(|a| {
-                        a.iter()
-                            .map(|g| g.as_str().map(str::to_owned))
-                            .collect::<Option<Vec<_>>>()
-                    })
-                    .context(
-                        "[proof] protected in the base cowproof.toml must be a list of strings",
-                    )?;
-                for glob in listed {
-                    if !globs.contains(&glob) {
-                        globs.push(glob);
-                    }
-                }
-            }
-        }
-    }
-    Ok(BaseProtected {
-        globs,
-        from_lanes_config,
-    })
+/// The repository rules at `base_commit`, from the base only, never the working tree: a
+/// patch could edit that. The two config files go through `cowproof_core::repo_rules_from_texts`,
+/// the one parser the report uses as well. Protected globs are the union of the base
+/// `cowproof.toml` `[proof] protected` and `lanes.config.json` `protected`, so a rename
+/// never shrinks protection. A value that is not a list of strings, or a file that does
+/// not parse, is an error, never "no globs".
+fn load_rules_from_base(base_repo: &Path, base_commit: &str) -> Result<cowproof_core::RepoRules> {
+    let lanes = git_show_optional(base_repo, base_commit, "lanes.config.json")?;
+    let toml = git_show_optional(base_repo, base_commit, "cowproof.toml")?;
+    cowproof_core::repo_rules_from_texts(lanes.as_deref(), toml.as_deref())
+        .context("reading the config files at the base")
 }
 
 /// Whether the base `cowproof.toml` sets `[proof] require_heldout = true`: a lane
@@ -363,7 +294,7 @@ fn check_protected_paths(
     packet: &GatePacket,
 ) -> Result<GateResult> {
     // Load protected list from repo config in the base commit, not the working tree
-    let base_protected = load_protected_from_base(base_repo, base_commit)?;
+    let base_rules = load_rules_from_base(base_repo, base_commit)?;
 
     // Build complete protected list
     let mut protected = Vec::new();
@@ -372,7 +303,7 @@ fn check_protected_paths(
             .iter()
             .map(|s| s.to_string()),
     );
-    protected.extend(base_protected.globs);
+    protected.extend(base_rules.protected.clone());
     protected.extend(packet.protected.clone());
 
     // Add defaults from design
@@ -402,10 +333,13 @@ fn check_protected_paths(
     }
     protected.extend([".yarnrc*".to_string(), "**/.yarnrc*".to_string()]);
 
-    // The default pack and every pack named in the base `cowproof.toml`
-    // `[proof] packs` are gate inputs, so a patch may not touch them.
-    protected.push(DEFAULT_FLAW_PACK.to_string());
-    protected.extend(configured_packs(base_repo, base_commit)?);
+    // Every pack file named in the base `cowproof.toml` `[proof] packs` is a gate input, so
+    // a patch may not touch it. Built-in names are embedded and have no path.
+    let base_files = BaseCommitFiles {
+        repo: base_repo,
+        commit: base_commit,
+    };
+    protected.extend(pack_file_paths(&configured_packs(&base_files)?));
 
     let deltas = parse_patch(lane_patch);
     let files: Vec<String> = deltas.iter().map(|d| d.path.clone()).collect();
@@ -438,7 +372,7 @@ fn check_protected_paths(
         ));
     }
     evidence.extend(protected_warnings);
-    if base_protected.from_lanes_config {
+    if base_rules.protected_from_lanes_config {
         evidence.push(LANES_CONFIG_NOTE.to_string());
     }
 
@@ -531,60 +465,34 @@ fn check_heldout(packet: &GatePacket, base_repo: &Path) -> GateResult {
 
 /// Gate 5: Flaw rules - run flaw pack rules over the patch.
 ///
-/// Packs are read with `git show <base>:<path>`, never from the working tree:
-/// the default pack (optional) plus every path named in the base
-/// `cowproof.toml` `[proof] packs` (required). A pack that is missing,
-/// malformed or holds a rule whose pattern does not compile FAILS the gate.
+/// The embedded generic pack always runs, plus every pack named in the base
+/// `cowproof.toml` `[proof] packs`. Named files are read with `git show <base>:<path>`,
+/// never from the working tree, through the loader the report shares. A pack that is
+/// missing, escapes the repository, is malformed or holds a rule whose pattern does not
+/// compile FAILS the gate.
 fn check_flaws(base_repo: &Path, base_commit: &str, lane_patch: &str) -> Result<GateResult> {
     let deltas = parse_patch(lane_patch);
     let mut evidence = Vec::new();
     let mut failed = false;
 
-    let mut rules = Vec::new();
-    let mut loaded = 0usize;
-    let configured = configured_packs(base_repo, base_commit)?;
-    let mut sources: Vec<(String, bool, bool)> =
-        vec![(DEFAULT_FLAW_PACK.to_string(), false, false)];
-    sources.extend(
-        configured
-            .into_iter()
-            .filter(|p| p != DEFAULT_FLAW_PACK)
-            .map(|p| {
-                let is_generic = p == "generic";
-                (p, true, is_generic)
-            }),
-    );
-    for (pack_name, required, is_generic) in sources {
-        let text = if is_generic {
-            Some(include_str!("../rules/generic.toml").to_string())
-        } else {
-            git_show_optional(base_repo, base_commit, &pack_name)?
-        };
-
-        match text {
-            None if required => {
-                failed = true;
-                evidence.push(format!(
-                    "Flaw pack {pack_name} is named in cowproof.toml but missing from the base"
-                ));
-            }
-            None => {}
-            Some(file_text) => match parse_rules(&file_text) {
-                Ok(file) => {
-                    loaded += 1;
-                    rules.extend(file.rules);
-                }
-                Err(e) => {
-                    failed = true;
-                    evidence.push(format!("Flaw pack {pack_name}: {e}"));
-                }
-            },
+    // The generic pack is embedded and always runs; the packs the base `cowproof.toml`
+    // names come from the base commit. One loader, shared with `cowproof report handback`.
+    let base_files = BaseCommitFiles {
+        repo: base_repo,
+        commit: base_commit,
+    };
+    let configured = configured_packs(&base_files)?;
+    let rules = match load_flaw_packs(&base_files, &configured) {
+        Ok(loaded) => loaded.rules,
+        Err(e) => {
+            return Ok(GateResult {
+                name: "flaws".to_string(),
+                passed: false,
+                warned: false,
+                evidence: vec![format!("Flaw pack error: {e:#}")],
+            });
         }
-    }
-
-    if loaded == 0 && !failed {
-        evidence.push("No flaw pack found in base".to_string());
-    }
+    };
 
     // The migration baseline is a gate input like the packs: base commit only. When a loaded
     // rule needs it and the base declares none, the gate says so rather than passing quietly.
@@ -658,42 +566,31 @@ fn verify_commit(repo: &Path, commit: &str) -> Result<()> {
     Ok(())
 }
 
-/// Pack paths named in the base `cowproof.toml` `[proof] packs`, normalized
-/// (leading `./` removed). `generic` is the built-in pack and has no path.
-/// A missing `cowproof.toml` means no packs; a malformed one is an error.
-fn configured_packs(repo: &Path, commit: &str) -> Result<Vec<String>> {
-    let Some(text) = git_show_optional(repo, commit, "cowproof.toml")? else {
-        return Ok(Vec::new());
-    };
-    let config: toml::Table =
-        toml::from_str(&text).context("cowproof.toml in the base does not parse")?;
-    let packs = config
-        .get("proof")
-        .and_then(|p| p.as_table())
-        .and_then(|p| p.get("packs"))
-        .and_then(|p| p.as_array());
-    Ok(packs
-        .into_iter()
-        .flatten()
-        .filter_map(|p| p.as_str())
-        .map(|p| p.trim_start_matches("./").to_string())
-        .collect())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
     use tempfile::TempDir;
 
+    /// A project pack with one rule the embedded generic pack does not have, so a test
+    /// can tell which pack a finding came from.
     const SWALLOW_PACK: &str = r#"[[rules]]
 id = "swallow-exceptions"
-pattern = "(?i)EXCEPTION\\s+WHEN\\s+OTHERS"
+pattern = "SWALLOWED_ERROR"
 files = ["**/*"]
 explanation = "This catches and can swallow every exception."
 "#;
 
-    const OFFENDING: &str = "    EXCEPTION WHEN OTHERS THEN NULL;\n";
+    const OFFENDING: &str = "    SWALLOWED_ERROR THEN NULL;\n";
+
+    /// Where the tests keep their project pack, and the base `cowproof.toml` that names it.
+    const TEST_PACK: &str = "cowproof/flaws.toml";
+    const TEST_PACK_CONFIG: &str = "[proof]\npacks = [\"./cowproof/flaws.toml\"]\n";
+
+    /// A base commit holding `pack` at `TEST_PACK`, named by its `cowproof.toml`.
+    fn named_pack(pack: &str) -> [(&str, &str); 2] {
+        [("cowproof.toml", TEST_PACK_CONFIG), (TEST_PACK, pack)]
+    }
 
     /// A real temporary git repository. The base is a commit; the patch under
     /// test is whatever `git diff` reports for the working tree against it.
@@ -1406,10 +1303,10 @@ command = "echo test2"
 
     #[test]
     fn flaws_detects_pattern_in_added_lines() -> Result<()> {
-        let repo = TestRepo::new(&[(DEFAULT_FLAW_PACK, SWALLOW_PACK)])?;
+        let repo = TestRepo::new(&named_pack(SWALLOW_PACK))?;
         repo.write("test.rs", OFFENDING)?;
         let patch = repo.patch()?;
-        assert!(patch.contains("+    EXCEPTION WHEN OTHERS"), "{patch}");
+        assert!(patch.contains("+    SWALLOWED_ERROR"), "{patch}");
 
         let result = check_flaws(repo.path(), &repo.base, &patch)?;
         assert!(!result.passed);
@@ -1421,7 +1318,7 @@ command = "echo test2"
 
     #[test]
     fn flaws_passes_a_clean_patch_and_says_which_pack_ran() -> Result<()> {
-        let repo = TestRepo::new(&[(DEFAULT_FLAW_PACK, SWALLOW_PACK)])?;
+        let repo = TestRepo::new(&named_pack(SWALLOW_PACK))?;
         repo.write("test.rs", "fn ok() {}\n")?;
         let patch = repo.patch()?;
 
@@ -1433,10 +1330,10 @@ command = "echo test2"
 
     #[test]
     fn flaws_sees_added_lines_that_start_with_plus_signs() -> Result<()> {
-        let repo = TestRepo::new(&[(DEFAULT_FLAW_PACK, SWALLOW_PACK)])?;
-        repo.write("test.sql", "++ EXCEPTION WHEN OTHERS\n")?;
+        let repo = TestRepo::new(&named_pack(SWALLOW_PACK))?;
+        repo.write("test.sql", "++ SWALLOWED_ERROR\n")?;
         let patch = repo.patch()?;
-        assert!(patch.contains("\n+++ EXCEPTION WHEN OTHERS"), "{patch}");
+        assert!(patch.contains("\n+++ SWALLOWED_ERROR"), "{patch}");
 
         let result = check_flaws(repo.path(), &repo.base, &patch)?;
         assert!(!result.passed, "an added `++` line evaded the flaw gate");
@@ -1446,15 +1343,15 @@ command = "echo test2"
     #[test]
     fn flaws_loaded_from_base_not_patched_tree() -> Result<()> {
         // The patch adds a violation AND deletes the rule that would catch it.
-        let repo = TestRepo::new(&[(DEFAULT_FLAW_PACK, SWALLOW_PACK)])?;
+        let repo = TestRepo::new(&named_pack(SWALLOW_PACK))?;
         repo.write("test.rs", OFFENDING)?;
-        repo.remove(DEFAULT_FLAW_PACK)?;
+        repo.remove(TEST_PACK)?;
         let patch = repo.patch()?;
         assert!(
             patch.contains("deleted file mode"),
             "the patch must delete the pack: {patch}"
         );
-        assert!(!repo.path().join(DEFAULT_FLAW_PACK).exists());
+        assert!(!repo.path().join(TEST_PACK).exists());
 
         // The flaw gate fails, naming the rule that only the base still has.
         let flaws = check_flaws(repo.path(), &repo.base, &patch)?;
@@ -1474,7 +1371,7 @@ command = "echo test2"
         assert!(!protected.passed);
         assert_eq!(
             protected.evidence,
-            vec![format!("Protected paths touched: {DEFAULT_FLAW_PACK}")]
+            vec![format!("Protected paths touched: {TEST_PACK}")]
         );
 
         // Through the public entry point both gates fail and the report fails.
@@ -1488,11 +1385,11 @@ command = "echo test2"
 
     #[test]
     fn flaws_weakened_in_patched_tree_still_catches_with_base_rules() -> Result<()> {
-        let repo = TestRepo::new(&[(DEFAULT_FLAW_PACK, SWALLOW_PACK)])?;
+        let repo = TestRepo::new(&named_pack(SWALLOW_PACK))?;
         repo.write("test.rs", OFFENDING)?;
         repo.write(
-            DEFAULT_FLAW_PACK,
-            &SWALLOW_PACK.replace("EXCEPTION", "NEVER_MATCHES"),
+            TEST_PACK,
+            &SWALLOW_PACK.replace("SWALLOWED_ERROR", "NEVER_MATCHES"),
         )?;
         let patch = repo.patch()?;
 
@@ -1509,15 +1406,14 @@ command = "echo test2"
 
     #[test]
     fn flaws_gate_fails_on_pattern_compilation_error() -> Result<()> {
-        let repo = TestRepo::new(&[(
-            DEFAULT_FLAW_PACK,
+        let repo = TestRepo::new(&named_pack(
             r#"[[rules]]
 id = "broken-rule"
 pattern = "[invalid(regex"
 files = ["**/*"]
 explanation = "This has a broken pattern."
 "#,
-        )])?;
+        ))?;
         // A clean patch: the failure is the broken rule, not a finding.
         repo.write("test.rs", "fn ok() {}\n")?;
         let patch = repo.patch()?;
@@ -1532,17 +1428,17 @@ explanation = "This has a broken pattern."
 
     #[test]
     fn flaws_gate_names_rules_without_an_id_by_position() -> Result<()> {
-        let repo = TestRepo::new(&[(
-            DEFAULT_FLAW_PACK,
+        let repo = TestRepo::new(&named_pack(
             "[[rules]]\npattern = \"fine\"\nfiles = [\"**/*\"]\nexplanation = \"x\"\n\n[[rules]]\npattern = \"(\"\nfiles = [\"**/*\"]\nexplanation = \"y\"\n",
-        )])?;
+        ))?;
         repo.write("test.rs", "x\n")?;
         let patch = repo.patch()?;
 
         let result = check_flaws(repo.path(), &repo.base, &patch)?;
         assert!(!result.passed);
+        // The generic pack's five rules load first, so the broken one is the seventh.
         assert!(
-            result.evidence[0].contains("rule #2"),
+            result.evidence[0].contains("rule #7"),
             "{:?}",
             result.evidence
         );
@@ -1551,13 +1447,13 @@ explanation = "This has a broken pattern."
 
     #[test]
     fn flaws_gate_fails_on_malformed_pack() -> Result<()> {
-        let repo = TestRepo::new(&[(DEFAULT_FLAW_PACK, "[[rules]]\npattern = \n")])?;
+        let repo = TestRepo::new(&named_pack("[[rules]]\npattern = \n"))?;
         repo.write("test.rs", OFFENDING)?;
         let patch = repo.patch()?;
 
         let result = check_flaws(repo.path(), &repo.base, &patch)?;
         assert!(!result.passed, "a malformed pack must not read as no rules");
-        assert!(result.evidence[0].contains(DEFAULT_FLAW_PACK));
+        assert!(result.evidence[0].contains(TEST_PACK));
         Ok(())
     }
 
@@ -1607,17 +1503,142 @@ explanation = "This has a broken pattern."
     }
 
     #[test]
-    fn flaws_gate_passes_with_a_note_when_no_pack_exists() -> Result<()> {
+    fn flaws_gate_runs_the_generic_rules_on_a_repository_with_no_pack_files_at_all() -> Result<()> {
+        // No cowproof.toml, no pack file: the embedded generic pack still runs.
         let repo = TestRepo::new(&[])?;
-        repo.write("test.rs", OFFENDING)?;
+        repo.write("test.sql", "    EXCEPTION WHEN OTHERS THEN NULL;\n")?;
         let patch = repo.patch()?;
 
         let result = check_flaws(repo.path(), &repo.base, &patch)?;
-        assert!(result.passed);
-        assert_eq!(
-            result.evidence,
-            vec!["No flaw pack found in base".to_string()]
+        assert!(!result.passed, "{:?}", result.evidence);
+        assert_eq!(result.evidence.len(), 1, "{:?}", result.evidence);
+        assert!(
+            result.evidence[0].starts_with("test.sql:1: [rule #1] "),
+            "{:?}",
+            result.evidence
         );
+
+        // A clean patch passes quietly: no note about a missing pack.
+        let clean = TestRepo::new(&[])?;
+        clean.write("test.rs", "fn ok() {}\n")?;
+        let result = check_flaws(clean.path(), &clean.base, &clean.patch()?)?;
+        assert!(result.passed && !result.warned, "{:?}", result.evidence);
+        assert!(result.evidence.is_empty(), "{:?}", result.evidence);
+        Ok(())
+    }
+
+    #[test]
+    fn a_built_in_name_in_packs_loads_its_embedded_pack() -> Result<()> {
+        let repo = TestRepo::new(&[(
+            "cowproof.toml",
+            "[proof]\npacks = [\"generic\", \"example-supabase\"]\n",
+        )])?;
+        repo.write("test.sql", "create policy p using (true);\n")?;
+        let patch = repo.patch()?;
+        let result = check_flaws(repo.path(), &repo.base, &patch)?;
+        assert!(!result.passed, "{:?}", result.evidence);
+        assert!(
+            result
+                .evidence
+                .iter()
+                .any(|e| e.contains("Placeholder or public policy")),
+            "{:?}",
+            result.evidence
+        );
+        // Built-in names are not repository paths, so they are not protected globs.
+        let protected =
+            check_protected_paths(repo.path(), &repo.base, &touching("generic"), &packet(&[]))?;
+        assert!(protected.passed, "{:?}", protected.evidence);
+        Ok(())
+    }
+
+    #[test]
+    fn a_pack_path_that_escapes_the_repository_fails_the_gate() -> Result<()> {
+        // Outside the repository, where a pack would parse if the loader followed the path.
+        let outside = tempfile::tempdir_in("/var/tmp")?;
+        let secret = outside.path().join("outside.toml");
+        fs::write(&secret, SWALLOW_PACK)?;
+        let absolute = secret.to_str().unwrap().to_string();
+        for named in ["../outside.toml", "cowproof/../../outside.toml", &absolute] {
+            let repo =
+                TestRepo::new(&[("cowproof.toml", &format!("[proof]\npacks = [{named:?}]\n"))])?;
+            repo.write("test.rs", OFFENDING)?;
+            let patch = repo.patch()?;
+
+            let result = check_flaws(repo.path(), &repo.base, &patch)?;
+            assert!(!result.passed, "{named}: {:?}", result.evidence);
+            assert!(
+                result.evidence[0].contains("inside the repository"),
+                "{named}: {:?}",
+                result.evidence
+            );
+            // The outside pack's rule did not run.
+            assert!(
+                result
+                    .evidence
+                    .iter()
+                    .all(|e| !e.contains("swallow-exceptions")),
+                "{named}: {:?}",
+                result.evidence
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_pack_that_is_a_symlink_in_the_base_fails_the_gate() -> Result<()> {
+        let outside = tempfile::tempdir_in("/var/tmp")?;
+        let secret = outside.path().join("secret.toml");
+        fs::write(&secret, "not = [toml\n")?;
+        let repo = TestRepo::new(&[("cowproof.toml", TEST_PACK_CONFIG)])?;
+        fs::create_dir_all(repo.path().join("cowproof"))?;
+        std::os::unix::fs::symlink(&secret, repo.path().join(TEST_PACK))?;
+        git(repo.path(), &["add", "-A"])?;
+        git(repo.path(), &["commit", "-q", "-m", "link"])?;
+        let base = git(repo.path(), &["rev-parse", "HEAD"])?.trim().to_string();
+
+        let result = check_flaws(repo.path(), &base, &touching("test.rs"))?;
+        assert!(!result.passed, "{:?}", result.evidence);
+        assert!(
+            result.evidence[0].contains("not a regular file"),
+            "{:?}",
+            result.evidence
+        );
+        // The target's text is not quoted into the evidence.
+        assert!(!result.evidence[0].contains("not = [toml"));
+        Ok(())
+    }
+
+    #[test]
+    fn a_malformed_packs_value_is_an_error_not_no_packs() -> Result<()> {
+        for text in ["[proof]\npacks = \"generic\"\n", "[proof]\npacks = [1]\n"] {
+            let repo = TestRepo::new(&[("cowproof.toml", text)])?;
+            repo.write("test.rs", "fn ok() {}\n")?;
+            let err = check_flaws(repo.path(), &repo.base, &repo.patch()?).expect_err(text);
+            assert!(
+                format!("{err:#}").contains("list of strings"),
+                "{text}: {err:#}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_pack_in_the_working_tree_but_not_the_base_has_no_effect() -> Result<()> {
+        // The patch adds a pack and names it in cowproof.toml; the base names none. The gate
+        // reads the base, so the new pack's rule does not run and the patch is not judged by it.
+        let repo = TestRepo::new(&[])?;
+        repo.write("cowproof.toml", TEST_PACK_CONFIG)?;
+        repo.write(TEST_PACK, SWALLOW_PACK)?;
+        repo.write("test.rs", OFFENDING)?;
+        let patch = repo.patch()?;
+        let result = check_flaws(repo.path(), &repo.base, &patch)?;
+        assert!(result.passed, "{:?}", result.evidence);
+        // But the gate also refuses the patch's edit to cowproof.toml.
+        let protected =
+            check_protected_paths(repo.path(), &repo.base, &patch, &packet(&["test.rs"]))?;
+        assert!(!protected.passed);
+        assert!(protected.evidence[0].contains("cowproof.toml"));
         Ok(())
     }
 
@@ -1774,7 +1795,7 @@ explanation = "This has a broken pattern."
             result.evidence
         );
         // A pack with no migration rule says nothing about migrations.
-        let quiet = TestRepo::new(&[(DEFAULT_FLAW_PACK, SWALLOW_PACK)])?;
+        let quiet = TestRepo::new(&named_pack(SWALLOW_PACK))?;
         quiet.write("test.rs", "fn ok() {}\n")?;
         let result = check_flaws(quiet.path(), &quiet.base, &quiet.patch()?)?;
         assert!(result.evidence.is_empty() && !result.warned);
@@ -1874,7 +1895,7 @@ explanation = "This has a broken pattern."
 
     #[test]
     fn run_gates_rejects_a_base_that_is_not_a_commit() -> Result<()> {
-        let repo = TestRepo::new(&[(DEFAULT_FLAW_PACK, SWALLOW_PACK)])?;
+        let repo = TestRepo::new(&named_pack(SWALLOW_PACK))?;
         repo.write("test.rs", OFFENDING)?;
         let patch = repo.patch()?;
 
@@ -1945,17 +1966,21 @@ explanation = "This has a broken pattern."
     }
 
     #[test]
-    fn empty_packs_list_passes() -> Result<()> {
+    fn an_empty_packs_list_still_runs_the_generic_pack() -> Result<()> {
         let repo = TestRepo::with_config(&[])?;
         repo.write("test.rs", "#[ignore]fn ok() {}")?;
         let patch = repo.patch()?;
 
         let report = run_gates(repo.path(), "HEAD", &patch, &packet(&["test.rs"]))?;
         let flaws = gate(&report, "flaws");
-        // Empty packs list should pass (no rules configured, so no violations)
+        // The generic pack is not optional: an empty list does not switch it off.
+        assert!(!flaws.passed, "{:?}", flaws.evidence);
         assert!(
-            flaws.passed,
-            "empty packs list should pass: {:?}",
+            flaws
+                .evidence
+                .iter()
+                .any(|e| e.contains("An ignored Rust test")),
+            "{:?}",
             flaws.evidence
         );
         Ok(())

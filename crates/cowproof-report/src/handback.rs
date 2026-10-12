@@ -6,7 +6,10 @@
 //! [--baseline FILE] [--json]`, wired in `crates/cowproof-cli/src/report.rs`.
 
 use anyhow::{Context, Result, bail};
-use cowproof_prove::flaws::{FlawRule, PatchDelta, check_rules, parse_patch, parse_rules};
+use cowproof_prove::flaws::{
+    LoadedPacks, NoFiles, PatchDelta, WorkingTreeFiles, builtin_pack, check_rules,
+    configured_packs, load_flaw_packs, parse_patch,
+};
 use regex::Regex;
 use serde::Serialize;
 use serde_json::Value;
@@ -63,6 +66,10 @@ pub struct Report {
     flaws: Vec<Finding>,
     removed_assertions: Vec<AssertionChange>,
     limits: Vec<String>,
+    /// Facts about the repository's config the reader should know (both config files set the
+    /// handoff directory and differ). Left out of the JSON when empty.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    warnings: Vec<String>,
     unverified: Vec<String>,
     questions: Vec<String>,
     verdict_hint: String,
@@ -507,17 +514,19 @@ fn packet_commands(text: &str) -> Vec<String> {
 fn packet_has_lane_id(text: &str, id: &str) -> bool {
     Regex::new(&format!(r#""id"\s*:\s*"{}""#, regex::escape(id))).is_ok_and(|re| re.is_match(text))
 }
-fn handoff_from_patch(patch: &str, summary: &Value, repo: Option<&Path>) -> Option<String> {
+/// The handoff text in the patch: the file the summary names, else the added file under
+/// `handoff_dir` (see `cowproof_core::repo_rules`) whose name contains "handoff".
+fn handoff_from_patch(
+    patch: &str,
+    summary: &Value,
+    repo: Option<&Path>,
+    handoff_dir: &str,
+) -> Option<String> {
     let path = value_str(summary, &["handoff"]).or_else(|| {
-        let handoff_dir = repo
-            .and_then(|r| fs::read_to_string(r.join("lanes.config.json")).ok())
-            .and_then(|s| serde_json::from_str::<Value>(&s).ok())
-            .and_then(|v| value_str(&v, &["handoffDir"]))
-            .unwrap_or_else(|| "docs/handoffs".to_string());
         patch.lines().find_map(|l| {
             l.strip_prefix("+++ b/")
                 .map(str::to_owned)
-                .filter(|p| p.starts_with(&handoff_dir) && p.contains("handoff"))
+                .filter(|p| p.starts_with(handoff_dir) && p.contains("handoff"))
         })
     })?;
     let mut capture = false;
@@ -609,102 +618,29 @@ pub struct Options {
     pub packs: Vec<String>,
 }
 
-/// The generic flaw pack: gaming patterns for any stack. It is the only pack that loads
-/// when nothing asks for another.
-pub const GENERIC_PACK: &str = include_str!("../rules/flaws.toml");
-/// The example project pack: rules one Postgres/Supabase project added. Never loaded by
-/// default.
-pub const EXAMPLE_SUPABASE_PACK: &str = include_str!("../rules/example-supabase.toml");
-
-/// The built-in pack called `name`, if there is one.
-pub fn builtin_pack(name: &str) -> Option<&'static str> {
-    match name {
-        "generic" => Some(GENERIC_PACK),
-        "example-supabase" => Some(EXAMPLE_SUPABASE_PACK),
-        _ => None,
-    }
-}
-
-/// `[proof] packs` from `<repo>/cowproof.toml`, as written. A missing file is no packs; a
-/// file that does not parse is an error, not an empty list.
-fn configured_packs(repo: &Path) -> Result<Vec<String>> {
-    let Ok(text) = fs::read_to_string(repo.join("cowproof.toml")) else {
-        return Ok(Vec::new());
+/// Load the rules to run through the loader the gates use (`cowproof_prove::flaws`): the
+/// embedded generic pack, then every pack named by `[proof] packs` in the repository's
+/// `cowproof.toml` (a path inside the repository that may not leave it, symlinks included),
+/// then every `--pack`. A `--pack` is a built-in name or a file path relative to the
+/// working directory, and is not confined: the director typed it. A pack named twice loads
+/// once; a missing or malformed pack is an error.
+fn load_packs(options: &Options) -> Result<LoadedPacks> {
+    let mut loaded = match options.repo.as_deref() {
+        Some(root) => {
+            let files = WorkingTreeFiles { root };
+            let configured = configured_packs(&files)?;
+            load_flaw_packs(&files, &configured)?
+        }
+        None => load_flaw_packs(&NoFiles, &[])?,
     };
-    let config: toml::Table = toml::from_str(&text).context("parse cowproof.toml")?;
-    Ok(config
-        .get("proof")
-        .and_then(|p| p.as_table())
-        .and_then(|p| p.get("packs"))
-        .and_then(|p| p.as_array())
-        .into_iter()
-        .flatten()
-        .filter_map(|p| p.as_str().map(str::to_owned))
-        .collect())
-}
-
-/// Load the rules to run: the generic pack, then every pack named by `[proof] packs` in
-/// the repository's `cowproof.toml`, then every `--pack`. Each name is a built-in pack or a
-/// file (a `cowproof.toml` path is relative to the repository and may not leave it; a
-/// `--pack` path is relative to the working directory). A pack named twice loads once;
-/// a missing or malformed pack is an error.
-fn load_packs(options: &Options) -> Result<(Vec<FlawRule>, Vec<String>)> {
-    let mut wanted: Vec<(String, Option<PathBuf>)> = vec![("generic".into(), None)];
-    if let Some(repo) = options.repo.as_deref() {
-        for name in configured_packs(repo)? {
-            wanted.push((name, Some(repo.to_path_buf())));
-        }
-    }
     for name in &options.packs {
-        wanted.push((name.clone(), None));
-    }
-    let mut names = Vec::new();
-    let mut rules = Vec::new();
-    for (name, base) in wanted {
-        let key = name.trim_start_matches("./").to_string();
-        if names.contains(&key) {
-            continue;
-        }
-        let text = match builtin_pack(&key) {
+        let text = match builtin_pack(name.trim_start_matches("./")) {
             Some(text) => text.to_string(),
-            None => {
-                let path = Path::new(&name);
-                if base.is_some()
-                    && (path.is_absolute()
-                        || path
-                            .components()
-                            .any(|c| matches!(c, std::path::Component::ParentDir)))
-                {
-                    bail!("flaw pack {name} in cowproof.toml must be a path inside the repository");
-                }
-                let full = base
-                    .as_ref()
-                    .map_or_else(|| path.to_path_buf(), |b| b.join(path));
-                // A pack named by the repository's own config stays inside it, symlinks
-                // included: a parse error quotes the file, so an escaping link would print
-                // part of a file from outside the repository into the report.
-                if let Some(base) = base {
-                    let root = base
-                        .canonicalize()
-                        .with_context(|| format!("resolve the repository {}", base.display()))?;
-                    let real = full
-                        .canonicalize()
-                        .with_context(|| format!("read flaw pack {name} ({})", full.display()))?;
-                    if !real.starts_with(&root) {
-                        bail!(
-                            "flaw pack {name} in cowproof.toml must be a path inside the repository"
-                        );
-                    }
-                }
-                fs::read_to_string(&full)
-                    .with_context(|| format!("read flaw pack {name} ({})", full.display()))?
-            }
+            None => fs::read_to_string(name).with_context(|| format!("read flaw pack {name}"))?,
         };
-        let file = parse_rules(&text).map_err(|e| anyhow::anyhow!("flaw pack {name}: {e}"))?;
-        rules.extend(file.rules);
-        names.push(key);
+        loaded.add(name, &text)?;
     }
-    Ok((rules, names))
+    Ok(loaded)
 }
 
 /// Build the report for one lane.
@@ -726,7 +662,14 @@ pub fn handback(options: &Options) -> Result<Report> {
         .len();
     let added: usize = deltas.iter().map(|d| d.added.len()).sum();
     let removed: usize = deltas.iter().map(|d| d.removed.len()).sum();
-    let mut handoff = handoff_from_patch(&patch, &summary, repo.as_deref());
+    // Both config files, working tree: `cowproof.toml` `[paths] handoffs` first, then
+    // `lanes.config.json` `handoffDir`, then the default. A conflict is a warning.
+    let repo_rules = match repo.as_deref() {
+        Some(root) => cowproof_core::repo_rules(root)?,
+        None => cowproof_core::repo_rules_from_texts(None, None)?,
+    };
+    let mut handoff =
+        handoff_from_patch(&patch, &summary, repo.as_deref(), &repo_rules.handoff_dir);
     if handoff.is_none()
         && let Some(p) = value_str(&summary, &["handoff"])
         && let Some(r) = repo.as_deref()
@@ -763,7 +706,10 @@ pub fn handback(options: &Options) -> Result<Report> {
         .filter(|c| !reported.contains(c.as_str()))
         .collect();
     // One matcher for the whole workspace: cowproof_prove::flaws.
-    let (rules, packs) = load_packs(options)?;
+    let LoadedPacks {
+        rules,
+        names: packs,
+    } = load_packs(options)?;
     let (found, errors) = check_rules(&rules, &deltas, baseline.as_deref());
     if !errors.is_empty() {
         bail!("bad flaw rule: {}", errors.join("; "));
@@ -858,6 +804,7 @@ pub fn handback(options: &Options) -> Result<Report> {
         flaws,
         removed_assertions,
         limits: extract_sections(&handoff, "limits"),
+        warnings: repo_rules.notes.clone(),
         unverified: extract_sections(&handoff, "unverified"),
         questions: extract_sections(&handoff, "questions"),
         verdict_hint: verdict.into(),
@@ -918,6 +865,9 @@ pub fn print_report(r: &Report) {
         "Limits: {:?}\nUnverified: {:?}\nQuestions: {:?}",
         r.limits, r.unverified, r.questions
     );
+    for w in &r.warnings {
+        println!("Warning: {w}");
+    }
     println!(
         "Verdict hint: {} ({})",
         r.verdict_hint,
@@ -954,8 +904,11 @@ mod tests {
     }
     #[test]
     fn flaw_rules_cover_seeded_classes_and_detect_hits() {
-        let generic = parse_rules(GENERIC_PACK).unwrap();
-        let example = parse_rules(EXAMPLE_SUPABASE_PACK).unwrap();
+        let generic =
+            cowproof_prove::flaws::parse_rules(cowproof_prove::flaws::GENERIC_PACK).unwrap();
+        let example =
+            cowproof_prove::flaws::parse_rules(cowproof_prove::flaws::EXAMPLE_SUPABASE_PACK)
+                .unwrap();
         assert_eq!(generic.rules.len(), 5);
         assert_eq!(example.rules.len(), 8);
         let mut rules = generic;
@@ -1005,7 +958,8 @@ mod tests {
 
     #[test]
     fn the_default_load_has_no_stack_specific_rule() {
-        let generic = parse_rules(GENERIC_PACK).unwrap();
+        let generic =
+            cowproof_prove::flaws::parse_rules(cowproof_prove::flaws::GENERIC_PACK).unwrap();
         for rule in &generic.rules {
             let text =
                 format!("{} {} {:?}", rule.pattern, rule.explanation, rule.files).to_lowercase();
@@ -1159,6 +1113,164 @@ mod tests {
             );
         }
     }
+    /// A lane directory whose patch adds `path` (a handoff with one limit) and `extra`.
+    fn handoff_lane(path: &str, extra: Option<(&str, &str)>) -> tempfile::TempDir {
+        let lane = tempfile::tempdir_in("/var/tmp").unwrap();
+        fs::write(
+            lane.path().join("summary.json"),
+            r#"{"id":"lane-x","status":"done"}"#,
+        )
+        .unwrap();
+        let mut patch = format!(
+            "diff --git a/{path} b/{path}\nnew file mode 100644\n--- /dev/null\n+++ b/{path}\n@@ -0,0 +1,3 @@\n+# Handoff\n+## Limits\n+- the one limit\n"
+        );
+        if let Some((file, line)) = extra {
+            patch.push_str(&format!(
+                "diff --git a/{file} b/{file}\nnew file mode 100644\n--- /dev/null\n+++ b/{file}\n@@ -0,0 +1 @@\n+{line}\n"
+            ));
+        }
+        fs::write(lane.path().join("lane.patch"), patch).unwrap();
+        lane
+    }
+
+    #[test]
+    fn the_handoff_dir_comes_from_cowproof_toml_then_lanes_config_then_the_default() {
+        let report_for = |json: Option<&str>, toml: Option<&str>, path: &str| {
+            let repo = tempfile::tempdir_in("/var/tmp").unwrap();
+            if let Some(json) = json {
+                fs::write(repo.path().join("lanes.config.json"), json).unwrap();
+            }
+            if let Some(toml) = toml {
+                fs::write(repo.path().join("cowproof.toml"), toml).unwrap();
+            }
+            let lane = handoff_lane(path, None);
+            handback(&Options {
+                lane: lane.path().to_path_buf(),
+                repo: Some(repo.path().to_path_buf()),
+                ..Options::default()
+            })
+            .unwrap()
+        };
+        let json = Some(r#"{"handoffDir":"from_json"}"#);
+        let toml = Some("[paths]\nhandoffs = \"from_toml\"\n");
+        // The default directory, with neither file.
+        assert_eq!(
+            report_for(None, None, "docs/handoffs/handoff-x.md")
+                .limits
+                .len(),
+            1
+        );
+        // lanes.config.json alone still works.
+        let r = report_for(json, None, "from_json/handoff-x.md");
+        assert_eq!(r.limits.len(), 1);
+        assert!(r.warnings.is_empty());
+        // cowproof.toml alone.
+        let r = report_for(None, toml, "from_toml/handoff-x.md");
+        assert_eq!(r.limits.len(), 1);
+        assert!(r.warnings.is_empty());
+        // Both, different: cowproof.toml wins, and the report says so.
+        let r = report_for(json, toml, "from_toml/handoff-x.md");
+        assert_eq!(
+            r.limits.len(),
+            1,
+            "cowproof.toml's directory is the one read"
+        );
+        assert_eq!(r.warnings.len(), 1, "{:?}", r.warnings);
+        assert!(r.warnings[0].contains("from_toml") && r.warnings[0].contains("from_json"));
+        let r = report_for(json, toml, "from_json/handoff-x.md");
+        assert!(r.limits.is_empty(), "lanes.config.json's directory lost");
+    }
+
+    /// Run a git command in `dir`, panicking with its stderr on failure.
+    fn git(dir: &Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .current_dir(dir)
+            .args([
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+            ])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap()
+    }
+
+    #[test]
+    fn the_gate_and_the_report_apply_the_same_pack_named_in_cowproof_toml() {
+        let repo = tempfile::tempdir_in("/var/tmp").unwrap();
+        git(repo.path(), &["init", "-q"]);
+        fs::write(
+            repo.path().join("cowproof.toml"),
+            "[proof]\npacks = [\"./packs/mine.toml\"]\n",
+        )
+        .unwrap();
+        fs::create_dir_all(repo.path().join("packs")).unwrap();
+        fs::write(
+            repo.path().join("packs/mine.toml"),
+            "[[rules]]\npattern = \"TODO_MARKER\"\nfiles = [\"**/*\"]\nexplanation = \"My own rule.\"\n",
+        )
+        .unwrap();
+        git(repo.path(), &["add", "-A"]);
+        git(repo.path(), &["commit", "-q", "-m", "base"]);
+        let base = git(repo.path(), &["rev-parse", "HEAD"]).trim().to_string();
+        fs::write(repo.path().join("work.rs"), "// TODO_MARKER\n").unwrap();
+        git(repo.path(), &["add", "-A"]);
+        let patch = git(
+            repo.path(),
+            &["diff", "--cached", "--no-color", "--no-ext-diff", &base],
+        );
+
+        // The gate, reading the base commit.
+        let packet = cowproof_prove::gates::GatePacket {
+            owns: vec!["work.rs".into()],
+            append_only: Default::default(),
+            protected: Vec::new(),
+            require_heldout: false,
+            heldout_path: None,
+        };
+        let gates = cowproof_prove::run_gates(repo.path(), &base, &patch, &packet).unwrap();
+        let flaws = gates.gates.iter().find(|g| g.name == "flaws").unwrap();
+        assert!(!flaws.passed, "{:?}", flaws.evidence);
+        assert!(
+            flaws.evidence.iter().any(|e| e.contains("My own rule.")),
+            "{:?}",
+            flaws.evidence
+        );
+
+        // The report, reading the working tree of the same repository.
+        let lane = tempfile::tempdir_in("/var/tmp").unwrap();
+        fs::write(
+            lane.path().join("summary.json"),
+            r#"{"id":"lane-x","status":"done"}"#,
+        )
+        .unwrap();
+        fs::write(lane.path().join("lane.patch"), &patch).unwrap();
+        let report = handback(&Options {
+            lane: lane.path().to_path_buf(),
+            repo: Some(repo.path().to_path_buf()),
+            ..Options::default()
+        })
+        .unwrap();
+        assert_eq!(report.packs, vec!["generic", "packs/mine.toml"]);
+        assert!(
+            report
+                .flaws
+                .iter()
+                .any(|f| f.explanation == "My own rule." && f.file == "work.rs"),
+            "{:?}",
+            report.flaws
+        );
+    }
+
     #[test]
     fn flaw_lane_fixture_runs_all_rules_including_baseline() {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/flaws");

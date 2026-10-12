@@ -1,6 +1,9 @@
-# Generic flaw rules that apply to any stack (no SQL dialect, auth system, or
-# runtime-specific constraints). Rules specific to one stack (Postgres RLS,
-# Supabase migrations, a project's auth guard) live in project-specific packs.
+# Generic flaw rules: gaming patterns that apply to any stack. This is the one copy of the
+# pack. It is embedded in `cowproof-prove` and loads first, always, in the proof gates and in
+# `cowproof report handback`: a repository needs no file for it. Rules tied to one stack or
+# project (Postgres policies, Supabase migrations, one codebase's naming) live in other packs
+# (`example-supabase` ships built in) that load only when asked for: `packs = [...]` under
+# `[proof]` in `cowproof.toml`, or `--pack` on the report.
 
 [[rules]]
 pattern = "(?i)EXCEPTION\\s+WHEN\\s+OTHERS"

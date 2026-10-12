@@ -7,7 +7,8 @@
 //! - `CheckRunner` trait and `SandboxedRunner` (the production runner, D6); the unsandboxed
 //!   `ProcessRunner` exists only in test builds
 //! - `run_gates()`: mechanical proof gates that load configuration from the base revision
-//! - `flaws`: shared flaw rule types and matching logic for gates and report
+//! - `flaws`: shared flaw rule types, matching logic and pack loader for gates and report;
+//!   the generic pack is embedded here
 
 pub mod capsule;
 pub mod flaws;
@@ -18,7 +19,7 @@ pub mod runner;
 pub mod verify;
 
 pub use capsule::{Capsule, CapsuleError, HELDOUT_FILE, SEAL_FILE, ToolTotals, TraceTotals};
-pub use flaws::{FlawFinding, FlawRule, PatchDelta, RuleFile};
+pub use flaws::{FlawFinding, FlawRule, GENERIC_PACK, LoadedPacks, PatchDelta, RuleFile};
 pub use gates::{GatePacket, GateReport, GateResult, record_verify_results, run_gates};
 pub use port::{
     PortCapsule, PortHeldOut, PortOutcome, PortResult, SurfaceSummary, fixture_set_hash,
