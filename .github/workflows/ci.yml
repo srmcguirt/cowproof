@@ -57,6 +57,9 @@ jobs:
           # A test that reads the repository above its crate skips in the published crate;
           # here a missing workspace is a failure, so a gate that always skips is caught.
           COWPROOF_WORKSPACE_TESTS: "1"
+          # The port adapter tests need `node` and `python3` (both preinstalled on the runners):
+          # a missing runtime fails here instead of skipping quietly.
+          COWPROOF_REQUIRE_RUNTIMES: "1"
         run: cargo test --workspace --locked
 
   msrv:
