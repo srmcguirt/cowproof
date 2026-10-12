@@ -215,6 +215,8 @@ pub async fn port(registry: &Registry, config: &Config, command: PortCommand) ->
             Ok(exit_code(report.is_success()))
         }
 
+        PortCommand::Adapter { lang, out, force } => port_adapter(&lang, out, force),
+
         PortCommand::Replay {
             fixtures,
             tool,
@@ -440,6 +442,39 @@ fn unknown_tool(registry: &Registry, tool: &str) -> Error {
         return Error::UnknownTool(tool.to_string());
     }
     Error::other(format!("unknown tool `{tool}`; registered tools: {known}"))
+}
+
+/// `pk port adapter`: the shipped capture adapter for `lang`, on stdout or in `out`.
+fn port_adapter(lang: &str, out: Option<PathBuf>, force: bool) -> Result<ExitCode> {
+    let Some(adapter) = portkit_port::adapters::adapter_for(lang) else {
+        let known: Vec<&str> = portkit_port::adapters::ADAPTERS
+            .iter()
+            .map(|a| a.lang)
+            .collect();
+        return Err(Error::other(format!(
+            "no capture adapter for `{lang}` (have: {}, and typescript through node)",
+            known.join(", ")
+        )));
+    };
+    match out {
+        None => print!("{}", adapter.source),
+        Some(path) => {
+            if path.exists() && !force {
+                return Err(Error::other(format!(
+                    "{} already exists; pass --force to replace it",
+                    path.display()
+                )));
+            }
+            std::fs::write(&path, adapter.source)?;
+            eprintln!(
+                "wrote {}; capture with: pk port capture --cmd '{} {} <module>'",
+                path.display(),
+                adapter.runner,
+                path.display()
+            );
+        }
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 fn exit_code(success: bool) -> ExitCode {

@@ -1,0 +1,3 @@
+{"tool":"quote","id":"tie-even","input":{"kg":1.25}}
+{"tool":"quote","id":"quarter","input":{"kg":0.5}}
+{"tool":"total","id":"round","input":{"charges":[1.5,2.25]}}

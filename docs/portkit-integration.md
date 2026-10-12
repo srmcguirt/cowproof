@@ -263,27 +263,31 @@ Founder decision 2026-10-09: adoption of scripts into Rust must be polyglot and 
 
 ### 6.1 Per-language capture adapters
 
+**Status (2026-10-12): the Python and Node/TypeScript function adapters are done (lane/port-adapters).** They are `crates/portkit/port/adapters/{node/adapter.mjs,python/adapter.py}`, standard library only, embedded in `portkit-port` and printed or written by `pk port adapter <lang>` (`cowproof pk port adapter ...`). Where the shipped adapters differ from the text below: the Node file is `adapter.mjs` and dispatches on the command line's function name or the request's `tool`, not on a hand-written table; `Map` is an array of `[key, value]`, `Set` an array; TypeScript runs through the same adapter on a Node that strips types (22.18+, 23.6+, or `--experimental-strip-types` on 22.6 to 22.17) and not through `tsx`; the templates for Ruby, Perl, PowerShell and Go (`templates/adapters/`) and whole-process capture (G3) are not built. README "Capture adapters" documents them.
+
 The contract never changes: one JSON request `{"tool": name, "input": object}` on stdin, one JSON result on stdout, `PORTKIT_TOOL` in the env (`port/src/capture.rs` L126-147). What changes per language is how a reference gets wrapped without restructuring it.
 
 | Language | Adapter model | What the adapter does | Status in portkit |
 | --- | --- | --- | --- |
-| Python | function-level shim (`adapter.py`) | imports the module, maps tool names to callables, `json.load(sys.stdin)`, `json.dump(result)`; the pattern of `examples/python/agent.py` | the only one documented today |
-| Node, TypeScript | function-level shim (`adapter.mjs`) | `import { ... } from './module.mjs'`, dispatch on `PORTKIT_TOOL` or `request.tool`, serialise non-JSON values (`RegExp` to `.source`, `Map`/`Set` to arrays, thrown `Error` to `{"error": message}`); TypeScript through `tsx` or a compiled output | works unchanged (the capture command is any `sh -c` string); the lane runner adapter (P1) is the first instance |
-| shell (bash, zsh, sh) | whole-process capture | no adapter in the script; `pk port exec` (G3) is the adapter: `input` is `{argv, env, stdin, files}`; `output` is `{exit, stdout, stderr, files_after, calls}` | missing (G3) |
+| Python | function-level shim (`adapter.py`) | imports the module, maps tool names to callables, `json.load(sys.stdin)`, `json.dump(result)`; the pattern of `examples/python/agent.py` | DONE: `crates/portkit/port/adapters/python/adapter.py` |
+| Node, TypeScript | function-level shim (`adapter.mjs`) | `import { ... } from './module.mjs'`, dispatch on `PORTKIT_TOOL` or `request.tool`, serialise non-JSON values (`RegExp` to `.source`, `Map`/`Set` to arrays, thrown `Error` to `{"error": message}`); TypeScript through `tsx` or a compiled output | DONE: `crates/portkit/port/adapters/node/adapter.mjs` (the lane runner's own dispatch table, P1, is still its first real instance) |
+| shell (bash, zsh, sh) | whole-process capture | no adapter in the script; `pk port exec` (G3) is the adapter: `input` is `{argv, env, stdin, files}`; `output` is `{exit, stdout, stderr, files_after, calls}` | missing (G3); the next step after the function adapters, in docs/backlog.md |
 | Ruby, Perl, PowerShell, Go, anything else | function-level shim if the language can read stdin JSON in a few lines (all of these can); otherwise whole-process capture | same contract; cowproof ships a template adapter per language under `templates/adapters/` | missing templates only |
 
-Rules for adapters: an adapter is committed beside the source it wraps and listed in the port packet; it never computes anything the module does not; it exposes module-level constants as a `__defaults` tool so fixtures can be captured with them as inputs (section 6.2 "config as input"); it returns `{"error": message}` for thrown errors (G4).
+Rules for adapters: an adapter is committed beside the source it wraps and listed in the port packet; it never computes anything the module does not; it exposes module-level constants as a `__defaults` tool so fixtures can be captured with them as inputs (section 6.2 "config as input"); it returns `{"error": message}` for thrown errors (G4; the adapters do, and exit 0 so the error is a fixture; only the adapter's own faults exit non-zero).
 
 Worked example, the lane runner: `mail/scripts/lanes/portkit-adapter.mjs` imports `parseHeader`, `globToRegExp`, `outsideOwnership`, `removedLines`, `classifyStatus`, `classLimits`, `redact`, `sandboxProfile`, `linuxSandboxArgs`, `sandboxCommand`, `codexIsolationArgs` from `run-lane.mjs`, `rsyncArgs` and `prepareScript` from `run-remote.mjs`, `parseQuestions`, `answeredNumbers`, `openItems` from `questions.mjs` and `assess` from `health.mjs`, plus a `__defaults` tool returning `PROTECTED`, `HANDOFF_DIR`, `CLASS_LIMITS`, `PORT_BASE` and `SLOT_DIR` (`run-lane.mjs` L533-534, L77-79, L85). Capture: `cowproof pk port capture --cmd 'node scripts/lanes/portkit-adapter.mjs' --cwd <mail checkout> --env HOME=/fixtures/home --env LANE_CLASS_LIMITS= --env TZ=UTC --cases cowproof/fixtures/lane-runner/cases.jsonl --out crates/cowproof-core/fixtures/node`. The fixtures commit to cowproof; CI replays them (no Node, no private repo needed); recapture is a director step on a machine with the mail checkout, recorded with the mail commit hash in each case's `note`.
 
 ### 6.2 Determinism per language
 
+**Status (2026-10-12): the adapter-side pins are done; the capture-runner side (G2) is not.** Done in both function adapters: `PORTKIT_NOW` (Node `Date`; Python `time`, `datetime`, `date`), `PORTKIT_SEED` (Node mulberry32 `Math.random`; Python `random.seed`), `TZ=UTC` when unset, Python `PYTHONHASHSEED=0` when unset (a one-time restart), the canonical output (keys sorted by UTF-16 code unit, ECMAScript number text, identical bytes from both adapters), module stdout kept off the result channel, and `__defaults`. Not done: `clear_env` and an env allowlist, `cwd`, `TMPDIR`, `mktemp` and `path_roots` (G2, G13: the capture runner and the process adapter). Today the director sets `PORTKIT_NOW`/`PORTKIT_SEED` in the capture shell, and a packet sets them in `port.reference.env`, which the verifier exports before the reference command. Cannot be pinned by a function adapter: monotonic clocks and timers, `crypto`/`secrets`/`uuid4`, a generator a module builds itself, numpy, and (shell) `$RANDOM`.
+
 Common, enforced by the capture runner (G2) and reused unchanged by the replay side:
 
 | Source of nondeterminism | Pin |
 | --- | --- |
-| clock | `PORTKIT_NOW=<RFC 3339>` in the env; adapters stub the clock when it is set; shell captures shim `date`; outputs that must carry a real time go under `accepted` with reason `nondeterministic: clock` or an `ignore_paths` entry (`config.rs` L173-174) |
-| RNG | `PORTKIT_SEED=<int>`; Python `random.seed`, Node a seeded replacement for `Math.random` installed by the adapter, shell cannot pin `$RANDOM`, so such scripts record the divergence |
+| clock | `PORTKIT_NOW=<RFC 3339>` in the env; adapters stub the clock when it is set (DONE for Node and Python); shell captures shim `date`; outputs that must carry a real time go under `accepted` with reason `nondeterministic: clock` or an `ignore_paths` entry (`config.rs` L173-174) |
+| RNG | `PORTKIT_SEED=<int>`; Python `random.seed`, Node a seeded replacement for `Math.random` installed by the adapter (both DONE), shell cannot pin `$RANDOM`, so such scripts record the divergence |
 | env | `clear_env` then an explicit allowlist: `PATH` (shims first), `HOME`, `TMPDIR`, `TZ=UTC`, `LANG=C.UTF-8`, `LC_ALL=C.UTF-8`, `PYTHONHASHSEED=0`, `NODE_OPTIONS=` empty |
 | cwd | `cwd` set explicitly; relative paths in inputs resolve against it |
 | temp paths | `TMPDIR=$ROOT/tmp` and a shimmed `mktemp` that numbers names; outputs normalised with `path_roots` (G13) |
@@ -291,7 +295,7 @@ Common, enforced by the capture runner (G2) and reused unchanged by the replay s
 | platform | functions that branch on the OS take `platform` as an input (`sandboxCommand` does, `run-lane.mjs` L579); capture runs on both OSes in the CI matrix and fixtures are tagged by platform in their `id` |
 | config as input | module constants captured through `__defaults` and passed back as inputs, so Everydom's defaults are data in the fixture, not an assumption in the port |
 
-Per language specifics: Python object key order follows insertion, Node follows insertion for string keys and sorts integer-like keys first, Rust with `preserve_order` (`Cargo.toml` L48) keeps parse order; the differ compares by JSON Pointer path, so object key order is not a difference, array order is. Floats: portkit's epsilon exists for last-place rounding (`README.md` L94-104); the lane tooling has none, so port packets for it set `epsilon = 0`.
+Per language specifics (DONE as canonical output: the adapters sort keys and print numbers as ECMAScript does, so a fixture's bytes do not depend on the engine): Python object key order follows insertion, Node follows insertion for string keys and sorts integer-like keys first, Rust with `preserve_order` (`Cargo.toml` L48) keeps parse order; the differ compares by JSON Pointer path, so object key order is not a difference, array order is. Floats: portkit's epsilon exists for last-place rounding (`README.md` L94-104); the lane tooling has none, so port packets for it set `epsilon = 0`.
 
 ### 6.3 Capturing effectful scripts
 
@@ -305,7 +309,7 @@ Signals, timers and process groups (step 13) do not fit any of the three; they a
 
 ### 6.4 Port packets in cowproof's processes
 
-**Status (2026-10-12): done for the first release (lane/port-packets).** The header, the seven lint rules, the replay gate, the held-out port cases and the capsule entry are built; the adapters (6.1) are the next step (docs/backlog.md). Where cowproof's implementation differs from the text below, the difference is named at the item:
+**Status (2026-10-12): done for the first release (lane/port-packets).** The header, the seven lint rules, the replay gate, the held-out port cases and the capsule entry are built; the function adapters (6.1) followed in lane/port-adapters; whole-process capture is the next step (docs/backlog.md). Where cowproof's implementation differs from the text below, the difference is named at the item:
 
 - `kind` and `port` are parsed by `cowproof-core` (`Header`, `PortSpec`), strictly: an unknown key in `port`, `port.reference` or `port.parity` is an error; `kind: port` needs the object and a work packet may not have one. `cowproof-lint` runs the rules (`crates/cowproof-lint/src/port.rs`).
 - `port.parity.unordered_arrays` is a boolean (portkit's own option); `path_roots` is a list of path prefixes or `$ROOT`, `$HOME`, `$TMP`, used by lint today and by the process adapter later. The `epsilon` default is `[port] epsilon` in the base `cowproof.toml` (0 when it has none); the lane's base commit is read, so a patch cannot raise it. The replay also passes `epsilon_rel = 0`.

@@ -1,0 +1,12 @@
+{
+  "tool": "total",
+  "id": "empty",
+  "input": {
+    "charges": []
+  },
+  "expected": {
+    "count": 0,
+    "total": 0
+  },
+  "source": "python3 reference/adapter.py reference/shipping.py"
+}

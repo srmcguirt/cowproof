@@ -1,0 +1,14 @@
+{
+  "tool": "quote",
+  "id": "tie",
+  "input": {
+    "kg": 0.25
+  },
+  "expected": {
+    "charge": 0.12,
+    "currency": "USD",
+    "kg": 0.25
+  },
+  "source": "python3 reference/adapter.py reference/shipping.py",
+  "note": "0.125 rounds to 0.12 in Python (exact tie, half to even); a half-up port says 0.13"
+}

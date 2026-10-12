@@ -27,6 +27,7 @@
 //! # fn my_registry() -> Registry { Registry::new() }
 //! ```
 
+pub mod adapters;
 pub mod capture;
 pub mod fixture;
 pub mod replay;

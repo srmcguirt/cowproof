@@ -1,0 +1,6 @@
+{"tool":"__defaults","id":"module","input":{},"note":"the module's constants, so the port is checked against them"}
+{"tool":"quote","id":"whole","input":{"kg":2}}
+{"tool":"quote","id":"third","input":{"kg":3.3}}
+{"tool":"quote","id":"tie","input":{"kg":0.25},"note":"0.125 rounds to 0.12 in Python (exact tie, half to even); a half-up port says 0.13"}
+{"tool":"total","id":"pair","input":{"charges":[0.1,0.2]},"note":"0.1 + 0.2 is 0.30000000000000004 in binary floating point; the fixture keeps it"}
+{"tool":"total","id":"empty","input":{"charges":[]}}

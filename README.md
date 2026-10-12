@@ -343,7 +343,40 @@ The header parses strictly: `kind` is `work` (the default) or `port`, a `port` o
 
 **The capsule.** A port capsule carries a sealed `port` entry (older capsules have none and still verify): the reference command, the source commit (the lane's base commit), a `sha256` over the fixtures directory of the rebuilt tree (every file path and its bytes, in path order), per surface the counts and only the failing and accepted outcomes, and the held-out state. `gates.json` lists each held-out check with its pass or fail on any lane, not only on port packets.
 
-Not built yet: the per-language capture adapters (Node and Python function shims, then whole-process capture for shell scripts), which `adapter` and `lang` already name. Today the reference command is any program that speaks the contract. `fixtures/port/` is a worked example (a shell reference with two tools, a Rust port, held-out cases) that `crates/cowproof-cli/tests/port_packets.rs` runs end to end.
+### Capture adapters: Node, TypeScript and Python
+
+A reference that is a module with functions needs a few lines to speak the contract. cowproof ships those lines as one standard-library-only file per language, so the module is not restructured:
+
+```sh
+cowproof pk port adapter python --out reference/adapter.py     # or: node, typescript
+cowproof pk port capture --cmd 'python3 reference/adapter.py reference/shipping.py' \
+  --cases ports/shipping/cases.jsonl --out ports/shipping/fixtures
+```
+
+`pk port adapter <lang>` prints the adapter, or writes it with `--out` (it will not replace a file without `--force`). Commit it beside the source, name the command in `port.reference.cmd` and the language in `port.lang`, with `"adapter": "function"`. The source is `crates/portkit/port/adapters/{node,python}/`.
+
+| | Node (`node adapter.mjs <module> [<function>]`) | Python (`python3 adapter.py <module> [<function>]`) |
+| --- | --- | --- |
+| Dispatch | the function named on the command line, else the request's `tool` (else `$PORTKIT_TOOL`) | the same |
+| Call | `fn(input)`; an input that is exactly `{"args": [...]}` is `fn(...args)`; promises are awaited | the same; coroutines are run |
+| `__defaults` | the module's `__defaults` export, else every exported non-function value | the module's `__defaults`, else its UPPER_CASE constants |
+| A thrown error | `{"error": message}`, exit 0, so it is a fixture | the same |
+| An adapter fault (no such function, bad request, a result that is not JSON, a bad `PORTKIT_*` value) | stderr, exit 2: the capture fails instead of recording a mistake | the same |
+| Output | one line of canonical JSON: keys sorted by UTF-16 code unit, numbers as ECMAScript prints them (`3.0` is `3`, `-0` is `0`), NaN and Infinity refused | byte-identical to Node's for equivalent data |
+| Clock (`PORTKIT_NOW`, RFC 3339) | `Date.now()`, `new Date()`, `Date()` | `time.time()`, `time.time_ns()`, `localtime`/`gmtime`/`ctime`/`strftime` without a time, `datetime.now()`/`utcnow()`/`today()`, `date.today()` |
+| Randomness (`PORTKIT_SEED`, an integer) | `Math.random` is a seeded generator (mulberry32) | `random.seed(seed)` |
+| Environment | `TZ=UTC` when unset | `TZ=UTC` when unset; `PYTHONHASHSEED=0` when unset, by restarting once, so `set` and `dict` order of strings repeats |
+| Module output | stdout writes go to stderr | the same |
+
+What an adapter cannot pin: monotonic clocks and timers (`performance.now`, `process.hrtime`, `time.monotonic`, `sleep`), file times, `crypto` and `secrets`/`uuid4`/`os.urandom`, generators a module creates itself without a seed, `Intl`'s own clock, `numpy`. A seeded generator makes a capture repeatable, not portable: Python's Mersenne Twister and Node's mulberry32 differ from each other and from any Rust generator, so a module whose output depends on random draws takes the draws as input. Python 3.12 made `sum()` of floats compensated; capture with the Python version the reference runs on. Effects (files, subprocesses) are not captured by a function adapter; that is whole-process capture, below.
+
+Pin the clock and seed for the held-out capture in the packet: `"reference": {"cmd": "...", "env": {"PORTKIT_NOW": "2026-01-02T03:04:05Z", "PORTKIT_SEED": "1"}, "runtime": "python3"}` (the verifier exports `env` before the command). The director pins the same way at capture time: `PORTKIT_NOW=2026-01-02T03:04:05Z cowproof pk port capture ...`. Parity stays exact: the adapter normalizes the reference's output, not the comparison. `epsilon` is still the project default, usually 0.
+
+TypeScript runs through the Node adapter when Node strips types itself: `node adapter.mjs ./module.ts` on Node 22.18+ or 23.6+, `node --experimental-strip-types adapter.mjs ./module.ts` on 22.6 to 22.17 (erasable syntax only: annotations and interfaces, not enums or namespaces). On an older Node, compile and name the output. The runtime a packet asks for is `node>=22` (or `python3`); a verifier without it reports `held-out: skipped`.
+
+`fixtures/port-adapters/` is the worked example, run by `crates/cowproof-cli/tests/port_adapters.rs` against the real `node`, `python3`, `pk` and `rustc`, and for Python through a whole `cowproof run`: a Node module and a Python module each with one trap (JavaScript lists integer-like keys first; Python rounds the tie 0.125 to 0.12 and sums `0.1 + 0.2` to `0.30000000000000004`), the fixtures captured through the adapters, a right Rust port that passes at epsilon 0 and a wrong one that is refuted. Those tests skip with a printed note when `node` or `python3` is missing, and fail under `COWPROOF_REQUIRE_RUNTIMES=1`. The tests that read `fixtures/port-adapters/` run in the workspace only (the published crate does not contain it): without the workspace they print a skip, and fail under `COWPROOF_WORKSPACE_TESTS=1`, which CI sets. The adapter-alone tests take the adapter from the embedded copy (`pk port adapter --out`) and run in the published crate too.
+
+Not built yet: whole-process capture (`pk port exec`) for shell scripts and other languages, with `port.adapter = "process"`; see docs/backlog.md. `fixtures/port/` is a worked example with a shell reference (a Rust port, held-out cases) that `crates/cowproof-cli/tests/port_packets.rs` runs end to end.
 
 ## Run a lane on another machine
 

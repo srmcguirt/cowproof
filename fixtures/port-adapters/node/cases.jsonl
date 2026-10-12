@@ -1,0 +1,4 @@
+{"tool":"__defaults","id":"module","input":{}}
+{"tool":"tally","id":"mixed","input":{"words":["b","a","2","1","B"]},"note":"integer-like keys: JavaScript lists 1 and 2 before b and a, whatever the insertion order"}
+{"tool":"tally","id":"empty","input":{"words":[]}}
+{"tool":"tally","id":"repeats","input":{"words":["x","x","X"]}}

@@ -269,6 +269,25 @@ pub enum PortCommand {
         fail_fast: bool,
     },
 
+    /// Print or write the capture adapter for a reference language (node, typescript, python).
+    ///
+    /// The adapter is one standard-library-only file to commit beside the source module. A
+    /// reference command is then `node adapter.mjs ./module.mjs` or
+    /// `python3 adapter.py ./module.py`, optionally followed by a function name.
+    Adapter {
+        /// Language of the reference: `node`, `typescript` or `python`.
+        #[arg(value_name = "LANG")]
+        lang: String,
+
+        /// Write the adapter to this file instead of printing it.
+        #[arg(short, long, value_name = "FILE")]
+        out: Option<PathBuf>,
+
+        /// Replace `--out` when it already exists.
+        #[arg(long, requires = "out")]
+        force: bool,
+    },
+
     /// Replay fixtures against the registry and report any drift.
     Replay {
         /// Directory holding the fixtures.

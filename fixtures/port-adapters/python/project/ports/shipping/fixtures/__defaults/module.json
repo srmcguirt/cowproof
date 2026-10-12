@@ -1,0 +1,11 @@
+{
+  "tool": "__defaults",
+  "id": "module",
+  "input": {},
+  "expected": {
+    "CURRENCY": "USD",
+    "RATE_PER_KG": 0.5
+  },
+  "source": "python3 reference/adapter.py reference/shipping.py",
+  "note": "the module's constants, so the port is checked against them"
+}

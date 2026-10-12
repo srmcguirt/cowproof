@@ -1,0 +1,13 @@
+{
+  "tool": "quote",
+  "id": "third",
+  "input": {
+    "kg": 3.3
+  },
+  "expected": {
+    "charge": 1.65,
+    "currency": "USD",
+    "kg": 3.3
+  },
+  "source": "python3 reference/adapter.py reference/shipping.py"
+}

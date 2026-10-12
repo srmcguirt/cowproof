@@ -1,0 +1,16 @@
+{
+  "tool": "total",
+  "id": "pair",
+  "input": {
+    "charges": [
+      0.1,
+      0.2
+    ]
+  },
+  "expected": {
+    "count": 2,
+    "total": 0.30000000000000004
+  },
+  "source": "python3 reference/adapter.py reference/shipping.py",
+  "note": "0.1 + 0.2 is 0.30000000000000004 in binary floating point; the fixture keeps it"
+}
