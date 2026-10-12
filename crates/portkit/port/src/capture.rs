@@ -207,8 +207,14 @@ async fn run_case(case: &Case, opts: &CaptureOptions) -> Result<Value> {
         .stdin
         .take()
         .ok_or_else(|| Error::other("could not open stdin on the reference process"))?;
-    stdin.write_all(request.to_string().as_bytes()).await?;
-    stdin.write_all(b"\n").await?;
+    // A reference that exits without reading its request (one that rejects the case up front)
+    // closes the pipe: its exit status and stderr are the answer, not the broken pipe.
+    for chunk in [request.to_string().into_bytes(), b"\n".to_vec()] {
+        match stdin.write_all(&chunk).await {
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => break,
+            other => other?,
+        }
+    }
     // Dropping stdin sends EOF; without it a reference that reads to end hangs.
     drop(stdin);
 
@@ -330,6 +336,31 @@ mod tests {
         assert_ne!(
             fixture(&base.join("out2"), "t", "plain").expected["home"],
             "unset"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[tokio::test]
+    async fn a_reference_that_exits_without_reading_its_request_is_answered_by_its_exit() {
+        let base = dir("unread");
+        // Larger than a pipe's buffer, so the write is still going when the reference exits.
+        let big = "x".repeat(1 << 20);
+        let path = cases(
+            &base,
+            &[json!({"tool": "t", "id": "bad", "input": {"big": big}, "expect_error": true})],
+        );
+        let out = base.join("out");
+        let report = capture(
+            &path,
+            &out,
+            &CaptureOptions::new("echo 'no such flag' >&2; exit 2"),
+        )
+        .await
+        .unwrap();
+        assert!(report.is_success(), "{:?}", report.failures);
+        assert_eq!(
+            fixture(&out, "t", "bad").expected,
+            json!({"error": {"exit": 2, "message": "no such flag"}})
         );
         let _ = std::fs::remove_dir_all(&base);
     }

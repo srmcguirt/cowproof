@@ -442,11 +442,15 @@ fn a_capture_that_would_record_a_flaky_fixture_is_refused_loudly() {
     assert_eq!(out.status.code(), Some(0), "{}", text(&out));
     assert_eq!(project.fixture("t", "pwd")["expected"]["stdout"], "$ROOT\n");
 
-    // Its own process id differs per run whatever is declared.
-    project.write("ref/pid.sh", "#!/bin/sh\necho $$\n");
+    // Random bytes differ per run whatever is declared. (`$$` is no test of this: on Linux each
+    // run has its own PID namespace, so it repeats.)
+    project.write(
+        "ref/random.sh",
+        "#!/bin/sh\nhead -c 8 /dev/urandom | od -An -tx1\n",
+    );
     let out = project.exec(
-        r#"sh "$PORTKIT_SRC/ref/pid.sh""#,
-        &case("pid", json!({})),
+        r#"sh "$PORTKIT_SRC/ref/random.sh""#,
+        &case("random", json!({})),
         &ROOTS,
     );
     assert_eq!(out.status.code(), Some(1), "{}", text(&out));
