@@ -24,8 +24,11 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use std::option::Option as StdOption;
+
+use crate::tools::{CheckEnd, CheckOutcome};
 
 /// Default park limit: how long a blocking escalation may wait for a ruling.
 pub const DEFAULT_PARK_LIMIT: Duration = Duration::from_secs(30 * 60);
@@ -45,6 +48,26 @@ struct CheckState {
     /// the check passes (or the lane is reassigned), so a builder that keeps
     /// failing the same check does not burn the escalation limit.
     escalated: bool,
+}
+
+/// What the lane's `run_check` calls for one check id add up to: how many there were and how
+/// the last one went. The capsule's `checks/<id>.json` is written from this. The pass or fail the
+/// escalate-early rule reads is [`CheckState`], which `reassign` clears; this is not, because
+/// attempts are counted over the whole lane.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckRunRecord {
+    /// `run_check` calls for this check id in the lane, the last one included.
+    pub attempts: u32,
+    /// The last run's exit code, or -1 when it had none.
+    pub exit_status: i32,
+    /// How the last run ended.
+    pub end: CheckEnd,
+    /// The last run's wall-clock time in milliseconds.
+    pub duration_ms: u64,
+    /// SHA-256 (hex) of the last run's combined output. The output itself is never kept.
+    pub output_sha256: String,
+    /// Length in bytes of the last run's combined output.
+    pub output_len: u64,
 }
 
 /// Segment state for cost and turn tracking per lane.
@@ -732,6 +755,7 @@ pub struct Queue {
     max_escalations: usize,
     // Escalate-early tracking
     check_state: HashMap<String, HashMap<String, CheckState>>,
+    check_runs: HashMap<String, BTreeMap<String, CheckRunRecord>>,
     segment_state: HashMap<String, SegmentState>,
     lane_state: HashMap<String, LaneState>,
     max_turns: usize,
@@ -787,6 +811,7 @@ impl Queue {
             park_limit,
             max_escalations,
             check_state: HashMap::new(),
+            check_runs: HashMap::new(),
             segment_state: HashMap::new(),
             lane_state: HashMap::new(),
             max_turns,
@@ -1304,6 +1329,35 @@ impl Queue {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// Note one `run_check` run: bump the check's attempt count and replace its last run with
+    /// this one. In memory only, like the pass or fail from [`Queue::record_check`], and not
+    /// cleared by `reassign`.
+    pub fn record_check_run(&mut self, lane: &str, check_id: &str, outcome: &CheckOutcome) {
+        let runs = self.check_runs.entry(lane.to_string()).or_default();
+        let attempts = runs
+            .get(check_id)
+            .map_or(0, |r| r.attempts)
+            .saturating_add(1);
+        runs.insert(
+            check_id.to_string(),
+            CheckRunRecord {
+                attempts,
+                exit_status: outcome.exit_status,
+                end: outcome.end,
+                duration_ms: outcome.duration_ms,
+                output_sha256: format!("{:x}", Sha256::digest(outcome.output.as_bytes())),
+                output_len: outcome.output.len() as u64,
+            },
+        );
+    }
+
+    /// What the lane's `run_check` calls came to, per check id: attempts and the last run. A
+    /// check id with no entry was never run. Read it from the `Queue` the tools server recorded
+    /// into, as [`Queue::check_results`].
+    pub fn check_runs(&self, lane: &str) -> BTreeMap<String, CheckRunRecord> {
+        self.check_runs.get(lane).cloned().unwrap_or_default()
     }
 
     /// What a fresh session needs: the question, what was tried, the ruling.

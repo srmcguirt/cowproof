@@ -1701,6 +1701,9 @@ fn check_reports_the_exit_code_of_a_passing_and_a_failing_command() {
     assert_eq!(json["exit_code"], 0);
     assert_eq!(json["timed_out"], false);
     assert_eq!(json["output_tail"], "fine\n");
+    // What the capsule records: no signal, and the command's own time.
+    assert!(json["signal"].is_null(), "{json}");
+    assert!(json["duration_ms"].is_u64(), "{json}");
 
     // A failing check is a report, not a refusal: exit 0 for the verb, ok false, the code kept.
     let out = bfx.run_check("c-fail", &check_spec("echo broken >&2; exit 3", 60));
@@ -1801,6 +1804,8 @@ fn check_kills_a_command_that_runs_past_its_timeout() {
     assert_eq!(json["timed_out"], true);
     assert_eq!(json["exit_code"], -1);
     assert!(json["output_tail"].as_str().unwrap().contains("timed out"));
+    assert!(json["signal"].is_null(), "{json}");
+    assert!(json["duration_ms"].as_u64().unwrap() >= 1000, "{json}");
 }
 
 /// A check that leaves a background subshell: it records its pid and writes a marker after

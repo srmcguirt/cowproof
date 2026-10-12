@@ -21,7 +21,7 @@ cat <lane>/control/capsule/gates.json
 - `verdict.json`: `verdict`, `exitCode`, `reasons`, `unrun` (declared checks never run), `failedChecks`, `heldOutFailed`, `diverged` (checks whose replay disagreed with the builder's record), `failedGates`.
 - `gates.json`: five gates, each with `name`, `passed`, `warned` and `evidence`: `ownership`, `append_only`, `protected_paths`, `held_out`, `flaws`.
 - `run.json`: how the builder ended (`finished`, `failed`, `stopped`, `escalation-limit`), turns and an estimated cost. The cost is an estimate.
-- `capsule/capsule.json`: base commit, builder model, `unsandboxed`, `local_replay_only`, dependency cache key and fetch outcome. `capsule/checks/<id>.json` holds each recorded check as pass or fail only (exit status 0 or 1); attempt counts, durations and output hashes are not recorded yet.
+- `capsule/capsule.json`: base commit, builder model, `unsandboxed`, `local_replay_only`, dependency cache key and fetch outcome. `capsule/checks/<id>.json` holds the builder's last run of each check: exit code (-1 when it had none) and `end` (exited, signalled, timed out, not run), attempts, duration and the SHA-256 and length of its output (never the output); `capsule/packets/` holds every packet version (`v1.md`, one more per redirect) with `versions.json`. `base_remote` names the remote-tracking ref that held the base commit.
 - `capsule/escalations.jsonl`: the builder's questions and your rulings, when there were any.
 
 Read the verdicts this way:

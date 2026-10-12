@@ -180,14 +180,14 @@ A gate verdict is a triage signal; the director still rules. Each new flaw found
 
 A capsule is a directory (or a `.capsule.tar.zst` of it) in the control directory, holding everything a replay needs, not just hashes:
 
-- `capsule.json`: base commit, the remote it is reachable from, base tree hash; hashes of every file below; environment fingerprint (OS, architecture, toolchain versions the checks use); lane state; builder model per segment (a reassigned lane has several), auth mode, estimated cost and tokens, parked time, portkit trace totals; for a `kind: port` packet a sealed `port` entry (the reference command, the source commit, a sha256 over the fixtures directory, the per-surface replay trimmed to failing and accepted outcomes, the held-out state)
+- `capsule.json`: base commit, the remote-tracking ref it was reachable from (`base_remote`, a ref name such as `origin/main`, never a URL), base tree hash; hashes of every file below; environment fingerprint (OS, architecture, toolchain versions the checks use); lane state; builder model per segment (a reassigned lane has several), auth mode, estimated cost and tokens, parked time, portkit trace totals; for a `kind: port` packet a sealed `port` entry (the reference command, the source commit, a sha256 over the fixtures directory, the per-surface replay trimmed to failing and accepted outcomes, the held-out state)
 - `base.patch` (only when dispatched with `--allow-dirty`) and `lane.patch`
-- `packets/`: every packet version with the verdict that introduced it, and the held-out checks (secret only while the lane runs; a replayer needs them)
-- `checks/`: per check id, the command, exit status, attempt count, duration and output hash from the verifier
+- `packets/`: every packet version (`v1.md` is the packet the lane started with, each redirect adds the next, byte for byte) with `versions.json` naming the escalation whose ruling introduced each, and the held-out checks (secret only while the lane runs; a replayer needs them)
+- `checks/`: per check id, the command and the builder's last `run_check` run of it: exit code (`exit_status`, -1 when the command had none) and how it ended (`end`: exited, signalled, timed out or never started), the attempt count (all `run_check` calls for that id in the lane), the wall-clock duration of that run, and the SHA-256 and length of its combined output. The output is never in the capsule. A capsule from before these were recorded has only pass or fail in `exit_status`, one attempt, no duration or hash, and still verifies
 - `gates.json` and `escalations.jsonl`
 - `applied/`: any `applied-clean` or `applied-at` records
 
-`cowproof verify <capsule>` rebuilds the base, applies `lane.patch`, re-runs every check in the same sandbox and network policy, and compares **pass or fail per check id**. Durations and output hashes are recorded but never compared, because they vary between runs. A check marked `flaky` in the packet is retried up to three times. If the base commit is not reachable from a remote, the capsule is marked `local-replay-only`. Signing comes later.
+`cowproof verify <capsule>` rebuilds the base, applies `lane.patch`, re-runs every check in the same sandbox and network policy, and compares **pass or fail per check id**. Durations and output hashes are recorded but never compared, because they vary between runs. A check marked `flaky` in the packet is retried up to three times. If no remote-tracking ref in the director's repository contains the base commit, the capsule is marked `local_replay_only` (it reads those local refs and never asks the remote, so a stale ref can make it wrong either way). Signing comes later.
 
 ### Director monitoring
 

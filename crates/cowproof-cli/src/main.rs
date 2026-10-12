@@ -311,6 +311,11 @@ struct RunOneArgs {
     /// still wins). It exists so tests can reach the limit in seconds, not in minutes
     #[arg(long, hide = true)]
     timeout_secs: Option<u64>,
+    /// How long one `run_check` command may run before its group is killed, in seconds,
+    /// replacing the built-in 20 minutes. It exists so tests can reach the check timeout in
+    /// seconds
+    #[arg(long, hide = true)]
+    check_timeout_secs: Option<u64>,
     /// Free space, in GB, on the lanes filesystem below which the preflight fails the run
     /// (exit 4, before any lane exists)
     #[arg(long, default_value_t = 5.0)]

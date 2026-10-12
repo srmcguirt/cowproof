@@ -275,6 +275,8 @@ fn write_capsule(dir: &Path, spec: &CapsuleSpec) {
             attempts: 1,
             duration_ms: 1,
             output_sha256: "ignored".to_string(),
+            output_len: None,
+            end: None,
         };
         std::fs::write(
             dir.join(format!("checks/{id}.json")),
@@ -2125,6 +2127,8 @@ async fn an_unsealed_check_file_is_refused_and_never_run() {
         attempts: 1,
         duration_ms: 1,
         output_sha256: "ignored".to_string(),
+        output_len: None,
+        end: None,
     };
     std::fs::write(
         capsule_dir.path().join("checks/injected.json"),
@@ -2288,6 +2292,8 @@ fn load_checks_takes_its_ids_from_file_hashes_not_the_directory() {
             attempts: 1,
             duration_ms: 1,
             output_sha256: "ignored".to_string(),
+            output_len: None,
+            end: None,
         })
         .unwrap()
     };

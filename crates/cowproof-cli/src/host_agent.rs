@@ -106,6 +106,7 @@ use cowproof_prove::runner::{
 };
 use cowproof_run::bridge::bridge_port;
 use cowproof_run::lane::{LaneControl, PrepareOptions, prepare_lane, validate_lane_id};
+use cowproof_run::tools::CheckEnd;
 use cowproof_run::tools::MAX_OUTPUT;
 use cowproof_run::{LaneLayout, NetworkMode, lane_tmp};
 use serde::{Deserialize, Serialize};
@@ -1891,6 +1892,10 @@ async fn check(lane_id: &str, check_id: &str, root: &Path) -> Result<Value> {
         }
     };
     let exit_code = run.outcome.exit_status;
+    let signal = match run.outcome.end {
+        CheckEnd::Signaled { signal } => Some(signal),
+        _ => None,
+    };
     let mut output = redact(&run.outcome.output);
     if interrupted {
         output.push_str("\n[the host agent was signalled: the check was ended]\n");
@@ -1899,6 +1904,10 @@ async fn check(lane_id: &str, check_id: &str, root: &Path) -> Result<Value> {
         "ok": exit_code == 0 && !run.timed_out && !interrupted,
         "exit_code": exit_code,
         "timed_out": run.timed_out,
+        // How the command ended and how long it ran, for the capsule's record of the check
+        // (older agents lack both and the director measures the call itself).
+        "signal": signal,
+        "duration_ms": run.outcome.duration_ms,
         "output_tail": tail(&output, MAX_OUTPUT),
     }))
 }

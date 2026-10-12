@@ -67,8 +67,8 @@ use cowproof_run::{
     deps::FetchOutcome,
     director::{self, VerdictEvent},
     escalate::{
-        Ask, DEFAULT_COST_FRACTION, DEFAULT_MAX_ESCALATIONS, DEFAULT_PARK_LIMIT, Delivery,
-        DeliveryError, DeliveryOutcome, DeliveryResult, EscalationId, LaneState, Queue,
+        Ask, CheckRunRecord, DEFAULT_COST_FRACTION, DEFAULT_MAX_ESCALATIONS, DEFAULT_PARK_LIMIT,
+        Delivery, DeliveryError, DeliveryOutcome, DeliveryResult, EscalationId, LaneState, Queue,
         SystemClock, Verdict as EscalationVerdict,
     },
     lane::{PrepareOptions, prepare_lane},
@@ -78,7 +78,7 @@ use cowproof_run::{
     proxy::{MetricsLog, Provider, ProxyConfig, ProxyServer},
     render_macos_profile, sandbox_command,
     stream::{MeterSummary, StreamMeter, UsageProbe},
-    tools::{self, CheckOutcome, CheckTable, RunCheck, SessionEnd, SessionEndSignal},
+    tools::{self, CheckEnd, CheckOutcome, CheckTable, RunCheck, SessionEnd, SessionEndSignal},
 };
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap};
@@ -1648,6 +1648,10 @@ struct LaneRun {
     /// The newest session id the stream reported.
     session_id: Option<String>,
     end: LaneEnd,
+    /// Every version of the packet the lane ran under, in order: the packet it started with
+    /// (`None`), then each redirect delivered, with the escalation whose ruling brought it.
+    /// Sealed in the capsule's `packets/`.
+    packet_versions: Vec<(Option<String>, String)>,
 }
 
 /// What waiting for the director found.
@@ -1887,6 +1891,7 @@ impl Drive<'_> {
     ) -> Result<LaneRun> {
         let mut rung = first_rung.clone();
         let mut packet = first_packet.to_string();
+        let mut packet_versions: Vec<(Option<String>, String)> = vec![(None, packet.clone())];
         let mut launch = Launch {
             runtime: rung.runtime,
             model: rung.model.clone(),
@@ -2041,6 +2046,7 @@ impl Drive<'_> {
                         Ok(text) => {
                             self.mark_delivered(&id)?;
                             packet = text;
+                            packet_versions.push((Some(id.to_string()), packet.clone()));
                             launch = Launch {
                                 runtime: rung.runtime,
                                 model: rung.model.clone(),
@@ -2178,6 +2184,7 @@ impl Drive<'_> {
             model: launch.model,
             session_id,
             end,
+            packet_versions,
         })
     }
 }
@@ -2374,13 +2381,13 @@ struct CheckContext {
     /// terminal Ctrl-C does not reach it): the runner ends exactly these when the lane stops
     /// or the runner is signalled.
     groups: Arc<GroupSet>,
+    /// How long one check may run before its group is killed: `CHECK_TIMEOUT`, or the hidden
+    /// `--check-timeout-secs` (tests).
+    check_timeout: Duration,
 }
 
 fn refused(output: impl Into<String>) -> CheckOutcome {
-    CheckOutcome {
-        exit_status: -1,
-        output: output.into(),
-    }
+    CheckOutcome::not_run(output)
 }
 
 /// Run one declared check in a fresh `SandboxPolicy::run_check` sandbox.
@@ -2394,7 +2401,7 @@ async fn run_declared_check(ctx: Arc<CheckContext>, id: String) -> CheckOutcome 
     };
     if let Some(remote) = &ctx.remote {
         return remote
-            .run_check(&id, command, Some(ctx.port_base), CHECK_TIMEOUT)
+            .run_check(&id, command, Some(ctx.port_base), ctx.check_timeout)
             .await;
     }
     run_check_command(
@@ -2402,7 +2409,7 @@ async fn run_declared_check(ctx: Arc<CheckContext>, id: String) -> CheckOutcome 
         &ctx.path,
         command,
         Some(ctx.port_base),
-        CHECK_TIMEOUT,
+        ctx.check_timeout,
         &id,
         &ctx.groups,
     )
@@ -2442,6 +2449,7 @@ pub(crate) async fn run_check_command(
         timed_out: false,
     };
     let policy = SandboxPolicy::run_check(layout);
+    let started = Instant::now();
     let argv = ["/bin/sh".to_string(), "-c".to_string(), command.to_string()];
     let mut env = vec![
         ("PATH".to_string(), path.to_string()),
@@ -2464,7 +2472,12 @@ pub(crate) async fn run_check_command(
     match run_in_group(child, timeout, CHECK_TERM_GRACE, Some(groups)).await {
         Ok(ran) => match ran.end {
             GroupEnd::TimedOut => CheckRun {
-                outcome: refused(format!("check {label:?} timed out after {timeout:?}")),
+                outcome: CheckOutcome {
+                    exit_status: -1,
+                    output: format!("check {label:?} timed out after {timeout:?}"),
+                    end: CheckEnd::TimedOut,
+                    duration_ms: elapsed_ms(started),
+                },
                 timed_out: true,
             },
             GroupEnd::Exited(status) => {
@@ -2473,11 +2486,27 @@ pub(crate) async fn run_check_command(
                 done(CheckOutcome {
                     exit_status: status.code().unwrap_or(-1),
                     output,
+                    end: check_end_of(status),
+                    duration_ms: elapsed_ms(started),
                 })
             }
         },
         Err(e) => done(refused(format!("could not start check {label:?}: {e}"))),
     }
+}
+
+/// How an exited check command ended: its exit code, or the signal that ended it.
+pub(crate) fn check_end_of(status: ExitStatus) -> CheckEnd {
+    match (status.code(), status.signal()) {
+        (Some(code), _) => CheckEnd::Exited { code },
+        (None, Some(signal)) => CheckEnd::Signaled { signal },
+        (None, None) => CheckEnd::NotRun,
+    }
+}
+
+/// Milliseconds since `started`, saturating.
+pub(crate) fn elapsed_ms(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
 /// What reading the builder's stdout saw.
@@ -2920,6 +2949,9 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
     }
     if args.timeout_min == 0 || args.timeout_secs == Some(0) {
         bail!("--timeout-min must be at least 1");
+    }
+    if args.check_timeout_secs == Some(0) {
+        bail!("--check-timeout-secs must be at least 1");
     }
     let cwd = std::env::current_dir().context("reading the current directory")?;
     // The credential mode (`--credential`, D2): a subscription lane that cannot run is refused
@@ -3470,6 +3502,9 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
         port_base,
         remote: remote.clone(),
         groups: check_groups.clone(),
+        check_timeout: args
+            .check_timeout_secs
+            .map_or(CHECK_TIMEOUT, Duration::from_secs),
     });
     let run_check: RunCheck =
         Arc::new(move |id: &str| Box::pin(run_declared_check(context.clone(), id.to_string())));
@@ -3954,6 +3989,10 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
             "the escalation queue is unavailable, so the recorded check results are lost"
                 .to_string()
         });
+    let runs = queue
+        .lock()
+        .map(|q| q.check_runs(&header.id))
+        .unwrap_or_default();
     let verdict = prove_lane(
         &ProofInput {
             layout: &layout,
@@ -3984,6 +4023,8 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
             trace: trace.clone(),
             trace_totals: trace_totals.clone(),
             host: remote.as_ref().map(|r| r.alias()),
+            runs: &runs,
+            packet_versions: &lane_run.packet_versions,
         },
         results,
     )
@@ -4187,6 +4228,10 @@ struct ProofInput<'a> {
     trace_totals: Option<TraceTotals>,
     /// The remote host that ran the builder (D27); the proof itself is always local.
     host: Option<&'a str>,
+    /// What the builder's `run_check` calls came to, per check id: attempts and the last run.
+    runs: &'a BTreeMap<String, CheckRunRecord>,
+    /// Every version of the packet the lane ran under (see `LaneRun::packet_versions`).
+    packet_versions: &'a [(Option<String>, String)],
 }
 
 /// Find the lane's held-out checks (D5): the explicit `--heldout` path, which must exist,
@@ -4390,19 +4435,27 @@ async fn replay_and_gate(
 
     // The capsule: only results the builder actually recorded. A check never
     // run has no file, so the verifier never compares an invented result.
-    // The queue keeps pass or fail only, so the stored exit status is 0 or 1
-    // and replay compares pass or fail, as the design says.
+    // Each check file carries the builder's last `run_check` run of it (exit code or
+    // signal or timeout, attempts, duration, output hash and length); replay compares
+    // pass or fail only, as the design says.
     let base = &input.prepared.base_commit;
     let base_tree_hash = git_stdout(input.repo, &["rev-parse", &format!("{base}^{{tree}}")])
         .await
         .context("reading the base tree hash")?;
-    let remote_reachable = !git_stdout(
+    let containing_refs = git_stdout(
         input.repo,
-        &["for-each-ref", "--contains", base, "refs/remotes"],
+        &[
+            "for-each-ref",
+            "--contains",
+            base,
+            "--format=%(refname:short)",
+            "refs/remotes",
+        ],
     )
     .await
-    .context("checking whether the base commit is on a remote")?
-    .is_empty();
+    .context("checking whether the base commit is on a remote")?;
+    let base_remote = base_remote_ref(&containing_refs);
+    let remote_reachable = base_remote.is_some();
     let mut tools = HashMap::new();
     for tool in ["git", "cargo", "rustc"] {
         if let Some(version) = tool_version(tool).await {
@@ -4432,6 +4485,7 @@ async fn replay_and_gate(
     capsule.estimated_tokens = input.tokens;
     capsule.unsandboxed = input.unsandboxed;
     capsule.local_replay_only = !remote_reachable;
+    capsule.base_remote = base_remote;
     capsule.flaky_checks = header
         .checks
         .iter()
@@ -4521,17 +4575,13 @@ async fn replay_and_gate(
         fs::copy(&escalations, capsule_dir.join("escalations.jsonl"))
             .context("copying escalations.jsonl")?;
     }
+    // Every packet version the lane ran under, written before the capsule hashes `packets/`.
+    cowproof_prove::capsule::write_packet_versions(&capsule_dir, input.packet_versions)
+        .context("writing the packet versions")?;
     let checks_dir = capsule_dir.join("checks");
     fs::create_dir_all(&checks_dir)?;
     for (check, passed) in ran {
-        let recorded = CheckResult {
-            command: check.command.clone(),
-            exit_status: if *passed { 0 } else { 1 },
-            // The queue keeps no run count, duration or output (backlog).
-            attempts: 1,
-            duration_ms: 0,
-            output_sha256: String::new(),
-        };
+        let recorded = check_result(check, *passed, input.runs.get(&check.id));
         fs::write(
             checks_dir.join(format!("{}.json", check.id)),
             serde_json::to_vec_pretty(&recorded)?,
@@ -4612,6 +4662,49 @@ async fn replay_and_gate(
             .push(format!("verify could not run: {e}")),
     }
     Ok(())
+}
+
+/// The remote-tracking ref to record as the capsule's `base_remote`, from the short names of the
+/// refs that contain the base commit (one per line): the first by name, a remote's `HEAD` alias
+/// (`origin/HEAD`) only when nothing else contains it. `None` when no ref does.
+fn base_remote_ref(containing: &str) -> Option<String> {
+    let mut names: Vec<&str> = containing
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    names.sort_unstable_by_key(|n| (n.ends_with("/HEAD") || !n.contains('/'), *n));
+    names.first().map(|n| (*n).to_string())
+}
+
+/// The capsule's record of one check the builder ran: the real run when the queue kept one, else
+/// (which the runner's own bookkeeping should make impossible) the pass or fail alone, marked by
+/// the lack of `end` so a reader can tell it from a measured run.
+fn check_result(
+    check: &cowproof_core::Check,
+    passed: bool,
+    run: Option<&CheckRunRecord>,
+) -> CheckResult {
+    match run {
+        Some(run) => CheckResult {
+            command: check.command.clone(),
+            exit_status: run.exit_status,
+            attempts: run.attempts,
+            duration_ms: run.duration_ms,
+            output_sha256: run.output_sha256.clone(),
+            output_len: Some(run.output_len),
+            end: Some(run.end),
+        },
+        None => CheckResult {
+            command: check.command.clone(),
+            exit_status: if passed { 0 } else { 1 },
+            attempts: 1,
+            duration_ms: 0,
+            output_sha256: String::new(),
+            output_len: None,
+            end: None,
+        },
+    }
 }
 
 /// Put what `verify` found into the sealed files: `gates.json` gets each held-out check's pass
@@ -5723,5 +5816,77 @@ body"#;
         let fenced_text = fenced("a ``` b ````` c");
         assert!(fenced_text.starts_with("``````\n"), "{fenced_text}");
         assert!(fenced_text.ends_with("\n``````"), "{fenced_text}");
+    }
+    #[test]
+    fn a_check_ends_as_its_exit_code_or_the_signal_that_ended_it() {
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(
+            check_end_of(ExitStatus::from_raw(3 << 8)),
+            CheckEnd::Exited { code: 3 }
+        );
+        assert_eq!(
+            check_end_of(ExitStatus::from_raw(0)),
+            CheckEnd::Exited { code: 0 }
+        );
+        // A raw wait status of 9 is "killed by signal 9": no exit code.
+        let killed = ExitStatus::from_raw(9);
+        assert_eq!(killed.code(), None);
+        assert_eq!(check_end_of(killed), CheckEnd::Signaled { signal: 9 });
+    }
+
+    #[test]
+    fn the_recorded_base_remote_is_the_first_real_ref_and_never_a_head_alias() {
+        assert_eq!(base_remote_ref(""), None);
+        assert_eq!(base_remote_ref("\n"), None);
+        assert_eq!(
+            base_remote_ref("origin/main\n").as_deref(),
+            Some("origin/main")
+        );
+        assert_eq!(
+            base_remote_ref("origin/HEAD\norigin/main\nupstream/main\n").as_deref(),
+            Some("origin/main")
+        );
+        assert_eq!(
+            base_remote_ref("upstream/zeta\norigin/main\n").as_deref(),
+            Some("origin/main")
+        );
+        // Only the alias contains it: better than nothing, and still a ref name.
+        assert_eq!(
+            base_remote_ref("origin/HEAD\n").as_deref(),
+            Some("origin/HEAD")
+        );
+    }
+
+    #[test]
+    fn a_check_file_holds_the_real_run_and_falls_back_to_pass_or_fail_alone() {
+        let check = cowproof_core::Check {
+            id: "unit".into(),
+            command: "cargo test".into(),
+            flaky: false,
+        };
+        let run = CheckRunRecord {
+            attempts: 3,
+            exit_status: 101,
+            end: CheckEnd::Exited { code: 101 },
+            duration_ms: 4321,
+            output_sha256: "ab".repeat(32),
+            output_len: 99,
+        };
+        let real = check_result(&check, false, Some(&run));
+        assert_eq!(
+            (real.exit_status, real.attempts, real.duration_ms),
+            (101, 3, 4321)
+        );
+        assert_eq!(real.output_sha256, "ab".repeat(32));
+        assert_eq!(real.output_len, Some(99));
+        assert_eq!(real.end, Some(CheckEnd::Exited { code: 101 }));
+
+        let bare = check_result(&check, true, None);
+        assert_eq!(
+            (bare.exit_status, bare.attempts, bare.duration_ms),
+            (0, 1, 0)
+        );
+        assert_eq!((bare.output_len, bare.end), (None, None));
+        assert_eq!(check_result(&check, false, None).exit_status, 1);
     }
 }

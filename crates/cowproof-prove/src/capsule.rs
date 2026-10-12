@@ -6,6 +6,8 @@ use std::fs;
 use std::path::Path;
 use thiserror::Error;
 
+pub use cowproof_run::tools::CheckEnd;
+
 /// The launch baseline: a JSON array of the relative paths the runner removed from
 /// the clone before the builder started. Paths only, never content (R15). It lives in
 /// its own hashed file, listed in `capsule.json`'s `file_hashes`.
@@ -130,22 +132,99 @@ pub struct EnvironmentFingerprint {
     pub tools: HashMap<String, String>,
 }
 
-/// Check result from the verifier.
+/// What the capsule records about one check: its command and the builder's last `run_check` run
+/// of it (`checks/<id>.json`). `cowproof verify` compares only pass or fail (`exit_status` equal
+/// to zero or not) and never the other fields, which vary between runs.
+///
+/// A capsule from before the run was recorded in full has `exit_status` 0 or 1, `attempts` 1,
+/// `duration_ms` 0, an empty `output_sha256` and neither `output_len` nor `end`; those two
+/// read as `None` and the capsule verifies as before.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CheckResult {
     pub command: String,
+    /// The last run's exit code, or -1 when the command had none (a signal, the timeout, never
+    /// started): `end` says which.
     pub exit_status: i32,
+    /// How many times the builder ran this check in the lane, the recorded run included.
     pub attempts: u32,
+    /// The recorded run's wall-clock time in milliseconds.
     pub duration_ms: u64,
+    /// SHA-256 (hex) of the recorded run's combined stdout and stderr. The output itself is
+    /// never kept in the capsule. Empty in a capsule from before runs were recorded.
     pub output_sha256: String,
+    /// Length in bytes of that output.
+    #[serde(default)]
+    pub output_len: Option<u64>,
+    /// How the recorded run ended: exited with a code, signalled, timed out, or never started.
+    #[serde(default)]
+    pub end: Option<CheckEnd>,
 }
 
-/// A packet version with the verdict that introduced it.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// One entry of `packets/versions.json`: a version of the packet the lane ran under.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PacketVersion {
+    /// 1 for the packet the lane started with, then one more for each redirect.
     pub version: u32,
-    pub verdict_id: Option<String>,
-    pub packet_json: String,
+    /// The file in `packets/` holding this version's text, byte for byte.
+    pub file: String,
+    /// The escalation whose redirect ruling introduced this version; null for version 1.
+    pub introduced_by: Option<String>,
+}
+
+/// The index of the packet versions, inside the capsule's `packets/`.
+pub const PACKET_VERSIONS_FILE: &str = "packets/versions.json";
+
+/// Write every packet version the lane ran under into `<dir>/packets/`: `v1.md`, `v2.md` and so
+/// on, byte for byte, and `versions.json` listing them. `versions` is `(introduced_by, text)` in
+/// order, the first being the packet the lane started with. Call it before [`Capsule::write`],
+/// which hashes what is in `packets/`.
+pub fn write_packet_versions(
+    dir: &Path,
+    versions: &[(Option<String>, String)],
+) -> std::io::Result<()> {
+    fs::create_dir_all(dir.join("packets"))?;
+    let mut index = Vec::new();
+    for (i, (introduced_by, text)) in versions.iter().enumerate() {
+        let version = u32::try_from(i + 1).unwrap_or(u32::MAX);
+        let file = format!("v{version}.md");
+        fs::write(dir.join("packets").join(&file), text)?;
+        index.push(PacketVersion {
+            version,
+            file,
+            introduced_by: introduced_by.clone(),
+        });
+    }
+    fs::write(
+        dir.join(PACKET_VERSIONS_FILE),
+        serde_json::to_vec_pretty(&index)?,
+    )
+}
+
+/// Read the packet versions of a capsule directory: each entry of `versions.json` with the text
+/// of its file. Empty when the capsule has no `versions.json` (a capsule from before they were
+/// written). Call it on a capsule [`Capsule::read`] accepted, which has checked the hashes.
+pub fn read_packet_versions(dir: &Path) -> Result<Vec<(PacketVersion, String)>, CapsuleError> {
+    let path = dir.join(PACKET_VERSIONS_FILE);
+    let raw = match fs::read(&path) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(CapsuleError::IoError(e)),
+    };
+    let index: Vec<PacketVersion> = serde_json::from_slice(&raw)
+        .map_err(|e| CapsuleError::InvalidFormat(format!("{PACKET_VERSIONS_FILE}: {e}")))?;
+    let mut out = Vec::new();
+    for entry in index {
+        if entry.file.is_empty() || entry.file.contains('/') || entry.file.contains("..") {
+            return Err(CapsuleError::InvalidFormat(format!(
+                "{PACKET_VERSIONS_FILE}: {:?} is not a file name inside packets/",
+                entry.file
+            )));
+        }
+        let text = fs::read_to_string(dir.join("packets").join(&entry.file))
+            .map_err(CapsuleError::IoError)?;
+        out.push((entry, text));
+    }
+    Ok(out)
 }
 
 /// Calls and the bytes they delivered into context, for one tool.
@@ -184,6 +263,12 @@ pub struct TraceTotals {
 pub struct Capsule {
     pub format_version: u32,
     pub base_commit: String,
+    /// The remote-tracking ref (`origin/main`) that contained the base commit when the capsule
+    /// was made, or null when none did. The ref's name, never a URL, which can carry
+    /// credentials. It is read from the director's own remote-tracking refs, as
+    /// `local_replay_only` is, so it says what those refs said at the time, not that the remote
+    /// still has the commit. Absent in older capsules, which read as null.
+    #[serde(default)]
     pub base_remote: Option<String>,
     pub base_tree_hash: String,
     pub environment: EnvironmentFingerprint,
@@ -233,6 +318,10 @@ pub struct Capsule {
     pub estimated_cost_usd: f64,
     pub estimated_tokens: u64,
     pub parked_seconds: u64,
+    /// True when no remote-tracking ref in the director's repository contained the base commit
+    /// (`git for-each-ref --contains <base> refs/remotes` was empty). It is a statement about
+    /// those local refs: a stale or never-fetched ref makes it wrong in either direction, and
+    /// the remote itself is never asked.
     pub local_replay_only: bool,
     pub unsandboxed: bool,
     pub file_hashes: HashMap<String, String>,

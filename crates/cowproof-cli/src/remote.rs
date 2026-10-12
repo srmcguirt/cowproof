@@ -37,11 +37,12 @@
 use crate::host_agent::{
     HOST_PROTOCOL, Identity, MAX_STDERR_FETCH, identity, process_start, write_json_atomic,
 };
+use crate::run::elapsed_ms;
 use anyhow::{Context, Result, anyhow, bail};
 use cowproof_core::redact;
 use cowproof_prove::runner::{kill_pid, terminate_pid};
 use cowproof_run::lane::validate_lane_id;
-use cowproof_run::tools::CheckOutcome;
+use cowproof_run::tools::{CheckEnd, CheckOutcome};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::fs;
@@ -342,6 +343,32 @@ pub(crate) async fn hold_lifeline(mut stdin: tokio::process::ChildStdin, line: V
 /// (the bundle follows those, to end of file).
 fn prepare_header(patch_bytes: usize) -> Vec<u8> {
     format!("{}\n", json!({"patch_bytes": patch_bytes})).into_bytes()
+}
+
+/// The outcome of a `host-agent check` report. The command's own time is the host's
+/// (`duration_ms`); an agent too old to report it is timed from here, ssh included. An exit code
+/// of -1 is the host's "no exit code" (a refusal), never a real status.
+pub(crate) fn check_outcome_from_report(report: &Value, measured_ms: u64) -> CheckOutcome {
+    let number = |key: &str| report[key].as_i64().and_then(|n| i32::try_from(n).ok());
+    let (exit_status, end) = if report["timed_out"].as_bool() == Some(true) {
+        (-1, CheckEnd::TimedOut)
+    } else if let Some(signal) = number("signal") {
+        (-1, CheckEnd::Signaled { signal })
+    } else {
+        match number("exit_code") {
+            Some(code) if code >= 0 => (code, CheckEnd::Exited { code }),
+            _ => (-1, CheckEnd::NotRun),
+        }
+    };
+    CheckOutcome {
+        exit_status,
+        output: report["output_tail"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string(),
+        end,
+        duration_ms: report["duration_ms"].as_u64().unwrap_or(measured_ms),
+    }
 }
 
 /// `host-agent check`'s `CheckSpec`.
@@ -923,13 +950,16 @@ impl RemoteLane {
         port_base: Option<u16>,
         timeout: Duration,
     ) -> CheckOutcome {
-        let refused = |why: String| CheckOutcome {
-            exit_status: -1,
-            output: format!("the check could not be run on {}: {why}", self.host.alias),
+        let refused = |why: String| {
+            CheckOutcome::not_run(format!(
+                "the check could not be run on {}: {why}",
+                self.host.alias
+            ))
         };
         let mut args = self.lane_args();
         args.extend(["--check-id".to_string(), check_id.to_string()]);
         let spec = check_spec(command, timeout.as_secs().max(1), port_base);
+        let started = Instant::now();
         let ran = run_ssh(
             &self.argv(&Step::Agent {
                 verb: "check",
@@ -943,16 +973,7 @@ impl RemoteLane {
             Ok(v) => v,
             Err(e) => return refused(format!("{e:#}")),
         };
-        CheckOutcome {
-            exit_status: report["exit_code"]
-                .as_i64()
-                .and_then(|c| i32::try_from(c).ok())
-                .unwrap_or(-1),
-            output: report["output_tail"]
-                .as_str()
-                .unwrap_or_default()
-                .to_string(),
-        }
+        check_outcome_from_report(&report, elapsed_ms(started))
     }
 
     /// `host-agent patch`: the lane patch, byte for byte.
@@ -1789,5 +1810,45 @@ mod tests {
             .expect("too long");
         assert!(format!("{err:#}").contains("too long"), "{err:#}");
         assert!(RemoteLane::new(host(), "lane", Path::new("/var/tmp/c")).is_ok());
+    }
+    #[test]
+    fn a_host_check_report_becomes_the_outcome_the_capsule_records() {
+        let exited = check_outcome_from_report(
+            &json!({"ok": true, "exit_code": 0, "timed_out": false, "signal": null,
+                    "duration_ms": 250, "output_tail": "fine\n"}),
+            9999,
+        );
+        assert_eq!(exited, CheckOutcome::exited(0, "fine\n", 250));
+
+        let failed = check_outcome_from_report(
+            &json!({"exit_code": 101, "timed_out": false, "output_tail": "bad"}),
+            777,
+        );
+        // An agent that does not report the time is timed from here.
+        assert_eq!(failed, CheckOutcome::exited(101, "bad", 777));
+
+        let timed_out = check_outcome_from_report(
+            &json!({"exit_code": -1, "timed_out": true, "duration_ms": 2001, "output_tail": "t"}),
+            1,
+        );
+        assert_eq!(
+            (timed_out.exit_status, timed_out.end, timed_out.duration_ms),
+            (-1, CheckEnd::TimedOut, 2001)
+        );
+
+        let signaled = check_outcome_from_report(
+            &json!({"exit_code": -1, "timed_out": false, "signal": 9, "output_tail": ""}),
+            5,
+        );
+        assert_eq!(
+            (signaled.exit_status, signaled.end),
+            (-1, CheckEnd::Signaled { signal: 9 })
+        );
+
+        // -1 with no signal and no timeout is the host's "never ran", not an exit status.
+        let refused = check_outcome_from_report(&json!({"exit_code": -1, "output_tail": "x"}), 5);
+        assert_eq!((refused.exit_status, refused.end), (-1, CheckEnd::NotRun));
+        let empty = check_outcome_from_report(&json!({}), 5);
+        assert_eq!(empty.end, CheckEnd::NotRun);
     }
 }

@@ -5,7 +5,7 @@
 
 mod common;
 
-use common::{Lane, output, run_checks, sandbox_available, text, var_tmp};
+use common::{Lane, git, mcp_session, output, run_checks, sandbox_available, text, var_tmp};
 use cowproof_prove::{Capsule, HELDOUT_FILE};
 use serde_json::{Value, json};
 use std::fs;
@@ -504,4 +504,216 @@ fn a_held_out_file_inside_the_repository_stops_the_run_before_any_lane_exists() 
         text(&out)
     );
     assert!(!lane.lane_dir().exists());
+}
+
+// ---- What the capsule records about the builder's check runs ---------------
+
+/// The SHA-256 of `bytes`, computed here and not by the code under test.
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+/// A lane whose builder runs the check `flip` while it still fails, edits README.md, and runs
+/// it again: two attempts, the second a pass that takes at least 100 ms and prints `flipped-ok`.
+fn flip_lane() -> Lane {
+    let run_flip = |out: &str| mcp_session(out, &[(3, "run_check", json!({"id": "flip"}))]);
+    let body = format!(
+        "{}echo second >> README.md\n{}",
+        run_flip("a.out"),
+        run_flip("b.out")
+    );
+    Lane::new(
+        &body,
+        json!([{"id": "flip", "command": "grep -q second README.md && sleep 0.1 && echo flipped-ok"}]),
+    )
+}
+
+fn check_record(lane: &Lane, id: &str) -> Value {
+    serde_json::from_slice(&fs::read(lane.capsule_dir().join(format!("checks/{id}.json"))).unwrap())
+        .unwrap()
+}
+
+fn passed_in(lane: &Lane, out: &str) -> bool {
+    let raw = fs::read_to_string(lane.lane_dir().join("home/fake").join(out)).unwrap();
+    raw.lines()
+        .map(|l| serde_json::from_str::<Value>(l).unwrap())
+        .find(|f| f["id"] == 3)
+        .unwrap()["result"]["structuredContent"]["passed"]
+        == true
+}
+
+#[test]
+fn a_check_that_failed_then_passed_records_two_attempts_a_duration_and_the_passing_output() {
+    if !sandbox_available() {
+        return;
+    }
+    let lane = flip_lane();
+    run_expecting(&lane, &[], 0);
+    assert!(!passed_in(&lane, "a.out"), "the first run must fail");
+    assert!(passed_in(&lane, "b.out"), "the second run must pass");
+
+    let record = check_record(&lane, "flip");
+    assert_eq!(record["exit_status"], 0, "{record}");
+    assert_eq!(record["attempts"], 2, "{record}");
+    assert!(
+        record["duration_ms"].as_u64().unwrap() >= 100,
+        "the passing run slept 100 ms: {record}"
+    );
+    assert_eq!(
+        record["output_sha256"],
+        sha256_hex(b"flipped-ok\n"),
+        "{record}"
+    );
+    assert_eq!(record["output_len"], 11, "{record}");
+    assert_eq!(
+        record["end"],
+        json!({"kind": "exited", "code": 0}),
+        "{record}"
+    );
+    // The output itself is not in the capsule: the record has these fields and no others.
+    let mut keys: Vec<&str> = record
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        [
+            "attempts",
+            "command",
+            "duration_ms",
+            "end",
+            "exit_status",
+            "output_len",
+            "output_sha256"
+        ]
+    );
+    // No remote holds the test repository's base commit.
+    let capsule = Capsule::read(&lane.capsule_dir()).unwrap();
+    assert_eq!(capsule.base_remote, None);
+    assert!(capsule.local_replay_only);
+}
+
+#[test]
+fn a_check_the_runner_timed_out_is_recorded_as_timed_out() {
+    if !sandbox_available() {
+        return;
+    }
+    let lane = Lane::new(
+        &run_checks(&["slow"]),
+        json!([{"id": "slow", "command": "sleep 6"}]),
+    );
+    // The check overruns its 2 s limit, so the builder saw a failure; the verifier then runs
+    // the full six seconds and passes it, which is a divergence: the lane is refuted.
+    run_expecting(
+        &lane,
+        &[Path::new("--check-timeout-secs"), Path::new("2")],
+        2,
+    );
+    let record = check_record(&lane, "slow");
+    assert_eq!(record["end"], json!({"kind": "timed_out"}), "{record}");
+    assert_eq!(record["exit_status"], -1, "{record}");
+    assert_eq!(record["attempts"], 1, "{record}");
+    assert!(
+        record["duration_ms"].as_u64().unwrap() >= 2000,
+        "it ran to its limit: {record}"
+    );
+    assert!(record["output_len"].as_u64().unwrap() > 0, "{record}");
+    assert_eq!(record["output_sha256"].as_str().unwrap().len(), 64);
+    assert_eq!(lane.verdict()["failedChecks"], json!(["slow"]));
+}
+
+#[test]
+fn a_capsule_naming_the_remote_tracking_ref_that_held_the_base_commit() {
+    if !sandbox_available() {
+        return;
+    }
+    let lane = lane();
+    let remote = var_tmp("cp-ver-remote-");
+    git(remote.path(), &["init", "-q", "--bare"]);
+    git(
+        &lane.repo,
+        &["remote", "add", "origin", remote.path().to_str().unwrap()],
+    );
+    git(
+        &lane.repo,
+        &["push", "-q", "origin", "HEAD:refs/heads/main"],
+    );
+    run_expecting(&lane, &[], 0);
+    let capsule = Capsule::read(&lane.capsule_dir()).unwrap();
+    assert_eq!(capsule.base_remote.as_deref(), Some("origin/main"));
+    assert!(!capsule.local_replay_only);
+    // A name, never the address, which can carry a credential.
+    let raw = fs::read_to_string(lane.capsule_dir().join("capsule.json")).unwrap();
+    assert!(!raw.contains(remote.path().to_str().unwrap()), "{raw}");
+}
+
+/// The seal covers the new records: a shorter duration, a different attempt count and a
+/// different output hash in `checks/<id>.json` are each refused (exit 4, naming the file), and the
+/// untouched capsule still reproduces.
+#[test]
+fn editing_a_recorded_duration_attempts_or_output_hash_fails_verify() {
+    if !sandbox_available() {
+        return;
+    }
+    let lane = flip_lane();
+    run_expecting(&lane, &[], 0);
+    let path = lane.capsule_dir().join("checks/flip.json");
+    let original = fs::read(&path).unwrap();
+    for (field, value) in [
+        ("duration_ms", json!(1)),
+        ("attempts", json!(1)),
+        ("output_sha256", json!(sha256_hex(b"something else"))),
+    ] {
+        let mut record: Value = serde_json::from_slice(&original).unwrap();
+        record[field] = value;
+        fs::write(&path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+        let out = replay(&lane);
+        assert_eq!(out.status.code(), Some(4), "{field}: {}", text(&out));
+        let err = String::from_utf8_lossy(&out.stderr).to_string();
+        assert!(
+            err.contains("tampered") && err.contains("checks/flip.json"),
+            "{field}: {err}"
+        );
+    }
+    fs::write(&path, &original).unwrap();
+    let out = replay(&lane);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+}
+
+/// A capsule made before runs were recorded has `exit_status` 0 or 1, one attempt, no duration,
+/// an empty output hash and neither `output_len` nor `end`. Sealed again over those bytes, as the
+/// older writer would have sealed it, it still reads and reproduces.
+#[test]
+fn a_capsule_whose_check_records_predate_the_run_fields_still_reproduces() {
+    if !sandbox_available() {
+        return;
+    }
+    let lane = flip_lane();
+    run_expecting(&lane, &[], 0);
+    let capsule = lane.capsule_dir();
+    let record = check_record(&lane, "flip");
+    let old = json!({
+        "command": record["command"],
+        "exit_status": 0,
+        "attempts": 1,
+        "duration_ms": 0,
+        "output_sha256": "",
+    });
+    let old_bytes = serde_json::to_vec_pretty(&old).unwrap();
+    fs::write(capsule.join("checks/flip.json"), &old_bytes).unwrap();
+    let path = capsule.join("capsule.json");
+    let mut json: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    json["file_hashes"]["checks/flip.json"] = json!(Capsule::hash_bytes(&old_bytes));
+    let raw = serde_json::to_vec_pretty(&json).unwrap();
+    fs::write(&path, &raw).unwrap();
+    fs::write(capsule.join("capsule.sha256"), Capsule::hash_bytes(&raw)).unwrap();
+
+    Capsule::read(&capsule).expect("an older capsule reads");
+    let out = replay(&lane);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    assert_eq!(stdout(&out).trim(), "reproduced");
 }

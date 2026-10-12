@@ -38,7 +38,7 @@
 
 use crate::escalate::{Ask, EscalationId, LaneState, NoteId, Origin, Queue};
 use crate::wire::{self, Read};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
 use std::future::Future;
@@ -64,12 +64,57 @@ pub type CheckTable = BTreeSet<String>;
 /// It is given the check id only; the command stays on the runner's side.
 pub type RunCheck = Arc<dyn Fn(&str) -> BoxFuture<'static, CheckOutcome> + Send + Sync>;
 
-/// What running a check produced. Only the exit status is recorded as the
-/// verdict; the output is for the builder to read.
+/// How a `run_check` command ended. Serialized as the capsule's `end` field of a check
+/// (`{"kind":"exited","code":0}`, `{"kind":"signaled","signal":9}`, `{"kind":"timed_out"}`,
+/// `{"kind":"not_run"}`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CheckEnd {
+    /// The command exited on its own with this status.
+    Exited { code: i32 },
+    /// The command was ended by this signal that nobody on the runner's side sent.
+    Signaled { signal: i32 },
+    /// The command ran past its limit and the runner killed its process group.
+    TimedOut,
+    /// The command never started (no sandbox, no such check, the host could not be reached).
+    NotRun,
+}
+
+/// What running a check produced. Only the exit status decides pass or fail; the output
+/// is for the builder to read, and the rest is what the capsule records about the run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CheckOutcome {
+    /// The command's exit code, or -1 when it had none (a signal, the timeout, never started).
     pub exit_status: i32,
+    /// The command's stdout then stderr (or the refusal's reason).
     pub output: String,
+    /// How the command ended.
+    pub end: CheckEnd,
+    /// The command's wall-clock time in milliseconds, from just before it started to just after
+    /// its group was reaped. Zero for a command that never started.
+    pub duration_ms: u64,
+}
+
+impl CheckOutcome {
+    /// A command that exited by itself with `code`.
+    pub fn exited(code: i32, output: impl Into<String>, duration_ms: u64) -> Self {
+        Self {
+            exit_status: code,
+            output: output.into(),
+            end: CheckEnd::Exited { code },
+            duration_ms,
+        }
+    }
+
+    /// A command that never ran, with the reason as its output.
+    pub fn not_run(output: impl Into<String>) -> Self {
+        Self {
+            exit_status: -1,
+            output: output.into(),
+            end: CheckEnd::NotRun,
+            duration_ms: 0,
+        }
+    }
 }
 
 /// Bind the lane's socket, replacing a stale socket file left by a previous
@@ -363,7 +408,12 @@ async fn run_check(ctx: &Context, id: Option<String>) -> Result<Value, String> {
     }
     let outcome = (ctx.run)(&id).await;
     let passed = outcome.exit_status == 0;
-    let recorded = lock(&ctx.queue)?.record_check(&ctx.lane, &id, passed);
+    // What this run was, for the capsule: kept apart from the pass or fail the escalate-early
+    // rule reads, and counted even when recording the pass or fail fails.
+    let mut queue = lock(&ctx.queue)?;
+    queue.record_check_run(&ctx.lane, &id, &outcome);
+    let recorded = queue.record_check(&ctx.lane, &id, passed);
+    drop(queue);
     let escalation = match recorded {
         Ok(escalation) => escalation,
         Err(e) => {
@@ -398,7 +448,8 @@ fn truncate(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::escalate::{AskKind, Opt, SystemClock, Verdict};
+    use crate::escalate::{AskKind, CheckRunRecord, Opt, SystemClock, Verdict};
+    use sha2::{Digest, Sha256};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::TempDir;
     use tokio::io::AsyncBufReadExt;
@@ -428,6 +479,22 @@ mod tests {
 
     /// [`harness`] with a session-end signal.
     fn harness_with(exit_status: i32, end: Option<SessionEndSignal>) -> Harness {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = calls.clone();
+        let run: RunCheck = Arc::new(move |id: &str| -> BoxFuture<'static, CheckOutcome> {
+            counter.fetch_add(1, Ordering::SeqCst);
+            let output = format!("ran {id}");
+            Box::pin(async move { CheckOutcome::exited(exit_status, output, 3) })
+        });
+        harness_running(run, calls, end)
+    }
+
+    /// A server whose `run_check` is `run`; `calls` is whatever count the caller keeps.
+    fn harness_running(
+        run: RunCheck,
+        calls: Arc<AtomicUsize>,
+        end: Option<SessionEndSignal>,
+    ) -> Harness {
         let tmp = TempDir::new().unwrap();
         let sock_dir = tmp.path().join("sock");
         std::fs::create_dir(&sock_dir).unwrap();
@@ -435,18 +502,6 @@ mod tests {
         let queue = Arc::new(Mutex::new(
             Queue::new(&tmp.path().join("control"), Box::new(SystemClock)).unwrap(),
         ));
-        let calls = Arc::new(AtomicUsize::new(0));
-        let counter = calls.clone();
-        let run: RunCheck = Arc::new(move |id: &str| -> BoxFuture<'static, CheckOutcome> {
-            counter.fetch_add(1, Ordering::SeqCst);
-            let output = format!("ran {id}");
-            Box::pin(async move {
-                CheckOutcome {
-                    exit_status,
-                    output,
-                }
-            })
-        });
         let checks: CheckTable = ["c1", "c2"].iter().map(|s| s.to_string()).collect();
         let task = tokio::spawn(serve_signalling(
             bind(&sock).unwrap(),
@@ -939,5 +994,130 @@ mod tests {
             format!("{}\n[output truncated]", "é".repeat(2))
         );
         assert_eq!(truncate("short", 100), "short");
+    }
+    /// A server whose `run_check` plays `outcomes` in order, one per call, whatever the id.
+    fn harness_playing(outcomes: Vec<CheckOutcome>) -> Harness {
+        let queue = Mutex::new(std::collections::VecDeque::from(outcomes));
+        let run: RunCheck = Arc::new(move |_id: &str| -> BoxFuture<'static, CheckOutcome> {
+            let next = queue.lock().unwrap().pop_front().expect("an outcome left");
+            Box::pin(async move { next })
+        });
+        harness_running(run, Arc::new(AtomicUsize::new(0)), None)
+    }
+
+    fn sha256_of(text: &str) -> String {
+        format!("{:x}", Sha256::digest(text.as_bytes()))
+    }
+
+    #[tokio::test]
+    async fn a_failing_then_passing_check_records_two_attempts_and_the_passing_run() {
+        let h = harness_playing(vec![
+            CheckOutcome::exited(1, "bad\n", 11),
+            CheckOutcome::exited(0, "good\n", 7),
+            CheckOutcome::exited(0, "other\n", 5),
+        ]);
+        let mut c = Client::connect(&h).await;
+        assert_eq!(
+            c.call(json!({"op": "run_check", "id": "c1"})).await["passed"],
+            false
+        );
+        assert_eq!(
+            c.call(json!({"op": "run_check", "id": "c1"})).await["passed"],
+            true
+        );
+        c.call(json!({"op": "run_check", "id": "c2"})).await;
+
+        let runs = h.queue.lock().unwrap().check_runs(LANE);
+        assert_eq!(
+            runs["c1"],
+            CheckRunRecord {
+                attempts: 2,
+                exit_status: 0,
+                end: CheckEnd::Exited { code: 0 },
+                duration_ms: 7,
+                output_sha256: sha256_of("good\n"),
+                output_len: 5,
+            }
+        );
+        assert_eq!(runs["c2"].attempts, 1);
+        assert_eq!(runs["c2"].output_sha256, sha256_of("other\n"));
+        // A check never run has no record.
+        assert!(h.queue.lock().unwrap().check_runs("other-lane").is_empty());
+    }
+
+    #[tokio::test]
+    async fn attempts_count_over_the_whole_lane_and_survive_a_reassign() {
+        let h = harness_playing(vec![
+            CheckOutcome::exited(1, "a", 1),
+            CheckOutcome::exited(0, "b", 1),
+        ]);
+        let mut c = Client::connect(&h).await;
+        c.call(json!({"op": "run_check", "id": "c1"})).await;
+        // `reassign` clears the pass or fail the escalate-early rule keeps; the count stays.
+        h.queue.lock().unwrap().reassign(LANE).unwrap();
+        assert!(h.queue.lock().unwrap().check_results(LANE).is_empty());
+        c.call(json!({"op": "run_check", "id": "c1"})).await;
+        assert_eq!(h.queue.lock().unwrap().check_runs(LANE)["c1"].attempts, 2);
+    }
+
+    #[tokio::test]
+    async fn a_timeout_a_signal_and_a_refusal_are_recorded_as_such() {
+        let timed_out = CheckOutcome {
+            exit_status: -1,
+            output: "timed out".into(),
+            end: CheckEnd::TimedOut,
+            duration_ms: 2000,
+        };
+        let signaled = CheckOutcome {
+            exit_status: -1,
+            output: String::new(),
+            end: CheckEnd::Signaled { signal: 9 },
+            duration_ms: 40,
+        };
+        let h = harness_playing(vec![
+            timed_out,
+            signaled,
+            CheckOutcome::not_run("sandbox unavailable"),
+        ]);
+        let mut c = Client::connect(&h).await;
+        for id in ["c1", "c2", "c1"] {
+            let r = c.call(json!({"op": "run_check", "id": id})).await;
+            assert_eq!(r["passed"], false, "{r}");
+        }
+        let runs = h.queue.lock().unwrap().check_runs(LANE);
+        // c1 ran twice: the timeout, then the refusal, which is the last run.
+        assert_eq!(runs["c1"].attempts, 2);
+        assert_eq!(runs["c1"].end, CheckEnd::NotRun);
+        assert_eq!(runs["c1"].duration_ms, 0);
+        assert_eq!(runs["c2"].end, CheckEnd::Signaled { signal: 9 });
+        assert_eq!(runs["c2"].exit_status, -1);
+        assert_eq!(runs["c2"].output_len, 0);
+    }
+
+    #[tokio::test]
+    async fn a_timed_out_last_run_is_recorded_and_the_ends_serialize_by_kind() {
+        let h = harness_playing(vec![CheckOutcome {
+            exit_status: -1,
+            output: "timed out after 2s".into(),
+            end: CheckEnd::TimedOut,
+            duration_ms: 2001,
+        }]);
+        let mut c = Client::connect(&h).await;
+        c.call(json!({"op": "run_check", "id": "c1"})).await;
+        let run = h.queue.lock().unwrap().check_runs(LANE)["c1"].clone();
+        assert_eq!(run.end, CheckEnd::TimedOut);
+        assert_eq!(run.duration_ms, 2001);
+        assert_eq!(
+            serde_json::to_value(run.end).unwrap(),
+            json!({"kind": "timed_out"})
+        );
+        assert_eq!(
+            serde_json::to_value(CheckEnd::Signaled { signal: 15 }).unwrap(),
+            json!({"kind": "signaled", "signal": 15})
+        );
+        assert_eq!(
+            serde_json::to_value(CheckEnd::Exited { code: 3 }).unwrap(),
+            json!({"kind": "exited", "code": 3})
+        );
     }
 }

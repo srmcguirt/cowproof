@@ -1757,6 +1757,106 @@ fn a_redirect_starts_a_fresh_session_whose_prompt_is_the_new_packet() {
 }
 
 #[test]
+fn a_redirect_writes_a_second_packet_version_that_the_capsule_seals() {
+    if !sandbox_available() {
+        return;
+    }
+    let h = owned_packet(&asks_first("Right task?", true, &then_checks()));
+    let redirected = h
+        .packet_text
+        .replace("Change the README.", "Change the README, then stop.");
+    let packet = h.work.path().join("redirect.md");
+    fs::write(&packet, &redirected).unwrap();
+    let mut child = start(&h);
+    let id = wait_for_ask(&h, &mut child, 1);
+    rule(&h, &id, &["--redirect", packet.to_str().unwrap()]);
+    let out = finish(child);
+    assert_eq!(out.status.code(), Some(0), "{}", stdout_of(&out));
+
+    let dir = h.lane().join("control/capsule");
+    // Both versions, byte for byte: the packet the lane started with, then the redirect.
+    assert_eq!(
+        fs::read_to_string(dir.join("packets/v1.md")).unwrap(),
+        h.packet_text
+    );
+    assert_eq!(
+        fs::read_to_string(dir.join("packets/v2.md")).unwrap(),
+        redirected
+    );
+    let index: Value =
+        serde_json::from_str(&fs::read_to_string(dir.join("packets/versions.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        index,
+        json!([
+            {"version": 1, "file": "v1.md", "introduced_by": null},
+            // The escalation whose ruling brought the version.
+            {"version": 2, "file": "v2.md", "introduced_by": id},
+        ])
+    );
+    let capsule = Capsule::read(&dir).expect("the capsule reads back");
+    for file in ["packets/v1.md", "packets/v2.md", "packets/versions.json"] {
+        assert!(capsule.file_hashes.contains_key(file), "{file} not sealed");
+    }
+
+    // A changed packet version is refused by the seal, and so by `cowproof verify`.
+    let original = fs::read(dir.join("packets/v2.md")).unwrap();
+    fs::write(dir.join("packets/v2.md"), "Change nothing.\n").unwrap();
+    assert!(matches!(
+        Capsule::read(&dir),
+        Err(cowproof_prove::CapsuleError::HashMismatch(name, _, _)) if name == "packets/v2.md"
+    ));
+    let workdir = var_tmp("cp-run-verify-");
+    let out = output(
+        Command::new(&h.cowproof)
+            .env("HOME", workdir.path())
+            .env_remove("ANTHROPIC_API_KEY")
+            .arg("verify")
+            .arg(&dir)
+            .arg("--repo")
+            .arg(&h.repo)
+            .arg("--workdir")
+            .arg(workdir.path().join("w")),
+    );
+    assert_eq!(out.status.code(), Some(4), "{}", stdout_of(&out));
+    let err = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(
+        err.contains("tampered") && err.contains("packets/v2.md"),
+        "{err}"
+    );
+    fs::write(dir.join("packets/v2.md"), original).unwrap();
+    Capsule::read(&dir).expect("restored, the capsule reads again");
+}
+
+#[test]
+fn a_lane_with_no_redirect_seals_exactly_one_packet_version() {
+    if !sandbox_available() {
+        return;
+    }
+    let h = owned_packet(&run_checks(&["edit", "made"]));
+    h.run_expecting(0);
+    let dir = h.lane().join("control/capsule");
+    assert_eq!(
+        fs::read_to_string(dir.join("packets/v1.md")).unwrap(),
+        h.packet_text
+    );
+    assert!(!dir.join("packets/v2.md").exists());
+    let index: Value =
+        serde_json::from_str(&fs::read_to_string(dir.join("packets/versions.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        index,
+        json!([{"version": 1, "file": "v1.md", "introduced_by": null}])
+    );
+    assert!(
+        Capsule::read(&dir)
+            .unwrap()
+            .file_hashes
+            .contains_key("packets/v1.md")
+    );
+}
+
+#[test]
 fn a_redirect_with_another_lanes_id_is_refused_and_nothing_launches() {
     if !sandbox_available() {
         return;
