@@ -289,9 +289,25 @@ fn is_script(bin: &Path) -> bool {
         .is_ok_and(|()| &head == b"#!")
 }
 
+/// `<bin> --version` with a cleared environment: the director's `PATH`, and `HOME` and
+/// `CODEX_HOME` at `home`, a throwaway directory. Without them Codex falls back to the home in the
+/// user database and writes its helper links under the director's real `~/.codex`.
+fn version_command(bin: &Path, director_path: &str, home: &Path) -> Command {
+    let mut command = Command::new(bin);
+    command
+        .arg("--version")
+        .env_clear()
+        .env("PATH", director_path)
+        .env("HOME", home)
+        .env("CODEX_HOME", home)
+        .stdin(Stdio::null())
+        .kill_on_drop(true);
+    command
+}
+
 /// Find Codex on the director's `PATH` (or as a path relative to `cwd`) and ask its version.
 /// The error is a line for the preflight to print. The environment is cleared first, so no key
-/// reaches the process.
+/// reaches the process, and Codex runs with a throwaway home (see [`version_command`]).
 pub(crate) async fn locate(name: &str, director_path: &str, cwd: &Path) -> Result<Codex, String> {
     let found = resolve_executable(name, director_path, cwd).map_err(|e| format!("{e}"))?;
     let mut bin = found
@@ -307,13 +323,9 @@ pub(crate) async fn locate(name: &str, director_path: &str, cwd: &Path) -> Resul
                 )
             })?;
     }
-    let mut command = Command::new(&bin);
-    command
-        .arg("--version")
-        .env_clear()
-        .env("PATH", director_path)
-        .stdin(Stdio::null())
-        .kill_on_drop(true);
+    let home = tempfile::TempDir::new()
+        .map_err(|e| format!("cannot make a throwaway home for {}: {e}", bin.display()))?;
+    let mut command = version_command(&bin, director_path, home.path());
     match tokio::time::timeout(VERSION_TIMEOUT, command.output()).await {
         Err(_) => Err(format!(
             "{} --version did not finish in {VERSION_TIMEOUT:?}",
@@ -449,6 +461,33 @@ pub(crate) fn codex_builder_command(l: &CodexLaunch<'_>) -> Result<Command> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn version_probe_runs_with_a_throwaway_codex_home() {
+        let home = Path::new("/nonexistent/probe-home");
+        let command = version_command(Path::new("/bin/codex"), "/usr/bin", home);
+        let envs: BTreeMap<_, _> = command
+            .as_std()
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.map(|v| v.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+        assert_eq!(
+            envs.keys().collect::<Vec<_>>(),
+            ["CODEX_HOME", "HOME", "PATH"],
+            "only these three reach the probe"
+        );
+        assert_eq!(
+            envs["CODEX_HOME"].as_deref(),
+            Some("/nonexistent/probe-home")
+        );
+        assert_eq!(envs["HOME"].as_deref(), Some("/nonexistent/probe-home"));
+        assert_eq!(envs["PATH"].as_deref(), Some("/usr/bin"));
+    }
 
     fn parse(text: &str) -> Result<CodexConfig> {
         CodexConfig::parse(Some(text))

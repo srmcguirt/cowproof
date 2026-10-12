@@ -45,8 +45,8 @@ portkit-cli.workspace = true
 portkit-mcp.workspace = true
 portkit-plugin.workspace = true
 portkit-read.workspace = true
+tempfile.workspace = true
 
 [dev-dependencies]
-tempfile.workspace = true
 sha2.workspace = true
 libc = "0.2"
