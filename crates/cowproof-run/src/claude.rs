@@ -24,6 +24,51 @@ const BUILDER_BUILTIN_TOOLS: &str = "Bash,Read,Edit,Write,Glob,Grep";
 const BUILDER_DISALLOWED_TOOLS: &str =
     "Task,Workflow,SendMessage,ScheduleWakeup,CronCreate,Skill,EnterWorktree";
 
+/// Which credential a Claude Code lane presents (D2, D28 clause 6).
+///
+/// Either way the lane holds only the proxy's placeholder and the real credential stays in the
+/// proxy. The two differ in the variable that carries the placeholder, because Claude Code reads
+/// them differently: an API key goes out as `x-api-key`, an OAuth token (`claude setup-token`)
+/// as `Authorization: Bearer` with the `oauth-2025-04-20` beta flag. Claude Code prefers an API
+/// key to the token when both are set (measured against 2.1.296 on 2026-10-11), so a launch
+/// sets exactly one of them and never both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Credential {
+    /// `ANTHROPIC_API_KEY`: the default, the supported path of the first release.
+    #[default]
+    ApiKey,
+    /// `CLAUDE_CODE_OAUTH_TOKEN`: the owner's Claude subscription, through a long-lived token.
+    Subscription,
+}
+
+impl Credential {
+    /// The mode as `run.json`, the capsule and `watch` name it.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::ApiKey => "api-key",
+            Self::Subscription => "subscription",
+        }
+    }
+
+    /// The kind of credential the proxy holds for a subscription lane; none for an API key
+    /// (each runtime's API key has its own provider and needs no extra label).
+    pub fn kind(self) -> Option<&'static str> {
+        match self {
+            Self::ApiKey => None,
+            Self::Subscription => Some("claude-oauth-token"),
+        }
+    }
+
+    /// The environment variable that carries the placeholder in the lane, and that holds the
+    /// real credential in the director's environment.
+    pub fn env_var(self) -> &'static str {
+        match self {
+            Self::ApiKey => "ANTHROPIC_API_KEY",
+            Self::Subscription => "CLAUDE_CODE_OAUTH_TOKEN",
+        }
+    }
+}
+
 /// Complete specification for a Claude Code invocation.
 ///
 /// Contains lane configuration, model selection, credentials, paths to configuration files,
@@ -55,6 +100,8 @@ pub struct ClaudeSpec {
     pub cache_ttl: String,
     /// PATH environment variable (colon-separated absolute paths, never read from process).
     pub path: String,
+    /// Which variable carries the placeholder: the API key's or the subscription token's.
+    pub credential: Credential,
 }
 
 /// A complete, validated invocation of Claude Code.
@@ -68,7 +115,8 @@ pub struct ClaudeInvocation {
     /// Arguments in stable order, never including `--bare`.
     pub args: Vec<String>,
     /// Complete environment: HOME, CLAUDE_CONFIG_DIR, CLAUDE_CODE_PROMPT_CACHE_TTL,
-    /// ANTHROPIC_BASE_URL, ANTHROPIC_API_KEY (placeholder), PATH, CARGO_HOME.
+    /// ANTHROPIC_BASE_URL, the placeholder in ANTHROPIC_API_KEY or, for a subscription lane,
+    /// CLAUDE_CODE_OAUTH_TOKEN (never both), PATH, CARGO_HOME.
     pub env: Vec<(String, String)>,
     /// Working directory (the lane clone).
     pub cwd: PathBuf,
@@ -81,7 +129,7 @@ impl fmt::Debug for ClaudeInvocation {
             .env
             .iter()
             .map(|(k, v)| {
-                if k == "ANTHROPIC_API_KEY" {
+                if k == "ANTHROPIC_API_KEY" || k == "CLAUDE_CODE_OAUTH_TOKEN" {
                     (k.clone(), "***REDACTED***".to_string())
                 } else {
                     (k.clone(), v.clone())
@@ -236,7 +284,7 @@ pub fn claude_command(spec: &ClaudeSpec) -> Result<ClaudeInvocation> {
             spec.proxy_base_url.clone(),
         ),
         (
-            "ANTHROPIC_API_KEY".to_string(),
+            spec.credential.env_var().to_string(),
             spec.placeholder_key.clone(),
         ),
     ];
@@ -289,6 +337,14 @@ mod tests {
             resume_session_id: None,
             cache_ttl: "1h".to_string(),
             path: "/usr/local/bin:/usr/bin:/bin".to_string(),
+            credential: Credential::ApiKey,
+        }
+    }
+
+    fn subscription_spec() -> ClaudeSpec {
+        ClaudeSpec {
+            credential: Credential::Subscription,
+            ..test_spec()
         }
     }
 
@@ -721,5 +777,86 @@ mod tests {
                 tool
             );
         }
+    }
+
+    // ------------------------------------------------------------------ subscription (D2)
+
+    #[test]
+    fn the_default_credential_is_the_api_key_and_the_names_are_stable() {
+        assert_eq!(Credential::default(), Credential::ApiKey);
+        assert_eq!(Credential::ApiKey.name(), "api-key");
+        assert_eq!(Credential::Subscription.name(), "subscription");
+        assert_eq!(Credential::ApiKey.kind(), None);
+        assert_eq!(Credential::Subscription.kind(), Some("claude-oauth-token"));
+        assert_eq!(Credential::ApiKey.env_var(), "ANTHROPIC_API_KEY");
+        assert_eq!(
+            Credential::Subscription.env_var(),
+            "CLAUDE_CODE_OAUTH_TOKEN"
+        );
+    }
+
+    #[test]
+    fn a_subscription_launch_holds_the_placeholder_in_the_oauth_variable_and_no_api_key() {
+        let inv = claude_command(&subscription_spec()).unwrap();
+        let env: std::collections::HashMap<_, _> = inv.env.iter().cloned().collect();
+        assert_eq!(
+            env.get("CLAUDE_CODE_OAUTH_TOKEN").map(String::as_str),
+            Some("placeholder-key-123")
+        );
+        // Claude Code prefers an API key to the OAuth token, so a lane that held both would
+        // silently bill the key: the variable must be absent, not merely empty.
+        for banned in ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"] {
+            assert!(
+                !env.contains_key(banned),
+                "{banned} in a subscription launch: {:?}",
+                inv.env
+            );
+        }
+        let mut keys: Vec<&str> = inv.env.iter().map(|(k, _)| k.as_str()).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec![
+                "ANTHROPIC_BASE_URL",
+                "CARGO_HOME",
+                "CLAUDE_CODE_OAUTH_TOKEN",
+                "CLAUDE_CODE_PROMPT_CACHE_TTL",
+                "CLAUDE_CONFIG_DIR",
+                "HOME",
+                "PATH",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_subscription_launch_carries_the_isolation_flags_and_no_bare() {
+        let inv = claude_command(&subscription_spec()).unwrap();
+        // SC-4: no setting source is loaded (the clone's `.claude/settings*.json` and the user's
+        // are ignored; only cowproof's `--settings` file applies) and only the MCP servers of
+        // cowproof's `--mcp-config` run. Both are values `claude --help` documents.
+        let idx = inv
+            .args
+            .iter()
+            .position(|a| a == "--setting-sources")
+            .expect("--setting-sources missing from a subscription launch");
+        assert_eq!(inv.args[idx + 1], "");
+        assert!(
+            inv.args.iter().any(|a| a == "--strict-mcp-config"),
+            "--strict-mcp-config missing from a subscription launch: {:?}",
+            inv.args
+        );
+        // `--bare` never reads the OAuth token (OAuth and keychain are never read), so it would
+        // break the subscription launch; the API-key launch does not use it either.
+        assert!(!inv.args.iter().any(|a| a == "--bare"));
+        // The two modes differ in the credential variable alone.
+        assert_eq!(inv.args, claude_command(&test_spec()).unwrap().args);
+    }
+
+    #[test]
+    fn debug_redacts_the_placeholder_in_the_oauth_variable_too() {
+        let inv = claude_command(&subscription_spec()).unwrap();
+        let debug_str = format!("{inv:?}");
+        assert!(!debug_str.contains("placeholder-key-123"), "{debug_str}");
+        assert!(debug_str.contains("***REDACTED***"), "{debug_str}");
     }
 }

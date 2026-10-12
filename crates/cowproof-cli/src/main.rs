@@ -337,6 +337,16 @@ struct RunOneArgs {
     /// `~/.config/cowproof/hosts.json`. Not combined with `--unsandboxed`
     #[arg(long, value_name = "ALIAS")]
     host: Option<String>,
+    /// Which Claude credential the lane spends (D2): `api-key` (the default) holds
+    /// `ANTHROPIC_API_KEY` in the proxy; `subscription` holds the owner's long-lived
+    /// `CLAUDE_CODE_OAUTH_TOKEN` (the token `claude setup-token` prints, which you export
+    /// yourself) in the proxy and gives the lane a placeholder. Neither mode falls back to the
+    /// other, and a missing credential stops the run (exit 4). Subscription lanes run Claude
+    /// rungs only, locally (not with `--host`), and the mode is recorded in `run.json`, the
+    /// capsule and `cowproof watch`. A flag and not a `cowproof.toml` setting, so repository
+    /// content cannot choose whose bill a lane runs on
+    #[arg(long, value_enum, default_value_t = run::CredentialArg::ApiKey)]
+    credential: run::CredentialArg,
 }
 
 #[derive(Parser)]

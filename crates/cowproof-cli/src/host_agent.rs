@@ -1271,6 +1271,8 @@ fn builder_launch(
         prompt: &spec.prompt,
         resume: spec.resume_session_id.as_deref(),
         unsandboxed: false,
+        // Remote lanes run on an API key held by the director's proxy (D27).
+        credential: cowproof_run::claude::Credential::ApiKey,
     })?;
     Ok(BuilderLaunched {
         command,

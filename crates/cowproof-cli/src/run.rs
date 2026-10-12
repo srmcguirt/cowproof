@@ -58,7 +58,7 @@ use cowproof_prove::{
 use cowproof_run::{
     LaneLayout, NetworkMode, SandboxPolicy,
     bridge::bridge_port,
-    claude::{ClaudeSpec, claude_command},
+    claude::{ClaudeSpec, Credential, claude_command},
     codex::CodexPrice,
     deps::FetchOutcome,
     director::{self, VerdictEvent},
@@ -95,6 +95,55 @@ use tokio::time::Instant as TokioInstant;
 
 /// The provider the proxy forwards to.
 const UPSTREAM: &str = "https://api.anthropic.com";
+
+/// The environment variable that replaces [`UPSTREAM`], for the director only: tests point it at
+/// a fake on 127.0.0.1. It is never a `cowproof.toml` setting, so repository content cannot
+/// redirect the director's credential, and a replacement is recorded in `run.json`.
+const ANTHROPIC_UPSTREAM_ENV: &str = "COWPROOF_ANTHROPIC_UPSTREAM";
+
+/// The Anthropic upstream the proxy forwards to, and whether the director replaced it. A
+/// replacement that is not a usable `http(s)` base URL is an error.
+fn anthropic_upstream() -> Result<(String, bool)> {
+    match std::env::var_os(ANTHROPIC_UPSTREAM_ENV) {
+        Some(v) if !v.is_empty() => {
+            let url = v
+                .into_string()
+                .map_err(|_| anyhow!("{ANTHROPIC_UPSTREAM_ENV} is not valid UTF-8"))?;
+            // The proxy's own parser decides what a usable base URL is; a throwaway key is
+            // enough for that and is dropped at once.
+            ProxyConfig::new("x", url.clone())
+                .with_context(|| format!("{ANTHROPIC_UPSTREAM_ENV} is not usable"))?;
+            Ok((url, true))
+        }
+        _ => Ok((UPSTREAM.to_string(), false)),
+    }
+}
+
+/// `--credential`: which credential a Claude lane spends (D2, D28 clause 6).
+///
+/// It is a flag of the director's command and not a rung or `cowproof.toml` setting on purpose:
+/// the choice decides whose bill the lane runs on, and repository content (the base commit's
+/// `cowproof.toml`, a packet header) must not be able to move a lane from an API key onto the
+/// owner's subscription. It applies to the whole lane, so a `reassign` never changes it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, clap::ValueEnum)]
+pub enum CredentialArg {
+    /// `ANTHROPIC_API_KEY`, held by the proxy: the default.
+    #[default]
+    #[value(name = "api-key")]
+    ApiKey,
+    /// The owner's Claude subscription through `CLAUDE_CODE_OAUTH_TOKEN` (`claude setup-token`),
+    /// held by the proxy. Claude rungs only, local lanes only.
+    Subscription,
+}
+
+impl CredentialArg {
+    pub fn mode(self) -> Credential {
+        match self {
+            Self::ApiKey => Credential::ApiKey,
+            Self::Subscription => Credential::Subscription,
+        }
+    }
+}
 
 /// The longest one `run_check` may run before it is killed.
 pub(crate) const CHECK_TIMEOUT: Duration = Duration::from_secs(20 * 60);
@@ -158,8 +207,14 @@ const BUILDER_DENY: [&str; 2] = ["WebFetch", "WebSearch"];
 /// The real credentials the proxy holds, one per provider it serves. They live in the
 /// director's process and the proxy's memory, nowhere else.
 pub struct ProxyKeys {
-    /// The Anthropic key, for `claude` rungs.
+    /// The Anthropic credential, for `claude` rungs: an API key, or with `anthropic_subscription`
+    /// the OAuth token of the owner's subscription.
     pub anthropic: Option<String>,
+    /// `anthropic` is a subscription OAuth token: the route sends it as `Authorization: Bearer`
+    /// and takes only a bearer placeholder from the lane (D2).
+    pub anthropic_subscription: bool,
+    /// The Anthropic upstream; `None` is the real one.
+    pub anthropic_upstream: Option<String>,
     /// The OpenRouter key and the upstream to send it to, for `openrouter` rungs.
     pub openrouter: Option<(String, String)>,
     /// The OpenAI key, the upstream to send it to and the models a request may name, for `codex`
@@ -173,6 +228,8 @@ impl From<String> for ProxyKeys {
     fn from(anthropic: String) -> Self {
         ProxyKeys {
             anthropic: Some(anthropic),
+            anthropic_subscription: false,
+            anthropic_upstream: None,
             openrouter: None,
             openai: None,
         }
@@ -217,7 +274,13 @@ pub async fn start_proxy(
     let keys = keys.into();
     let mut config: Option<ProxyConfig> = None;
     if let Some(key) = keys.anthropic {
-        config = Some(ProxyConfig::new(key, UPSTREAM).context("configuring the egress proxy")?);
+        let upstream = keys.anthropic_upstream.as_deref().unwrap_or(UPSTREAM);
+        let route = if keys.anthropic_subscription {
+            ProxyConfig::for_subscription(key, upstream)
+        } else {
+            ProxyConfig::new(key, upstream)
+        };
+        config = Some(route.context("configuring the egress proxy")?);
     }
     if let Some((key, upstream)) = keys.openrouter {
         config = Some(
@@ -723,6 +786,8 @@ pub(crate) struct BuilderLaunch<'a> {
     pub resume: Option<&'a str>,
     /// Launch without the OS sandbox (trusted local experiments only).
     pub unsandboxed: bool,
+    /// Which variable carries the placeholder: the API key's or the subscription token's.
+    pub credential: Credential,
 }
 
 /// The builder's command: the bridge wrapper, then `claude`, under the builder sandbox policy
@@ -744,6 +809,7 @@ pub(crate) fn builder_command(l: &BuilderLaunch<'_>) -> Result<Command> {
         resume_session_id: l.resume.map(str::to_string),
         cache_ttl: "1h".to_string(),
         path: l.path.to_string(),
+        credential: l.credential,
     })?;
     invocation.env.push((
         "COWPROOF_RUNNER_SOCKET".to_string(),
@@ -880,6 +946,9 @@ struct Launcher {
     has_anthropic_key: bool,
     has_openrouter_key: bool,
     has_openai_key: bool,
+    /// The credential the Claude rungs of this lane use (`--credential`). A subscription lane
+    /// holds no key for any other runtime, so it runs Claude rungs only.
+    credential: Credential,
     /// The director's price of every Codex model the lane may run, by exact model id, from the
     /// base commit's `cowproof.toml`. A launch on a `codex` rung with no entry here is refused:
     /// the cost cap cannot act without a price.
@@ -954,6 +1023,13 @@ impl Launcher {
     fn runtime_refusal(&self, runtime: Runtime) -> Option<String> {
         if let Some(refusal) = runtime.adapter_refusal() {
             return Some(refusal);
+        }
+        if self.credential == Credential::Subscription && runtime != Runtime::Claude {
+            return Some(format!(
+                "this lane runs on a Claude subscription (--credential subscription), which holds \
+                 no key for the `{}` runtime: subscription lanes run Claude rungs only",
+                runtime.name()
+            ));
         }
         match runtime {
             Runtime::Claude => {
@@ -1230,6 +1306,7 @@ impl Launcher {
                         prompt: &launch.prompt,
                         resume: launch.resume.as_deref(),
                         unsandboxed: self.unsandboxed,
+                        credential: self.credential,
                     })?;
                     (command, None)
                 }
@@ -2647,6 +2724,8 @@ async fn next_signal(sigint: &mut Signal, sigterm: &mut Signal) -> &'static str 
 #[derive(Clone, Copy)]
 struct RunKind<'a> {
     unsandboxed: bool,
+    /// The credential mode the lane was started with, recorded as `authMode` (D28 clause 6).
+    credential: Credential,
     /// The remote host that ran the builder, if any.
     host: Option<&'a str>,
 }
@@ -2675,6 +2754,10 @@ fn record_interrupted(
         "host": kind.host,
         "status": "interrupted",
         "unsandboxed": kind.unsandboxed,
+        "authMode": kind.credential.name(),
+        "credentialKind": kind.credential.kind(),
+        // Every credential stays in the director's proxy (D24): no lane holds one.
+        "credentialInLane": false,
         "signal": signal_name,
         "exitCode": INTERRUPTED_EXIT_CODE,
         "durationMs": started.elapsed().as_millis() as u64,
@@ -2727,6 +2810,41 @@ fn lane_timeout(header_min: Option<u64>, flag_secs: Option<u64>, flag_min: u64) 
     }
 }
 
+/// The real OAuth token of a subscription lane (`--credential subscription`), or why the lane
+/// cannot start: a remote host (not built, not tested) or no token in the director's
+/// environment. `token` is the value of `CLAUDE_CODE_OAUTH_TOKEN`. It never falls back to an
+/// API key: a refusal here stops the run before anything is created. For an API-key lane there
+/// is nothing to read and the answer is `None`; the token is never looked at.
+fn subscription_token(
+    credential: Credential,
+    host: Option<&str>,
+    token: Option<std::ffi::OsString>,
+) -> std::result::Result<Option<String>, String> {
+    if credential != Credential::Subscription {
+        return Ok(None);
+    }
+    if host.is_some() {
+        return Err(
+            "--credential subscription cannot be combined with --host: remote lanes run on an \
+             API key held by the director's proxy (D27), and a subscription token has not been \
+             built or tested for a remote host; cowproof never copies or relays a login"
+                .to_string(),
+        );
+    }
+    let var = Credential::Subscription.env_var();
+    match token {
+        Some(v) if !v.is_empty() => v
+            .into_string()
+            .map(Some)
+            .map_err(|_| format!("{var} is not valid UTF-8")),
+        _ => Err(format!(
+            "{var} is not set: --credential subscription needs the long-lived token \
+             `claude setup-token` prints, exported by you in this shell (cowproof never runs or \
+             scripts a login), and it does not fall back to ANTHROPIC_API_KEY"
+        )),
+    }
+}
+
 pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
     let started = Instant::now();
     if args.turn_budget == 0 {
@@ -2739,6 +2857,28 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
         bail!("--timeout-min must be at least 1");
     }
     let cwd = std::env::current_dir().context("reading the current directory")?;
+    // The credential mode (`--credential`, D2): a subscription lane that cannot run is refused
+    // here, before anything else is read or created, and never falls back to an API key.
+    let credential = args.credential.mode();
+    let subscription_token = match subscription_token(
+        credential,
+        args.host.as_deref(),
+        std::env::var_os(Credential::Subscription.env_var()),
+    ) {
+        Ok(token) => token,
+        Err(refusal) => {
+            eprintln!("preflight failed: key: {refusal}");
+            eprintln!("nothing was started");
+            return Ok(INFRASTRUCTURE_EXIT_CODE);
+        }
+    };
+    let subscription = credential == Credential::Subscription;
+    if subscription && std::env::var_os("ANTHROPIC_API_KEY").is_some_and(|k| !k.is_empty()) {
+        eprintln!(
+            "preflight note: ANTHROPIC_API_KEY is set and not used: --credential subscription \
+             sends the subscription token only"
+        );
+    }
     // The host entry, read and checked before anything else (`--host`, D27).
     let remote_host = match args.host.as_deref() {
         None => None,
@@ -2827,13 +2967,17 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
     let needed = |c: &crate::preflight::Check| {
         !(remote_host.is_some() && c.name == "claude")
             && !(starts_on_other_runtime && matches!(c.name, "claude" | "key"))
+            // A subscription lane holds no API key; its token was checked above.
+            && !(subscription && c.name == "key")
     };
     for check in &preflight_checks {
         match check.status {
             CheckStatus::Ok => {}
             CheckStatus::Warn => eprintln!("preflight warning: {}: {}", check.name, check.detail),
             CheckStatus::Fail if !needed(check) => {
-                let why = if starts_on_other_runtime {
+                let why = if subscription && check.name == "key" {
+                    "the lane uses the subscription token, not an API key"
+                } else if starts_on_other_runtime {
                     "the lane starts on a rung of another runtime"
                 } else {
                     "the builder runs on the host"
@@ -2887,6 +3031,19 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
         return Ok(INFRASTRUCTURE_EXIT_CODE);
     }
 
+    // A subscription lane runs Claude rungs only (D2): the proxy holds the one token and no key
+    // for any other runtime.
+    if subscription && first_rung.runtime != Runtime::Claude {
+        eprintln!(
+            "rung {first_rung} refused ({} chose it): --credential subscription runs Claude rungs \
+             only, and the {} runtime needs its own API key",
+            rung_source.name(),
+            first_rung.runtime.name()
+        );
+        eprintln!("nothing was started");
+        return Ok(INFRASTRUCTURE_EXIT_CODE);
+    }
+
     // 2b'. The packet profile of the rung the lane starts on, whichever source chose it
     // (`--model` included, which `cowproof lint` cannot see): the same checker as lint, on the
     // same base commit. An unmet profile stops the run here (exit 4), before any lane exists.
@@ -2911,17 +3068,30 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
     // Claude rung needs the Anthropic key; one that starts on an `openrouter` rung needs the
     // OpenRouter key and OpenCode (exit 4, naming whichever is missing). The other provider's
     // key is optional: it only lets a later `reassign` cross runtimes.
-    let anthropic_key = match std::env::var_os("ANTHROPIC_API_KEY") {
-        Some(k) if !k.is_empty() => Some(
-            k.into_string()
-                .map_err(|_| anyhow!("ANTHROPIC_API_KEY is not valid UTF-8"))?,
-        ),
-        _ if first_rung.runtime == Runtime::Claude => {
-            bail!("ANTHROPIC_API_KEY is not set; the proxy needs the real key")
+    let anthropic_key = if subscription {
+        // The token read above, and no API key: the director's `ANTHROPIC_API_KEY` stays
+        // unread, so it can reach neither the proxy nor the lane (no fallback, D2).
+        subscription_token
+    } else {
+        match std::env::var_os("ANTHROPIC_API_KEY") {
+            Some(k) if !k.is_empty() => Some(
+                k.into_string()
+                    .map_err(|_| anyhow!("ANTHROPIC_API_KEY is not valid UTF-8"))?,
+            ),
+            _ if first_rung.runtime == Runtime::Claude => {
+                bail!("ANTHROPIC_API_KEY is not set; the proxy needs the real key")
+            }
+            _ => None,
         }
-        _ => None,
     };
-    let openrouter_key = openrouter::real_key()?;
+    let (anthropic_upstream, anthropic_upstream_overridden) = anthropic_upstream()?;
+    // A subscription lane holds no key for another runtime: the keys stay unread, so a ladder
+    // with an `openrouter` or `codex` rung above the start cannot be reached by a `reassign`.
+    let openrouter_key = if subscription {
+        None
+    } else {
+        openrouter::real_key()?
+    };
     let (openrouter_upstream, openrouter_upstream_overridden) = openrouter::upstream()?;
     // OpenCode, found once on the director's PATH; its version goes into the record. A lane
     // that starts on an `openrouter` rung refuses to start without it, and without the key.
@@ -2994,7 +3164,11 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
     // on this price and a `reassign` may land there. A lane that starts on a `codex` rung also
     // needs Codex itself and the OpenAI key; each is named. A lane that starts elsewhere finds
     // Codex and the key only to let a later `reassign` land on a `codex` rung.
-    let openai_key = codex::real_key()?;
+    let openai_key = if subscription {
+        None
+    } else {
+        codex::real_key()?
+    };
     let (openai_upstream, openai_upstream_overridden) = codex::upstream()?;
     let codex_models = codex::priced_models(&first_rung, &routing);
     let starts_on_codex = first_rung.runtime == Runtime::Codex;
@@ -3150,6 +3324,7 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
                     started,
                     RunKind {
                         unsandboxed: args.unsandboxed,
+                        credential,
                         host: None,
                     },
                 );
@@ -3173,6 +3348,8 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
         &header.id,
         ProxyKeys {
             anthropic: anthropic_key,
+            anthropic_subscription: subscription,
+            anthropic_upstream: anthropic_upstream_overridden.then(|| anthropic_upstream.clone()),
             openrouter: openrouter_key.map(|key| (key, openrouter_upstream.clone())),
             // Only a ladder with a `codex` rung on or above the start can use the key at all.
             openai: openai_key
@@ -3320,6 +3497,7 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
                     started,
                     RunKind {
                         unsandboxed: args.unsandboxed,
+                        credential,
                         host: Some(remote.alias()),
                     },
                 );
@@ -3371,6 +3549,7 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
         has_anthropic_key,
         has_openrouter_key,
         has_openai_key,
+        credential,
         codex_prices,
         metrics: endpoint.metrics.clone(),
         prices,
@@ -3456,6 +3635,7 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
                 started,
                 RunKind {
                     unsandboxed: args.unsandboxed,
+                    credential,
                     host: remote.as_ref().map(|r| r.alias()),
                 },
             );
@@ -3637,6 +3817,15 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
     // The Codex the lane could use, and the director's override of the OpenAI upstream.
     run["codexVersion"] = json!(launcher.codex.as_ref().map(|c| c.version.as_str()));
     run["openaiUpstream"] = json!(openai_upstream_overridden.then_some(openai_upstream.as_str()));
+    // The credential mode (D28 clause 6), recorded beside `unsandboxed`: the mode, the kind of
+    // credential the proxy holds for a subscription lane, and whether any credential is inside
+    // the lane. None is: the proxy holds the real one (D24).
+    run["authMode"] = json!(launcher.credential.name());
+    run["credentialKind"] = json!(launcher.credential.kind());
+    run["credentialInLane"] = json!(false);
+    // The director's override of the Anthropic upstream (null otherwise).
+    run["anthropicUpstream"] =
+        json!(anthropic_upstream_overridden.then_some(anthropic_upstream.as_str()));
     // What the egress proxy refused or could not forward: nothing but the allowed requests
     // should reach it, so an entry here is a runtime doing something it should not.
     run["proxyRefused"] = proxy_refused(&launcher.metrics);
@@ -3708,6 +3897,7 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
             class_limit,
             port_base,
             unsandboxed: launcher.unsandboxed,
+            credential: launcher.credential,
             trace: trace.clone(),
             trace_totals: trace_totals.clone(),
             host: remote.as_ref().map(|r| r.alias()),
@@ -3903,6 +4093,8 @@ struct ProofInput<'a> {
     port_base: u16,
     /// Whether the builder ran without the OS sandbox.
     unsandboxed: bool,
+    /// The credential mode of the lane (D28 clause 6), recorded in the capsule and the verdict.
+    credential: Credential,
     /// The portkit trace verdict: whether the lane was traced (D5).
     trace: Value,
     /// What the lane's trace adds up to; `Some` exactly when `trace` says traced.
@@ -3977,6 +4169,9 @@ async fn prove_lane(
         "id": header.id,
         "verdict": verdict.outcome.name(),
         "unsandboxed": input.unsandboxed,
+        "authMode": input.credential.name(),
+        "credentialKind": input.credential.kind(),
+        "credentialInLane": false,
         "exitCode": verdict.outcome.exit_code(),
         "reasons": verdict.reasons,
         "unrun": evidence.unrun,
@@ -4101,8 +4296,11 @@ async fn replay_and_gate(
             tools,
         },
         input.model.to_string(),
-        "api-key".to_string(),
+        input.credential.name().to_string(),
     );
+    capsule.credential_kind = input.credential.kind().map(str::to_string);
+    // No credential is inside any lane today: the proxy holds the real one (D24).
+    capsule.credential_in_lane = false;
     capsule.builder_runtime = input.runtime.to_string();
     capsule.builder_runtime_version = input.runtime_version.map(str::to_string);
     capsule.openrouter_price = input.openrouter_price.clone();
@@ -4899,6 +5097,35 @@ body"#;
         proxy.task.abort();
     }
 
+    #[test]
+    fn a_subscription_token_is_read_only_for_a_subscription_lane_and_never_replaced_by_a_key() {
+        use std::ffi::OsString;
+        let token = || Some(OsString::from("tok-unit"));
+        // An API-key lane never looks at the token.
+        assert_eq!(
+            subscription_token(Credential::ApiKey, None, token()),
+            Ok(None)
+        );
+        assert_eq!(subscription_token(Credential::ApiKey, None, None), Ok(None));
+        assert_eq!(
+            subscription_token(Credential::Subscription, None, token()),
+            Ok(Some("tok-unit".to_string()))
+        );
+        // No token, an empty one: refused, with the variable named and no key offered instead.
+        for missing in [None, Some(OsString::new())] {
+            let why = subscription_token(Credential::Subscription, None, missing).unwrap_err();
+            assert!(why.contains("CLAUDE_CODE_OAUTH_TOKEN"), "{why}");
+            assert!(why.contains("does not fall back"), "{why}");
+        }
+        // A remote host is refused first, even with a token, naming the flag.
+        let why = subscription_token(Credential::Subscription, Some("box"), token()).unwrap_err();
+        assert!(
+            why.contains("--host") && why.contains("subscription"),
+            "{why}"
+        );
+        assert!(!why.contains("tok-unit"));
+    }
+
     #[tokio::test]
     async fn an_openrouter_only_proxy_starts_without_an_anthropic_key_and_a_proxy_needs_a_key() {
         let tmp = tempfile::tempdir().unwrap();
@@ -4909,6 +5136,8 @@ body"#;
             "t-run",
             ProxyKeys {
                 anthropic: None,
+                anthropic_subscription: false,
+                anthropic_upstream: None,
                 openrouter: Some(("sk-or-unit-real".into(), "http://127.0.0.1:9".into())),
                 openai: None,
             },
@@ -4924,6 +5153,8 @@ body"#;
             "t-run2",
             ProxyKeys {
                 anthropic: None,
+                anthropic_subscription: false,
+                anthropic_upstream: None,
                 openrouter: None,
                 openai: None,
             },

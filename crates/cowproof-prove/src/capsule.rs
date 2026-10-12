@@ -218,6 +218,18 @@ pub struct Capsule {
     #[serde(default)]
     pub rung_source: Option<String>,
     pub auth_mode: String,
+    /// The kind of credential the proxy held for the lane when it is not an API key (D2, D28
+    /// clause 6): `claude-oauth-token` for a Claude subscription lane, null for an API-key lane.
+    /// Sealed in `capsule.json`; absent in older capsules, which read as null.
+    #[serde(default)]
+    pub credential_kind: Option<String>,
+    /// Whether a credential was readable inside the lane (D28 clause 6). Always false today: the
+    /// proxy holds every credential, the subscription token included, and the lane holds a
+    /// placeholder. It is recorded so a lane that ever did hold one says so everywhere it
+    /// appears, as `unsandboxed` does. Sealed in `capsule.json`; absent in older capsules, which
+    /// read as false.
+    #[serde(default)]
+    pub credential_in_lane: bool,
     pub estimated_cost_usd: f64,
     pub estimated_tokens: u64,
     pub parked_seconds: u64,
@@ -303,6 +315,8 @@ impl Capsule {
             codex_price: None,
             rung_source: None,
             auth_mode,
+            credential_kind: None,
+            credential_in_lane: false,
             estimated_cost_usd: 0.0,
             estimated_tokens: 0,
             parked_seconds: 0,

@@ -17,6 +17,10 @@
 //!   never contacted.
 //! - Every credential on the request (`x-api-key`, `Authorization: Bearer`) must be the lane's
 //!   placeholder, and there must be at least one. Otherwise 403.
+//! - A subscription route (Claude Code with `CLAUDE_CODE_OAUTH_TOKEN`, D2 and D28 clause 6) is
+//!   bearer-only: the lane presents `Authorization: Bearer <placeholder>`, the proxy sends
+//!   `Authorization: Bearer <real OAuth token>`, and a request that carries an `x-api-key`
+//!   at all is refused, so a lane can never fall from the subscription onto an API key.
 //! - Incoming `x-api-key`, `authorization` and `proxy-authorization` are never forwarded; the proxy
 //!   sets the provider's own credential header to the real key (Anthropic: `x-api-key`;
 //!   OpenRouter and OpenAI: `Authorization: Bearer`). Headers are forwarded by allowlist (see
@@ -137,6 +141,9 @@ struct Route {
     upstream: Upstream,
     /// When set, a request is forwarded only if its JSON body names one of these models.
     models: Option<BTreeSet<String>>,
+    /// The route takes `Authorization: Bearer <placeholder>` and nothing else: a request with an
+    /// `x-api-key` header is refused. Set for the subscription route.
+    bearer_only: bool,
 }
 
 /// Configuration for the proxy.
@@ -165,6 +172,27 @@ impl ProxyConfig {
         upstream_base: impl Into<String>,
     ) -> Result<Self> {
         let route = Route::new(provider, real_api_key.into(), upstream_base.into())?;
+        Ok(Self {
+            routes: vec![route],
+            placeholder_key: format!("placeholder-{}", uuid::Uuid::new_v4()),
+            idle_timeout: DEFAULT_IDLE_TIMEOUT,
+        })
+    }
+
+    /// A configuration that serves the Anthropic API for a Claude subscription alone, with a
+    /// freshly generated placeholder key (D2, D28 clause 6).
+    ///
+    /// Claude Code with `CLAUDE_CODE_OAUTH_TOKEN` sends `Authorization: Bearer <token>` and an
+    /// `anthropic-beta` list that includes `oauth-2025-04-20`, to the same two paths as an API
+    /// key. The lane holds the placeholder in that variable; the proxy swaps in the real token
+    /// as the bearer, so the token stays out of the lane. The route is bearer-only: an
+    /// `x-api-key` on the request is refused (403), which Claude Code would send in preference
+    /// to the token if the lane's environment held an API key.
+    pub fn for_subscription(
+        oauth_token: impl Into<String>,
+        upstream_base: impl Into<String>,
+    ) -> Result<Self> {
+        let route = Route::subscription(oauth_token.into(), upstream_base.into())?;
         Ok(Self {
             routes: vec![route],
             placeholder_key: format!("placeholder-{}", uuid::Uuid::new_v4()),
@@ -263,8 +291,33 @@ impl Route {
                 (header::AUTHORIZATION, format!("Bearer {real_api_key}"))
             }
         };
+        Self::build(provider, credential_header, text, upstream_base, false)
+    }
+
+    /// The Anthropic route for a Claude subscription: the real OAuth token goes upstream as
+    /// `Authorization: Bearer`, and only that credential form is accepted from the lane.
+    fn subscription(oauth_token: String, upstream_base: String) -> Result<Self> {
+        if oauth_token.is_empty() {
+            bail!("the real OAuth token is empty");
+        }
+        Self::build(
+            Provider::Anthropic,
+            header::AUTHORIZATION,
+            format!("Bearer {oauth_token}"),
+            upstream_base,
+            true,
+        )
+    }
+
+    fn build(
+        provider: Provider,
+        credential_header: HeaderName,
+        text: String,
+        upstream_base: String,
+        bearer_only: bool,
+    ) -> Result<Self> {
         let mut credential = HeaderValue::from_str(&text)
-            .map_err(|_| anyhow::anyhow!("the real API key is not a valid header value"))?;
+            .map_err(|_| anyhow::anyhow!("the real credential is not a valid header value"))?;
         credential.set_sensitive(true);
         let upstream = Upstream::parse(&upstream_base)?;
         Ok(Self {
@@ -274,6 +327,7 @@ impl Route {
             upstream_base,
             upstream,
             models: None,
+            bearer_only,
         })
     }
 }
@@ -611,10 +665,14 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
 /// True when the request carries at least one credential and every credential is the placeholder.
 ///
 /// Checking all of them, not the first, means a request that smuggles a foreign key beside the
-/// placeholder is refused.
-fn credential_ok(headers: &HeaderMap, placeholder: &str) -> bool {
+/// placeholder is refused. On a `bearer_only` route (the subscription) an `x-api-key` header is
+/// refused whatever it holds, and only `Authorization: Bearer <placeholder>` counts.
+fn credential_ok(headers: &HeaderMap, placeholder: &str, bearer_only: bool) -> bool {
     let mut seen = false;
     for value in headers.get_all("x-api-key") {
+        if bearer_only {
+            return false;
+        }
         seen = true;
         if !ct_eq(value.as_bytes(), placeholder.as_bytes()) {
             return false;
@@ -723,7 +781,11 @@ async fn handle(req: Request<Incoming>, state: Arc<State>) -> Response<ProxyBody
     let Some(route) = state.config.route_for(req.uri().path()) else {
         return forbidden(&state, path);
     };
-    if !credential_ok(req.headers(), state.config.placeholder_key()) {
+    if !credential_ok(
+        req.headers(),
+        state.config.placeholder_key(),
+        route.bearer_only,
+    ) {
         return forbidden(&state, path);
     }
 
@@ -1258,40 +1320,79 @@ mod tests {
     #[test]
     fn credential_requires_placeholder_everywhere() {
         let p = "placeholder-1";
-        assert!(credential_ok(&headers(&[("x-api-key", p)]), p));
+        assert!(credential_ok(&headers(&[("x-api-key", p)]), p, false));
         assert!(credential_ok(
             &headers(&[("authorization", "Bearer placeholder-1")]),
-            p
+            p,
+            false
         ));
         assert!(credential_ok(
             &headers(&[("authorization", "bearer placeholder-1")]),
-            p
+            p,
+            false
         ));
         assert!(credential_ok(
             &headers(&[("x-api-key", p), ("authorization", "Bearer placeholder-1")]),
-            p
+            p,
+            false
         ));
-        assert!(!credential_ok(&headers(&[]), p));
-        assert!(!credential_ok(&headers(&[("x-api-key", "other")]), p));
+        assert!(!credential_ok(&headers(&[]), p, false));
+        assert!(!credential_ok(
+            &headers(&[("x-api-key", "other")]),
+            p,
+            false
+        ));
         assert!(!credential_ok(
             &headers(&[("authorization", "Basic placeholder-1")]),
-            p
+            p,
+            false
         ));
         assert!(!credential_ok(
             &headers(&[("authorization", "placeholder-1")]),
-            p
+            p,
+            false
         ));
         // A foreign credential beside the placeholder is refused, in either header.
         assert!(!credential_ok(
             &headers(&[("x-api-key", p), ("authorization", "Bearer other")]),
-            p
+            p,
+            false
         ));
         assert!(!credential_ok(
             &headers(&[("x-api-key", p), ("x-api-key", "other")]),
-            p
+            p,
+            false
         ));
         // proxy-authorization is stripped, never a credential.
-        assert!(!credential_ok(&headers(&[("proxy-authorization", p)]), p));
+        assert!(!credential_ok(
+            &headers(&[("proxy-authorization", p)]),
+            p,
+            false
+        ));
+    }
+
+    #[test]
+    fn a_bearer_only_route_takes_the_bearer_placeholder_and_no_api_key_at_all() {
+        let p = "placeholder-1";
+        assert!(credential_ok(
+            &headers(&[("authorization", "Bearer placeholder-1")]),
+            p,
+            true
+        ));
+        // The placeholder itself in `x-api-key` is refused too: the lane that sends one has the
+        // API-key variable set, and Claude Code prefers it to the OAuth token.
+        assert!(!credential_ok(&headers(&[("x-api-key", p)]), p, true));
+        assert!(!credential_ok(
+            &headers(&[("x-api-key", p), ("authorization", "Bearer placeholder-1")]),
+            p,
+            true
+        ));
+        assert!(!credential_ok(&headers(&[]), p, true));
+        assert!(!credential_ok(
+            &headers(&[("authorization", "Bearer other")]),
+            p,
+            true
+        ));
     }
 
     #[test]

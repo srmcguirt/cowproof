@@ -1418,3 +1418,121 @@ async fn a_model_limit_does_not_touch_the_other_providers() {
     assert_eq!(response.status, 200, "{}", response.head);
     assert_eq!(fake.count(), 1);
 }
+
+// ---------------------------------------------------------------- subscription route (D2)
+
+/// A lettered synthetic OAuth token, built at run time so the source holds no key-shaped string.
+fn real_token() -> String {
+    format!("sk-ant-oat01-{}", "abcdefghij".repeat(4))
+}
+
+async fn start_subscription_proxy(upstream_base: &str) -> Proxy {
+    let config = ProxyConfig::for_subscription(real_token(), upstream_base).unwrap();
+    let placeholder = config.placeholder_key().to_string();
+    let server = ProxyServer::new(config);
+    let metrics = server.metrics();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(server.serve_tcp(listener));
+    Proxy {
+        addr,
+        placeholder,
+        metrics,
+    }
+}
+
+#[tokio::test]
+async fn the_subscription_route_swaps_the_bearer_and_forwards_the_oauth_beta_flag() {
+    let fake = fake_upstream(Reply::Json).await;
+    let proxy = start_subscription_proxy(&fake.base()).await;
+    let real = real_token();
+    let bearer = format!("Bearer {}", proxy.placeholder);
+    // What Claude Code 2.1.296 sends with CLAUDE_CODE_OAUTH_TOKEN (measured): a bearer, the
+    // OAuth beta flag among the betas, and the usual Anthropic headers.
+    let response = send(
+        &proxy,
+        &request(
+            "POST",
+            "/v1/messages?beta=true",
+            &[
+                ("authorization", &bearer),
+                ("anthropic-version", "2023-06-01"),
+                (
+                    "anthropic-beta",
+                    "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14",
+                ),
+                ("x-app", "cli"),
+                ("proxy-authorization", "Basic Zm9vOmJhcg=="),
+            ],
+            REQUEST_BODY,
+        ),
+    )
+    .await;
+    assert_eq!(response.status, 200, "{}", response.head);
+    assert_eq!(fake.count(), 1);
+    let seen = fake.first();
+    assert_eq!(seen.request_line, "POST /v1/messages?beta=true HTTP/1.1");
+    // The real token is the bearer; the placeholder never leaves; no API-key header exists.
+    let want = format!("Bearer {real}");
+    assert_eq!(seen.header("authorization"), Some(want.as_str()));
+    assert_eq!(seen.header("x-api-key"), None);
+    assert_eq!(seen.header("proxy-authorization"), None);
+    assert_eq!(
+        seen.header("anthropic-beta"),
+        Some("claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14")
+    );
+    assert_eq!(seen.header("x-app"), Some("cli"));
+    for (name, value) in &seen.headers {
+        assert!(
+            !value.contains(&proxy.placeholder),
+            "placeholder leaked in header {name}"
+        );
+    }
+    assert!(!response.head.contains(&real) && !response.body.contains(&real));
+    // The response relays untouched, and the usage is read as for an API-key route.
+    assert_eq!(response.body, JSON_BODY);
+}
+
+#[tokio::test]
+async fn the_subscription_route_refuses_any_x_api_key_and_any_foreign_bearer() {
+    let fake = fake_upstream(Reply::Json).await;
+    let proxy = start_subscription_proxy(&fake.base()).await;
+    let ph = proxy.placeholder.clone();
+    let bearer = format!("Bearer {ph}");
+    let cases: Vec<(&str, Vec<(&str, String)>)> = vec![
+        // Claude Code prefers an API key to the token, so a lane that held one would bill it:
+        // the proxy refuses the request even when the key is the placeholder.
+        ("placeholder in x-api-key", vec![("x-api-key", ph.clone())]),
+        (
+            "x-api-key beside the bearer",
+            vec![("x-api-key", ph.clone()), ("authorization", bearer.clone())],
+        ),
+        (
+            "foreign bearer",
+            vec![("authorization", "Bearer sk-ant-attacker".into())],
+        ),
+        ("no credential", vec![]),
+    ];
+    for (name, headers) in cases {
+        let pairs: Vec<(&str, &str)> = headers.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        let response = send(
+            &proxy,
+            &request("POST", "/v1/messages", &pairs, REQUEST_BODY),
+        )
+        .await;
+        assert_eq!(response.status, 403, "{name}: {}", response.head);
+        assert!(!response.body.contains(&real_token()));
+    }
+    assert_eq!(fake.count(), 0, "the upstream must not be contacted");
+}
+
+#[test]
+fn the_subscription_config_redacts_the_token_and_refuses_an_empty_one() {
+    let config = ProxyConfig::for_subscription(real_token(), "http://127.0.0.1:9").unwrap();
+    let shown = format!("{config:?}");
+    assert!(!shown.contains(&real_token()), "{shown}");
+    let err = ProxyConfig::for_subscription("", "http://127.0.0.1:9").unwrap_err();
+    assert!(!format!("{err:#}").contains(&real_token()));
+    let err = ProxyConfig::for_subscription("bad\nvalue", "http://127.0.0.1:9").unwrap_err();
+    assert!(!format!("{err:#}").contains("bad"), "{err:#}");
+}

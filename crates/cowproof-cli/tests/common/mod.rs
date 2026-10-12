@@ -1439,3 +1439,159 @@ fn openai_serve(
     }
     Ok(())
 }
+
+// ---------------------------------------------------------------------------------------------
+// A FAKE Anthropic (D2, subscription mode): the upstream the proxy forwards Claude's requests to.
+// ---------------------------------------------------------------------------------------------
+
+/// The lettered synthetic OAuth token the subscription tests give the director. Not a real
+/// token: a repeated alphabet fragment after the prefix `claude setup-token` tokens carry.
+#[allow(dead_code)] // only `tests/subscription.rs` uses the fake Anthropic
+pub fn claude_oauth_test_token() -> String {
+    format!("sk-ant-oat01-{}", "abcdefghij".repeat(6))
+}
+
+/// A lettered synthetic API key, for the tests that give the director both credentials.
+#[allow(dead_code)]
+pub fn anthropic_test_key() -> String {
+    format!("sk-ant-api03-{}", "zyxwvutsrq".repeat(6))
+}
+
+/// What the fake Anthropic saw of one request: the method, the whole target (query included)
+/// and every header, names lower case.
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+pub struct AnthropicSeen {
+    pub method: String,
+    pub target: String,
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+}
+
+#[allow(dead_code)]
+impl AnthropicSeen {
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.as_str())
+    }
+}
+
+/// A small HTTP server on 127.0.0.1 that answers `POST /v1/messages` with a one-line JSON
+/// message and records every request it gets, whatever the path, method or credential. It does
+/// not check the credential: the tests read it from the record, so a wrong one is a finding and
+/// not a silent 401.
+#[allow(dead_code)]
+pub struct FakeAnthropic {
+    addr: std::net::SocketAddr,
+    seen: std::sync::Arc<Mutex<Vec<AnthropicSeen>>>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+#[allow(dead_code)]
+impl FakeAnthropic {
+    pub fn start() -> Self {
+        use std::sync::atomic::Ordering;
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (sn, sp) = (seen.clone(), stop.clone());
+        let thread = std::thread::spawn(move || {
+            while !sp.load(Ordering::SeqCst) {
+                match listener.accept() {
+                    Ok((conn, _)) => {
+                        let sn = sn.clone();
+                        std::thread::spawn(move || {
+                            let _ = anthropic_serve(conn, sn);
+                        });
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        FakeAnthropic {
+            addr,
+            seen,
+            stop,
+            thread: Some(thread),
+        }
+    }
+
+    /// `http://127.0.0.1:<port>`, what `COWPROOF_ANTHROPIC_UPSTREAM` is set to.
+    pub fn base(&self) -> String {
+        format!("http://{}", self.addr)
+    }
+
+    /// Every request so far, oldest first.
+    pub fn seen(&self) -> Vec<AnthropicSeen> {
+        self.seen.lock().unwrap().clone()
+    }
+
+    /// The requests so far for the Messages path (query ignored).
+    pub fn messages(&self) -> Vec<AnthropicSeen> {
+        self.seen()
+            .into_iter()
+            .filter(|r| r.target.split('?').next() == Some("/v1/messages"))
+            .collect()
+    }
+}
+
+impl Drop for FakeAnthropic {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+fn anthropic_serve(
+    conn: std::net::TcpStream,
+    seen: std::sync::Arc<Mutex<Vec<AnthropicSeen>>>,
+) -> std::io::Result<()> {
+    use std::io::{BufReader, Write};
+    conn.set_nonblocking(false)?;
+    conn.set_read_timeout(Some(std::time::Duration::from_secs(120)))?;
+    let mut writer = conn.try_clone()?;
+    let mut reader = BufReader::new(conn);
+    // One request per connection: every reply says `Connection: close`.
+    if let Some(HttpRequest {
+        method,
+        path,
+        headers,
+        body,
+    }) = read_http_request(&mut reader)?
+    {
+        let ok = method == "POST" && path.split('?').next() == Some("/v1/messages");
+        seen.lock().unwrap().push(AnthropicSeen {
+            method,
+            target: path,
+            headers,
+            body,
+        });
+        let (status, body) = if ok {
+            (
+                "200 OK",
+                json!({"id":"msg_fake","type":"message","role":"assistant","model":"fake",
+                       "content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn",
+                       "stop_sequence":null,"usage":{"input_tokens":3,"output_tokens":5}})
+                .to_string(),
+            )
+        } else {
+            ("404 Not Found", String::new())
+        };
+        write!(
+            writer,
+            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )?;
+    }
+    Ok(())
+}

@@ -331,6 +331,73 @@ fn count_pending_notes(control_dir: &Path, lane_name: &str) -> Result<usize> {
     Ok(notes.values().filter(|&delivered| !delivered).count())
 }
 
+/// A lane's credential mode when it is not the default API key (D28 clause 6), from the
+/// `authMode`, `credentialKind` and `credentialInLane` of `control/run.json`. A lane with no such
+/// record (older, still running, or an API-key lane) has none, and `watch` shows it as it always
+/// did.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct LaneCredential {
+    pub mode: String,
+    pub kind: Option<String>,
+    pub in_lane: bool,
+}
+
+impl LaneCredential {
+    /// The cell `watch` prints: `subscription (claude-oauth-token)`, with `, in lane` when a
+    /// credential was readable inside the lane.
+    fn cell(&self) -> String {
+        let mut inner = self.kind.clone().unwrap_or_default();
+        if self.in_lane {
+            if !inner.is_empty() {
+                inner.push_str(", ");
+            }
+            inner.push_str("in lane");
+        }
+        if inner.is_empty() {
+            self.mode.clone()
+        } else {
+            format!("{} ({inner})", self.mode)
+        }
+    }
+}
+
+/// The credential mode recorded in the lane's `control/run.json`, when it is not `api-key`. The
+/// file is read without following a link and only up to a bound; the label is a file the builder
+/// cannot write, printed in a table, so it is held to a short lower-case alphabet anyway.
+fn lane_credential(lane_dir: &Path) -> Option<LaneCredential> {
+    let path = lane_dir.join("control/run.json");
+    let meta = fs::symlink_metadata(&path).ok()?;
+    if !meta.is_file() || meta.len() > 4 * 1024 * 1024 {
+        return None;
+    }
+    let mut text = String::new();
+    fs::File::open(&path)
+        .ok()?
+        .take(4 * 1024 * 1024)
+        .read_to_string(&mut text)
+        .ok()?;
+    let doc: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let label = |v: &serde_json::Value| {
+        v.as_str()
+            .filter(|n| {
+                !n.is_empty()
+                    && n.len() <= 32
+                    && n.chars().all(|c| c.is_ascii_lowercase() || c == '-')
+            })
+            .map(str::to_string)
+    };
+    let mode = label(doc.get("authMode")?)?;
+    let in_lane = doc.get("credentialInLane").and_then(|v| v.as_bool()) == Some(true);
+    if mode == "api-key" && !in_lane {
+        return None;
+    }
+    Some(LaneCredential {
+        mode,
+        kind: doc.get("credentialKind").and_then(label),
+        in_lane,
+    })
+}
+
 /// One lane as the table and the director's `lanes` tool show it.
 #[derive(Debug, Clone, Serialize)]
 pub struct LaneSnapshot {
@@ -342,6 +409,9 @@ pub struct LaneSnapshot {
     pub queue_unreadable: bool,
     pub pending_notes: Option<usize>,
     pub last_event_ms: Option<u64>,
+    /// The credential mode, present only when it is not the default API key.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credential: Option<LaneCredential>,
 }
 
 /// Every lane under `lanes_root`, sorted by name, as data.
@@ -363,6 +433,7 @@ pub fn lane_snapshots(
             parked: parked.ok().flatten(),
             pending_notes: notes.ok(),
             last_event_ms: get_last_event_time(&lane_dir),
+            credential: lane_credential(&lane_dir),
         });
     }
     Ok(rows)
@@ -372,7 +443,14 @@ fn watch_table(lanes_root: &Path, cache_ttl_ms: u64) -> Result<()> {
     let now_ms = now_ms();
     let rows = lane_snapshots(lanes_root, now_ms, cache_ttl_ms)?;
 
-    println!("LANE\tSTATE\tPARKED\tAGE\tNOTES\tLAST EVENT");
+    // The credential column appears only when some lane is not on the default API key, so the
+    // table of API-key lanes is unchanged.
+    let show_credential = rows.iter().any(|r| r.credential.is_some());
+    if show_credential {
+        println!("LANE\tSTATE\tPARKED\tAGE\tNOTES\tLAST EVENT\tCREDENTIAL");
+    } else {
+        println!("LANE\tSTATE\tPARKED\tAGE\tNOTES\tLAST EVENT");
+    }
 
     for row in rows {
         let (parked_info, parked_age) = if row.queue_unreadable {
@@ -394,10 +472,21 @@ fn watch_table(lanes_root: &Path, cache_ttl_ms: u64) -> Result<()> {
             None => "-".to_string(),
         };
 
-        println!(
-            "{}\t{}\t{}\t{}\t{}\t{}",
-            row.id, row.state, parked_info, parked_age, notes, last_event
-        );
+        if show_credential {
+            let credential = row
+                .credential
+                .as_ref()
+                .map_or_else(|| "api-key".to_string(), LaneCredential::cell);
+            println!(
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                row.id, row.state, parked_info, parked_age, notes, last_event, credential
+            );
+        } else {
+            println!(
+                "{}\t{}\t{}\t{}\t{}\t{}",
+                row.id, row.state, parked_info, parked_age, notes, last_event
+            );
+        }
     }
 
     Ok(())
@@ -679,5 +768,51 @@ mod tests {
         let parts: Vec<&str> = result.split('.').collect();
         assert_eq!(parts.len(), 2, "RFC3339 must have milliseconds");
         assert!(parts[1].starts_with("0") && parts[1].ends_with("Z"));
+    }
+
+    fn lane_with_run_json(json: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("control")).unwrap();
+        fs::write(dir.path().join("control/run.json"), json).unwrap();
+        dir
+    }
+
+    #[test]
+    fn the_credential_column_names_a_subscription_lane_and_says_when_a_credential_is_in_the_lane() {
+        let sub = lane_with_run_json(
+            r#"{"authMode":"subscription","credentialKind":"claude-oauth-token","credentialInLane":false}"#,
+        );
+        let credential = lane_credential(sub.path()).unwrap();
+        assert_eq!(credential.cell(), "subscription (claude-oauth-token)");
+        assert!(!credential.in_lane);
+
+        // A lane that did hold a credential says so, as the design (D28 clause 6) requires.
+        let held = lane_with_run_json(
+            r#"{"authMode":"subscription","credentialKind":"claude-oauth-token","credentialInLane":true}"#,
+        );
+        assert_eq!(
+            lane_credential(held.path()).unwrap().cell(),
+            "subscription (claude-oauth-token, in lane)"
+        );
+
+        // The default API key, a lane with no record and a hostile label show nothing.
+        for json in [
+            r#"{"authMode":"api-key","credentialKind":null,"credentialInLane":false}"#,
+            r#"{"status":"finished"}"#,
+            r#"{"authMode":"Sub\tscription"}"#,
+            "not json",
+        ] {
+            assert_eq!(
+                lane_credential(lane_with_run_json(json).path()),
+                None,
+                "{json}"
+            );
+        }
+        // An API-key lane that somehow held a credential is shown.
+        let odd = lane_with_run_json(r#"{"authMode":"api-key","credentialInLane":true}"#);
+        assert_eq!(
+            lane_credential(odd.path()).unwrap().cell(),
+            "api-key (in lane)"
+        );
     }
 }
