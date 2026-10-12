@@ -99,6 +99,8 @@ The command prints a builder summary line, then a one-line verdict such as `add-
 - 2 refuted (a recorded check failed, verify diverged, or a gate failed)
 - 3 incomplete (a declared check was never run)
 - 4 infrastructure (the proof could not run; never a refutation)
+- 5 timeout, 6 cost-cap (nothing is proved; the work is kept)
+- 7 stopped by a `stop` ruling, 8 ended at the escalation limit (nothing is proved; the work is kept)
 - 1 the run failed before a verdict
 - 130 interrupted
 

@@ -11,7 +11,7 @@ Below, `<lane>` is `<lanes-root>/<id>` (default lanes root `~/.cache/cowproof/la
 
 ## 1. Read the verdict
 
-`cowproof run` exits 0 proved, 2 refuted, 3 incomplete, 4 infrastructure, 1 failed before a verdict, 130 interrupted. The files it leaves in `<lane>/control/`:
+`cowproof run` exits 0 proved, 2 refuted, 3 incomplete, 4 infrastructure, 5 timeout, 6 cost-cap, 7 stopped, 8 escalation-limit (none of these four is proved), 1 failed before a verdict, 130 interrupted. The files it leaves in `<lane>/control/`:
 
 ```sh
 cat <lane>/control/verdict.json

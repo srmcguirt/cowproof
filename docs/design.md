@@ -128,16 +128,16 @@ The builder gets three tools, `ask`, `check_ruling` and `run_check`, mirrored as
 - "The same check failed twice" means two recorded failures of one check id with no pass in between.
 - Cost is tallied from the builder's event stream as turns complete (usage per message where the runtime reports it). Where a runtime reports cost only at the end, the cost trigger is replaced by a turn budget (`--max-turns` for Claude).
 - On a trigger, the runner ends the session and opens a forced escalation itself, filled with the failing check's output and the attempt history. Forced escalations count toward the per-lane limit.
-- Limits per lane: 3 escalations (forced ones included) and 30 minutes parked by default. Beyond either, the lane ends as `escalation-limit` with its work kept. After a `reassign`, the attempt counters reset; the escalation count does not.
+- Limits per lane: 3 escalations (forced ones included) and 30 minutes parked by default. Beyond either, the lane ends as `escalation-limit` with its work kept (`cowproof run` exits 8). After a `reassign`, the attempt counters reset; the escalation count does not.
 
 Escalations land in a runner-owned queue in the control directory, so they survive restarts and work for every runtime. The director follows one stream, `cowproof watch --events`, which a Claude Code Monitor can tail, and rules with `cowproof rule <lane> <verdict>`:
 
 | Verdict | Effect |
 | --- | --- |
 | `answer` | The ruling is delivered as above; the builder resumes |
-| `redirect` | A revised `packet.md` (and optionally revised held-out checks) replaces the current one. It is linted again before delivery. Held-out checks can be added by a redirect but not removed. The capsule keeps every packet version with the verdict that introduced it; gates use the final version |
+| `redirect` | A revised `packet.md` (and optionally revised held-out checks) replaces the current one. It is linted again before delivery. Held-out checks can be added by a redirect but not removed. The capsule keeps every packet version with the verdict that introduced it; the gates, the required checks and the sealed capsule use the header of the final version (the last one delivered), and the checks it declares are the ones the builder can run from then on. Held-out checks come only from the director's store |
 | `reassign` | The lane moves to the next model on the ladder (or a named one) on the same clone, carrying the patch so far, the question and the runner's summary of what was tried |
-| `stop` | The lane ends; its work is kept for inspection |
+| `stop` | The lane ends; its work is kept for inspection. `cowproof run` exits 7 |
 
 For a design question the director cannot settle alone, the existing `lane-escalate` flow applies: a stronger model recommends, a challenger attacks the recommendation, the director adopts. Every escalation and verdict is logged by the runner and summarized in the capsule, so it shows which decisions were the builder's and which were the director's.
 
