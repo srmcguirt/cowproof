@@ -68,8 +68,6 @@ pub struct SandboxPolicy {
     pub network: NetworkMode,
     /// Environment variables to set inside the sandbox.
     pub env_set: Vec<(String, String)>,
-    /// Environment variables allowed (if None, all allowed).
-    pub env_allowlist: Option<BTreeSet<String>>,
     /// The user's real home directory. It is hidden (denied on macOS, a tmpfs
     /// on Linux) except for the toolchain paths the policy grants back.
     pub home: PathBuf,
@@ -303,7 +301,6 @@ impl SandboxPolicy {
                     lane_tmp(&lane.scratch).to_string_lossy().into_owned(),
                 ),
             ],
-            env_allowlist: None,
             home: lane.real_home.clone(),
             connect_socket: Some(lane.sock.clone()),
             lanes_root: lane.lanes_root.clone(),
@@ -353,7 +350,6 @@ impl SandboxPolicy {
                 tmpdir(lane),
                 ("CARGO_NET_OFFLINE".to_string(), "true".to_string()),
             ],
-            env_allowlist: None,
             home: lane.real_home.clone(),
             connect_socket: None,
             lanes_root: lane.lanes_root.clone(),
@@ -389,7 +385,6 @@ impl SandboxPolicy {
             deny_paths: vec![lane.control.clone()],
             network: NetworkMode::None,
             env_set: vec![cargo_home(&lane_cargo), tmpdir(lane)],
-            env_allowlist: None,
             home: lane.real_home.clone(),
             connect_socket: Some(lane.sock.clone()),
             lanes_root: lane.lanes_root.clone(),
@@ -407,7 +402,6 @@ impl SandboxPolicy {
             deny_paths: vec![lane.control.clone()],
             network,
             env_set: vec![],
-            env_allowlist: None,
             home: lane.real_home.clone(),
             connect_socket: None,
             lanes_root: lane.lanes_root.clone(),
@@ -424,7 +418,6 @@ impl SandboxPolicy {
             deny_paths: vec![lane.control.clone()],
             network: NetworkMode::None,
             env_set: vec![tmpdir(lane)],
-            env_allowlist: None,
             home: lane.real_home.clone(),
             connect_socket: None,
             lanes_root: lane.lanes_root.clone(),
