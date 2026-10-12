@@ -2445,17 +2445,31 @@ fn a_stop_of_a_builder_that_ignores_sigterm_is_reported_as_waiting_for_the_grace
     let grace = term_grace();
     let h = owned_packet(&nonblocking_stubborn("Quit?"));
     let (mut run, _id, _, ended) = stop_a_non_blocking_ask(&h);
-    assert!(
-        ended.after_sigkill,
-        "SIGKILL was needed but the line does not say so:\n{}",
-        run.stderr()
-    );
-    assert!(
-        ended.took >= grace * 3 / 4,
-        "the builder ended {:?} after SIGTERM, well inside a {grace:?} grace:\n{}",
-        ended.took,
-        run.stderr()
-    );
+    if cfg!(target_os = "linux") {
+        // On Linux the group's SIGTERM also reaches bubblewrap, and the sandbox's PID
+        // namespace ends with it: a builder cannot outlive SIGTERM there, so the line must
+        // show a prompt end with no SIGKILL. (Seen in the Linux container: "ended 0 ms".)
+        assert!(
+            !ended.after_sigkill && ended.took < grace / 4,
+            "on Linux the sandbox ends with SIGTERM, but the builder ended {:?} after it \
+             (SIGKILL needed: {}):\n{}",
+            ended.took,
+            ended.after_sigkill,
+            run.stderr()
+        );
+    } else {
+        assert!(
+            ended.after_sigkill,
+            "SIGKILL was needed but the line does not say so:\n{}",
+            run.stderr()
+        );
+        assert!(
+            ended.took >= grace * 3 / 4,
+            "the builder ended {:?} after SIGTERM, well inside a {grace:?} grace:\n{}",
+            ended.took,
+            run.stderr()
+        );
+    }
     let status = exit_within(&mut run, RULED_WITHIN);
     assert_eq!(status.code(), Some(1), "{}", run.stderr());
 }
