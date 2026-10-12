@@ -644,7 +644,7 @@ fn the_turn_budget_parks_an_openrouter_lane_and_a_stop_ends_it() {
     assert!(reason.contains("turn budget 1"), "{reason}");
     rule(&lane, &id, &["--stop"]);
     let out = finish(child);
-    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+    assert_eq!(out.status.code(), Some(7), "{}", text(&out));
     let run = run_json(&lane);
     assert_eq!(run["status"], "stopped", "{run}");
     let segment = &run["segments"][0];

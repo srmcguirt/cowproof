@@ -46,7 +46,7 @@ use std::io;
 use std::os::unix::fs::FileTypeExt;
 use std::path::Path;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 
@@ -59,6 +59,33 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 /// The check ids the packet declares. `run_check` accepts nothing else.
 pub type CheckTable = BTreeSet<String>;
+
+/// The check ids `run_check` accepts right now. It starts as the packet's table and is
+/// replaced when a `redirect` delivers a packet that declares other checks (the lane's last
+/// delivered packet version is the one that is proved), so the runner holds a clone of it and
+/// the tools server holds another. A [`CheckTable`] converts into one.
+#[derive(Clone, Default)]
+pub struct LiveChecks(Arc<RwLock<CheckTable>>);
+
+impl LiveChecks {
+    /// Replace the accepted ids.
+    pub fn replace(&self, ids: CheckTable) {
+        *self.0.write().unwrap_or_else(|e| e.into_inner()) = ids;
+    }
+
+    fn contains(&self, id: &str) -> bool {
+        self.0
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(id)
+    }
+}
+
+impl From<CheckTable> for LiveChecks {
+    fn from(ids: CheckTable) -> Self {
+        Self(Arc::new(RwLock::new(ids)))
+    }
+}
 
 /// Runs one declared check in a fresh sandbox and reports what it observed.
 /// It is given the check id only; the command stays on the runner's side.
@@ -167,7 +194,7 @@ pub type SessionEndSignal = tokio::sync::mpsc::UnboundedSender<SessionEnd>;
 struct Context {
     lane: String,
     queue: Arc<Mutex<Queue>>,
-    checks: CheckTable,
+    checks: LiveChecks,
     run: RunCheck,
     end: Option<SessionEndSignal>,
 }
@@ -201,7 +228,7 @@ pub async fn serve(
     listener: UnixListener,
     lane: String,
     queue: Arc<Mutex<Queue>>,
-    checks: CheckTable,
+    checks: impl Into<LiveChecks>,
     run: RunCheck,
 ) -> io::Result<()> {
     serve_signalling(listener, lane, queue, checks, run, None).await
@@ -215,14 +242,14 @@ pub async fn serve_signalling(
     listener: UnixListener,
     lane: String,
     queue: Arc<Mutex<Queue>>,
-    checks: CheckTable,
+    checks: impl Into<LiveChecks>,
     run: RunCheck,
     end: Option<SessionEndSignal>,
 ) -> io::Result<()> {
     let ctx = Arc::new(Context {
         lane,
         queue,
-        checks,
+        checks: checks.into(),
         run,
         end,
     });

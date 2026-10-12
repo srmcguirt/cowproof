@@ -747,7 +747,7 @@ fn the_turn_budget_parks_a_codex_lane_after_the_proxy_has_seen_that_many_calls()
     assert!(reason.contains("turn budget 1"), "{reason}");
     rule(&lane, &id, &["--stop"]);
     let out = finish(child);
-    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+    assert_eq!(out.status.code(), Some(7), "{}", text(&out));
     let run = run_json(&lane);
     assert_eq!(run["status"], "stopped", "{run}");
     let segment = &run["segments"][0];

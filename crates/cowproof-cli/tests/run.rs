@@ -1410,6 +1410,8 @@ fn run_help_documents_every_exit_code() {
         "4 infrastructure",
         "5 timeout",
         "6 cost-cap",
+        "7 stopped",
+        "8 escalation-limit",
         "130 interrupted by SIGINT or SIGTERM",
     ] {
         assert!(help.contains(code), "no {code:?} in: {help}");
@@ -1639,7 +1641,7 @@ fn a_stop_ruling_ends_the_lane_after_one_launch_and_keeps_the_work() {
     let id = wait_for_ask(&h, &mut child, 1);
     rule(&h, &id, &["--stop"]);
     let out = finish(child);
-    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(out.status.code(), Some(7));
     assert!(
         String::from_utf8_lossy(&out.stderr).contains("stopped"),
         "{}",
@@ -1877,6 +1879,273 @@ fn a_redirect_with_another_lanes_id_is_refused_and_nothing_launches() {
     assert_eq!(h.launches(), 1);
 }
 
+// ---- The proof uses the last delivered packet version ----------------------------------
+//
+// A redirect is the director's own packet, so its header is trusted like the original: the
+// gates, the required checks and the sealed capsule come from the LAST version delivered to
+// the builder. The tests use their own temporary HOME, never the real one.
+
+/// `text` with one field of its `<!-- lane {...} -->` header replaced.
+fn packet_with(text: &str, key: &str, value: Value) -> String {
+    let start = text.find("<!-- lane ").unwrap() + "<!-- lane ".len();
+    let end = start + text[start..].find(" -->").unwrap();
+    let mut header: Value = serde_json::from_str(&text[start..end]).unwrap();
+    header[key] = value;
+    format!("{}{header}{}", &text[..start], &text[end..])
+}
+
+/// [`start`], with a `HOME` of the test's own.
+fn start_in(h: &Harness, home: &Path) -> Child {
+    let _g = fork_lock();
+    h.command(h.lanes.path())
+        .env("ANTHROPIC_API_KEY", REAL_KEY)
+        .env("HOME", home)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap()
+}
+
+/// Run `h` until its first launch asks, rule a redirect to `redirect`, and return the output.
+fn redirected_run(h: &Harness, redirect: &str) -> Output {
+    let home = var_tmp("cp-run-home-");
+    let packet = h.work.path().join("redirect.md");
+    fs::write(&packet, redirect).unwrap();
+    let mut child = start_in(h, home.path());
+    let id = wait_for_ask(h, &mut child, 1);
+    rule(h, &id, &["--redirect", packet.to_str().unwrap()]);
+    finish(child)
+}
+
+/// `cowproof verify` of the lane's capsule against the repository, from a home of its own.
+fn verify_capsule_of(h: &Harness) -> Output {
+    let home = var_tmp("cp-run-home-");
+    let elsewhere = var_tmp("cp-run-cwd-");
+    output(
+        Command::new(&h.cowproof)
+            .current_dir(elsewhere.path())
+            .env("HOME", home.path())
+            .env_remove("ANTHROPIC_API_KEY")
+            .arg("verify")
+            .arg(h.lane().join("control/capsule"))
+            .arg("--repo")
+            .arg(&h.repo)
+            .arg("--workdir")
+            .arg(home.path().join("w")),
+    )
+}
+
+/// A packet that owns only README.md, though the fake also creates created.txt; the one
+/// check passes. The first launch asks (blocking); a later launch runs `edit`.
+fn narrow_packet() -> Harness {
+    Harness::with_packet(
+        &asks_first("Right task?", true, &run_checks(&["edit"])),
+        json!(["README.md"]),
+        json!([{"id": "edit", "command": "grep -q edited README.md"}]),
+    )
+}
+
+#[test]
+fn a_redirect_that_widens_owns_lets_a_patch_touching_the_new_file_pass_and_it_reproduces() {
+    if !sandbox_available() {
+        return;
+    }
+    let h = narrow_packet();
+    let widened = packet_with(&h.packet_text, "owns", json!(["README.md", "created.txt"]));
+    let out = redirected_run(&h, &widened);
+    assert_eq!(out.status.code(), Some(0), "{}", stdout_of(&out));
+    let verdict = h.verdict();
+    assert_eq!(verdict["verdict"], "proved", "{verdict}");
+    assert_eq!(verdict["failedGates"], json!([]), "{verdict}");
+    assert!(
+        h.read("control/lane.patch").contains("created.txt"),
+        "the patch touches the newly owned file"
+    );
+    // Both versions are sealed, and the capsule replays: `cowproof verify` judges nothing by
+    // a header, only the sealed checks and patches, which the final header produced.
+    let dir = h.lane().join("control/capsule");
+    assert!(dir.join("packets/v2.md").exists());
+    let out = verify_capsule_of(&h);
+    assert_eq!(out.status.code(), Some(0), "{}", text_of(&out));
+    assert_eq!(stdout_of(&out).trim(), "reproduced");
+}
+
+#[test]
+fn without_a_widening_redirect_the_same_patch_is_refuted_by_the_ownership_gate() {
+    if !sandbox_available() {
+        return;
+    }
+    let h = narrow_packet();
+    // A redirect that changes only the words keeps `owns` as it was.
+    let reworded = h
+        .packet_text
+        .replace("Change the README.", "Change the README, then stop.");
+    assert_ne!(reworded, h.packet_text);
+    let out = redirected_run(&h, &reworded);
+    assert_eq!(out.status.code(), Some(2), "{}", stdout_of(&out));
+    let verdict = h.verdict();
+    assert_eq!(verdict["failedGates"], json!(["ownership"]), "{verdict}");
+    assert!(
+        reasons(&verdict).iter().any(|r| r.contains("created.txt")),
+        "{verdict}"
+    );
+}
+
+/// A packet that owns what the fake touches and declares only `edit`; the first launch asks,
+/// a later one runs `later` (a list of check ids).
+fn one_check_packet(later: &[&str]) -> Harness {
+    Harness::with_packet(
+        &asks_first("Right task?", true, &run_checks(later)),
+        json!(["README.md", "created.txt"]),
+        json!([{"id": "edit", "command": "grep -q edited README.md"}]),
+    )
+}
+
+fn with_made_check(h: &Harness) -> String {
+    packet_with(
+        &h.packet_text,
+        "checks",
+        json!([
+            {"id": "edit", "command": "grep -q edited README.md"},
+            {"id": "made", "command": "test -f created.txt"},
+        ]),
+    )
+}
+
+#[test]
+fn a_redirect_that_adds_a_check_makes_it_required_and_never_running_it_is_incomplete() {
+    if !sandbox_available() {
+        return;
+    }
+    let h = one_check_packet(&["edit"]);
+    let out = redirected_run(&h, &with_made_check(&h));
+    assert_eq!(out.status.code(), Some(3), "{}", stdout_of(&out));
+    let verdict = h.verdict();
+    assert_eq!(verdict["verdict"], "incomplete", "{verdict}");
+    assert_eq!(verdict["unrun"], json!(["made"]), "{verdict}");
+    assert!(
+        reasons(&verdict)
+            .iter()
+            .any(|r| r.contains("\"made\" was never run")),
+        "{verdict}"
+    );
+    // Only what the builder recorded is sealed.
+    assert!(h.lane().join("control/capsule/checks/edit.json").exists());
+    assert!(!h.lane().join("control/capsule/checks/made.json").exists());
+}
+
+#[test]
+fn a_check_a_redirect_adds_can_be_run_by_the_builder_sealed_and_reproduced() {
+    if !sandbox_available() {
+        return;
+    }
+    let h = one_check_packet(&["edit", "made"]);
+    let out = redirected_run(&h, &with_made_check(&h));
+    assert_eq!(out.status.code(), Some(0), "{}", stdout_of(&out));
+    assert!(passed(&h, 3) && passed(&h, 4), "both ran and passed");
+    let verdict = h.verdict();
+    assert_eq!(verdict["verdict"], "proved", "{verdict}");
+    let made: Value = serde_json::from_str(&h.read("control/capsule/checks/made.json")).unwrap();
+    assert_eq!(made["command"], "test -f created.txt");
+    assert_eq!(made["exit_status"], 0);
+    let out = verify_capsule_of(&h);
+    assert_eq!(out.status.code(), Some(0), "{}", text_of(&out));
+}
+
+#[test]
+fn a_check_the_redirect_removes_is_no_longer_required() {
+    if !sandbox_available() {
+        return;
+    }
+    // The packet starts with two checks; the redirect declares only `edit`, and the builder
+    // runs only `edit` after it.
+    let h = owned_packet(&asks_first("Right task?", true, &run_checks(&["edit"])));
+    let only_edit = packet_with(
+        &h.packet_text,
+        "checks",
+        json!([{"id": "edit", "command": "grep -q edited README.md"}]),
+    );
+    let out = redirected_run(&h, &only_edit);
+    assert_eq!(out.status.code(), Some(0), "{}", stdout_of(&out));
+    let verdict = h.verdict();
+    assert_eq!(verdict["verdict"], "proved", "{verdict}");
+    assert_eq!(verdict["unrun"], json!([]), "{verdict}");
+}
+
+fn text_of(out: &Output) -> String {
+    format!(
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    )
+}
+
+// ---- `require_heldout` is checked before the builder starts ---------------------------------
+
+/// Commit `cowproof.toml` with `[proof] require_heldout = true` into the harness's repository.
+fn require_heldout_in_base(h: &Harness) {
+    fs::write(
+        h.repo.join("cowproof.toml"),
+        "[proof]\nrequire_heldout = true\n",
+    )
+    .unwrap();
+    git(&h.repo, &["add", "cowproof.toml"]);
+    git(&h.repo, &["commit", "-q", "-m", "require held-out checks"]);
+}
+
+#[test]
+fn require_heldout_with_no_held_out_file_refuses_before_any_lane_or_builder_exists() {
+    if !sandbox_available() {
+        return;
+    }
+    // The fake would leave a marker in its lane home if it ever started.
+    let h = Harness::new("echo started > \"$HOME/builder-started\"\n");
+    require_heldout_in_base(&h);
+    let home = var_tmp("cp-run-home-");
+    let out = output(
+        h.command(h.lanes.path())
+            .env("ANTHROPIC_API_KEY", REAL_KEY)
+            .env("HOME", home.path()),
+    );
+    assert_eq!(out.status.code(), Some(1), "{}", text_of(&out));
+    let err = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(
+        err.contains("require_heldout") && err.contains("--heldout") && err.contains(&h.id),
+        "{err}"
+    );
+    // No lane directory at all, so no builder: the lanes root is empty.
+    assert_eq!(fs::read_dir(h.lanes.path()).unwrap().count(), 0);
+    assert!(!h.lane().exists());
+}
+
+#[test]
+fn require_heldout_with_a_held_out_file_starts_the_builder_as_usual() {
+    if !sandbox_available() {
+        return;
+    }
+    let h = owned_packet(&run_checks(&["edit", "made"]));
+    require_heldout_in_base(&h);
+    let held = var_tmp("cp-run-heldout-");
+    let file = held.path().join("held.toml");
+    fs::write(
+        &file,
+        "[[check]]\nid = \"hidden\"\ncommand = \"grep -q edited README.md\"\n",
+    )
+    .unwrap();
+    let home = var_tmp("cp-run-home-");
+    let out = output(
+        h.command(h.lanes.path())
+            .arg("--heldout")
+            .arg(&file)
+            .env("ANTHROPIC_API_KEY", REAL_KEY)
+            .env("HOME", home.path()),
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", text_of(&out));
+    assert_eq!(h.launches(), 1, "the builder ran");
+    assert_eq!(h.verdict()["verdict"], "proved");
+}
+
 /// A fake whose `--resume` fails at once with no output, like `claude` does
 /// for a session that no longer exists.
 fn session_gone_then_checks() -> String {
@@ -1991,7 +2260,7 @@ fn the_fourth_ask_ends_the_lane_as_escalation_limit_without_a_proof() {
         rule(&h, &id, &["--answer", "keep going"]);
     }
     let out = finish(child);
-    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(out.status.code(), Some(8));
     assert_eq!(h.launches(), 4);
     assert_eq!(h.run_json()["status"], "escalation-limit");
     assert_eq!(queue_events(&h, "lane-escalation-limit").len(), 1);
@@ -2167,7 +2436,7 @@ fn the_runner_ends_the_whole_process_group_so_no_background_child_survives() {
     run.wait_for_stderr(WAITING, SESSION_END_WITHIN);
     rule(&h, &id, &["--stop"]);
     let out = finish(run.child);
-    assert_eq!(out.status.code(), Some(1), "{}", stdout_of(&out));
+    assert_eq!(out.status.code(), Some(7), "{}", stdout_of(&out));
     assert_eq!(h.run_json()["status"], "stopped");
 
     // By pid where the sandbox shares the host's pid space (macOS). bwrap runs
@@ -2372,7 +2641,7 @@ fn a_stop_on_a_non_blocking_ask_ends_the_live_session_and_the_lane() {
         use std::io::Read;
         let _ = pipe.read_to_string(&mut stdout);
     }
-    assert_eq!(status.code(), Some(1), "{stdout}\n{}", run.stderr());
+    assert_eq!(status.code(), Some(7), "{stdout}\n{}", run.stderr());
     assert_eq!(h.launches(), 1, "no second launch");
     assert_eq!(h.run_json()["status"], "stopped");
     assert_eq!(segments(&h).len(), 1);
@@ -2430,7 +2699,7 @@ fn a_stop_does_not_count_the_slow_work_after_the_builder_is_gone_as_waiting_for_
         "the slow `pk doctor` did not delay the exit ({exit:?}), so this proves nothing:\n{}",
         run.stderr()
     );
-    assert_eq!(status.code(), Some(1), "{}", run.stderr());
+    assert_eq!(status.code(), Some(7), "{}", run.stderr());
     assert_eq!(h.run_json()["status"], "stopped");
 }
 
@@ -2471,7 +2740,7 @@ fn a_stop_of_a_builder_that_ignores_sigterm_is_reported_as_waiting_for_the_grace
         );
     }
     let status = exit_within(&mut run, RULED_WITHIN);
-    assert_eq!(status.code(), Some(1), "{}", run.stderr());
+    assert_eq!(status.code(), Some(7), "{}", run.stderr());
 }
 
 #[test]
@@ -2598,7 +2867,7 @@ fn a_turn_budget_forces_one_escalation_ends_the_session_and_a_stop_ends_the_lane
 
     rule(&h, &id, &["--stop"]);
     let out = finish(run.child);
-    assert_eq!(out.status.code(), Some(1), "{}", stdout_of(&out));
+    assert_eq!(out.status.code(), Some(7), "{}", stdout_of(&out));
     assert_eq!(h.run_json()["status"], "stopped");
     assert_eq!(
         h.launches(),
@@ -2643,7 +2912,7 @@ fn a_cost_estimate_past_the_share_forces_one_escalation_and_ends_the_session() {
 
     rule(&h, &id, &["--stop"]);
     let out = finish(run.child);
-    assert_eq!(out.status.code(), Some(1), "{}", stdout_of(&out));
+    assert_eq!(out.status.code(), Some(7), "{}", stdout_of(&out));
     assert_eq!(h.run_json()["status"], "stopped");
     let segs = segments(&h);
     assert_eq!(segs[0]["sessionEnd"], "forced", "{segs:?}");
@@ -5215,7 +5484,7 @@ fn a_stop_ruling_ends_the_check_the_parked_builder_left_running() {
     let out = finish(child);
     assert_eq!(
         out.status.code(),
-        Some(1),
+        Some(7),
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
@@ -5253,5 +5522,5 @@ fn a_check_is_ended_when_the_builder_exits_and_the_lane_parks_before_any_ruling(
     let id = wait_for_ask(&h, &mut run.child, 1);
     rule(&h, &id, &["--stop"]);
     let status = exit_within(&mut run, SESSION_END_WITHIN);
-    assert_eq!(status.code(), Some(1), "{}", run.stderr());
+    assert_eq!(status.code(), Some(7), "{}", run.stderr());
 }

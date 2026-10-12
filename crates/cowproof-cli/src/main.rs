@@ -55,8 +55,12 @@ enum Action {
     /// failed); 3 incomplete (a declared check was never run); 4 infrastructure (the proof could
     /// not run, never a refutation); 5 timeout (wall-clock limit exceeded, nothing is proved,
     /// `control/run.json` says `timeout`); 6 cost-cap (cost estimate reached 100% of the cap,
-    /// nothing is proved, `control/run.json` says `cost-cap`); 1 the run itself failed before
-    /// a verdict; 130 interrupted by SIGINT or SIGTERM (the builder's process group is ended,
+    /// nothing is proved, `control/run.json` says `cost-cap`); 7 stopped (the director ruled
+    /// `stop`; the work is kept, nothing is proved, `control/run.json` says `stopped`);
+    /// 8 escalation-limit (the lane ended at the escalation or park limit; the work is kept,
+    /// nothing is proved, `control/run.json` says `escalation-limit`); 1 the run itself
+    /// failed before a verdict (including `[proof] require_heldout = true` in the base with
+    /// no held-out checks for the lane, which is refused before the builder starts); 130 interrupted by SIGINT or SIGTERM (the builder's process group is ended,
     /// nothing is proved, and `control/run.json` says `interrupted`).
     Run(RunOneArgs),
     /// Replay a proof capsule against a repository, from any directory

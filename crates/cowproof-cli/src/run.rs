@@ -25,9 +25,11 @@
 //!    `run_check` results, replay it in the verifier, run the gates and write
 //!    `control/verdict.json`. The exit code is the verdict (0 proved, or 0
 //!    finished for a `--unsandboxed` lane, which is checked the same way but
-//!    never proved; 2 refuted, 3 incomplete, 4 infrastructure). A lane the director stopped,
-//!    or one that hit the escalation limit, keeps its work and is not proved:
-//!    `run.json` says how it ended and the exit code is 1. The two hard limits
+//!    never proved; 2 refuted, 3 incomplete, 4 infrastructure). The gates and the verifier
+//!    judge by the header of the LAST packet version delivered to the builder (the packet it
+//!    started with, or the latest `redirect`), never the original's. A lane the director
+//!    stopped (exit 7), or one that hit the escalation limit (exit 8), keeps its work and is
+//!    not proved: `run.json` says how it ended. The two hard limits
 //!    end a lane the same way, with its work kept and no proof: a wall-clock
 //!    timeout (exit 5, status `timeout`) and a running cost ESTIMATE at 100% of
 //!    the cap (exit 6, status `cost-cap`).
@@ -78,7 +80,10 @@ use cowproof_run::{
     proxy::{MetricsLog, Provider, ProxyConfig, ProxyServer},
     render_macos_profile, sandbox_command,
     stream::{MeterSummary, StreamMeter, UsageProbe},
-    tools::{self, CheckEnd, CheckOutcome, CheckTable, RunCheck, SessionEnd, SessionEndSignal},
+    tools::{
+        self, CheckEnd, CheckOutcome, CheckTable, LiveChecks, RunCheck, SessionEnd,
+        SessionEndSignal,
+    },
 };
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap};
@@ -88,7 +93,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::process::Command;
@@ -193,6 +198,14 @@ const TIMEOUT_EXIT_CODE: i32 = 5;
 /// The exit code when the cost estimate reached 100% of the cap and ended the
 /// lane (`run.json` status `cost-cap`).
 const COST_CAP_EXIT_CODE: i32 = 6;
+
+/// The exit code when the director ruled `stop` (`run.json` status `stopped`): the work is
+/// kept and nothing is proved. Not 77, which is the forced-key refusal of `host-agent`.
+const STOPPED_EXIT_CODE: i32 = 7;
+
+/// The exit code when the lane ended at the escalation limit (`run.json` status
+/// `escalation-limit`): the work is kept and nothing is proved.
+const ESCALATION_LIMIT_EXIT_CODE: i32 = 8;
 
 /// On the first SIGINT or SIGTERM, how long past [`TERM_GRACE`] the runner waits
 /// for the launcher to finish ending the builder's group before it stops waiting.
@@ -1717,6 +1730,31 @@ struct Drive<'a> {
     cwd: &'a Path,
     repo: &'a Path,
     plans: &'a [cowproof_plan::Plan],
+    /// The checks `run_check` accepts and runs; a delivered redirect replaces them.
+    declared: &'a DeclaredChecks,
+}
+
+/// The checks the builder may run through `run_check`: the ids the tools server accepts and the
+/// commands the runner executes for them. They start as the packet's and are replaced when a
+/// `redirect` is delivered, because the lane is proved against the last delivered packet.
+struct DeclaredChecks {
+    ids: LiveChecks,
+    context: Arc<CheckContext>,
+}
+
+impl DeclaredChecks {
+    fn replace(&self, checks: &[cowproof_core::Check]) {
+        *self
+            .context
+            .commands
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = checks
+            .iter()
+            .map(|c| (c.id.clone(), c.command.clone()))
+            .collect();
+        self.ids
+            .replace(checks.iter().map(|c| c.id.clone()).collect());
+    }
 }
 
 impl Drive<'_> {
@@ -1815,7 +1853,11 @@ impl Drive<'_> {
     /// lane is on when the redirect is delivered (D28 clause 5; the redirect keeps that rung).
     /// Anything wrong refuses the redirect, which ends the lane refused with its work kept and
     /// the ruling left recorded and undelivered, as a refused reassign does.
-    fn load_redirect(&self, packet_path: &str, rung: &Rung) -> Result<String, String> {
+    fn load_redirect(
+        &self,
+        packet_path: &str,
+        rung: &Rung,
+    ) -> Result<(String, cowproof_core::Header), String> {
         const MAX_PACKET: u64 = 1024 * 1024;
         let path = self.cwd.join(packet_path);
         let meta = fs::metadata(&path).map_err(|e| format!("{}: {e}", path.display()))?;
@@ -1846,7 +1888,7 @@ impl Drive<'_> {
         if let Some(refusal) = profile_refusal(self.profiles, rung, &text) {
             return Err(format!("{rung} is the rung this lane is on, but {refusal}"));
         }
-        Ok(text)
+        Ok((text, header))
     }
 
     fn segment_record(
@@ -2071,8 +2113,11 @@ impl Drive<'_> {
                 }
                 EscalationVerdict::Redirect { packet_path } => {
                     match self.load_redirect(&packet_path, &rung) {
-                        Ok(text) => {
+                        Ok((text, redirected)) => {
                             self.mark_delivered(&id)?;
+                            // The redirect's checks are the ones the builder may run from here
+                            // on, and the ones the proof will require.
+                            self.declared.replace(&redirected.checks);
                             packet = text;
                             packet_versions.push((Some(id.to_string()), packet.clone()));
                             launch = Launch {
@@ -2397,7 +2442,7 @@ pub(crate) fn sandboxed_command(
 struct CheckContext {
     layout: LaneLayout,
     path: String,
-    commands: BTreeMap<String, String>,
+    commands: RwLock<BTreeMap<String, String>>,
     /// One check at a time per lane (a builder can open several connections).
     slot: Semaphore,
     /// The first port of the lane's block (`COWPROOF_PORT_BASE`), the same one the builder gets.
@@ -2421,9 +2466,16 @@ fn refused(output: impl Into<String>) -> CheckOutcome {
 /// Run one declared check in a fresh `SandboxPolicy::run_check` sandbox.
 /// Fails closed: if the sandbox cannot be built, nothing runs.
 async fn run_declared_check(ctx: Arc<CheckContext>, id: String) -> CheckOutcome {
-    let Some(command) = ctx.commands.get(&id) else {
+    let command = ctx
+        .commands
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&id)
+        .cloned();
+    let Some(command) = command else {
         return refused(format!("no command is declared for check {id:?}"));
     };
+    let command = &command;
     let Ok(_slot) = ctx.slot.acquire().await else {
         return refused("the check queue is closed");
     };
@@ -3364,6 +3416,19 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
     // repository, or one that is unreadable, stops the run here.
     let heldout = resolve_heldout(args.heldout.as_deref(), &repo, &real_home, &header.id)?;
     check_heldout_port(heldout.as_deref(), &header)?;
+    // `[proof] require_heldout = true` in the base commit: a lane with no held-out checks would
+    // be refuted at the gate only after the builder had run and spent its budget, so refuse
+    // here, before any lane exists. The gate keeps its own check as the backstop (a base that
+    // does not parse is the gate's to report, as it was).
+    if heldout.is_none() && matches!(base_requires_heldout(&repo, "HEAD"), Ok(true)) {
+        bail!(
+            "[proof] require_heldout = true in cowproof.toml at the base commit, but lane {} has \
+             no held-out checks: pass --heldout <file>, or put them in the director store \
+             (~/.cowproof/heldout/<repo-id>/{}.toml); nothing was started",
+            header.id,
+            header.id
+        );
+    }
     let path = builder_path(&director_path, &real_home);
     let claude_bin = match claude_bin {
         Some(bin) if remote_host.is_none() => Some(
@@ -3518,14 +3583,17 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
         .transpose()?;
     let tools_queue = queue.clone();
     let table: CheckTable = checks.iter().map(|c| c.id.clone()).collect();
+    let live_ids = LiveChecks::from(table);
     let check_groups = Arc::new(GroupSet::new());
     let context = Arc::new(CheckContext {
         layout: layout.clone(),
         path: path.clone(),
-        commands: checks
-            .iter()
-            .map(|c| (c.id.clone(), c.command.clone()))
-            .collect(),
+        commands: RwLock::new(
+            checks
+                .iter()
+                .map(|c| (c.id.clone(), c.command.clone()))
+                .collect(),
+        ),
         slot: Semaphore::new(1),
         port_base,
         remote: remote.clone(),
@@ -3534,6 +3602,10 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
             .check_timeout_secs
             .map_or(CHECK_TIMEOUT, Duration::from_secs),
     });
+    let declared = DeclaredChecks {
+        ids: live_ids.clone(),
+        context: context.clone(),
+    };
     let run_check: RunCheck =
         Arc::new(move |id: &str| Box::pin(run_declared_check(context.clone(), id.to_string())));
     let _tools = AbortOnDrop(tokio::spawn({
@@ -3544,7 +3616,7 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
                 tools_listener,
                 lane_id,
                 tools_queue,
-                table,
+                live_ids,
                 run_check,
                 Some(end_tx),
             )
@@ -3720,6 +3792,7 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
         cwd: &cwd,
         repo: &repo,
         plans: &plans,
+        declared: &declared,
     };
 
     // 5b. SIGINT and SIGTERM (caught since the slot wait). The builder is not in the
@@ -3994,11 +4067,20 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
     patch?;
     match end {
         LaneEnd::Builder => {}
-        LaneEnd::Stopped => bail!("the director stopped lane {}; its work is kept", header.id),
-        LaneEnd::EscalationLimit => bail!(
-            "lane {} ended as escalation-limit; its work is kept",
-            header.id
-        ),
+        LaneEnd::Stopped => {
+            eprintln!(
+                "the director stopped lane {}; its work is kept and nothing is proved",
+                header.id
+            );
+            return Ok(STOPPED_EXIT_CODE);
+        }
+        LaneEnd::EscalationLimit => {
+            eprintln!(
+                "lane {} ended as escalation-limit; its work is kept and nothing is proved",
+                header.id
+            );
+            return Ok(ESCALATION_LIMIT_EXIT_CODE);
+        }
         LaneEnd::Timeout => return Ok(TIMEOUT_EXIT_CODE),
         LaneEnd::CostCap => return Ok(COST_CAP_EXIT_CODE),
         LaneEnd::Refused(why) => bail!("{why}"),
@@ -4021,12 +4103,15 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
         .lock()
         .map(|q| q.check_runs(&header.id))
         .unwrap_or_default();
+    // The gates, the checks and the capsule come from the header of the last packet version
+    // delivered to the builder, never from the original when a redirect replaced it.
+    let proof_header = final_header(&header, &lane_run.packet_versions)?;
     let verdict = prove_lane(
         &ProofInput {
             layout: &layout,
             repo: &repo,
             prepared: &prepared,
-            header: &header,
+            header: &proof_header,
             runtime: lane_run.runtime.name(),
             runtime_version: launcher.runtime_version(lane_run.runtime),
             openrouter_price: launcher
@@ -4058,6 +4143,26 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
     )
     .await?;
     Ok(verdict.outcome.exit_code())
+}
+
+/// The header the lane is proved by: the one in the last packet version delivered to the
+/// builder, which is the packet it started with when no `redirect` was delivered. A redirect is
+/// the director's own packet, so its header is trusted like the original (it was linted and
+/// checked against the rung's profile before delivery). The held-out checks are not in any
+/// packet: they come from the director's store alone.
+///
+/// The class stays the original's: the lane holds a slot of the class it started with, and the
+/// capsule records that one.
+fn final_header(
+    original: &cowproof_core::Header,
+    versions: &[(Option<String>, String)],
+) -> Result<cowproof_core::Header> {
+    let Some((Some(_), text)) = versions.last() else {
+        return Ok(original.clone());
+    };
+    let mut header = parse_header(text).context("the last delivered packet version")?;
+    header.class_name = original.class_name.clone();
+    Ok(header)
 }
 
 /// How a lane ends. The exit code of `cowproof run` is the outcome's.
@@ -4338,6 +4443,13 @@ async fn prove_lane(
         evidence.infrastructure.push(e);
         BTreeMap::new()
     });
+    // A redirect can change the packet's port kind; the held-out port cases still need a
+    // reference command to capture them from. (Checked before launch for the first packet.)
+    if let Err(e) = check_heldout_port(input.heldout_path, header) {
+        evidence.infrastructure.push(format!(
+            "the held-out checks do not fit the final packet: {e:#}"
+        ));
+    }
     let mut ran: Vec<(&cowproof_core::Check, bool)> = Vec::new();
     for check in &header.checks {
         match results.get(&check.id) {
