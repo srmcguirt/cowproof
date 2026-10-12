@@ -1269,8 +1269,13 @@ fn start_planned_lane(
 
 fn plan_collect(repo: &Path) -> Result<()> {
     let repo = repo.canonicalize()?;
+    let known_ids = cowproof_plan::lanes(&cowproof_plan::load_plans(&repo, &[])?)
+        .into_iter()
+        .map(|lane| lane.id)
+        .collect();
     let mut runner = CliPlanHostRunner {
         configured: configured_hosts()?,
+        known_ids,
     };
     for (id, status) in collect_running(&repo, &mut runner)? {
         println!("{id}\t{status}");
@@ -1280,6 +1285,9 @@ fn plan_collect(repo: &Path) -> Result<()> {
 
 struct CliPlanHostRunner {
     configured: serde_json::Map<String, Value>,
+    /// Every lane id of the plans, so a directory `x-1-<stamp>` goes to lane `x-1` and not to
+    /// lane `x`, whose prefix `x-` it also begins with.
+    known_ids: Vec<String>,
 }
 impl CliPlanHostRunner {
     fn lane_dir(&self, lane: &cowproof_plan::LaneRef) -> Result<Option<PathBuf>> {
@@ -1302,14 +1310,18 @@ impl CliPlanHostRunner {
                 .find(|p| {
                     p.is_dir()
                         && p.file_name().is_some_and(|n| {
-                            n.to_string_lossy().starts_with(&format!("{}-", lane.id))
+                            cowproof_plan::lane_dir_belongs_to(
+                                &n.to_string_lossy(),
+                                &lane.id,
+                                &self.known_ids,
+                            )
                         })
                 }));
         }
         let ssh = host.get("ssh").and_then(Value::as_str).unwrap_or(alias);
         let root = remote_host_root(alias, host, ssh)?;
         let query = format!(
-            "find {} -maxdepth 1 -type d -name {} -print -quit",
+            "find {} -maxdepth 1 -type d -name {} -print",
             shell_quote(&root.to_string_lossy()),
             shell_quote(&format!("{}-*", lane.id))
         );
@@ -1320,8 +1332,21 @@ impl CliPlanHostRunner {
         if !out.status.success() {
             bail!("could not locate {} on {alias}", lane.id);
         }
-        let path = String::from_utf8_lossy(&out.stdout).trim().to_owned();
-        Ok((!path.is_empty()).then(|| PathBuf::from(path)))
+        // The remote glob `<id>-*` also lists the directories of lanes whose ids begin
+        // `<id>-`; keep the first one that is this lane's.
+        let found = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(|l| PathBuf::from(l.trim()))
+            .find(|p| {
+                p.file_name().is_some_and(|n| {
+                    cowproof_plan::lane_dir_belongs_to(
+                        &n.to_string_lossy(),
+                        &lane.id,
+                        &self.known_ids,
+                    )
+                })
+            });
+        Ok(found)
     }
 }
 impl PlanHostRunner for CliPlanHostRunner {

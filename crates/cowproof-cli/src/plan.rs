@@ -5,7 +5,8 @@
 
 use anyhow::{Context, Result};
 use cowproof_plan::{
-    blocked_by, check_plans, lanes, load_plans, ready_next, set_status, waiting_on_founder,
+    blocked_by, check_plans, lane_dir_belongs_to, lanes, load_plans, ready_next, set_status,
+    waiting_on_founder,
 };
 use serde_json::{Value, json};
 use std::fs;
@@ -299,6 +300,7 @@ fn brief(repo: &Path, root: Option<&Path>, as_json: bool) -> Result<()> {
     let plans = load_plans(repo, &[])?;
     let all = lanes(&plans);
     let ready = ready_next(&all);
+    let all_ids: Vec<String> = all.iter().map(|l| l.id.clone()).collect();
     let mut running: Vec<String> = all
         .iter()
         .filter(|l| l.status == "running")
@@ -324,7 +326,10 @@ fn brief(repo: &Path, root: Option<&Path>, as_json: bool) -> Result<()> {
             let name = e.file_name().to_string_lossy().into_owned();
             let summary = dir.join("summary.json");
             if !summary.exists() {
-                if !running.iter().any(|id| name.starts_with(&format!("{id}-"))) {
+                if !running
+                    .iter()
+                    .any(|id| lane_dir_belongs_to(&name, id, &all_ids))
+                {
                     running.push(name);
                 }
             } else {
@@ -332,7 +337,7 @@ fn brief(repo: &Path, root: Option<&Path>, as_json: bool) -> Result<()> {
                     .modified()
                     .unwrap_or(SystemTime::UNIX_EPOCH);
                 for lane in &all {
-                    if name.starts_with(&format!("{}-", lane.id))
+                    if lane_dir_belongs_to(&name, &lane.id, &all_ids)
                         && fs::metadata(&lane.plan_path)
                             .and_then(|m| m.modified())
                             .unwrap_or(SystemTime::UNIX_EPOCH)

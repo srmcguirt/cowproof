@@ -9,8 +9,8 @@
 mod common;
 
 use common::{
-    Lane, REAL_KEY, fork_lock, group_gone, output, run_checks, sandbox_available, signal_pid,
-    spawn_to_file, text, unique_lane_id, var_tmp,
+    Lane, REAL_KEY, fork_lock, output, run_checks, sandbox_available, signal_pid, spawn_to_file,
+    text, unique_lane_id, var_tmp, wait_group_gone,
 };
 use cowproof_prove::Capsule;
 use serde_json::{Value, json};
@@ -135,6 +135,46 @@ impl Remote {
             &fs::read_to_string(&p).unwrap_or_else(|e| panic!("{}: {e}", p.display())),
         )
         .unwrap()
+    }
+
+    /// Everything that says why the run of lane `id` ended as it did, for an assertion message
+    /// on a host where the failure cannot be repeated at will: the run's output, the files of
+    /// its control directory that explain an infrastructure failure, the first lane's remote
+    /// record, and the end of the fake ssh's log.
+    fn diagnostics(&self, id: &str, out: &std::process::Output) -> String {
+        let control = self
+            .lane
+            .lanes
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| self.lane.lanes.path().to_path_buf())
+            .join(id)
+            .join("control");
+        let mut report = text(out);
+        for name in [
+            "run.json",
+            "verdict.json",
+            "remote.json",
+            "ssh-master.log",
+            "ssh-finish.log",
+            "builder.stderr",
+        ] {
+            let body = fs::read_to_string(control.join(name))
+                .unwrap_or_else(|e| format!("(not readable: {e})"));
+            report.push_str(&format!("\n--- {id}/control/{name}:\n{body}"));
+        }
+        let first = self.lane.lane_dir().join("control/remote.json");
+        report.push_str(&format!(
+            "\n--- first lane's remote.json:\n{}",
+            fs::read_to_string(first).unwrap_or_else(|e| format!("(not readable: {e})"))
+        ));
+        let log = self.log();
+        let from = log.len().saturating_sub(60);
+        report.push_str("\n--- the last fake ssh log entries:\n");
+        for entry in &log[from..] {
+            report.push_str(&format!("{entry}\n"));
+        }
+        report
     }
 
     fn log(&self) -> Vec<Value> {
@@ -293,6 +333,25 @@ fn a_remote_lane_is_proved_from_the_patch_the_host_returned() {
     // The capsule is the same whole as a local one: its checks replay here.
     assert_eq!(capsule.lane_state, "proved");
     remote.assert_torn_down();
+}
+
+#[test]
+fn a_forward_whose_relay_is_slow_to_listen_still_succeeds() {
+    if !sandbox_available() {
+        return;
+    }
+    // A relay that needs longer than the fake's old five-second wait to listen: a Python start
+    // on a loaded host. The forward waits for it, and the run proves.
+    let mut remote = Remote::new(&proving_builder(), checks());
+    remote.lane.set_env("FAKE_SSH_RELAY_DELAY", "6");
+    let out = finish(remote.command(&[]));
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        remote.diagnostics(&remote.lane.id, &out)
+    );
+    assert_eq!(remote.lane.verdict()["verdict"], "proved", "{}", text(&out));
 }
 
 #[test]
@@ -960,8 +1019,11 @@ fn killing_the_directors_ssh_ends_the_remote_builder() {
     assert!(began.elapsed() < STOP_WITHIN);
     // The builder's group went with `host-agent` (the sandbox shares the pid space on macOS only).
     if cfg!(target_os = "macos") {
-        assert!(group_gone(&builder.to_string()), "builder group is alive");
-        assert!(!pid_alive(background), "the background child is alive");
+        assert!(
+            wait_group_gone(&builder.to_string(), STOP_WITHIN),
+            "builder group is still alive {STOP_WITHIN:?} after host-agent ended"
+        );
+        assert_pid_gone_within(background, STOP_WITHIN);
     }
 
     // The director saw its builder's ssh die and finished the lane its usual way.
@@ -1329,7 +1391,12 @@ fn an_orphaned_remote_lane_is_swept_by_the_next_run() {
     fs::write(flag.path().join("proceed"), "go\n").unwrap();
     let second = unique_lane_id();
     let out = finish(remote.second_command(&second));
-    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        remote.diagnostics(&second, &out)
+    );
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
     assert!(
         stderr.contains(&format!(
@@ -1385,8 +1452,14 @@ fn a_live_directors_lane_is_never_swept() {
 
     // A second director shares the lanes root while the first one is alive and busy.
     fs::write(flag.path().join("proceed"), "go\n").unwrap();
-    let out = finish(remote.second_command(&unique_lane_id()));
-    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    let second = unique_lane_id();
+    let out = finish(remote.second_command(&second));
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        remote.diagnostics(&second, &out)
+    );
     assert!(
         !String::from_utf8_lossy(&out.stderr).contains("swept"),
         "{}",
@@ -1462,8 +1535,14 @@ fn a_finished_lane_is_never_swept() {
     let cleanups = |remote: &Remote| cleanup_count(&remote.log(), &remote.lane.id);
     assert_eq!(cleanups(&remote), 1, "the run's own cleanup");
 
-    let out = finish(remote.second_command(&unique_lane_id()));
-    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    let second = unique_lane_id();
+    let out = finish(remote.second_command(&second));
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        remote.diagnostics(&second, &out)
+    );
     assert!(
         !String::from_utf8_lossy(&out.stderr).contains("swept"),
         "{}",

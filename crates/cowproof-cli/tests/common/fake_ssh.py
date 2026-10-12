@@ -36,6 +36,7 @@ that holds the bytes it read on stdin ($FAKE_SSH_DIR/stdin.<pid>, written as the
 `command-started` line with the command's pid, this process's pid (`ssh_pid`) and the command
 line (`command`; not `argv`, which only the invocation lines carry).
 Environment: FAKE_SSH_LOG,
+FAKE_SSH_RELAY_DELAY (seconds a forward's relay waits before it listens),
 FAKE_SSH_DIR and FAKE_REMOTE_HOME (the remote user's home and working directory). When
 FAKE_SSH_FORBIDDEN and FAKE_REMOTE_ROOT are set, the fake looks through every file under the
 remote root and home for the forbidden text just before it runs `host-agent cleanup` (the last
@@ -84,6 +85,8 @@ def master_alive(ctl):
 
 def relay(a, b, master):
     """Listen on the socket path `a`; relay each connection to the socket at `b`."""
+    # A test sets FAKE_SSH_RELAY_DELAY to stand in for a Python start on a loaded host.
+    time.sleep(float(os.environ.get("FAKE_SSH_RELAY_DELAY", "0")))
     try:
         os.unlink(a)
     except FileNotFoundError:
@@ -336,7 +339,9 @@ def main():
                 stderr=subprocess.DEVNULL,
                 start_new_session=True,
             )
-            deadline = time.time() + 5
+            # Only a relay that never starts fails the wait, so the deadline is long: a Python
+            # start on a loaded host has taken most of five seconds.
+            deadline = time.time() + 60
             while time.time() < deadline:
                 try:
                     if stat.S_ISSOCK(os.stat(a).st_mode):

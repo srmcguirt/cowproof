@@ -88,6 +88,22 @@ pub fn group_gone(pgid: &str) -> bool {
     cowproof_prove::runner::group_exists(pgid) == Some(false)
 }
 
+/// [`group_gone`], polled for at most `within`: a group whose leader has just been told to
+/// end is not empty until the kernel has reaped every member, which a loaded host does late.
+#[allow(dead_code)] // `tests/remote.rs` uses it; the other test crates that share this module do not
+pub fn wait_group_gone(pgid: &str, within: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + within;
+    loop {
+        if group_gone(pgid) {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
 /// A signal by the name `kill` takes without its dash (`"KILL"`, `"TERM"`, `"INT"`, or `"0"`
 /// for the existence probe), as its `libc` number. No test starts the `kill` program: Ubuntu's
 /// procps `kill` keeps only the first digit of a negative id not preceded by `--`, so

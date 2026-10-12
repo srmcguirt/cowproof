@@ -1433,7 +1433,10 @@ fn a_missing_api_key_stops_the_run_before_any_lane_exists() {
 // `cowproof rule`. The fake `claude` asks on its first launch only; on later
 // launches it records what it was started with and runs the checks.
 
-const PARKED_WAIT: Duration = Duration::from_secs(60);
+/// How long a parked-lane test waits for a run to ask or to end. It only keeps a hung run from
+/// hanging the test, so it is long: a launch that takes a few seconds on an idle machine has
+/// taken most of a minute on a loaded Linux host.
+const PARKED_WAIT: Duration = Duration::from_secs(180);
 
 /// A `cowproof run` in flight.
 fn start(h: &Harness) -> Child {

@@ -1158,3 +1158,40 @@ pub fn parse_json(path: &Path) -> Result<Value> {
 fn valid_stage(stage: &str) -> bool {
     matches!(stage, "foundation" | "alpha" | "beta" | "ga" | "later")
 }
+
+/// Whether the lane-root directory `name` is a directory of lane `id`. A lane's directory is
+/// `<id>-<suffix>` (the legacy runner adds a timestamp), so the id alone is a prefix of the
+/// directories of every lane whose id begins `<id>-`: lane `x`'s prefix `x-` matches
+/// `x-1-20261012T000000`, which belongs to lane `x-1`. A directory belongs to the longest
+/// known id that prefixes it, so `all_ids` (every lane id the caller knows, `id` included)
+/// decides between them. The hyphen already keeps `x-1` from claiming `x-10-...`.
+pub fn lane_dir_belongs_to(name: &str, id: &str, all_ids: &[String]) -> bool {
+    let prefix = |lane: &str| name.starts_with(&format!("{lane}-"));
+    prefix(id)
+        && !all_ids
+            .iter()
+            .any(|other| other.len() > id.len() && prefix(other))
+}
+
+#[cfg(test)]
+mod lane_dir_tests {
+    use super::lane_dir_belongs_to;
+
+    #[test]
+    fn a_directory_belongs_to_the_longest_lane_id_that_prefixes_it() {
+        let ids: Vec<String> = ["x", "x-1", "x-10"].map(String::from).to_vec();
+        let owners = |name: &str| -> Vec<&str> {
+            ids.iter()
+                .filter(|id| lane_dir_belongs_to(name, id, &ids))
+                .map(String::as_str)
+                .collect()
+        };
+        assert_eq!(owners("x-20261012T000000"), ["x"]);
+        assert_eq!(owners("x-1-20261012T000000"), ["x-1"]);
+        assert_eq!(owners("x-10-20261012T000000"), ["x-10"]);
+        assert_eq!(owners("y-1-20261012T000000"), Vec::<&str>::new());
+        // With only `x` known, its prefix still claims the name: nothing says otherwise.
+        let only_x = vec!["x".to_string()];
+        assert!(lane_dir_belongs_to("x-1-20261012T000000", "x", &only_x));
+    }
+}
