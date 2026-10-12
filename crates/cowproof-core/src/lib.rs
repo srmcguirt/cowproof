@@ -11,12 +11,14 @@ pub mod git_show;
 pub mod heldout;
 pub mod ladder;
 pub mod patch;
+pub mod profiles;
 pub mod redact;
 pub mod status;
 
 pub use git_show::{LinkedFile, git_show_following_links, git_show_optional};
 pub use ladder::{PACKET_CLASSES, Routing, Rung, RungSource, Runtime, valid_model_name};
 pub use patch::{PatchDelta, parse_patch};
+pub use profiles::{Profiles, Requirement};
 pub use redact::redact;
 pub use status::{LaneStatus, StatusClass, StatusFacts, classify_opencode, classify_status};
 

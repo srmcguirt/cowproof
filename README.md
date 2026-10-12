@@ -45,6 +45,39 @@ classes = { rust = "claude:sonnet", pg = "claude:sonnet" }
 
 The `claude` and `openrouter` runtimes have an adapter ([OpenRouter models through OpenCode](#openrouter-models-through-opencode) below). The ladder may list `codex` rungs, but a lane that would start on one is refused with exit 4 ("runtime `codex` has no adapter yet (D28 step 1)"), and a `reassign` that would land on one ends the lane the way the top of the ladder does. So does a `reassign` onto a rung that cannot run here: no `opencode` on `PATH`, no `OPENROUTER_API_KEY`, no `claude` or `ANTHROPIC_API_KEY`, or a remote lane.
 
+## Packet profiles per rung
+
+A cheaper model needs more from its packet: the exact tests to write, the exact mutations to try, and a numbered list that says when it is done. A *profile* is a named list of requirements, and `[routing.profiles]` maps a rung to one. `cowproof lint` then requires that rung's profile of a packet. A profile shapes the packet only: the gates and the proof are the same whichever model wrote the patch. Like the ladder, profiles are read from `cowproof.toml` in the lane's base commit, never from a working tree.
+
+```toml
+[profiles.strict]
+require = ["tests", "mutations", "done-checklist"]
+[profiles.standard]
+require = ["checks"]
+[routing.profiles]
+"claude:haiku" = "strict"
+"openrouter:z-ai/glm-5.3-flash" = "strict"
+```
+
+With no `[profiles]` and no `[routing.profiles]` nothing is required, as before. A rung with no route is required nothing, even when profiles exist. The parse is strict: an unknown key, an unknown requirement name, a requirement listed twice, a route for a rung that is not on the ladder (or the same rung twice), and a route naming a profile that `[profiles]` does not define are all errors, reported by `cowproof lint` as rule `profile`.
+
+The requirements are a closed set. Each is a plain check of the packet text, with no model involved, and none grades quality. A heading is a Markdown line of `#` marks and a space (not inside a fenced block); a section runs to the next heading of the same or a higher level.
+
+| Requirement | The packet needs |
+| --- | --- |
+| `tests` | A section whose heading starts with the word "Tests" (for example `## Tests`) holding a list item or paragraph that names a test in backticks (an identifier, or `module::name`) and has at least four other words, the sentence that says what it asserts. |
+| `mutations` | A section whose heading starts with the word "Mutations" holding at least one list item with text, or a non-blank line inside a fenced block (the exact mutation command). |
+| `done-checklist` | A numbered list item (`1.` or `1)`) under a heading that contains the word "Done", for example `## Done checklist`. A bulleted list does not count. |
+| `checks` | The header's `checks` is not empty. |
+
+`cowproof lint` resolves the packet's starting rung the way `cowproof run` does: the header's `rung`, else the `[routing] classes` entry for its class, else the default. It reports each requirement of that rung's profile the packet does not meet as an error, naming the requirement and what to add:
+
+```
+error [profile]: mutations: profile "strict" for rung claude:haiku (the header chose it) requires mutations; add a "## Mutations" section with at least one item: ...
+```
+
+`cowproof run` lints first and stops on a lint error, so a packet that lacks a requirement of its rung's profile does not start: no lane directory exists. Lint has no `--model`, so it checks the rung the header, the class route or the default names. `cowproof run --model` can start the lane on another rung, and lint does not check that rung's profile. A `reassign` onto a higher rung does not re-lint the packet either.
+
 ## OpenRouter models through OpenCode
 
 A rung `openrouter:<model>` (for example `openrouter:z-ai/glm-5.3-flash`) runs the model through [OpenCode](https://opencode.ai), not Claude Code: OpenRouter's own Claude Code integration is only guaranteed to work with Anthropic models. The runner, the sandbox, the queue, the checks and the proof are the same as for a Claude lane; only the builder's launcher, its event parser and the provider the proxy forwards to differ.
@@ -73,7 +106,7 @@ or name the rung in the ladder, the header or a class route (`openrouter:z-ai/gl
 
 `COWPROOF_OPENROUTER_UPSTREAM` replaces `https://openrouter.ai` as the proxy's upstream, for a test server or a self-hosted gateway. It is read from the environment and never from `cowproof.toml`, so repository content cannot redirect your key.
 
-**Limits.** Remote lanes (`--host`) run Claude only: `--host` with an `openrouter` rung is refused with exit 4, naming the rung. OpenCode has no hooks, so an `openrouter` lane is untraced by portkit. The model's context limit and output limit come from the same fetched entry (128k and 16k when it lists none, recorded in `defaulted`), because OpenCode's bundled catalog does not list OpenRouter offline. The price is read once per run: a rate change during a long lane is not seen. The builder preamble names the tools `ask`, `check_ruling` and `run_check`; in OpenCode they are `cowproof-tools_ask` and so on, which the lane's instructions say. A provider that is unreachable makes OpenCode retry silently, so the lane ends at its wall-clock limit rather than at once. Packet profiles for low rungs, the Codex adapter and subscription logins are still to come.
+**Limits.** Remote lanes (`--host`) run Claude only: `--host` with an `openrouter` rung is refused with exit 4, naming the rung. OpenCode has no hooks, so an `openrouter` lane is untraced by portkit. The model's context limit and output limit come from the same fetched entry (128k and 16k when it lists none, recorded in `defaulted`), because OpenCode's bundled catalog does not list OpenRouter offline. The price is read once per run: a rate change during a long lane is not seen. The builder preamble names the tools `ask`, `check_ruling` and `run_check`; in OpenCode they are `cowproof-tools_ask` and so on, which the lane's instructions say. A provider that is unreachable makes OpenCode retry silently, so the lane ends at its wall-clock limit rather than at once. The Codex adapter and subscription logins are still to come.
 
 ## Tune the ladder from data: `cowproof report rollup`
 

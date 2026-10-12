@@ -202,7 +202,8 @@ impl Routing {
             let table = table
                 .as_table()
                 .context("cowproof.toml: [routing] must be a table")?;
-            refuse_unknown_keys("[routing]", table, &["default", "classes"])?;
+            // `profiles` is read by `crate::profiles` (packet profiles per rung, D28 clause 5).
+            refuse_unknown_keys("[routing]", table, &["default", "classes", "profiles"])?;
             if let Some(default) = table.get("default") {
                 let default = default
                     .as_str()
@@ -308,7 +309,11 @@ impl Routing {
     }
 }
 
-fn refuse_unknown_keys(table_name: &str, table: &toml::Table, known: &[&str]) -> Result<()> {
+pub(crate) fn refuse_unknown_keys(
+    table_name: &str,
+    table: &toml::Table,
+    known: &[&str],
+) -> Result<()> {
     for key in table.keys() {
         if !known.contains(&key.as_str()) {
             bail!(

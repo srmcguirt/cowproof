@@ -1,11 +1,13 @@
 #![forbid(unsafe_code)]
 
-use cowproof_core::{Header, Routing, parse_header};
+use cowproof_core::{Header, Profiles, Routing, parse_header};
 use cowproof_plan::{Plan, check_packet_reservations};
 use globset::Glob;
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
+
+mod profile;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Severity {
@@ -56,6 +58,7 @@ pub fn lint_packet(packet_text: &str, repo_root: &Path, plans: &[Plan]) -> Vec<F
         lint_migrations(packet_text, header, repo_root, plans, &mut findings);
         lint_header_checks(header, packet_text, &mut findings);
         lint_rung(header, repo_root, &mut findings);
+        lint_profile(header, packet_text, repo_root, &mut findings);
     }
     lint_secrets(packet_text, &mut findings);
     if let Some((start, section)) = checks_section(packet_text) {
@@ -98,12 +101,7 @@ fn lint_rung(header: &Header, repo_root: &Path, findings: &mut Vec<Finding>) {
     let Some(rung) = &header.rung else {
         return;
     };
-    let has_head = std::process::Command::new("git")
-        .current_dir(repo_root)
-        .args(["rev-parse", "--verify", "--quiet", "HEAD^{commit}"])
-        .output()
-        .is_ok_and(|out| out.status.success());
-    if !has_head {
+    if !has_head(repo_root) {
         return;
     }
     let routing = match Routing::at_commit(repo_root, "HEAD") {
@@ -115,6 +113,57 @@ fn lint_rung(header: &Header, repo_root: &Path, findings: &mut Vec<Finding>) {
     };
     if let Err(e) = routing.ladder_rung(rung) {
         findings.push(error("rung", None, format!("the header's \"rung\": {e:#}")));
+    }
+}
+
+/// Whether `repo_root` is a repository with a commit, so that there is a base to read.
+fn has_head(repo_root: &Path) -> bool {
+    std::process::Command::new("git")
+        .current_dir(repo_root)
+        .args(["rev-parse", "--verify", "--quiet", "HEAD^{commit}"])
+        .output()
+        .is_ok_and(|out| out.status.success())
+}
+
+/// The packet profile of the starting rung (D28 clause 5). The rung is resolved as `cowproof
+/// run` resolves it without `--model`: the header's `rung`, else the class route, else the
+/// default, on the base commit's ladder. Each requirement of that rung's profile the packet
+/// does not meet is an error, `profile`, whose message starts with the requirement's name.
+/// `cowproof run --model` can start the lane on another rung, which lint cannot see. No
+/// repository or commit, an unreadable ladder or a rung off it are left to rule `rung` and to
+/// the run's own refusal. A `[profiles]` or `[routing.profiles]` that does not parse is an
+/// error here, so a broken profile configuration stops a run.
+fn lint_profile(header: &Header, packet_text: &str, repo_root: &Path, findings: &mut Vec<Finding>) {
+    if !has_head(repo_root) {
+        return;
+    }
+    let Ok(routing) = Routing::at_commit(repo_root, "HEAD") else {
+        return;
+    };
+    let profiles = match Profiles::at_commit(repo_root, "HEAD", &routing) {
+        Ok(profiles) => profiles,
+        Err(e) => {
+            findings.push(error("profile", None, format!("{e:#}")));
+            return;
+        }
+    };
+    let Ok((rung, source)) = routing.start(None, header.rung.as_deref(), &header.class_name) else {
+        return;
+    };
+    let Some((name, required)) = profiles.for_rung(&rung) else {
+        return;
+    };
+    for requirement in required {
+        if let Some(need) = profile::missing(*requirement, packet_text, header) {
+            findings.push(error(
+                "profile",
+                None,
+                format!(
+                    "{requirement}: profile \"{name}\" for rung {rung} (the {} chose it) requires {requirement}; {need}",
+                    source.name()
+                ),
+            ));
+        }
     }
 }
 
@@ -964,6 +1013,163 @@ mod tests {
             "rung"
         ));
         fs::remove_dir_all(bare).unwrap();
+    }
+
+    const PROFILE_CONFIG: &str = "[ladder]\nrungs = [\"claude:haiku\", \"claude:sonnet\", \"claude:opus\"]\n\
+        [profiles.strict]\nrequire = [\"tests\", \"mutations\", \"done-checklist\"]\n\
+        [profiles.standard]\nrequire = [\"checks\"]\n\
+        [routing.profiles]\n\"claude:haiku\" = \"strict\"\n\"claude:sonnet\" = \"standard\"\n";
+
+    const FULL_BODY: &str = "\n## Tests\n\n- `case_one` asserts that the run stops before any lane exists.\n\
+        \n## Mutations\n\n- (a) break the parser with sed, then run the tests\n\
+        \n## Done checklist\n\n1. tests pass\n2. fmt is clean\n";
+
+    fn profile_packet(header: &str, body: &str) -> String {
+        format!("<!-- lane {header} -->\n{body}")
+    }
+
+    fn profile_messages(findings: &[Finding]) -> Vec<&str> {
+        findings
+            .iter()
+            .filter(|f| f.rule == "profile")
+            .map(|f| f.message.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn a_haiku_packet_missing_mutations_reports_profile_mutations() {
+        let dir = repo_with_config(Some(PROFILE_CONFIG));
+        let body = FULL_BODY.replace("## Mutations", "## Notes");
+        let text = profile_packet(
+            r#"{"id":"lane-x","owns":["README.md"],"rung":"claude:haiku","checks":[{"id":"unit","command":"cargo test"}]}"#,
+            &body,
+        );
+        let findings = lint_packet(&text, &dir, &[]);
+        let messages = profile_messages(&findings);
+        assert_eq!(messages.len(), 1, "{findings:?}");
+        assert!(messages[0].starts_with("mutations: "), "{}", messages[0]);
+        assert!(messages[0].contains("\"## Mutations\""), "{}", messages[0]);
+        assert!(
+            messages[0].contains("rung claude:haiku (the header chose it)"),
+            "{}",
+            messages[0]
+        );
+        let finding = findings.iter().find(|f| f.rule == "profile").unwrap();
+        assert_eq!(finding.severity, Severity::Error);
+
+        // The same packet, routed to a rung with no profile, passes; so does the full body.
+        let opus = text.replace("claude:haiku", "claude:opus");
+        assert!(!has(&lint_packet(&opus, &dir, &[]), "profile"));
+        let full = profile_packet(
+            r#"{"id":"lane-x","owns":["README.md"],"rung":"claude:haiku"}"#,
+            FULL_BODY,
+        );
+        assert!(!has(&lint_packet(&full, &dir, &[]), "profile"));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn every_missing_requirement_is_its_own_error() {
+        let dir = repo_with_config(Some(PROFILE_CONFIG));
+        let text = profile_packet(
+            r#"{"id":"lane-x","owns":["README.md"],"rung":"haiku"}"#,
+            "\nChange the README.\n",
+        );
+        let messages: Vec<String> = profile_messages(&lint_packet(&text, &dir, &[]))
+            .into_iter()
+            .map(|m| m.split(':').next().unwrap().to_string())
+            .collect();
+        assert_eq!(messages, ["tests", "mutations", "done-checklist"]);
+        // `standard` wants the header's checks.
+        let sonnet = text.replace("haiku", "claude:sonnet");
+        let findings = lint_packet(&sonnet, &dir, &[]);
+        let messages = profile_messages(&findings);
+        assert_eq!(messages.len(), 1);
+        assert!(messages[0].starts_with("checks: "), "{}", messages[0]);
+        let with_checks = profile_packet(
+            r#"{"id":"lane-x","owns":["README.md"],"rung":"claude:sonnet","checks":[{"id":"unit","command":"cargo test"}]}"#,
+            "\nChange the README.\n",
+        );
+        assert!(!has(&lint_packet(&with_checks, &dir, &[]), "profile"));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn lint_resolves_the_rung_as_run_does_header_then_class_then_default() {
+        let config = "[ladder]\nrungs = [\"claude:haiku\", \"claude:sonnet\", \"claude:opus\"]\n\
+            [profiles.strict]\nrequire = [\"mutations\"]\n\
+            [routing]\ndefault = \"claude:opus\"\n[routing.classes]\nlight = \"claude:sonnet\"\n\
+            [routing.profiles]\n\"claude:haiku\" = \"strict\"\n\"claude:sonnet\" = \"strict\"\n\"claude:opus\" = \"strict\"\n";
+        let dir = repo_with_config(Some(config));
+        let lint = |header: &str| lint_packet(&profile_packet(header, "\nBody.\n"), &dir, &[]);
+        // The header rung wins over the class route.
+        let f =
+            lint(r#"{"id":"lane-x","owns":["README.md"],"class":"light","rung":"claude:haiku"}"#);
+        assert!(
+            profile_messages(&f)[0].contains("rung claude:haiku (the header chose it)"),
+            "{f:?}"
+        );
+        // No header rung: the class route.
+        let f = lint(r#"{"id":"lane-x","owns":["README.md"],"class":"light"}"#);
+        assert!(
+            profile_messages(&f)[0].contains("rung claude:sonnet (the class chose it)"),
+            "{f:?}"
+        );
+        // Neither: the default.
+        let f = lint(r#"{"id":"lane-x","owns":["README.md"],"class":"rust"}"#);
+        assert!(
+            profile_messages(&f)[0].contains("rung claude:opus (the default chose it)"),
+            "{f:?}"
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn profiles_come_from_the_base_commit_and_a_broken_config_is_a_profile_error() {
+        let dir = repo_with_config(Some(PROFILE_CONFIG));
+        let text = profile_packet(
+            r#"{"id":"lane-x","owns":["README.md"],"rung":"claude:haiku"}"#,
+            FULL_BODY,
+        );
+        // A working-tree edit that drops the profiles changes nothing.
+        fs::write(
+            dir.join("cowproof.toml"),
+            "[ladder]\nrungs = [\"claude:haiku\"]\n",
+        )
+        .unwrap();
+        let bare = profile_packet(
+            r#"{"id":"lane-x","owns":["README.md"],"rung":"claude:haiku"}"#,
+            "\nBody.\n",
+        );
+        assert!(has(&lint_packet(&bare, &dir, &[]), "profile"));
+        assert!(!has(&lint_packet(&text, &dir, &[]), "profile"));
+        fs::remove_dir_all(dir).unwrap();
+
+        // A route to a rung off the ladder is refused, even with no header rung.
+        let broken = repo_with_config(Some(
+            "[profiles.strict]\nrequire = [\"tests\"]\n[routing.profiles]\n\"claude:gone\" = \"strict\"\n",
+        ));
+        let no_rung = profile_packet(r#"{"id":"lane-x","owns":["README.md"]}"#, "\nBody.\n");
+        let findings = lint_packet(&no_rung, &broken, &[]);
+        let messages = profile_messages(&findings);
+        assert_eq!(messages.len(), 1, "{findings:?}");
+        assert!(
+            messages[0].contains("rung claude:gone is not on the ladder"),
+            "{}",
+            messages[0]
+        );
+        fs::remove_dir_all(broken).unwrap();
+
+        // No profile tables, a broken ladder (rule `rung`'s business) and no repository: silent.
+        let plain = repo_with_config(None);
+        assert!(!has(&lint_packet(&no_rung, &plain, &[]), "profile"));
+        fs::remove_dir_all(plain).unwrap();
+        let ladder = repo_with_config(Some("[ladder]\nrungs = []\n"));
+        assert!(!has(&lint_packet(&no_rung, &ladder, &[]), "profile"));
+        fs::remove_dir_all(ladder).unwrap();
+        let bare_dir = root();
+        assert!(!has(&lint_packet(&no_rung, &bare_dir, &[]), "profile"));
+        fs::remove_dir_all(bare_dir).unwrap();
     }
 
     #[test]

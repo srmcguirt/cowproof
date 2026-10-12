@@ -65,6 +65,8 @@ cowproof lint packet.md --repo <repo-path>
 
 Exit 0 means no errors. Warnings, such as a check command missing from the `## Checks` section, print but do not fail it.
 
+If the repository's `cowproof.toml` routes the packet's rung to a packet profile (`[routing.profiles]`), lint requires what that profile names, and a low rung usually needs the most: a `## Tests` section naming each test with what it asserts, a `## Mutations` section with the exact commands, and a numbered `## Done checklist`. Check `cowproof lint` for the rung's profile before you launch; the errors are rule `profile`.
+
 ```sh
 cowproof run packet.md --repo <repo-path>
 ```
