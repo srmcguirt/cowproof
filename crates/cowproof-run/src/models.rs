@@ -237,21 +237,21 @@ pub fn price_from_list(
         .filter(|p| p.is_object())
         .ok_or_else(|| unusable("it has no `pricing` object".to_string()))?;
     let input = price_field(pricing, "prompt", true)
-        .map_err(&unusable)?
+        .map_err(unusable)?
         .unwrap_or_default();
     let output = price_field(pricing, "completion", true)
-        .map_err(&unusable)?
+        .map_err(unusable)?
         .unwrap_or_default();
-    let cache_read = price_field(pricing, "input_cache_read", false).map_err(&unusable)?;
-    let cache_write = price_field(pricing, "input_cache_write", false).map_err(&unusable)?;
-    let context = limit(entry.get("context_length"), "context_length").map_err(&unusable)?;
+    let cache_read = price_field(pricing, "input_cache_read", false).map_err(unusable)?;
+    let cache_write = price_field(pricing, "input_cache_write", false).map_err(unusable)?;
+    let context = limit(entry.get("context_length"), "context_length").map_err(unusable)?;
     let max_output = limit(
         entry
             .get("top_provider")
             .and_then(|p| p.get("max_completion_tokens")),
         "top_provider.max_completion_tokens",
     )
-    .map_err(&unusable)?;
+    .map_err(unusable)?;
 
     let mut defaulted = Vec::new();
     let mut or_default = |value: Option<u64>, default: u64, name: &'static str| {
