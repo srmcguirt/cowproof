@@ -250,6 +250,55 @@ fn brief_reads_a_lanes_root_for_lanes_that_have_no_summary_yet() {
     );
 }
 
+/// Lanes `x` and `x-1`: the directory `x-1-<stamp>` is lane `x-1`'s, and lane `x`, whose
+/// prefix `x-` it also begins with, has no claim on it.
+const PREFIX_PLAN: &str = r#"{"version":1,"plan":"work","lanes":[
+  {"id":"x","title":"x","priority":1,"status":"running"},
+  {"id":"x-1","title":"x-1","priority":1,"status":"packet"}
+]}"#;
+
+#[test]
+fn brief_does_not_give_a_longer_lanes_directory_to_a_shorter_lane() {
+    let repo = repo_with_plan(PREFIX_PLAN);
+    let root = tempfile::tempdir().unwrap();
+    fs::create_dir(root.path().join("x-1-20261011")).unwrap();
+    let out = plan(
+        repo.path(),
+        &["brief", "--root", root.path().to_str().unwrap()],
+    );
+    assert!(out.status.success(), "{}", text(&out));
+    // Lane `x` is running in the plan, and the directory has no summary: if `x` claimed it,
+    // the directory would not be listed as running.
+    assert!(
+        stdout(&out).starts_with("Running: x, x-1-20261011\n"),
+        "{}",
+        text(&out)
+    );
+}
+
+#[test]
+fn brief_awaits_review_only_of_the_lane_that_owns_a_finished_directory() {
+    let repo = repo_with_plan(PREFIX_PLAN);
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join("x-1-20261011");
+    fs::create_dir(&dir).unwrap();
+    let summary = fs::File::create(dir.join("summary.json")).unwrap();
+    // Newer than the plan file, whatever the clock granularity.
+    summary
+        .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(3600))
+        .unwrap();
+    let out = plan(
+        repo.path(),
+        &["brief", "--root", root.path().to_str().unwrap()],
+    );
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(
+        stdout(&out).contains("\nAwaiting review: x-1\n"),
+        "{}",
+        text(&out)
+    );
+}
+
 fn lane_plan(status: &str) -> String {
     format!(
         r#"{{"version":1,"plan":"work","lanes":[{{"id":"worker","title":"worker","priority":1,"status":"{status}"}}]}}"#

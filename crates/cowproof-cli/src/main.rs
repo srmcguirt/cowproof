@@ -1301,22 +1301,17 @@ impl CliPlanHostRunner {
         };
         if alias == "local" {
             let root = configured_host_root(alias, host);
-            return Ok(fs::read_dir(&root)
-                .ok()
-                .into_iter()
-                .flatten()
-                .flatten()
-                .map(|e| e.path())
-                .find(|p| {
-                    p.is_dir()
-                        && p.file_name().is_some_and(|n| {
-                            cowproof_plan::lane_dir_belongs_to(
-                                &n.to_string_lossy(),
-                                &lane.id,
-                                &self.known_ids,
-                            )
-                        })
-                }));
+            return Ok(pick_lane_dir(
+                fs::read_dir(&root)
+                    .ok()
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+                    .map(|e| e.path())
+                    .filter(|p| p.is_dir()),
+                &lane.id,
+                &self.known_ids,
+            ));
         }
         let ssh = host.get("ssh").and_then(Value::as_str).unwrap_or(alias);
         let root = remote_host_root(alias, host, ssh)?;
@@ -1333,21 +1328,30 @@ impl CliPlanHostRunner {
             bail!("could not locate {} on {alias}", lane.id);
         }
         // The remote glob `<id>-*` also lists the directories of lanes whose ids begin
-        // `<id>-`; keep the first one that is this lane's.
-        let found = String::from_utf8_lossy(&out.stdout)
-            .lines()
-            .map(|l| PathBuf::from(l.trim()))
-            .find(|p| {
-                p.file_name().is_some_and(|n| {
-                    cowproof_plan::lane_dir_belongs_to(
-                        &n.to_string_lossy(),
-                        &lane.id,
-                        &self.known_ids,
-                    )
-                })
-            });
-        Ok(found)
+        // `<id>-`; `pick_lane_dir` keeps the one that is this lane's.
+        Ok(pick_lane_dir(
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .map(|l| PathBuf::from(l.trim())),
+            &lane.id,
+            &self.known_ids,
+        ))
     }
+}
+
+/// The directory of lane `id` among `candidates` (lane-root directories, local or listed by
+/// the remote `find`), or `None`. A directory `<id>-<stamp>` is the lane's unless a longer
+/// known lane id (`x-1` for `x`) also prefixes it: see `cowproof_plan::lane_dir_belongs_to`.
+fn pick_lane_dir(
+    candidates: impl IntoIterator<Item = PathBuf>,
+    id: &str,
+    known_ids: &[String],
+) -> Option<PathBuf> {
+    candidates.into_iter().find(|p| {
+        p.file_name().is_some_and(|name| {
+            cowproof_plan::lane_dir_belongs_to(&name.to_string_lossy(), id, known_ids)
+        })
+    })
 }
 impl PlanHostRunner for CliPlanHostRunner {
     fn status(&mut self, lane: &cowproof_plan::LaneRef) -> Result<cowproof_host::LaneStatus> {
@@ -1687,6 +1691,20 @@ async fn check_command(args: CheckArgs) -> Result<()> {
 #[cfg(test)]
 mod cli_tests {
     use super::*;
+
+    #[test]
+    fn a_lane_gets_its_own_directory_and_not_one_of_a_lane_whose_id_extends_its_own() {
+        let root = Path::new("/lanes");
+        let long = root.join("x-1-20261012T000000");
+        let short = root.join("x-20261012T000000");
+        let ids: Vec<String> = vec!["x".into(), "x-1".into()];
+        let both = || vec![long.clone(), short.clone()];
+
+        assert_eq!(pick_lane_dir(both(), "x", &ids), Some(short.clone()));
+        assert_eq!(pick_lane_dir(both(), "x-1", &ids), Some(long.clone()));
+        assert_eq!(pick_lane_dir(vec![long.clone()], "x", &ids), None);
+        assert_eq!(pick_lane_dir(vec![short.clone()], "x-1", &ids), None);
+    }
 
     #[test]
     fn host_run_argv_constructs_correct_command() {
