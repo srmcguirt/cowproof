@@ -56,7 +56,7 @@ use cowproof_prove::{
     verify::{VerifyOptions, verify},
 };
 use cowproof_run::{
-    LaneLayout, NetworkMode, SandboxPolicy,
+    LaneLayout, NetworkMode, RustupEnv, SandboxPolicy,
     bridge::bridge_port,
     claude::{ClaudeSpec, Credential, claude_command},
     codex::CodexPrice,
@@ -2266,12 +2266,36 @@ fn lane_dir(layout: &LaneLayout) -> Result<PathBuf> {
 
 /// The builder's `PATH`: the director's, minus empty, relative and
 /// real-home entries (the home is hidden from the sandbox, and an empty entry
-/// would search the builder's clone).
+/// would search the builder's clone). The one exception is the director's cargo bin
+/// directory (the rustup proxies, `RustupEnv::cargo_bin`), which the policies grant
+/// read-only: it stays, where the director has it.
 pub(crate) fn builder_path(director_path: &str, real_home: &Path) -> String {
-    let kept: Vec<&str> = director_path
+    let rustup = RustupEnv::from_director_env(real_home);
+    builder_path_keeping(director_path, real_home, rustup.cargo_bin.as_deref())
+}
+
+/// [`builder_path`] with the exempt directory given: `keep`, resolved. An entry is that
+/// directory only when it resolves to exactly it, so `~/.cargo/bin/..` and a sibling of
+/// it under the home are dropped like any other home entry. The exempt entry is written
+/// as its resolved path, the spelling the sandbox grants.
+pub(crate) fn builder_path_keeping(
+    director_path: &str,
+    real_home: &Path,
+    keep: Option<&Path>,
+) -> String {
+    let kept: Vec<String> = director_path
         .split(':')
-        .filter(|e| {
-            !e.is_empty() && Path::new(e).is_absolute() && !Path::new(e).starts_with(real_home)
+        .filter_map(|e| {
+            let entry = Path::new(e);
+            if e.is_empty() || !entry.is_absolute() {
+                return None;
+            }
+            if let Some(keep) = keep
+                && std::fs::canonicalize(entry).is_ok_and(|c| c == keep)
+            {
+                return Some(keep.to_string_lossy().into_owned());
+            }
+            (!entry.starts_with(real_home)).then(|| e.to_string())
         })
         .collect();
     if kept.is_empty() {
@@ -4790,6 +4814,49 @@ body"#;
             "/usr/bin:/bin:/opt/homex/bin"
         );
         assert_eq!(builder_path("::relative", home), "/usr/bin:/bin");
+    }
+
+    /// The director's cargo bin directory (the rustup proxies) is the one entry under the
+    /// real home that survives, exactly as resolved; every other home entry is still
+    /// dropped, spelling tricks and siblings included.
+    #[test]
+    fn builder_path_keeps_only_the_resolved_cargo_bin_under_the_home() {
+        let tmp = tempfile::Builder::new()
+            .prefix("cp-bp-")
+            .tempdir_in("/var/tmp")
+            .unwrap();
+        let home = tmp.path().canonicalize().unwrap();
+        for d in [".cargo/bin", ".cargo/other", ".local/bin"] {
+            fs::create_dir_all(home.join(d)).unwrap();
+        }
+        let bin = home.join(".cargo/bin");
+        std::os::unix::fs::symlink(&bin, home.join("link-to-bin")).unwrap();
+        let h = |d: &str| home.join(d).display().to_string();
+        let path = format!(
+            "{}:/usr/bin:{}:{}:{}/..:{}:{}:/bin",
+            h(".cargo/bin"),
+            h(".cargo/other"),
+            h(".local/bin"),
+            h(".cargo/bin"),
+            h(".cargo"),
+            h("link-to-bin"),
+        );
+        // Without the exemption every home entry goes.
+        assert_eq!(
+            builder_path_keeping(&path, &home, None),
+            "/usr/bin:/bin".to_string()
+        );
+        // With it, the resolved directory stays where the director had it, and the
+        // symlinked spelling of that same directory is written as the resolved path.
+        assert_eq!(
+            builder_path_keeping(&path, &home, Some(&bin)),
+            format!("{0}:/usr/bin:{0}:/bin", bin.display())
+        );
+        // A resolved directory outside the home changes nothing about the home rule.
+        assert_eq!(
+            builder_path_keeping("/usr/bin:/opt/x/bin", &home, Some(&bin)),
+            "/usr/bin:/opt/x/bin"
+        );
     }
 
     #[test]

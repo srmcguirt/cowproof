@@ -1043,6 +1043,130 @@ fn the_builder_and_every_check_get_a_temp_dir_inside_the_lane() {
     assert!(h.lane().join("scratch/verify/tmp").is_dir());
 }
 
+/// A director whose rustup home is somewhere other than `~/.rustup` (CI images and custom
+/// installs): a rustup proxy inside a lane finds its toolchains through `RUSTUP_HOME`,
+/// else `$HOME/.rustup`, and the lane's `HOME` holds none. The test's own rustup home is a
+/// directory with a `marker` file in it, so it needs no rustup at all: the builder, the
+/// builder's `run_check` and the verifier must each see `RUSTUP_HOME` naming a directory
+/// they can read, and the toolchain pin passes through with it.
+#[test]
+fn the_directors_rustup_home_reaches_the_builder_every_check_and_the_verifier() {
+    if !sandbox_available() {
+        return;
+    }
+    let rustup = var_tmp("cp-run-rustup-");
+    fs::write(rustup.path().join("marker"), "toolchains live here\n").unwrap();
+    let canonical = rustup.path().canonicalize().unwrap();
+    let h = Harness::with_packet(
+        &run_checks(&["edit", "home", "pin"]),
+        json!(["README.md", "created.txt"]),
+        json!([
+            {"id": "edit", "command": "grep -q edited README.md"},
+            {"id": "home", "command": "test -n \"$RUSTUP_HOME\" && test -r \"$RUSTUP_HOME/marker\""},
+            {"id": "pin", "command": "test \"$RUSTUP_TOOLCHAIN\" = 1.80.0"},
+        ]),
+    );
+    let out = output(
+        h.command(h.lanes.path())
+            .env("ANTHROPIC_API_KEY", REAL_KEY)
+            .env("RUSTUP_HOME", rustup.path())
+            .env("RUSTUP_TOOLCHAIN", "1.80.0"),
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "cowproof run:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // The builder itself: its environment names the director's rustup home (resolved).
+    let env = h.read("home/fake/env.txt");
+    for line in [
+        format!("RUSTUP_HOME={}", canonical.display()),
+        "RUSTUP_TOOLCHAIN=1.80.0".to_string(),
+    ] {
+        assert!(env.lines().any(|l| l == line), "{line} not in\n{env}");
+    }
+    // The builder's `run_check` sandbox saw it (the three checks passed there) ...
+    assert!(
+        passed(&h, 3) && passed(&h, 4) && passed(&h, 5),
+        "all three checks pass in the lane"
+    );
+    // ... and so did the verifier's rerun, so the lane is proved.
+    let verdict = h.verdict();
+    assert_eq!(verdict["verdict"], "proved", "{verdict}");
+}
+
+/// The usual rustup install: the proxies (`cargo`, `rustc`) live in `<home>/.cargo/bin`, the
+/// toolchains in `<home>/.rustup`, and the director's `PATH` starts with the first. Both are
+/// under the real home, which the sandbox hides, so a check that runs a proxy needs that ONE
+/// bin directory on the sandbox `PATH` and readable, and the rustup home named in
+/// `RUSTUP_HOME`. The fake proxy here exits 0 only if `$RUSTUP_HOME/marker` is readable, so
+/// it proves both; it must run in the builder's `run_check` and in the verifier.
+#[test]
+fn a_rustup_proxy_in_the_directors_cargo_bin_runs_in_run_check_and_in_the_verifier() {
+    if !sandbox_available() {
+        return;
+    }
+    let fake_home = var_tmp("cp-run-home-");
+    let home = fake_home.path().canonicalize().unwrap();
+    let bin = home.join(".cargo/bin");
+    fs::create_dir_all(&bin).unwrap();
+    fs::create_dir_all(home.join(".rustup")).unwrap();
+    fs::write(home.join(".rustup/marker"), "toolchains live here\n").unwrap();
+    // A secret that lives beside the bin directory, in the cargo home: it must stay hidden.
+    fs::write(
+        home.join(".cargo/credentials.toml"),
+        "token = \"CANARY-CARGO\"\n",
+    )
+    .unwrap();
+    {
+        let _g = fork_lock();
+        let proxy = bin.join("fakerustc");
+        fs::write(&proxy, "#!/bin/sh\ntest -r \"$RUSTUP_HOME/marker\"\n").unwrap();
+        fs::set_permissions(&proxy, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let h = Harness::with_packet(
+        &run_checks(&["edit", "proxy", "secret"]),
+        json!(["README.md", "created.txt"]),
+        json!([
+            {"id": "edit", "command": "grep -q edited README.md"},
+            {"id": "proxy", "command": "fakerustc"},
+            {"id": "secret", "command": format!("! cat {}/.cargo/credentials.toml", home.display())},
+        ]),
+    );
+    let out = output(
+        h.command(h.lanes.path())
+            .env("ANTHROPIC_API_KEY", REAL_KEY)
+            .env("HOME", &home)
+            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+            .env_remove("CARGO_HOME")
+            .env_remove("RUSTUP_HOME")
+            .env_remove("RUSTUP_TOOLCHAIN"),
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "cowproof run:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        passed(&h, 3) && passed(&h, 4) && passed(&h, 5),
+        "the proxy and the hidden credentials check pass in the lane"
+    );
+    // The builder's own PATH keeps the bin directory, first, and nothing else of the home.
+    let env = h.read("home/fake/env.txt");
+    assert!(
+        env.lines()
+            .any(|l| l == format!("PATH={}:/usr/bin:/bin", bin.display())),
+        "{env}"
+    );
+    // The verifier ran the proxy again in the rebuilt tree: the lane is proved.
+    let verdict = h.verdict();
+    assert_eq!(verdict["verdict"], "proved", "{verdict}");
+}
+
 /// Every file under `dir` (not following symlinks) whose bytes contain `needle`.
 fn files_containing(dir: &Path, needle: &str) -> Vec<PathBuf> {
     let mut found = Vec::new();

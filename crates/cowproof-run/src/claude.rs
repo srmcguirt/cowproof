@@ -200,28 +200,8 @@ pub fn claude_command(spec: &ClaudeSpec) -> Result<ClaudeInvocation> {
         );
     }
 
-    // Validate PATH: must be non-empty, all entries absolute, no entries under real_home
-    if spec.path.is_empty() {
-        bail!("path is empty");
-    }
-    for entry in spec.path.split(':') {
-        if entry.is_empty() {
-            // An empty entry means the current directory, which is the builder's
-            // clone: a builder could plant a fake `git` or `cargo` there.
-            bail!("path has an empty entry (it would search the current directory)");
-        }
-        let entry_path = PathBuf::from(entry);
-        if !entry_path.is_absolute() {
-            bail!("path entry is not absolute: {}", entry);
-        }
-        if entry_path.starts_with(&spec.lane.real_home) {
-            bail!(
-                "path entry is under real home ({}): {}",
-                spec.lane.real_home.display(),
-                entry
-            );
-        }
-    }
+    // Validate PATH: non-empty, absolute, nothing under the real home but the cargo bin.
+    crate::validate_builder_path(&spec.path, &spec.lane.real_home)?;
 
     // Build args in stable order
     let mut args = vec![

@@ -244,24 +244,7 @@ pub fn opencode_command(spec: &OpencodeSpec) -> Result<OpencodeInvocation> {
             bail!("{what} is not absolute: {}", path.display());
         }
     }
-    if spec.path.is_empty() {
-        bail!("path is empty");
-    }
-    for entry in spec.path.split(':') {
-        if entry.is_empty() {
-            bail!("path has an empty entry (it would search the current directory)");
-        }
-        let entry_path = Path::new(entry);
-        if !entry_path.is_absolute() {
-            bail!("path entry is not absolute: {entry}");
-        }
-        if entry_path.starts_with(&spec.lane.real_home) {
-            bail!(
-                "path entry is under real home ({}): {entry}",
-                spec.lane.real_home.display()
-            );
-        }
-    }
+    crate::validate_builder_path(&spec.path, &spec.lane.real_home)?;
 
     let mut args = vec![
         "run".to_string(),

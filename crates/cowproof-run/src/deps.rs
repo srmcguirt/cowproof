@@ -347,14 +347,10 @@ fn fetch_cargo(
         Some(c) if c.is_absolute() => c.to_string_lossy().into_owned(),
         _ => "cargo".to_string(),
     };
-    let rustup_home = lane.real_home.join(".rustup");
+    // `RUSTUP_HOME` (the director's rustup home) comes from the policy, with its grant.
     let mut env = vec![
         ("PATH".to_string(), tools.path.clone()),
         ("HOME".to_string(), home.to_string_lossy().into_owned()),
-        (
-            "RUSTUP_HOME".to_string(),
-            rustup_home.to_string_lossy().into_owned(),
-        ),
     ];
     policy.env_set = vec![(
         "CARGO_HOME".to_string(),

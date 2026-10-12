@@ -87,12 +87,195 @@ pub struct SandboxPolicy {
     /// and target are granted. Used for toolchain binaries that live under
     /// the hidden home.
     pub executables: Vec<PathBuf>,
+    /// The rustup home this process may read, and the toolchain pin it carries
+    /// (see [`RustupEnv`]). The home is granted read-only and `RUSTUP_HOME` is set
+    /// to it by [`SandboxPolicy::apply_env`], for every policy that runs Rust tools.
+    pub rustup: RustupEnv,
+}
+
+/// Where rustup keeps its toolchains, as the director has it, for the sandboxes whose
+/// processes may run `rustc` or `cargo` through a rustup proxy.
+///
+/// A proxy (`~/.cargo/bin/rustc`, a link to `rustup`) finds its toolchains through
+/// `RUSTUP_HOME`, else `$HOME/.rustup`, and inside a lane `HOME` is the lane's own
+/// home, which holds none. So the sandbox gets the director's rustup home explicitly:
+/// the director's `RUSTUP_HOME` when it is set to an absolute path, else
+/// `<real home>/.rustup`. It is granted read-only and named in `RUSTUP_HOME`; when it
+/// does not exist (a machine without rustup) nothing is granted and nothing is set.
+///
+/// `RUSTUP_TOOLCHAIN` (a pinned toolchain name) passes through with it. The other
+/// rustup variables are left out on purpose: `RUSTUP_UPDATE_ROOT` and
+/// `RUSTUP_DIST_SERVER` only matter to `rustup update` and to installing a toolchain,
+/// which need a network no tool sandbox has (and a writable rustup home none has);
+/// `RUSTUP_HOME` and `RUSTUP_TOOLCHAIN` are what choose and find a toolchain.
+///
+/// The proxies themselves live in the director's cargo bin directory (`CARGO_HOME/bin`
+/// when `CARGO_HOME` is absolute, else `<real home>/.cargo/bin`: the usual rustup
+/// install, and on a CI runner `$HOME/.cargo/bin`), which sits under the hidden home. That
+/// ONE directory is resolved here too ([`RustupEnv::cargo_bin`]) and granted read-only
+/// with the rustup home; nothing else of the director's cargo home is (its
+/// `credentials.toml`, registry caches and `config.toml` stay hidden, and the lane has
+/// its own private `CARGO_HOME`, D18). Granting a directory of executables read-only is
+/// the same class of grant as `.rustup`: the sandbox can run what the director installed
+/// and cannot change it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RustupEnv {
+    /// The director's cargo bin directory (the rustup proxies and `cargo install`ed
+    /// tools), resolved the way every granted path is. `None` when it does not exist.
+    pub cargo_bin: Option<PathBuf>,
+    /// The rustup home, resolved (symlinks followed) the way every granted path is.
+    pub home: Option<PathBuf>,
+    /// The director's `RUSTUP_TOOLCHAIN`, when it is a plain toolchain name.
+    pub toolchain: Option<String>,
+}
+
+impl RustupEnv {
+    /// Resolve from the director's values: `director_home` is its `RUSTUP_HOME` and
+    /// `director_toolchain` its `RUSTUP_TOOLCHAIN`. An empty or relative `RUSTUP_HOME`
+    /// is ignored (rustup itself would not resolve it against a lane's directory); an
+    /// absolute one that does not exist yields no home, because the director's own
+    /// rustup would not work with it either and the default is not what it asked for.
+    /// The toolchain passes only when there is a home, and only as a plain name
+    /// (letters, digits, `.`, `_`, `-`, at most 128 characters): a path would name a
+    /// toolchain outside every grant.
+    pub fn resolve(
+        real_home: &Path,
+        director_home: Option<&std::ffi::OsStr>,
+        director_toolchain: Option<&std::ffi::OsStr>,
+    ) -> Self {
+        Self::resolve_with_cargo_home(real_home, director_home, director_toolchain, None)
+    }
+
+    /// [`RustupEnv::resolve`] with the director's `CARGO_HOME` too: the cargo bin
+    /// directory is `<CARGO_HOME>/bin` when that is an absolute path (an empty or
+    /// relative value is ignored), else `<real home>/.cargo/bin`. It is used only if it
+    /// exists as a directory.
+    pub fn resolve_with_cargo_home(
+        real_home: &Path,
+        director_home: Option<&std::ffi::OsStr>,
+        director_toolchain: Option<&std::ffi::OsStr>,
+        director_cargo_home: Option<&std::ffi::OsStr>,
+    ) -> Self {
+        let cargo_bin = director_cargo_home
+            .map(PathBuf::from)
+            .filter(|p| p.is_absolute())
+            .unwrap_or_else(|| real_home.join(".cargo"))
+            .join("bin");
+        let cargo_bin = cargo_bin
+            .is_dir()
+            .then(|| canonicalize_for_sandbox(&cargo_bin).ok())
+            .flatten();
+        let explicit = director_home.map(PathBuf::from).filter(|p| p.is_absolute());
+        let candidate = explicit.unwrap_or_else(|| real_home.join(".rustup"));
+        let home = candidate
+            .is_dir()
+            .then(|| canonicalize_for_sandbox(&candidate).ok())
+            .flatten();
+        let toolchain = director_toolchain
+            .and_then(|t| t.to_str())
+            .filter(|t| {
+                !t.is_empty()
+                    && t.len() <= 128
+                    && t.chars()
+                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+            })
+            .filter(|_| home.is_some())
+            .map(str::to_string);
+        Self {
+            cargo_bin,
+            home,
+            toolchain,
+        }
+    }
+
+    /// [`RustupEnv::resolve`] from this process's environment: the director's.
+    pub fn from_director_env(real_home: &Path) -> Self {
+        Self::resolve_with_cargo_home(
+            real_home,
+            std::env::var_os("RUSTUP_HOME").as_deref(),
+            std::env::var_os("RUSTUP_TOOLCHAIN").as_deref(),
+            std::env::var_os("CARGO_HOME").as_deref(),
+        )
+    }
+
+    /// The cargo bin directory, when the director's `PATH` (`path_env`) lists it: the
+    /// sandbox's `PATH` carries it exactly when the director's does. An entry matches by
+    /// its resolved path, so a symlinked spelling counts; empty and relative entries
+    /// never match.
+    pub fn cargo_bin_on_path(&self, path_env: &std::ffi::OsStr) -> Option<&Path> {
+        let bin = self.cargo_bin.as_deref()?;
+        std::env::split_paths(path_env)
+            .filter(|e| e.is_absolute())
+            .any(|e| canonicalize_for_sandbox(&e).is_ok_and(|c| c == bin))
+            .then_some(bin)
+    }
+
+    /// The variables this sets in a sandboxed process.
+    fn vars(&self) -> Vec<(String, String)> {
+        let mut vars = Vec::new();
+        if let Some(home) = &self.home {
+            vars.push((
+                "RUSTUP_HOME".to_string(),
+                home.to_string_lossy().into_owned(),
+            ));
+            if let Some(t) = &self.toolchain {
+                vars.push(("RUSTUP_TOOLCHAIN".to_string(), t.clone()));
+            }
+        }
+        vars
+    }
+}
+
+/// Check the `PATH` a builder is launched with (each runtime's launcher does): non-empty,
+/// every entry absolute, none empty (it would search the builder's clone), and none under
+/// the hidden real home, except the director's cargo bin directory (the one
+/// [`RustupEnv::cargo_bin`] resolves and the policies grant read-only), written as that
+/// resolved path.
+pub fn validate_builder_path(path: &str, real_home: &Path) -> Result<()> {
+    let cargo_bin = RustupEnv::from_director_env(real_home).cargo_bin;
+    validate_builder_path_keeping(path, real_home, cargo_bin.as_deref())
+}
+
+/// [`validate_builder_path`] with the exempt directory given.
+pub fn validate_builder_path_keeping(
+    path: &str,
+    real_home: &Path,
+    keep: Option<&Path>,
+) -> Result<()> {
+    if path.is_empty() {
+        bail!("path is empty");
+    }
+    for entry in path.split(':') {
+        if entry.is_empty() {
+            // An empty entry means the current directory, which is the builder's
+            // clone: a builder could plant a fake `git` or `cargo` there.
+            bail!("path has an empty entry (it would search the current directory)");
+        }
+        let entry_path = Path::new(entry);
+        if !entry_path.is_absolute() {
+            bail!("path entry is not absolute: {entry}");
+        }
+        if entry_path.starts_with(real_home) && Some(entry_path) != keep {
+            bail!(
+                "path entry is under real home ({}): {entry}",
+                real_home.display()
+            );
+        }
+    }
+    Ok(())
 }
 
 impl SandboxPolicy {
+    /// Replace the rustup home and toolchain this policy carries (the constructors that
+    /// run Rust tools take them from the director's environment).
+    pub fn with_rustup(mut self, rustup: RustupEnv) -> Self {
+        self.rustup = rustup;
+        self
+    }
+
     /// Builder for a lane doing development work.
     /// rw: clone, lane home (D18: its `.cargo` is the builder's CARGO_HOME), scratch
-    /// ro: real ~/.cargo/registry and ~/.cargo/git; real ~/.rustup
+    /// ro: real ~/.cargo/registry and ~/.cargo/git; the director's rustup home
     /// network: must be passed by caller (not hardcoded)
     pub fn builder(lane: &LaneLayout, network: NetworkMode) -> Self {
         let lane_cargo = lane.home.join(".cargo");
@@ -104,7 +287,6 @@ impl SandboxPolicy {
                 lane_cargo.clone(),
             ],
             ro_paths: vec![
-                lane.real_home.join(".rustup"),
                 lane.real_home.join(".cargo/registry"),
                 lane.real_home.join(".cargo/git"),
             ],
@@ -126,6 +308,7 @@ impl SandboxPolicy {
             connect_socket: Some(lane.sock.clone()),
             lanes_root: lane.lanes_root.clone(),
             executables: vec![],
+            rustup: RustupEnv::from_director_env(&lane.real_home),
         }
     }
 
@@ -150,7 +333,7 @@ impl SandboxPolicy {
 
     /// Verifier for checking patches.
     /// rw: clone, scratch, verifier cache dir (passed as parameter)
-    /// ro: real ~/.rustup
+    /// ro: the director's rustup home
     /// network: none (D6)
     pub fn verifier(lane: &LaneLayout, cache_dir: &Path) -> Self {
         let verifier_cargo = cache_dir.join(".cargo");
@@ -160,7 +343,7 @@ impl SandboxPolicy {
                 lane.scratch.clone(),
                 verifier_cargo.clone(),
             ],
-            ro_paths: vec![lane.real_home.join(".rustup")],
+            ro_paths: vec![],
             deny_paths: vec![lane.control.clone()],
             network: NetworkMode::None,
             // Checks never reach a registry (D6): cargo is told so, and fails fast
@@ -175,6 +358,7 @@ impl SandboxPolicy {
             connect_socket: None,
             lanes_root: lane.lanes_root.clone(),
             executables: vec![],
+            rustup: RustupEnv::from_director_env(&lane.real_home),
         }
     }
 
@@ -201,7 +385,7 @@ impl SandboxPolicy {
         let lane_cargo = lane.home.join(".cargo");
         Self {
             rw_paths: vec![lane.clone.clone(), lane.scratch.clone(), lane_cargo.clone()],
-            ro_paths: vec![lane.real_home.join(".rustup")],
+            ro_paths: vec![],
             deny_paths: vec![lane.control.clone()],
             network: NetworkMode::None,
             env_set: vec![cargo_home(&lane_cargo), tmpdir(lane)],
@@ -210,6 +394,7 @@ impl SandboxPolicy {
             connect_socket: Some(lane.sock.clone()),
             lanes_root: lane.lanes_root.clone(),
             executables: vec![],
+            rustup: RustupEnv::from_director_env(&lane.real_home),
         }
     }
 
@@ -227,6 +412,7 @@ impl SandboxPolicy {
             connect_socket: None,
             lanes_root: lane.lanes_root.clone(),
             executables: vec![],
+            rustup: RustupEnv::from_director_env(&lane.real_home),
         }
     }
 
@@ -243,13 +429,14 @@ impl SandboxPolicy {
             connect_socket: None,
             lanes_root: lane.lanes_root.clone(),
             executables: vec![],
+            rustup: RustupEnv::default(),
         }
     }
 
     /// Apply `env_set` to a child environment, replacing an existing value for
     /// the same key.
     pub fn apply_env(&self, env: &mut Vec<(String, String)>) {
-        for (k, v) in &self.env_set {
+        for (k, v) in self.env_set.iter().chain(self.rustup.vars().iter()) {
             match env.iter_mut().find(|(ek, _)| ek == k) {
                 Some(slot) => slot.1 = v.clone(),
                 None => env.push((k.clone(), v.clone())),
@@ -653,6 +840,14 @@ fn resolve(policy: &SandboxPolicy) -> Result<Resolved> {
     let mut ro = resolve_all(&policy.ro_paths)?;
     // D10: the toolchain stays readable for every policy.
     ro.insert(canonicalize_for_sandbox(&home.join(".rustup"))?);
+    // The director's rustup home, wherever it is (`RUSTUP_HOME`): readable, never writable.
+    if let Some(rustup) = &policy.rustup.home {
+        ro.insert(canonicalize_for_sandbox(rustup)?);
+    }
+    // And the one directory of the director's rustup proxies and installed tools.
+    if let Some(bin) = &policy.rustup.cargo_bin {
+        ro.insert(canonicalize_for_sandbox(bin)?);
+    }
     for p in rw.iter().chain(ro.iter()) {
         if home.starts_with(p) {
             bail!(
@@ -1345,7 +1540,9 @@ mod tests {
     #[test]
     fn d18_builder_sets_cargo_home_env() {
         let lane = test_lane();
-        let policy = SandboxPolicy::builder(&lane, NetworkMode::None);
+        // No rustup home: the count below must not depend on the machine's own.
+        let policy =
+            SandboxPolicy::builder(&lane, NetworkMode::None).with_rustup(RustupEnv::default());
         assert!(
             policy.env_set.contains(&(
                 "CARGO_HOME".to_string(),
@@ -1366,6 +1563,387 @@ mod tests {
         assert_eq!(env.len(), 2 + policy.env_set.len() - 1);
     }
 
+    // The director's rustup home reaches every sandbox that may run Rust tools.
+
+    /// A real home with a `.rustup`, and a second rustup home elsewhere, under /var/tmp.
+    struct RustupFixture {
+        _tmp: tempfile::TempDir,
+        lane: LaneLayout,
+        /// `<real home>/.rustup`, canonical.
+        default_home: PathBuf,
+        /// The director's own `RUSTUP_HOME`, outside the real home, canonical.
+        elsewhere: PathBuf,
+        /// `<real home>/.cargo/bin`, canonical.
+        default_bin: PathBuf,
+        /// A `CARGO_HOME` outside the real home (its `bin` exists), canonical.
+        cargo_home: PathBuf,
+    }
+
+    fn rustup_fixture() -> RustupFixture {
+        let tmp = tempfile::Builder::new()
+            .prefix("cp-rustup-")
+            .tempdir_in("/var/tmp")
+            .unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        for d in [
+            "lane/clone",
+            "lane/home",
+            "lane/scratch",
+            "lane/control",
+            "lane/sock",
+            "realhome/.rustup",
+            "realhome/.cargo/bin",
+            "ch/bin",
+            "rh",
+            "cache",
+        ] {
+            std::fs::create_dir_all(root.join(d)).unwrap();
+        }
+        let lane = LaneLayout {
+            clone: root.join("lane/clone"),
+            home: root.join("lane/home"),
+            scratch: root.join("lane/scratch"),
+            control: root.join("lane/control"),
+            real_home: root.join("realhome"),
+            sock: root.join("lane/sock/runner.sock"),
+            lanes_root: root.join("lane"),
+        };
+        RustupFixture {
+            default_home: root.join("realhome/.rustup"),
+            default_bin: root.join("realhome/.cargo/bin"),
+            cargo_home: root.join("ch"),
+            elsewhere: root.join("rh"),
+            lane,
+            _tmp: tmp,
+        }
+    }
+
+    fn os(s: &Path) -> std::ffi::OsString {
+        s.as_os_str().to_os_string()
+    }
+
+    #[test]
+    fn rustup_home_is_the_directors_absolute_value_else_the_real_homes() {
+        let f = rustup_fixture();
+        // The director's RUSTUP_HOME wins, even with a default beside it.
+        let r = RustupEnv::resolve(&f.lane.real_home, Some(&os(&f.elsewhere)), None);
+        assert_eq!(r.home.as_deref(), Some(f.elsewhere.as_path()));
+        // Unset: <real home>/.rustup.
+        let r = RustupEnv::resolve(&f.lane.real_home, None, None);
+        assert_eq!(r.home.as_deref(), Some(f.default_home.as_path()));
+        // Empty or relative values are ignored (the default applies).
+        for bad in ["", "relative/rustup", "."] {
+            let r = RustupEnv::resolve(&f.lane.real_home, Some(std::ffi::OsStr::new(bad)), None);
+            assert_eq!(r.home.as_deref(), Some(f.default_home.as_path()), "{bad:?}");
+        }
+        // A symlinked spelling resolves, like every granted path.
+        let link = f.elsewhere.with_file_name("rh-link");
+        std::os::unix::fs::symlink(&f.elsewhere, &link).unwrap();
+        let r = RustupEnv::resolve(&f.lane.real_home, Some(&os(&link)), None);
+        assert_eq!(r.home.as_deref(), Some(f.elsewhere.as_path()));
+    }
+
+    #[test]
+    fn rustup_home_that_does_not_exist_grants_and_sets_nothing() {
+        let f = rustup_fixture();
+        let missing = f.elsewhere.join("absent");
+        // An explicit absolute value that is not there is not replaced by the default.
+        let r = RustupEnv::resolve(&f.lane.real_home, Some(&os(&missing)), None);
+        assert_eq!(r.home, None);
+        assert_eq!(r.toolchain, None);
+        // No rustup under the real home either.
+        let r = RustupEnv::resolve(&f.elsewhere, None, Some(std::ffi::OsStr::new("stable")));
+        assert_eq!(r, RustupEnv::default());
+        let p = SandboxPolicy::run_check(&f.lane).with_rustup(r);
+        let mut env = vec![("PATH".to_string(), "/bin".to_string())];
+        p.apply_env(&mut env);
+        assert!(
+            !env.iter()
+                .any(|(k, _)| k == "RUSTUP_HOME" || k == "RUSTUP_TOOLCHAIN"),
+            "{env:?}"
+        );
+    }
+
+    #[test]
+    fn rustup_toolchain_passes_only_as_a_plain_name_with_a_home() {
+        let f = rustup_fixture();
+        let home = os(&f.elsewhere);
+        let pass = |t: &str| {
+            RustupEnv::resolve(
+                &f.lane.real_home,
+                Some(&home),
+                Some(std::ffi::OsStr::new(t)),
+            )
+            .toolchain
+        };
+        for ok in [
+            "stable",
+            "1.80.0",
+            "nightly-2026-01-02",
+            "1.80.0-x86_64-unknown-linux-gnu",
+        ] {
+            assert_eq!(pass(ok).as_deref(), Some(ok));
+        }
+        for bad in [
+            "",
+            "/opt/toolchain",
+            "a b",
+            "x;y",
+            "../stable",
+            &"a".repeat(129),
+        ] {
+            assert_eq!(pass(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn every_policy_that_runs_rust_tools_grants_and_sets_the_directors_rustup_home() {
+        let f = rustup_fixture();
+        let cache = f._tmp.path().join("cache");
+        let rustup = RustupEnv::resolve(
+            &f.lane.real_home,
+            Some(&os(&f.elsewhere)),
+            Some(std::ffi::OsStr::new("1.80.0")),
+        );
+        let rh = f.elsewhere.to_str().unwrap().to_string();
+        for (name, policy) in [
+            (
+                "builder",
+                SandboxPolicy::builder(&f.lane, NetworkMode::None),
+            ),
+            ("verifier", SandboxPolicy::verifier(&f.lane, &cache)),
+            ("run_check", SandboxPolicy::run_check(&f.lane)),
+            (
+                "dependency_fetch",
+                SandboxPolicy::dependency_fetch(&f.lane, &cache, NetworkMode::None),
+            ),
+        ] {
+            // Built without help, each takes the director's own environment.
+            assert_eq!(
+                policy.rustup,
+                RustupEnv::from_director_env(&f.lane.real_home),
+                "{name}"
+            );
+            let policy = policy.with_rustup(rustup.clone());
+            // The variable: set once, replacing whatever the caller's environment had.
+            let mut env = vec![
+                ("RUSTUP_HOME".to_string(), "/stale".to_string()),
+                ("HOME".to_string(), "/lane/home".to_string()),
+            ];
+            policy.apply_env(&mut env);
+            let count = |k: &str| env.iter().filter(|(ek, _)| ek == k).count();
+            assert_eq!(count("RUSTUP_HOME"), 1, "{name}: {env:?}");
+            assert!(
+                env.contains(&("RUSTUP_HOME".to_string(), rh.clone())),
+                "{name}: {env:?}"
+            );
+            assert!(
+                env.contains(&("RUSTUP_TOOLCHAIN".to_string(), "1.80.0".to_string())),
+                "{name}: {env:?}"
+            );
+            // Linux: bound read-only, never writable.
+            let args = render_bwrap_args(&policy, &[]).unwrap();
+            assert!(
+                args.windows(3)
+                    .any(|w| w[0] == "--ro-bind" && w[1] == rh && w[2] == rh),
+                "{name}: {args:?}"
+            );
+            assert!(
+                !args
+                    .windows(3)
+                    .any(|w| w[0] == "--bind" && (w[1] == rh || w[2] == rh)),
+                "{name}: {args:?}"
+            );
+            // macOS: read allowed, no write allowed.
+            let profile = render_macos_profile(&policy).unwrap();
+            assert!(
+                profile.contains(&format!("(allow file-read* (subpath \"{rh}\"))")),
+                "{name}: {profile}"
+            );
+            assert!(
+                !profile.contains(&format!(
+                    "(allow file-read* file-write* (subpath \"{rh}\"))"
+                )),
+                "{name}: {profile}"
+            );
+        }
+    }
+
+    #[test]
+    fn cargo_bin_is_cargo_homes_bin_when_absolute_else_the_real_homes() {
+        let f = rustup_fixture();
+        let resolve = |ch: Option<&std::ffi::OsStr>| {
+            RustupEnv::resolve_with_cargo_home(&f.lane.real_home, None, None, ch).cargo_bin
+        };
+        // Unset, empty or relative: <real home>/.cargo/bin.
+        assert_eq!(resolve(None), Some(f.default_bin.clone()));
+        for bad in ["", "relative/cargo"] {
+            assert_eq!(
+                resolve(Some(std::ffi::OsStr::new(bad))),
+                Some(f.default_bin.clone()),
+                "{bad:?}"
+            );
+        }
+        // The director's absolute CARGO_HOME wins; only its `bin` is named.
+        assert_eq!(
+            resolve(Some(&os(&f.cargo_home))),
+            Some(f.cargo_home.join("bin"))
+        );
+        // A CARGO_HOME with no `bin` yields none, not the default.
+        let empty = f.cargo_home.with_file_name("empty-ch");
+        std::fs::create_dir_all(&empty).unwrap();
+        assert_eq!(resolve(Some(&os(&empty))), None);
+        // Nothing under the real home: none.
+        assert_eq!(
+            RustupEnv::resolve_with_cargo_home(&f.elsewhere, None, None, None).cargo_bin,
+            None
+        );
+    }
+
+    #[test]
+    fn cargo_bin_is_on_the_path_only_when_the_directors_path_lists_it() {
+        let f = rustup_fixture();
+        let r = RustupEnv::resolve(&f.lane.real_home, None, None);
+        let join = |parts: &[&Path]| std::env::join_paths(parts.iter().copied()).unwrap();
+        let link = f.elsewhere.with_file_name("bin-link");
+        std::os::unix::fs::symlink(&f.default_bin, &link).unwrap();
+        for listed in [&f.default_bin, &link] {
+            assert_eq!(
+                r.cargo_bin_on_path(&join(&[Path::new("/usr/bin"), listed])),
+                Some(f.default_bin.as_path())
+            );
+        }
+        // Not listed, a sibling, and a relative spelling do not count.
+        assert_eq!(
+            r.cargo_bin_on_path(&join(&[Path::new("/usr/bin"), &f.elsewhere])),
+            None
+        );
+        assert_eq!(
+            r.cargo_bin_on_path(&join(&[Path::new(".cargo/bin"), Path::new("")])),
+            None
+        );
+        assert_eq!(
+            RustupEnv::default().cargo_bin_on_path(&join(&[&f.default_bin])),
+            None
+        );
+    }
+
+    #[test]
+    fn every_policy_that_runs_rust_tools_grants_the_cargo_bin_read_only_and_nothing_else_of_the_cargo_home()
+     {
+        let f = rustup_fixture();
+        let cache = f._tmp.path().join("cache");
+        let rustup = RustupEnv::resolve_with_cargo_home(
+            &f.lane.real_home,
+            None,
+            None,
+            Some(&os(&f.cargo_home)),
+        );
+        let bin = f.cargo_home.join("bin").to_str().unwrap().to_string();
+        let ch = f.cargo_home.to_str().unwrap().to_string();
+        std::fs::write(f.cargo_home.join("credentials.toml"), "token = 'x'").unwrap();
+        for (name, policy) in [
+            (
+                "builder",
+                SandboxPolicy::builder(&f.lane, NetworkMode::None),
+            ),
+            ("verifier", SandboxPolicy::verifier(&f.lane, &cache)),
+            ("run_check", SandboxPolicy::run_check(&f.lane)),
+            (
+                "dependency_fetch",
+                SandboxPolicy::dependency_fetch(&f.lane, &cache, NetworkMode::None),
+            ),
+        ] {
+            let policy = policy.with_rustup(rustup.clone());
+            let args = render_bwrap_args(&policy, &[]).unwrap();
+            assert!(
+                args.windows(3)
+                    .any(|w| w[0] == "--ro-bind" && w[1] == bin && w[2] == bin),
+                "{name}: {args:?}"
+            );
+            assert!(
+                !args.windows(3).any(|w| w[0] == "--bind" && w[1] == bin),
+                "{name}: {args:?}"
+            );
+            // Not the cargo home itself: its credentials stay out of reach.
+            assert!(
+                !args.windows(2).any(|w| w[1] == ch),
+                "{name} binds the cargo home: {args:?}"
+            );
+            let profile = render_macos_profile(&policy).unwrap();
+            assert!(
+                profile.contains(&format!("(allow file-read* (subpath \"{bin}\"))")),
+                "{name}: {profile}"
+            );
+            assert!(
+                !profile.contains(&format!("(subpath \"{ch}\"))")),
+                "{name}: {profile}"
+            );
+            assert!(
+                !profile.contains(&format!(
+                    "(allow file-read* file-write* (subpath \"{bin}\"))"
+                )),
+                "{name}: {profile}"
+            );
+        }
+        // capture runs only git: no grant.
+        let capture = SandboxPolicy::capture(&f.lane);
+        assert_eq!(capture.rustup, RustupEnv::default());
+    }
+
+    #[test]
+    fn a_builder_path_may_hold_the_cargo_bin_and_no_other_entry_under_the_home() {
+        let home = Path::new("/h");
+        let bin = Path::new("/h/.cargo/bin");
+        let ok = |p: &str, keep| validate_builder_path_keeping(p, home, keep).is_ok();
+        assert!(ok("/h/.cargo/bin:/usr/bin", Some(bin)));
+        assert!(!ok("/h/.cargo/bin:/usr/bin", None));
+        // Exactly that directory: a sibling, a child and a different spelling are refused.
+        for bad in [
+            "/h/.cargo",
+            "/h/.cargo/bin/x",
+            "/h/.cargo/bin/..",
+            "/h/.local/bin",
+        ] {
+            assert!(!ok(&format!("/usr/bin:{bad}"), Some(bin)), "{bad}");
+        }
+        // The other rules are unchanged.
+        assert!(!ok("", Some(bin)));
+        assert!(!ok("/usr/bin::/bin", Some(bin)));
+        assert!(!ok("/usr/bin:rel/bin", Some(bin)));
+    }
+
+    #[test]
+    fn the_default_rustup_home_is_granted_and_set_when_the_director_names_none() {
+        let f = rustup_fixture();
+        let rustup = RustupEnv::resolve(&f.lane.real_home, None, None);
+        let policy = SandboxPolicy::run_check(&f.lane).with_rustup(rustup);
+        let mut env = Vec::new();
+        policy.apply_env(&mut env);
+        assert!(
+            env.contains(&(
+                "RUSTUP_HOME".to_string(),
+                f.default_home.to_str().unwrap().to_string()
+            )),
+            "{env:?}"
+        );
+        assert!(
+            !env.iter().any(|(k, _)| k == "RUSTUP_TOOLCHAIN"),
+            "no pin unless the director set one: {env:?}"
+        );
+    }
+
+    #[test]
+    fn capture_runs_no_rust_tools_and_gets_no_rustup_variables() {
+        let f = rustup_fixture();
+        let mut env = Vec::new();
+        SandboxPolicy::capture(&f.lane).apply_env(&mut env);
+        assert!(
+            !env.iter().any(|(k, _)| k.starts_with("RUSTUP_")),
+            "{env:?}"
+        );
+    }
+
     #[test]
     fn d18_builder_rw_and_ro_structure() {
         let lane = test_lane();
@@ -1379,7 +1957,6 @@ mod tests {
         assert!(!policy.ro_paths.contains(&real_cargo));
         assert!(policy.ro_paths.contains(&real_cargo.join("registry")));
         assert!(policy.ro_paths.contains(&real_cargo.join("git")));
-        assert!(policy.ro_paths.contains(&lane.real_home.join(".rustup")));
     }
 
     #[test]
@@ -2342,7 +2919,9 @@ mod tests {
 
     /// A builder policy with a read-write grant and a read-only grant inside it.
     fn nested_grant_profile() -> Vec<String> {
-        let mut policy = SandboxPolicy::builder(&test_lane(), NetworkMode::None);
+        // No rustup home of the machine's own: the read-only mounts are counted below.
+        let mut policy = SandboxPolicy::builder(&test_lane(), NetworkMode::None)
+            .with_rustup(RustupEnv::default());
         policy.rw_paths.push(PathBuf::from("/nonexistent-cp/rw"));
         policy.ro_paths.push(PathBuf::from("/nonexistent-cp/rw/ro"));
         render_macos_profile(&policy)

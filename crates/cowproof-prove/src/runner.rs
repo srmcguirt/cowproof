@@ -1,6 +1,6 @@
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
-use cowproof_run::{LaneLayout, SandboxPolicy, render_macos_profile, sandbox_command};
+use cowproof_run::{LaneLayout, RustupEnv, SandboxPolicy, render_macos_profile, sandbox_command};
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -268,16 +268,21 @@ impl CheckRunner for ProcessRunner {
 /// The fixed system directories on the verifier's `PATH`.
 const SYSTEM_PATH_DIRS: [&str; 5] = ["/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"];
 
-/// Build the verifier's `PATH`: the fixed system directories plus the directory of the
-/// `cargo` the director runs. The verifier's environment is otherwise cleared and its
-/// home is hidden, so without this a check that needs `cargo` could not find it.
+/// Build the verifier's `PATH`: the director's cargo bin directory when its `PATH` has
+/// one (`cargo_bin`: the rustup proxies, granted read-only by the policy, and first like
+/// the director's own), the fixed system directories, then the directory of the `cargo`
+/// the director runs. The verifier's environment is otherwise cleared and its home is
+/// hidden, so without this a check that needs `cargo` could not find it.
 ///
 /// An empty entry means "the current directory" and a relative entry resolves against
 /// it, which is the builder-controlled tree, so a builder could plant a fake `git` or
 /// `cargo` there. Both are refused, as is an entry containing the `:` separator.
-fn compose_path(cargo_dir: Option<&Path>) -> Result<String, InfraError> {
-    let mut entries: Vec<&Path> = SYSTEM_PATH_DIRS.iter().map(Path::new).collect();
-    entries.extend(cargo_dir);
+fn compose_path(cargo_dir: Option<&Path>, cargo_bin: Option<&Path>) -> Result<String, InfraError> {
+    let mut entries: Vec<&Path> = Vec::new();
+    entries.extend(cargo_bin);
+    entries.extend(SYSTEM_PATH_DIRS.iter().map(Path::new));
+    // The same directory twice adds nothing.
+    entries.extend(cargo_dir.filter(|d| Some(*d) != cargo_bin));
     let mut parts = Vec::with_capacity(entries.len());
     for entry in entries {
         let shown = entry.display();
@@ -321,13 +326,23 @@ fn find_in_path(path_env: &OsStr, name: &str) -> Option<PathBuf> {
 
 /// The verifier's `PATH` and the `cargo` executable it finds, resolved in the caller's
 /// environment: what the dependency fetch needs to run the same toolchain the checks do.
-pub fn verifier_toolchain() -> Result<(String, Option<PathBuf>), InfraError> {
+pub fn verifier_toolchain(real_home: &Path) -> Result<(String, Option<PathBuf>), InfraError> {
     let cargo_dir = resolve_cargo_dir(
         std::env::var_os("CARGO").as_deref(),
         std::env::var_os("PATH").as_deref(),
     );
     let cargo = cargo_dir.as_ref().map(|d| d.join("cargo"));
-    Ok((compose_path(cargo_dir.as_deref())?, cargo))
+    let path = director_cargo_bin(real_home);
+    Ok((compose_path(cargo_dir.as_deref(), path.as_deref())?, cargo))
+}
+
+/// The director's cargo bin directory, when the director's own `PATH` lists it (see
+/// [`RustupEnv::cargo_bin_on_path`]).
+fn director_cargo_bin(real_home: &Path) -> Option<PathBuf> {
+    let path_env = std::env::var_os("PATH")?;
+    RustupEnv::from_director_env(real_home)
+        .cargo_bin_on_path(&path_env)
+        .map(Path::to_path_buf)
 }
 
 /// SandboxedRunner executes checks inside SandboxPolicy::verifier, with no network
@@ -362,13 +377,14 @@ impl SandboxedRunner {
             std::env::var_os("CARGO").as_deref(),
             std::env::var_os("PATH").as_deref(),
         );
+        let cargo_bin = director_cargo_bin(&lane.real_home);
         Self {
+            path: compose_path(cargo_dir.as_deref(), cargo_bin.as_deref()),
             lane,
             cache_dir,
             platform,
             deps_cache: None,
             port_base: None,
-            path: compose_path(cargo_dir.as_deref()),
         }
     }
 
@@ -700,7 +716,7 @@ pub(crate) mod tests {
 
     #[test]
     fn path_refuses_an_empty_entry() {
-        match compose_path(Some(Path::new(""))) {
+        match compose_path(Some(Path::new("")), None) {
             Err(InfraError::SpawnError(msg)) => assert!(msg.contains("empty"), "{msg}"),
             other => panic!("expected a refusal, got {other:?}"),
         }
@@ -708,7 +724,7 @@ pub(crate) mod tests {
 
     #[test]
     fn path_refuses_a_relative_entry() {
-        match compose_path(Some(Path::new("target/debug"))) {
+        match compose_path(Some(Path::new("target/debug")), None) {
             Err(InfraError::SpawnError(msg)) => {
                 assert!(
                     msg.contains("target/debug") && msg.contains("not absolute"),
@@ -722,13 +738,36 @@ pub(crate) mod tests {
     #[test]
     fn path_is_the_system_dirs_plus_the_cargo_dir() {
         assert_eq!(
-            compose_path(Some(Path::new("/opt/cargo/bin"))).unwrap(),
+            compose_path(Some(Path::new("/opt/cargo/bin")), None).unwrap(),
             "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/cargo/bin"
         );
         assert_eq!(
-            compose_path(None).unwrap(),
+            compose_path(None, None).unwrap(),
             "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
         );
+    }
+
+    /// The director's cargo bin directory (the rustup proxies) comes first, like on the
+    /// director's own `PATH`, and is not listed twice when it is also the `cargo` dir.
+    #[test]
+    fn path_puts_the_directors_cargo_bin_first() {
+        assert_eq!(
+            compose_path(
+                Some(Path::new("/opt/tc/bin")),
+                Some(Path::new("/h/.cargo/bin"))
+            )
+            .unwrap(),
+            "/h/.cargo/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/tc/bin"
+        );
+        assert_eq!(
+            compose_path(
+                Some(Path::new("/h/.cargo/bin")),
+                Some(Path::new("/h/.cargo/bin"))
+            )
+            .unwrap(),
+            "/h/.cargo/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+        );
+        assert!(compose_path(None, Some(Path::new("rel/bin"))).is_err());
     }
 
     /// The current directory holds a file with the searched name, so an empty entry, `.`
@@ -1126,6 +1165,41 @@ mod sandbox_tests {
             "{}",
             sandboxed.output
         );
+    }
+
+    /// A rust toolchain reached through a rustup proxy finds its toolchains through
+    /// `RUSTUP_HOME`. The verifier's check starts from an empty environment, so the policy
+    /// must name the director's rustup home in it (here: the fake real home's `.rustup`,
+    /// unless the director's own `RUSTUP_HOME` names another), and the directory is
+    /// readable there.
+    #[tokio::test]
+    async fn sandboxed_runner_gives_the_check_the_directors_rustup_home() {
+        if !sandbox_available() {
+            return;
+        }
+        let fx = SandboxFixture::new();
+        std::fs::create_dir_all(fx.root.join("realhome/.rustup")).unwrap();
+        let expected = cowproof_run::RustupEnv::from_director_env(&fx.lane.real_home)
+            .home
+            .expect("the fake real home has a .rustup, so a rustup home resolves");
+
+        let out = fx
+            .runner()
+            .run(
+                &fx.lane.clone,
+                "echo \"home=$RUSTUP_HOME\"; test -d \"$RUSTUP_HOME\" && echo readable",
+                LIMIT,
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.exit_status, 0, "{}", out.output);
+        assert!(
+            out.output
+                .contains(&format!("home={}\n", expected.display())),
+            "{}",
+            out.output
+        );
+        assert!(out.output.contains("readable"), "{}", out.output);
     }
 
     /// Timeout under the real sandbox policy kills the whole group too: the background

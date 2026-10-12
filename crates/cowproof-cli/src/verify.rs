@@ -174,7 +174,7 @@ pub(crate) async fn fetch_dependencies(
     layout: &LaneLayout,
 ) -> Result<Option<Prefetch>> {
     let network = FetchNetwork::from_env()?;
-    let (path, cargo) = verifier_toolchain().map_err(|e| anyhow!("{e}"))?;
+    let (path, cargo) = verifier_toolchain(&layout.real_home).map_err(|e| anyhow!("{e}"))?;
     let root = deps::cache_root(&layout.real_home);
     let layout = layout.clone();
     tokio::task::spawn_blocking(move || {
