@@ -128,7 +128,8 @@ cowproof doctor
   tests that read the repository's `fixtures/`, `plugin/` and `README.md`. Tests run from
   the repository.
 - Release builds do not run the test suite; the tagged commit's CI run is the gate.
-- The workflow pins actions by exact version tag (`actions/checkout@v4.2.2`,
-  `actions/upload-artifact@v4.6.2`, `actions/download-artifact@v4.3.0`) and uses the
-  runners' preinstalled `rustup` and `gh`. Pinning to commit SHAs is a follow-up.
+- Both workflows pin every action to a full commit SHA, with the version in a trailing comment
+  (`actions/checkout@<sha> # v4.2.2`), so a moved tag cannot change what runs. To update one,
+  resolve the new tag with `gh api repos/<owner>/<action>/commits/<tag> -q .sha`. The release
+  workflow otherwise uses the runners' preinstalled `rustup` and `gh`.
 - A Homebrew tap follows the first release (`docs/design.md`, Distribution Plan).
