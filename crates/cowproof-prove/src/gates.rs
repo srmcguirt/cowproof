@@ -191,6 +191,35 @@ pub fn base_requires_heldout(repo: &Path, commit: &str) -> Result<bool> {
         .unwrap_or(false))
 }
 
+/// The migration baseline declared in the base `cowproof.toml`, `[proof] migration_baseline`:
+/// the file name of the last applied migration. A migration that sorts at or before it
+/// (see `flaws::migration_order`) is applied, and the `applied_migration` flaw rules fire
+/// on a patch that edits or deletes one. Read from the base commit, so a patch cannot move
+/// it (and `cowproof.toml` is protected, so editing it is flagged as well). A missing file
+/// or key means no baseline; a value that is not a non-empty string, or a file that does
+/// not parse, is an error.
+pub fn base_migration_baseline(repo: &Path, commit: &str) -> Result<Option<String>> {
+    verify_commit(repo, commit)?;
+    let Some(text) = git_show_optional(repo, commit, "cowproof.toml")? else {
+        return Ok(None);
+    };
+    let config: toml::Table =
+        toml::from_str(&text).context("cowproof.toml in the base does not parse")?;
+    let Some(value) = config
+        .get("proof")
+        .and_then(|p| p.as_table())
+        .and_then(|p| p.get("migration_baseline"))
+    else {
+        return Ok(None);
+    };
+    match value.as_str().map(str::trim) {
+        Some(name) if !name.is_empty() => Ok(Some(name.to_string())),
+        _ => {
+            bail!("[proof] migration_baseline in the base cowproof.toml must be a non-empty string")
+        }
+    }
+}
+
 /// Gate 1: Ownership - files outside `owns` fail.
 fn check_ownership(lane_patch: &str, packet: &GatePacket) -> Result<GateResult> {
     let deltas = parse_patch(lane_patch);
@@ -475,7 +504,27 @@ fn check_flaws(base_repo: &Path, base_commit: &str, lane_patch: &str) -> Result<
         evidence.push("No flaw pack found in base".to_string());
     }
 
-    let (findings, errors) = check_rules(&rules, &deltas, None);
+    // The migration baseline is a gate input like the packs: base commit only. When a loaded
+    // rule needs it and the base declares none, the gate says so rather than passing quietly.
+    let baseline = base_migration_baseline(base_repo, base_commit)?;
+    let mut warned = false;
+    if rules.iter().any(|r| r.applied_migration) {
+        match &baseline {
+            Some(name) => evidence.push(format!(
+                "applied_migration rules checked against [proof] migration_baseline {name} \
+                 (from the base cowproof.toml)"
+            )),
+            None => {
+                warned = true;
+                evidence.push(
+                    "applied_migration rules skipped: the base cowproof.toml sets no \
+                     [proof] migration_baseline"
+                        .to_string(),
+                );
+            }
+        }
+    }
+    let (findings, errors) = check_rules(&rules, &deltas, baseline.as_deref());
     failed |= !errors.is_empty() || !findings.is_empty();
     evidence.extend(errors.into_iter().map(|e| format!("Rule error: {e}")));
     evidence.extend(findings.iter().map(|f| match f.line {
@@ -489,7 +538,7 @@ fn check_flaws(base_repo: &Path, base_commit: &str, lane_patch: &str) -> Result<
     Ok(GateResult {
         name: "flaws".to_string(),
         passed: !failed,
-        warned: false,
+        warned,
         evidence,
     })
 }
@@ -1286,6 +1335,231 @@ explanation = "This has a broken pattern."
         assert_eq!(
             result.evidence,
             vec!["No flaw pack found in base".to_string()]
+        );
+        Ok(())
+    }
+
+    /// A base commit that names the generic pack and a migration baseline, with applied
+    /// migrations `001`, `002` and `010`.
+    fn migration_repo(baseline: &str) -> Result<TestRepo> {
+        TestRepo::new(&[
+            (
+                "cowproof.toml",
+                &format!("[proof]\npacks = [\"generic\"]\nmigration_baseline = \"{baseline}\"\n"),
+            ),
+            ("db/migrations/001_init.sql", "create table a (id int);\n"),
+            ("db/migrations/002_more.sql", "create table b (id int);\n"),
+            ("db/migrations/010_late.sql", "create table c (id int);\n"),
+        ])
+    }
+
+    #[test]
+    fn migration_baseline_is_read_from_the_base_cowproof_toml() -> Result<()> {
+        let with = migration_repo("010_late.sql")?;
+        assert_eq!(
+            base_migration_baseline(with.path(), &with.base)?.as_deref(),
+            Some("010_late.sql")
+        );
+        let without = TestRepo::new(&[("cowproof.toml", "[proof]\npacks = []\n")])?;
+        assert_eq!(
+            base_migration_baseline(without.path(), &without.base)?,
+            None
+        );
+        let no_file = TestRepo::new(&[])?;
+        assert_eq!(
+            base_migration_baseline(no_file.path(), &no_file.base)?,
+            None
+        );
+        // A baseline that is not a non-empty string is refused, never read as "none".
+        for bad in ["migration_baseline = 10", "migration_baseline = \"\""] {
+            let repo = TestRepo::new(&[("cowproof.toml", &format!("[proof]\n{bad}\n"))])?;
+            let err = base_migration_baseline(repo.path(), &repo.base).unwrap_err();
+            assert!(err.to_string().contains("migration_baseline"), "{err}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn flaws_gate_fails_a_patch_that_edits_an_applied_migration_naming_file_and_baseline()
+    -> Result<()> {
+        let repo = migration_repo("010_late.sql")?;
+        repo.write(
+            "db/migrations/002_more.sql",
+            "create table b (id bigint);\n",
+        )?;
+        let patch = repo.patch()?;
+
+        let report = run_gates(repo.path(), &repo.base, &patch, &packet(&["db/**"]))?;
+        let flaws = gate(&report, "flaws");
+        assert!(!flaws.passed, "{:?}", flaws.evidence);
+        assert!(report.any_failed);
+        let line = flaws
+            .evidence
+            .iter()
+            .find(|e| e.contains("db/migrations/002_more.sql"))
+            .unwrap_or_else(|| panic!("no finding names the file: {:?}", flaws.evidence));
+        assert!(line.contains("010_late.sql"), "{line}");
+        assert!(line.contains("baseline"), "{line}");
+        Ok(())
+    }
+
+    #[test]
+    fn flaws_gate_fails_a_patch_that_deletes_an_applied_migration() -> Result<()> {
+        let repo = migration_repo("010_late.sql")?;
+        repo.remove("db/migrations/001_init.sql")?;
+        let patch = repo.patch()?;
+
+        let result = check_flaws(repo.path(), &repo.base, &patch)?;
+        assert!(!result.passed, "{:?}", result.evidence);
+        assert!(
+            result
+                .evidence
+                .iter()
+                .any(|e| e.contains("db/migrations/001_init.sql") && e.contains("010_late.sql")),
+            "{:?}",
+            result.evidence
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn flaws_gate_passes_a_new_migration_after_the_baseline() -> Result<()> {
+        let repo = migration_repo("010_late.sql")?;
+        repo.write("db/migrations/011_new.sql", "create table d (id int);\n")?;
+        let patch = repo.patch()?;
+
+        let result = check_flaws(repo.path(), &repo.base, &patch)?;
+        assert!(result.passed, "{:?}", result.evidence);
+        assert!(!result.warned);
+        // It still says the rule ran and against what, so the gate is not silent.
+        assert!(
+            result
+                .evidence
+                .iter()
+                .any(|e| e.contains("checked against")
+                    && e.contains("migration_baseline 010_late.sql")),
+            "{:?}",
+            result.evidence
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn flaws_gate_orders_migrations_by_number_not_by_string() -> Result<()> {
+        // As strings "9_a.sql" sorts after "10_b.sql", which would let this edit through.
+        let repo = TestRepo::new(&[
+            (
+                "cowproof.toml",
+                "[proof]\npacks = [\"generic\"]\nmigration_baseline = \"10_b.sql\"\n",
+            ),
+            ("db/migrations/9_a.sql", "select 1;\n"),
+            ("db/migrations/10_b.sql", "select 2;\n"),
+        ])?;
+        repo.write("db/migrations/9_a.sql", "select 3;\n")?;
+        let patch = repo.patch()?;
+        let result = check_flaws(repo.path(), &repo.base, &patch)?;
+        assert!(!result.passed, "{:?}", result.evidence);
+        assert!(
+            result
+                .evidence
+                .iter()
+                .any(|e| e.contains("db/migrations/9_a.sql"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn flaws_gate_says_the_migration_rule_was_skipped_when_the_base_has_no_baseline() -> Result<()>
+    {
+        let repo = TestRepo::with_config(&["generic"])?;
+        repo.write("db/migrations/001_init.sql", "select 1;\n")?;
+        let patch = repo.patch()?;
+
+        let result = check_flaws(repo.path(), &repo.base, &patch)?;
+        assert!(result.passed, "{:?}", result.evidence);
+        assert!(
+            result.warned,
+            "a skipped rule is a warning, not a silent pass"
+        );
+        assert!(
+            result
+                .evidence
+                .iter()
+                .any(|e| e.contains("applied_migration rules skipped")
+                    && e.contains("migration_baseline")),
+            "{:?}",
+            result.evidence
+        );
+        // A pack with no migration rule says nothing about migrations.
+        let quiet = TestRepo::new(&[(DEFAULT_FLAW_PACK, SWALLOW_PACK)])?;
+        quiet.write("test.rs", "fn ok() {}\n")?;
+        let result = check_flaws(quiet.path(), &quiet.base, &quiet.patch()?)?;
+        assert!(result.evidence.is_empty() && !result.warned);
+        Ok(())
+    }
+
+    #[test]
+    fn a_patch_cannot_move_the_baseline_and_is_flagged_for_trying() -> Result<()> {
+        // The patch edits applied migration 002 and rewrites the baseline in cowproof.toml
+        // to one before it. The gate still uses the base's baseline, and the protected
+        // path gate flags the cowproof.toml edit.
+        let repo = migration_repo("010_late.sql")?;
+        repo.write(
+            "db/migrations/002_more.sql",
+            "create table b (id bigint);\n",
+        )?;
+        repo.write(
+            "cowproof.toml",
+            "[proof]\npacks = [\"generic\"]\nmigration_baseline = \"001_init.sql\"\n",
+        )?;
+        let patch = repo.patch()?;
+
+        let report = run_gates(
+            repo.path(),
+            &repo.base,
+            &patch,
+            &packet(&["db/**", "cowproof.toml"]),
+        )?;
+        let flaws = gate(&report, "flaws");
+        assert!(
+            !flaws.passed,
+            "the patched baseline was used: {:?}",
+            flaws.evidence
+        );
+        assert!(flaws.evidence.iter().any(|e| e.contains("010_late.sql")));
+        assert!(!flaws.evidence.iter().any(|e| e.contains("001_init.sql ")));
+        // Owned, so the protected gate passes but warns that the harness changed.
+        let protected = gate(&report, "protected_paths");
+        assert!(protected.warned, "{:?}", protected.evidence);
+        assert!(
+            protected
+                .evidence
+                .iter()
+                .any(|e| e.contains("cowproof.toml"))
+        );
+        // Not owned: it fails.
+        let report = run_gates(repo.path(), &repo.base, &patch, &packet(&["db/**"]))?;
+        let protected = gate(&report, "protected_paths");
+        assert!(!protected.passed);
+        assert!(protected.evidence[0].contains("cowproof.toml"));
+        Ok(())
+    }
+
+    #[test]
+    fn a_baseline_added_only_by_the_patch_does_not_enable_the_rule() -> Result<()> {
+        let repo = TestRepo::with_config(&["generic"])?;
+        repo.write("db/migrations/001_init.sql", "select 1;\n")?;
+        repo.write(
+            "cowproof.toml",
+            "[proof]\npacks = [\"generic\"]\nmigration_baseline = \"001_init.sql\"\n",
+        )?;
+        let patch = repo.patch()?;
+        let result = check_flaws(repo.path(), &repo.base, &patch)?;
+        assert!(result.warned, "{:?}", result.evidence);
+        assert!(
+            result.evidence.iter().any(|e| e.contains("skipped")),
+            "{:?}",
+            result.evidence
         );
         Ok(())
     }

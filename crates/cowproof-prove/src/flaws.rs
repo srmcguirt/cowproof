@@ -65,6 +65,35 @@ fn finding(rule: &FlawRule, label: &str, file: &str, line: Option<usize>) -> Fla
     }
 }
 
+/// Order two migration file names: by the leading number when both names start
+/// with digits (so `9_x` sorts before `10_x`, `009_x` before `010_x`, and
+/// timestamp names by their timestamp), by the whole name otherwise. Names whose
+/// leading numbers are equal fall back to the whole name, so `20261012T0900_a`
+/// sorts before `20261012T1000_a`.
+pub fn migration_order(a: &str, b: &str) -> std::cmp::Ordering {
+    fn digits(name: &str) -> Option<&str> {
+        let end = name
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(name.len());
+        (end > 0).then(|| &name[..end])
+    }
+    if let (Some(x), Some(y)) = (digits(a), digits(b)) {
+        // Compare as numbers without parsing, so a very long number cannot overflow.
+        let (x, y) = (x.trim_start_matches('0'), y.trim_start_matches('0'));
+        let by_number = x.len().cmp(&y.len()).then_with(|| x.cmp(y));
+        if by_number != std::cmp::Ordering::Equal {
+            return by_number;
+        }
+    }
+    a.cmp(b)
+}
+
+/// Whether the migration file `file` is the baseline or sorts before it, by
+/// [`migration_order`]: an applied migration.
+pub fn migration_at_or_before(file: &str, baseline: &str) -> bool {
+    migration_order(file, baseline) != std::cmp::Ordering::Greater
+}
+
 /// Check one rule against one file's delta.
 ///
 /// `label` names the rule in errors and findings. `baseline` is the last
@@ -92,13 +121,14 @@ pub fn check_rule(
     };
 
     if rule.applied_migration {
+        // A leading slash lets a root-level `migrations/` directory match too.
+        let rooted = format!("/{}", delta.path);
+        let file = rooted
+            .split("/migrations/")
+            .nth(1)
+            .and_then(|f| f.rsplit('/').next());
         let hit = baseline.is_some_and(|base| {
-            delta
-                .path
-                .split("/migrations/")
-                .nth(1)
-                .and_then(|f| f.rsplit('/').next())
-                .is_some_and(|f| f <= base.rsplit('/').next().unwrap_or(base))
+            file.is_some_and(|f| migration_at_or_before(f, base.rsplit('/').next().unwrap_or(base)))
         });
         if hit {
             let mut f = finding(rule, label, &delta.path, None);
@@ -309,6 +339,108 @@ mod tests {
         let newer = delta("supabase/migrations/20260402_new.sql", &[], &["x"]);
         assert!(
             check_rule(&r, "r", &newer, Some("20260401_existing.sql"))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn migration_order_compares_leading_numbers_as_numbers() {
+        use std::cmp::Ordering::{Equal, Greater, Less};
+        assert_eq!(migration_order("9_x.sql", "10_x.sql"), Less);
+        assert_eq!(migration_order("10_x.sql", "9_x.sql"), Greater);
+        assert_eq!(migration_order("009_x.sql", "010_x.sql"), Less);
+        assert_eq!(migration_order("010_x.sql", "009_x.sql"), Greater);
+        // Zero padding of different widths is the same number, so the rest of the name
+        // decides (and the same name is equal).
+        assert_eq!(migration_order("9_a.sql", "009_b.sql"), Greater);
+        assert_eq!(migration_order("009_a.sql", "9_b.sql"), Less);
+        assert_eq!(migration_order("0009_a.sql", "9_a.sql"), Less);
+        assert_eq!(migration_order("9_a.sql", "9_a.sql"), Equal);
+        assert_eq!(migration_order("9_a.sql", "10_a.sql"), Less);
+        assert_eq!(migration_order("10_a.sql", "9_a.sql"), Greater);
+        // Timestamps: by date, then by the rest of the name.
+        assert_eq!(
+            migration_order("20261012T090000_a.sql", "20261012T100000_a.sql"),
+            Less
+        );
+        assert_eq!(
+            migration_order("20261011T235959_z.sql", "20261012T000000_a.sql"),
+            Less
+        );
+        assert_eq!(
+            migration_order("20261012120000_a.sql", "20261012120000_a.sql"),
+            Equal
+        );
+        // A number longer than any integer type still compares.
+        assert_eq!(
+            migration_order("99999999999999999999999_a", "100000000000000000000000_a"),
+            Less
+        );
+    }
+
+    #[test]
+    fn migration_order_falls_back_to_strings_without_a_leading_number() {
+        use std::cmp::Ordering::{Greater, Less};
+        assert_eq!(migration_order("init.sql", "setup.sql"), Less);
+        assert_eq!(migration_order("setup.sql", "init.sql"), Greater);
+        // One side numeric, the other not: plain string order ("1" < "a").
+        assert_eq!(migration_order("1_x.sql", "base.sql"), Less);
+        assert_eq!(migration_order("base.sql", "1_x.sql"), Greater);
+    }
+
+    #[test]
+    fn applied_migration_compares_numbers_not_strings() {
+        let mut r = rule(".*", &["**/*"]);
+        r.applied_migration = true;
+        // "9_add.sql" > "10_add.sql" as strings; as numbers it is applied.
+        let nine = delta("db/migrations/9_add.sql", &[], &["x"]);
+        assert_eq!(
+            check_rule(&r, "r", &nine, Some("10_add.sql"))
+                .unwrap()
+                .len(),
+            1
+        );
+        let eleven = delta("db/migrations/11_add.sql", &[], &["x"]);
+        assert!(
+            check_rule(&r, "r", &eleven, Some("10_add.sql"))
+                .unwrap()
+                .is_empty()
+        );
+        let padded = delta("db/migrations/009_add.sql", &[], &["x"]);
+        assert_eq!(
+            check_rule(&r, "r", &padded, Some("010_add.sql"))
+                .unwrap()
+                .len(),
+            1
+        );
+        let after = delta("db/migrations/011_add.sql", &[], &["x"]);
+        assert!(
+            check_rule(&r, "r", &after, Some("010_add.sql"))
+                .unwrap()
+                .is_empty()
+        );
+        // The baseline may be given as a path.
+        assert_eq!(
+            check_rule(&r, "r", &nine, Some("db/migrations/10_add.sql"))
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn applied_migration_matches_a_root_level_migrations_directory() {
+        let mut r = rule(".*", &["**/*"]);
+        r.applied_migration = true;
+        let d = delta("migrations/001_init.sql", &[], &["x"]);
+        assert_eq!(
+            check_rule(&r, "r", &d, Some("002_next.sql")).unwrap().len(),
+            1
+        );
+        let outside = delta("docs/001_init.sql", &[], &["x"]);
+        assert!(
+            check_rule(&r, "r", &outside, Some("002_next.sql"))
                 .unwrap()
                 .is_empty()
         );
