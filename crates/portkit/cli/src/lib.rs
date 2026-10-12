@@ -25,6 +25,13 @@ use clap::{Parser, Subcommand, ValueEnum};
 
 use portkit_core::{Config, Registry};
 
+/// Handle one Claude Code hook event from a payload already read, as
+/// `pk hook <event>` does with stdin. For tests and embedders that drive the
+/// hooks without a subprocess.
+pub fn handle_hook(event: &str, payload: &str, config: &Config) {
+    hook::handle(event, payload, config);
+}
+
 /// Parse arguments, run the requested command, and map the result to an exit code.
 ///
 /// Errors are printed to stderr — stdout stays reserved for command output and
@@ -183,7 +190,8 @@ pub enum Command {
 
     /// Handle a Claude Code hook event. Reads the payload on stdin.
     Hook {
-        /// One of: post-tool-use, user-prompt-submit, session-end.
+        /// One of: pre-tool-use, post-tool-use, user-prompt-submit,
+        /// session-end, pre-compact, session-start.
         event: String,
     },
 

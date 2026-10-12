@@ -14,6 +14,7 @@ pub mod state;
 
 pub use state::{gaps, intersect, merge, FileState, Interval, SessionState};
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -28,6 +29,7 @@ pub fn hash_file(path: &Path) -> Option<String> {
 }
 
 /// Where session state lives: `~/.portkit/read/`, never the working directory.
+/// The directory only; see [`session_state_path`] for the file.
 ///
 /// `PORTKIT_STATE_DIR` overrides it. That exists so tests can isolate — moving
 /// state out of the working directory also moved it out of reach of a tempdir
@@ -54,10 +56,18 @@ pub fn now_rfc3339() -> String {
 ///
 /// Usage: `pk-read [--range A:B] [--ls] [--full] [--compacted] <path>`
 ///
-/// Session identity comes from `PORTKIT_SESSION`, which the hook sets from the
-/// `session_id` on its stdin payload. Without it every call is a first call,
-/// which is the safe direction to fail.
+/// Session identity comes from `PORTKIT_SESSION`, set by whatever launches the
+/// agent session (the cowproof runner sets it to the lane id). The compaction
+/// hooks key the watermark on the same variable through
+/// [`session_state_path`]. Without it all calls share one `default` session,
+/// which a compaction invalidates like any other.
 pub fn run(args: Vec<String>) -> ExitCode {
+    run_to(args, &mut std::io::stdout().lock())
+}
+
+/// [`run`] with the output stream given, so a caller (a test, or the hook's
+/// own tests) can read what `pk-read` would have printed.
+pub fn run_to(args: Vec<String>, out: &mut dyn Write) -> ExitCode {
     if args.is_empty() {
         eprintln!("usage: pk-read [--range A:B] [--ls] [--full] [--compacted] <path>");
         return ExitCode::FAILURE;
@@ -86,7 +96,7 @@ pub fn run(args: Vec<String>) -> ExitCode {
         }
     }
 
-    let state_path = state_path_fn();
+    let state_path = session_state_path();
     if compacted {
         let mut state = SessionState::load(&state_path);
         state.mark_compacted(now_rfc3339());
@@ -100,9 +110,9 @@ pub fn run(args: Vec<String>) -> ExitCode {
     };
 
     if ls {
-        return list(Path::new(&path));
+        return list(Path::new(&path), out);
     }
-    read(Path::new(&path), range, full, &state_path)
+    read(Path::new(&path), range, full, &state_path, out)
 }
 
 fn parse_range(s: &str) -> Option<Interval> {
@@ -110,10 +120,23 @@ fn parse_range(s: &str) -> Option<Interval> {
     Some((a.trim().parse().ok()?, b.trim().parse().ok()?))
 }
 
-/// Per-session state file. Falls back to a shared one when no session is set,
-/// which costs a little precision and never correctness.
-fn state_path_fn() -> PathBuf {
+/// Per-session state file for the session named by `PORTKIT_SESSION`.
+///
+/// The one place that decides where session state lives, for the reader and
+/// for the hooks that write the compaction watermark. They must agree, or the
+/// reader never sees the watermark and keeps answering UNCHANGED for a file the
+/// caller no longer has in context. Falls back to a shared `default` session
+/// when none is set, which costs a little precision and never correctness:
+/// the hook then invalidates that shared session too.
+pub fn session_state_path() -> PathBuf {
     let session = std::env::var("PORTKIT_SESSION").unwrap_or_else(|_| "default".into());
+    session_state_path_for(&session)
+}
+
+/// The state file for a named session, under [`state_dir`]. The name is
+/// reduced to letters, digits, `-` and `_` and cut at 48 characters, so it can
+/// never name another directory.
+pub fn session_state_path_for(session: &str) -> PathBuf {
     let safe: String = session
         .chars()
         .filter(|c| c.is_alphanumeric() || *c == '-' || *c == '_')
@@ -122,7 +145,13 @@ fn state_path_fn() -> PathBuf {
     state_dir().join(format!("{safe}.json"))
 }
 
-fn read(path: &Path, range: Option<Interval>, full: bool, state_path: &Path) -> ExitCode {
+fn read(
+    path: &Path,
+    range: Option<Interval>,
+    full: bool,
+    state_path: &Path,
+    out: &mut dyn Write,
+) -> ExitCode {
     let Ok(text) = std::fs::read_to_string(path) else {
         eprintln!("cannot read {}", path.display());
         return ExitCode::FAILURE;
@@ -153,7 +182,8 @@ fn read(path: &Path, range: Option<Interval>, full: bool, state_path: &Path) -> 
     if missing.is_empty() {
         // The caller has all of it, the file is unchanged, and the delivery
         // survives the last compaction.
-        println!(
+        let _ = writeln!(
+            out,
             "UNCHANGED L{}-{} sha:{short} (recover: pk-read --range {}:{} {} --full)",
             want.0,
             want.1,
@@ -166,7 +196,8 @@ fn read(path: &Path, range: Option<Interval>, full: bool, state_path: &Path) -> 
 
     // Say what is being withheld, and how to get it, before the content.
     for (lo, hi) in intersect(&held, want) {
-        println!(
+        let _ = writeln!(
+            out,
             "KNOWN L{lo}-{hi} sha:{short} (recover: pk-read --range {lo}:{hi} {} --full)",
             path.display()
         );
@@ -175,7 +206,7 @@ fn read(path: &Path, range: Option<Interval>, full: bool, state_path: &Path) -> 
     for (lo, hi) in &missing {
         for n in *lo..=*hi {
             if let Some(line) = lines.get((n - 1) as usize) {
-                println!("{n}\u{2502}{line}");
+                let _ = writeln!(out, "{n}\u{2502}{line}");
             }
         }
         state.deliver(&key, (*lo, *hi), hash.clone(), now_rfc3339());
@@ -186,7 +217,7 @@ fn read(path: &Path, range: Option<Interval>, full: bool, state_path: &Path) -> 
 }
 
 /// `ls -la` without the columns nobody reads back.
-fn list(path: &Path) -> ExitCode {
+fn list(path: &Path, out: &mut dyn Write) -> ExitCode {
     let Ok(entries) = std::fs::read_dir(path) else {
         eprintln!("cannot list {}", path.display());
         return ExitCode::FAILURE;
@@ -206,11 +237,11 @@ fn list(path: &Path) -> ExitCode {
 
     for (name, size, is_dir) in &rows {
         if *is_dir {
-            println!("{name}/");
+            let _ = writeln!(out, "{name}/");
         } else {
-            println!("{name}\t{size}");
+            let _ = writeln!(out, "{name}\t{size}");
         }
     }
-    println!("({} entries)", rows.len());
+    let _ = writeln!(out, "({} entries)", rows.len());
     ExitCode::SUCCESS
 }

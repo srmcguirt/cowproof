@@ -47,19 +47,25 @@ pub fn run(event: &str, config: &Config) -> ExitCode {
     if std::io::stdin().read_to_string(&mut raw).is_err() {
         return ExitCode::SUCCESS;
     }
-    let payload: Payload = serde_json::from_str(&raw).unwrap_or_default();
+    handle(event, &raw, config);
+    ExitCode::SUCCESS
+}
+
+/// Handle one hook event whose stdin payload is already read. The testable
+/// core of [`run`]; also always successful, because it cannot fail.
+pub fn handle(event: &str, raw: &str, config: &Config) {
+    let payload: Payload = serde_json::from_str(raw).unwrap_or_default();
 
     match event {
         "pre-tool-use" => rewrite(&payload, config),
         // Both mean the same thing to a delivery ledger: what we sent may no
         // longer be in the caller's context.
-        "pre-compact" | "session-start" => mark_compacted(&payload),
+        "pre-compact" | "session-start" => mark_compacted(),
         "post-tool-use" => record(&payload, config),
         "user-prompt-submit" => suggest(&payload, config),
         "session-end" => summarize(&payload, config),
         _ => {}
     }
-    ExitCode::SUCCESS
 }
 
 /// Treat everything delivered so far as gone.
@@ -69,19 +75,15 @@ pub fn run(event: &str, config: &Config) -> ExitCode {
 /// stops implying "they still have it" — and it stops implying that exactly
 /// when a re-read matters most. Without this watermark the reference class is
 /// unsafe, so it ships with it rather than after it.
-fn mark_compacted(payload: &Payload) {
-    if payload.session_id.is_empty() {
-        return;
-    }
-    let safe: String = payload
-        .session_id
-        .chars()
-        .filter(|c| c.is_alphanumeric() || *c == '-' || *c == '_')
-        .take(48)
-        .collect();
-    let path = PathBuf::from(".portkit")
-        .join("read")
-        .join(format!("{safe}.json"));
+///
+/// The watermark goes to the file `pk-read` reads, through the one function
+/// that owns that location ([`portkit_read::session_state_path`]): under
+/// `PORTKIT_STATE_DIR` when set, else under the home directory, and never
+/// under the working directory, which in a lane is the builder's clone. The
+/// session is `PORTKIT_SESSION`, as it is for the reader; the payload's own
+/// `session_id` is not used, because the reader does not know it.
+fn mark_compacted() {
+    let path = portkit_read::session_state_path();
 
     let mut state = portkit_read::SessionState::load(&path);
     state.mark_compacted(portkit_read::now_rfc3339());

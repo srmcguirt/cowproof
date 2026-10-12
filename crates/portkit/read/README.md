@@ -63,9 +63,13 @@ pk-read --range 40:80 f.ts --full    # everything, ignoring session state
 pk-read --compacted                  # watermark
 ```
 
-Session identity comes from `PORTKIT_SESSION`, which the hook sets from the
-payload's `session_id`. Unset means every call is a first call — the safe
-direction to fail.
+Session identity comes from `PORTKIT_SESSION`, set by whatever launches the
+agent session (the cowproof runner sets it to the lane id). The compaction
+hooks read the same variable, and both go through
+`portkit_read::session_state_path`, so the watermark lands in the file the
+reader reads, under `PORTKIT_STATE_DIR` (default `~/.portkit/read/`) and never
+the working directory. Unset means one shared `default` session, which a
+compaction invalidates like any other.
 
 ## Status
 

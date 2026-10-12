@@ -67,11 +67,17 @@ impl SessionState {
 
     /// Whether a delivery timestamp survives the last compaction.
     fn survives_compaction(&self, delivered_at: &str) -> bool {
-        match &self.compacted_at {
-            // String compare is correct for RFC3339 UTC, which sorts
-            // lexicographically.
-            Some(at) => delivered_at > at.as_str(),
-            None => true,
+        let Some(at) = &self.compacted_at else {
+            return true;
+        };
+        // Compare instants, not strings. RFC3339 sorts lexicographically only
+        // at a fixed width, and the fractional part is as short as it can be:
+        // ".5Z" sorts after ".51Z", so a delivery just before a compaction in
+        // the same second could be taken as surviving it. A stamp that does not
+        // parse is treated as gone, which only ever costs a re-send.
+        match (parse_instant(delivered_at), parse_instant(at)) {
+            (Some(delivered), Some(compacted)) => delivered > compacted,
+            _ => false,
         }
     }
 
@@ -92,9 +98,18 @@ impl SessionState {
 
     /// Record what was just sent.
     pub fn deliver(&mut self, path: &str, sent: Interval, hash: String, now: String) {
+        // `delivered_at` is one stamp for the whole file, so intervals that
+        // predate a compaction must go before this delivery refreshes it.
+        // Otherwise a range sent after the watermark would carry older ranges
+        // across it, and they would be reported UNCHANGED for lines the
+        // caller no longer holds.
+        let stale = self
+            .files
+            .get(path)
+            .is_some_and(|f| !self.survives_compaction(&f.delivered_at));
         let entry = self.files.entry(path.to_string()).or_default();
         // A changed file invalidates every earlier interval for it.
-        if entry.hash != hash {
+        if stale || entry.hash != hash {
             entry.intervals.clear();
             entry.hash = hash;
         }
@@ -102,6 +117,10 @@ impl SessionState {
         entry.intervals = merge(std::mem::take(&mut entry.intervals));
         entry.delivered_at = now;
     }
+}
+
+fn parse_instant(stamp: &str) -> Option<time::OffsetDateTime> {
+    time::OffsetDateTime::parse(stamp, &time::format_description::well_known::Rfc3339).ok()
 }
 
 /// Merge overlapping and touching intervals.
@@ -215,6 +234,40 @@ mod tests {
         s.mark_compacted("2026-01-01T00:00:00Z".into());
         s.deliver("a.rs", (1, 50), "h".into(), "2026-01-02T00:00:00Z".into());
         assert_eq!(s.covered("a.rs", (1, 50), "h").len(), 1);
+    }
+
+    #[test]
+    fn a_delivery_after_compaction_drops_ranges_from_before_it() {
+        let mut s = SessionState::default();
+        s.deliver("a.rs", (1, 10), "h".into(), "2026-01-01T00:00:00Z".into());
+        s.mark_compacted("2026-01-02T00:00:00Z".into());
+        s.deliver("a.rs", (20, 30), "h".into(), "2026-01-03T00:00:00Z".into());
+        assert!(s.covered("a.rs", (1, 10), "h").is_empty());
+        assert_eq!(s.covered("a.rs", (20, 30), "h"), vec![(20, 30)]);
+    }
+
+    #[test]
+    fn timestamps_compare_as_instants_not_strings() {
+        // As strings ".5Z" > ".51Z", which would let a delivery at .5s
+        // survive a compaction at .51s in the same second.
+        let mut s = SessionState::default();
+        s.deliver("a.rs", (1, 5), "h".into(), "2026-01-01T00:00:00.5Z".into());
+        s.mark_compacted("2026-01-01T00:00:00.51Z".into());
+        assert!(s.covered("a.rs", (1, 5), "h").is_empty());
+
+        // And the other way round, a whole-second stamp against a fractional one.
+        let mut t = SessionState::default();
+        t.mark_compacted("2026-01-01T00:00:00Z".into());
+        t.deliver("a.rs", (1, 5), "h".into(), "2026-01-01T00:00:00.5Z".into());
+        assert_eq!(t.covered("a.rs", (1, 5), "h"), vec![(1, 5)]);
+    }
+
+    #[test]
+    fn an_unparseable_stamp_is_treated_as_gone() {
+        let mut s = SessionState::default();
+        s.deliver("a.rs", (1, 5), "h".into(), "not a time".into());
+        s.mark_compacted("2026-01-01T00:00:00Z".into());
+        assert!(s.covered("a.rs", (1, 5), "h").is_empty());
     }
 
     #[test]
