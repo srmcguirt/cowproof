@@ -229,13 +229,23 @@ pub fn prefetch(
     timeout: Duration,
     alive: Alive,
 ) -> Result<Option<Prefetch>> {
+    // Ask first, create after: a root that already holds things cowproof did not make is
+    // not swept (below), though the fetch still works there.
+    let owned = cache::require_owned(cache_root, &lane.real_home);
     let work_root = cache_root.join("deps-work");
     fs::create_dir_all(&work_root).context("creating the dependency work directory")?;
     fs::create_dir_all(cache_root.join("deps")).context("creating the dependency cache")?;
+    // The one place a cache root is first created: mark it as cowproof's.
+    cache::write_marker(cache_root).context("marking the dependency cache root")?;
     // A `cowproof` that was interrupted left its work directory behind (nothing removes it
     // but the run that made it): clear the ones whose process is gone. Best effort, and
-    // never a directory whose process is alive.
-    let _ = cache::remove_stale_work(cache_root, &lane.real_home, alive);
+    // never a directory whose process is alive, nor one in a root cowproof did not make.
+    match owned {
+        Ok(()) => {
+            let _ = cache::remove_stale_work(cache_root, &lane.real_home, alive);
+        }
+        Err(e) => eprintln!("warning: not sweeping stale dependency work directories: {e:#}"),
+    }
     let stamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
     let work = work_root.join(format!("{}-{stamp}", std::process::id()));
     fs::create_dir(&work).context("creating the dependency work directory")?;
@@ -770,6 +780,77 @@ mod tests {
             .modified()
             .unwrap();
         assert!(SystemTime::now().duration_since(used).unwrap() < Duration::from_secs(60));
+    }
+
+    #[test]
+    fn a_fetch_does_not_sweep_a_root_that_holds_something_else_but_still_works() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("cache");
+        let lane = LaneLayout {
+            clone: tmp.path().join("lane/clone"),
+            home: tmp.path().join("lane/home"),
+            scratch: tmp.path().join("lane/scratch"),
+            control: tmp.path().join("lane/control"),
+            real_home: tmp.path().join("home"),
+            sock: tmp.path().join("lane/sock/runner.sock"),
+            lanes_root: tmp.path().to_path_buf(),
+        };
+        let dead = 4_000_002u32;
+        fs::create_dir_all(root.join("deps/old-project")).unwrap();
+        fs::create_dir_all(root.join(format!("deps-work/{dead}-1"))).unwrap();
+        let tools = FetchTools {
+            path: String::new(),
+            cargo: None,
+        };
+        let got = prefetch(
+            |_| Ok(()),
+            &root,
+            &lane,
+            FetchNetwork::None,
+            &tools,
+            Duration::from_secs(5),
+            &|_| false,
+        )
+        .unwrap();
+        assert!(got.is_none(), "the fetch itself ran");
+        assert!(
+            root.join(format!("deps-work/{dead}-1")).is_dir(),
+            "the sweep ran in an unmarked root that holds something else"
+        );
+        assert!(root.join("deps/old-project").is_dir());
+    }
+
+    #[test]
+    fn a_fetch_into_a_new_root_marks_it_as_cowproofs() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("cache");
+        let lane = LaneLayout {
+            clone: tmp.path().join("lane/clone"),
+            home: tmp.path().join("lane/home"),
+            scratch: tmp.path().join("lane/scratch"),
+            control: tmp.path().join("lane/control"),
+            real_home: tmp.path().join("home"),
+            sock: tmp.path().join("lane/sock/runner.sock"),
+            lanes_root: tmp.path().to_path_buf(),
+        };
+        let tools = FetchTools {
+            path: String::new(),
+            cargo: None,
+        };
+        prefetch(
+            |_| Ok(()),
+            &root,
+            &lane,
+            FetchNetwork::None,
+            &tools,
+            Duration::from_secs(5),
+            &|_| true,
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read_to_string(root.join(cache::MARKER)).unwrap(),
+            cache::MARKER_BODY
+        );
     }
 
     #[test]

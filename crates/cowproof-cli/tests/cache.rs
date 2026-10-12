@@ -16,6 +16,12 @@ use tempfile::TempDir;
 
 const DAY: Duration = Duration::from_secs(86_400);
 
+/// A cache-key-shaped name for a readable label: the label's hex, padded with zeros.
+fn key(label: &str) -> String {
+    let hex: String = label.bytes().map(|b| format!("{b:02x}")).collect();
+    format!("{hex:0<64}")
+}
+
 struct Fixture {
     _tmp: TempDir,
     root: PathBuf,
@@ -29,6 +35,11 @@ impl Fixture {
         let home = tmp.path().join("home");
         fs::create_dir_all(root.join("deps")).unwrap();
         fs::create_dir_all(&home).unwrap();
+        fs::write(
+            root.join(cowproof_run::cache::MARKER),
+            cowproof_run::cache::MARKER_BODY,
+        )
+        .unwrap();
         Fixture {
             _tmp: tmp,
             root,
@@ -51,8 +62,8 @@ impl Fixture {
     }
 
     /// An entry of `bytes` bytes, last used `days` days ago.
-    fn entry(&self, key: &str, bytes: usize, days: u32) -> PathBuf {
-        let dir = self.root.join("deps").join(key);
+    fn entry(&self, label: &str, bytes: usize, days: u32) -> PathBuf {
+        let dir = self.root.join("deps").join(key(label));
         fs::create_dir_all(dir.join("cargo/registry")).unwrap();
         fs::write(dir.join("cargo/registry/crate"), vec![b'x'; bytes]).unwrap();
         let marker = fs::File::create(dir.join(".last-used")).unwrap();
@@ -65,8 +76,8 @@ impl Fixture {
         fs::write(dir.join("leases").join(pid.to_string()), "").unwrap();
     }
 
-    fn has(&self, key: &str) -> bool {
-        self.root.join("deps").join(key).exists()
+    fn has(&self, label: &str) -> bool {
+        self.root.join("deps").join(key(label)).exists()
     }
 }
 
@@ -133,7 +144,7 @@ fn prune_removes_old_entries_keeps_recent_ones_and_reports_the_bytes() {
     let o = f.cowproof(&["cache", "prune"]);
     assert!(o.status.success(), "{}", text(&o));
     let out = String::from_utf8_lossy(&o.stdout).into_owned();
-    assert!(out.contains("removed old"), "{out}");
+    assert!(out.contains(&format!("removed {}", key("old"))), "{out}");
     assert!(out.contains("removed 1 of 2 entries"), "{out}");
     assert!(!f.has("old") && f.has("recent"));
 
@@ -165,7 +176,10 @@ fn a_dry_run_names_what_it_would_remove_and_removes_nothing() {
     let o = f.cowproof(&["cache", "prune", "--dry-run"]);
     assert!(o.status.success(), "{}", text(&o));
     let out = String::from_utf8_lossy(&o.stdout).into_owned();
-    assert!(out.contains("would remove old"), "{out}");
+    assert!(
+        out.contains(&format!("would remove {}", key("old"))),
+        "{out}"
+    );
     assert!(out.contains("would remove 1 of 1 entries"), "{out}");
     assert!(out.contains("500 bytes would be freed"), "{out}");
     assert!(f.has("old"));
@@ -184,7 +198,11 @@ fn a_live_lease_protects_an_old_entry_and_a_dead_one_does_not() {
     assert!(o.status.success(), "{}", text(&o));
     let out = String::from_utf8_lossy(&o.stdout).into_owned();
     assert!(
-        out.contains(&format!("kept held: in use by pid {}", sleeper.pid())),
+        out.contains(&format!(
+            "kept {}: in use by pid {}",
+            key("held"),
+            sleeper.pid()
+        )),
         "{out}"
     );
     assert!(f.has("held") && !f.has("stale"), "{out}");
@@ -234,7 +252,7 @@ fn a_symlinked_entry_is_removed_as_a_link_and_its_target_survives() {
     let outside = f._tmp.path().join("outside");
     fs::create_dir_all(&outside).unwrap();
     fs::write(outside.join("precious"), vec![b'p'; 4000]).unwrap();
-    std::os::unix::fs::symlink(&outside, f.root.join("deps/linked")).unwrap();
+    std::os::unix::fs::symlink(&outside, f.root.join("deps").join(key("linked"))).unwrap();
     let o = f.cowproof(&["cache"]);
     assert!(
         String::from_utf8_lossy(&o.stdout).contains("(0 bytes)") || {
@@ -247,4 +265,38 @@ fn a_symlinked_entry_is_removed_as_a_link_and_its_target_survives() {
     assert!(o.status.success(), "{}", text(&o));
     assert!(!f.has("linked"));
     assert_eq!(fs::read(outside.join("precious")).unwrap().len(), 4000);
+}
+
+#[test]
+fn a_root_without_the_marker_that_holds_something_else_is_refused_with_exit_1() {
+    let f = Fixture::new();
+    fs::remove_file(f.root.join(cowproof_run::cache::MARKER)).unwrap();
+    fs::create_dir_all(f.root.join("deps/old-project")).unwrap();
+    fs::write(f.root.join("deps/old-project/file"), "x").unwrap();
+    for args in [
+        &["cache", "prune", "--older-than", "0"][..],
+        &["cache", "prune", "--max-size", "0"][..],
+        &["cache", "ls"][..],
+    ] {
+        let o = f.cowproof(args);
+        assert_eq!(o.status.code(), Some(1), "{args:?}: {}", text(&o));
+        let err = String::from_utf8_lossy(&o.stderr).into_owned();
+        assert!(err.contains(&f.root.display().to_string()), "{err}");
+        assert!(err.contains("run a lane with"), "{err}");
+    }
+    assert!(f.root.join("deps/old-project/file").is_file());
+    assert!(!f.root.join(cowproof_run::cache::MARKER).exists());
+}
+
+#[test]
+fn an_older_cache_without_the_marker_is_adopted_by_ls() {
+    let f = Fixture::new();
+    fs::remove_file(f.root.join(cowproof_run::cache::MARKER)).unwrap();
+    f.entry("aaa", 100, 3);
+    let o = f.cowproof(&["cache"]);
+    assert!(o.status.success(), "{}", text(&o));
+    assert_eq!(
+        fs::read_to_string(f.root.join(cowproof_run::cache::MARKER)).unwrap(),
+        cowproof_run::cache::MARKER_BODY
+    );
 }

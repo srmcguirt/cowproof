@@ -22,6 +22,16 @@
 //!   (a fetch in progress, or an entry a prune is deleting). One whose pid is dead is stale
 //!   ([`remove_stale_work`]); a name that does not start with a pid is never touched.
 //!
+//! * `<root>/.cowproof-cache` is the **ownership marker**: cowproof writes it when it first
+//!   creates a cache root, and `cache ls`, `cache prune` and the fetch's stale-work sweep
+//!   refuse a root without it ([`require_owned`]), so a `COWPROOF_CACHE_ROOT` set by mistake
+//!   to a directory that merely holds a `deps/` never loses anything. A root made before the
+//!   marker existed is adopted (the marker is written) only when everything in it has
+//!   cowproof's shape: each name in `deps/` is a cache key ([`is_key`], 64 lowercase hex
+//!   digits, the SHA-256 of [`crate::dependency_cache_key`]) and each name in `deps-work/` is
+//!   `<pid>-<digits>[-prune]`. Even in a marked root a prune lists and removes only names of
+//!   that shape.
+//!
 //! Everything here removes things only under `<root>/deps` and `<root>/deps-work`, never
 //! follows a symlink (a link is measured as nothing and removed as a link), and refuses a
 //! root that is empty, relative, `/` or the home directory ([`check_root`]).
@@ -42,6 +52,11 @@ pub const LEASES: &str = "leases";
 pub const DEPS: &str = "deps";
 /// The directory of private work directories under the root.
 pub const DEPS_WORK: &str = "deps-work";
+
+/// The ownership marker at the cache root.
+pub const MARKER: &str = ".cowproof-cache";
+/// What the marker holds: a fixed header and a version.
+pub const MARKER_BODY: &str = "cowproof dependency cache\nversion 1\n";
 
 /// Whether a pid is a live process. `true` also for "cannot tell".
 pub type Alive<'a> = &'a dyn Fn(u32) -> bool;
@@ -68,10 +83,95 @@ pub fn check_root(root: &Path, home: &Path) -> Result<()> {
     Ok(())
 }
 
-/// The pid a `deps-work` directory name starts with: `<pid>-...`.
+/// Whether `name` is a cache key: the 64 lowercase hex digits of a SHA-256
+/// ([`crate::dependency_cache_key`]).
+pub fn is_key(name: &str) -> bool {
+    name.len() == 64 && name.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// The pid of a `deps-work` directory name, which is `<pid>-<digits>` or
+/// `<pid>-<digits>-prune`; any other name is not cowproof's.
 fn work_pid(name: &str) -> Option<u32> {
-    let pid: u32 = name.split('-').next()?.parse().ok()?;
+    let rest = name.strip_suffix("-prune").unwrap_or(name);
+    let (pid, stamp) = rest.split_once('-')?;
+    if stamp.is_empty() || !stamp.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let pid: u32 = pid.parse().ok()?;
     (pid > 0).then_some(pid)
+}
+
+fn dir_names(dir: &Path) -> io::Result<Vec<String>> {
+    Ok(fs::read_dir(dir)?
+        .flatten()
+        .map(|i| i.file_name().to_string_lossy().into_owned())
+        .collect())
+}
+
+/// Write the ownership marker at `root` if it is not there. Never follows a link.
+pub fn write_marker(root: &Path) -> io::Result<()> {
+    match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(root.join(MARKER))
+    {
+        Ok(mut f) => io::Write::write_all(&mut f, MARKER_BODY.as_bytes()),
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+fn has_marker(root: &Path) -> bool {
+    let path = root.join(MARKER);
+    fs::symlink_metadata(&path).is_ok_and(|m| m.is_file())
+        && fs::read_to_string(&path).is_ok_and(|t| t.starts_with("cowproof dependency cache\n"))
+}
+
+/// Refuse a root cowproof did not make. Fine: a root with the marker; a root with no
+/// `deps/` and no `deps-work/` entries at all (nothing there to lose); a root without the
+/// marker whose every `deps/` name is a key and every `deps-work/` name is a work name (an
+/// older cowproof's cache), which gets the marker now. Anything else is an error that says
+/// how to make a cache there.
+pub fn require_owned(root: &Path, home: &Path) -> Result<()> {
+    check_root(root, home)?;
+    if has_marker(root) {
+        return Ok(());
+    }
+    let mut foreign: Option<String> = None;
+    let mut any = false;
+    for (sub, ok) in [
+        (DEPS, is_key as fn(&str) -> bool),
+        (DEPS_WORK, |n: &str| work_pid(n).is_some()),
+    ] {
+        let dir = root.join(sub);
+        match fs::symlink_metadata(&dir) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e.into()),
+            Ok(m) if !m.is_dir() => {
+                foreign = Some(format!("{sub} is not a plain directory"));
+                continue;
+            }
+            Ok(_) => {}
+        }
+        for name in dir_names(&dir)? {
+            any = true;
+            if !ok(&name) && foreign.is_none() {
+                foreign = Some(format!("{sub}/{name} is not something cowproof makes"));
+            }
+        }
+    }
+    match foreign {
+        None if !any => Ok(()),
+        None => Ok(write_marker(root)?),
+        Some(why) => bail!(
+            "{} is not a cowproof cache: it has no {MARKER} marker and {why}. cowproof only \
+             prunes a cache it created; to make one there, run a lane with \
+             COWPROOF_CACHE_ROOT={} (an empty directory is best)",
+            root.display(),
+            root.display()
+        ),
+    }
 }
 
 /// A lease file's pid: its name.
@@ -199,7 +299,7 @@ fn is_plain_dir(path: &Path) -> bool {
 
 /// Every entry under `<root>/deps`, oldest use first. `deps` that is a symlink is refused.
 pub fn list(root: &Path, home: &Path, alive: Alive) -> Result<Vec<Entry>> {
-    check_root(root, home)?;
+    require_owned(root, home)?;
     let deps = root.join(DEPS);
     match fs::symlink_metadata(&deps) {
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -211,6 +311,10 @@ pub fn list(root: &Path, home: &Path, alive: Alive) -> Result<Vec<Entry>> {
     for item in fs::read_dir(&deps)?.flatten() {
         let path = item.path();
         let key = item.file_name().to_string_lossy().into_owned();
+        // Only what has a cache key's name is cowproof's, marker or not.
+        if !is_key(&key) {
+            continue;
+        }
         let Ok(meta) = fs::symlink_metadata(&path) else {
             continue;
         };
@@ -440,7 +544,7 @@ pub struct WorkSweep {
 /// Remove every `deps-work/<pid>-...` whose pid is dead; keep the ones whose pid is alive;
 /// leave any other name alone. (A prune's own sweep can also list without removing.)
 pub fn remove_stale_work(root: &Path, home: &Path, alive: Alive) -> Result<WorkSweep> {
-    check_root(root, home)?;
+    require_owned(root, home)?;
     sweep_work(root, alive, false)
 }
 
@@ -450,10 +554,7 @@ fn sweep_work(root: &Path, alive: Alive, dry_run: bool) -> Result<WorkSweep> {
     if !is_plain_dir(&work) {
         return Ok(sweep);
     }
-    let mut names: Vec<_> = fs::read_dir(&work)?
-        .flatten()
-        .map(|i| i.file_name().to_string_lossy().into_owned())
-        .collect();
+    let mut names = dir_names(&work)?;
     names.sort();
     for name in names {
         let Some(pid) = work_pid(&name) else { continue };
@@ -490,6 +591,22 @@ mod tests {
         pid == LIVE
     }
 
+    /// A cache-key-shaped name for a readable label: the label's hex, padded with zeros.
+    fn key(label: &str) -> String {
+        let hex: String = label.bytes().map(|b| format!("{b:02x}")).collect();
+        format!("{hex:0<64}")
+    }
+
+    /// The label of [`key`].
+    fn label(key: &str) -> String {
+        key.as_bytes()
+            .chunks(2)
+            .map(|c| u8::from_str_radix(std::str::from_utf8(c).unwrap(), 16).unwrap())
+            .take_while(|b| *b != 0)
+            .map(char::from)
+            .collect()
+    }
+
     /// A temp dir under /var/tmp, never the real home or cache.
     fn tmp() -> TempDir {
         fs::create_dir_all("/var/tmp").unwrap();
@@ -513,6 +630,7 @@ mod tests {
             let home = t.path().join("home");
             fs::create_dir_all(root.join(DEPS)).unwrap();
             fs::create_dir_all(&home).unwrap();
+            fs::write(root.join(MARKER), MARKER_BODY).unwrap();
             Cache {
                 _tmp: t,
                 root,
@@ -522,8 +640,8 @@ mod tests {
         }
 
         /// An entry of `bytes` bytes, last used `days` days ago.
-        fn entry(&self, key: &str, bytes: usize, days: u64) -> PathBuf {
-            let dir = self.root.join(DEPS).join(key);
+        fn entry(&self, label: &str, bytes: usize, days: u64) -> PathBuf {
+            let dir = self.root.join(DEPS).join(key(label));
             fs::create_dir_all(dir.join("cargo/registry")).unwrap();
             fs::write(dir.join("cargo/registry/crate"), vec![b'x'; bytes]).unwrap();
             set_last_used(&dir, self.now - DAY * days as u32).unwrap();
@@ -548,13 +666,13 @@ mod tests {
             prune(&self.root, &self.home, opts, &alive).unwrap()
         }
 
-        fn has(&self, key: &str) -> bool {
-            self.root.join(DEPS).join(key).exists()
+        fn has(&self, label: &str) -> bool {
+            self.root.join(DEPS).join(key(label)).exists()
         }
     }
 
-    fn keys(report: &PruneReport) -> Vec<&str> {
-        report.removed.iter().map(|r| r.key.as_str()).collect()
+    fn keys(report: &PruneReport) -> Vec<String> {
+        report.removed.iter().map(|r| label(&r.key)).collect()
     }
 
     #[test]
@@ -621,7 +739,7 @@ mod tests {
         opts.max_bytes = Some(0);
         let report = c.prune(&opts);
         assert_eq!(keys(&report), ["idle"]);
-        assert_eq!(report.in_use, [("busy".to_string(), vec![LIVE])]);
+        assert_eq!(report.in_use, [(key("busy"), vec![LIVE])]);
         assert!(c.has("busy"));
         assert!(!c.has("idle"));
         assert!(
@@ -767,7 +885,7 @@ mod tests {
         let deps = c.root.join(DEPS);
 
         // 1. An entry that is itself a link to a directory outside.
-        std::os::unix::fs::symlink(&outside, deps.join("link-entry")).unwrap();
+        std::os::unix::fs::symlink(&outside, deps.join(key("link-entry"))).unwrap();
         // 2. A real entry with a link to the outside inside it.
         let real = c.entry("real", 100, 90);
         std::os::unix::fs::symlink(&outside, real.join("cargo/escape")).unwrap();
@@ -777,17 +895,17 @@ mod tests {
 
         // The listing measures the links as nothing.
         let listed = list(&c.root, &c.home, &alive).unwrap();
-        let link = listed.iter().find(|e| e.key == "link-entry").unwrap();
+        let link = listed.iter().find(|e| e.key == key("link-entry")).unwrap();
         assert!(link.link);
         assert_eq!(link.bytes, 0, "the link's target was measured");
-        let real_entry = listed.iter().find(|e| e.key == "real").unwrap();
+        let real_entry = listed.iter().find(|e| e.key == key("real")).unwrap();
         assert_eq!(real_entry.bytes, 100, "the link inside an entry was walked");
 
         let mut opts = c.opts(0);
         opts.max_bytes = Some(0);
         let report = c.prune(&opts);
         assert_eq!(report.removed.len(), 3, "{report:?}");
-        assert!(!deps.join("link-entry").exists());
+        assert!(!deps.join(key("link-entry")).exists());
         assert!(!c.has("real") && !c.has("sneaky"));
         assert_eq!(
             fs::read(outside.join("deep/precious")).unwrap().len(),
@@ -846,5 +964,105 @@ mod tests {
         assert_eq!((o.entries, o.bytes), (2, 150));
         let oldest = o.oldest.unwrap();
         assert_eq!(c.now.duration_since(oldest).unwrap().as_secs() / 86_400, 40);
+    }
+
+    /// A root with no marker, made by hand: `deps/` and `deps-work/` hold what is given.
+    fn unmarked(deps: &[&str], work: &[&str]) -> Cache {
+        let c = Cache::new();
+        fs::remove_file(c.root.join(MARKER)).unwrap();
+        for name in deps {
+            let d = c.root.join(DEPS).join(name);
+            fs::create_dir_all(&d).unwrap();
+            fs::write(d.join("file"), "x").unwrap();
+        }
+        for name in work {
+            fs::create_dir_all(c.root.join(DEPS_WORK).join(name)).unwrap();
+        }
+        c
+    }
+
+    #[test]
+    fn a_root_without_the_marker_that_holds_something_else_is_refused_and_nothing_is_deleted() {
+        let c = unmarked(&["old-project", "other"], &[&format!("{DEAD}-5")]);
+        let mut opts = c.opts(0);
+        opts.max_bytes = Some(0);
+        let err = prune(&c.root, &c.home, &opts, &alive)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(&c.root.display().to_string()), "{err}");
+        assert!(err.contains("COWPROOF_CACHE_ROOT"), "{err}");
+        assert!(overview(&c.root, &c.home, &alive).is_err());
+        assert!(remove_stale_work(&c.root, &c.home, &alive).is_err());
+        assert!(c.root.join("deps/old-project/file").is_file());
+        assert!(c.root.join("deps/other/file").is_file());
+        assert!(c.root.join(DEPS_WORK).join(format!("{DEAD}-5")).is_dir());
+        assert!(!c.root.join(MARKER).exists(), "a foreign root was marked");
+    }
+
+    #[test]
+    fn a_work_name_that_is_not_cowproofs_also_makes_an_unmarked_root_foreign() {
+        let c = unmarked(&[&key("a")], &["build-cache"]);
+        assert!(prune(&c.root, &c.home, &c.opts(0), &alive).is_err());
+        assert!(c.has("a"));
+    }
+
+    #[test]
+    fn an_unmarked_root_of_cowproof_shaped_entries_is_adopted_and_marked() {
+        let c = unmarked(
+            &[&key("old")],
+            &[&format!("{DEAD}-5"), &format!("{LIVE}-6-prune")],
+        );
+        set_last_used(&c.root.join(DEPS).join(key("old")), c.now - DAY * 90).unwrap();
+        let report = c.prune(&c.opts(30));
+        assert_eq!(keys(&report), ["old"]);
+        assert_eq!(report.work_removed, [format!("{DEAD}-5")]);
+        assert_eq!(
+            fs::read_to_string(c.root.join(MARKER)).unwrap(),
+            MARKER_BODY,
+            "the marker was written on adoption"
+        );
+        // `ls` adopts too.
+        let c = unmarked(&[&key("x")], &[]);
+        assert_eq!(overview(&c.root, &c.home, &alive).unwrap().entries, 1);
+        assert!(c.root.join(MARKER).is_file());
+    }
+
+    #[test]
+    fn a_root_with_nothing_in_it_is_not_refused_and_not_marked_by_a_look() {
+        let c = unmarked(&[], &[]);
+        assert_eq!(overview(&c.root, &c.home, &alive).unwrap().entries, 0);
+        assert!(
+            prune(&c.root, &c.home, &c.opts(0), &alive)
+                .unwrap()
+                .removed
+                .is_empty()
+        );
+        assert!(!c.root.join(MARKER).exists());
+        let missing = c._tmp.path().join("missing");
+        assert_eq!(overview(&missing, &c.home, &alive).unwrap().entries, 0);
+    }
+
+    #[test]
+    fn a_marked_root_prunes_only_names_shaped_like_keys() {
+        let c = Cache::new();
+        c.entry("old", 100, 90);
+        let keep = c.root.join(DEPS).join("not-a-key");
+        fs::create_dir_all(&keep).unwrap();
+        let report = c.prune(&c.opts(0));
+        assert_eq!(keys(&report), ["old"]);
+        assert!(keep.is_dir(), "a name that is no cache key was removed");
+    }
+
+    #[test]
+    fn keys_and_work_names_have_one_shape() {
+        assert!(is_key(&key("x")));
+        assert!(!is_key("old-project"));
+        assert!(!is_key(&key("j").to_uppercase()), "upper case is not a key");
+        assert!(!is_key(&format!("{}0", key("x"))));
+        assert_eq!(work_pid("123-456"), Some(123));
+        assert_eq!(work_pid("123-456-prune"), Some(123));
+        for bad in ["123", "123-", "123-abc", "0-1", "x-1", "-1", "123-1-other"] {
+            assert_eq!(work_pid(bad), None, "{bad}");
+        }
     }
 }
