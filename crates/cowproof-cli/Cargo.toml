@@ -1,9 +1,14 @@
 [package]
-name = "cowproof-cli"
+name = "cowproof"
 version.workspace = true
 rust-version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+description = "Run many AI builders in parallel on one project, each in its own copy-on-write clone and OS sandbox, and let nothing land until it is proven."
+readme = "../../README.md"
+keywords = ["ai", "agents", "sandbox", "verification", "cli"]
+categories = ["command-line-utilities", "development-tools"]
 
 [lib]
 name = "cowproof_cli"
@@ -28,13 +33,13 @@ serde_json.workspace = true
 serde.workspace = true
 toml.workspace = true
 tokio = { workspace = true, features = ["net", "sync"] }
-cowproof-core = { path = "../cowproof-core" }
-cowproof-host = { path = "../cowproof-host" }
-cowproof-plan = { path = "../cowproof-plan" }
-cowproof-lint = { path = "../cowproof-lint" }
-cowproof-run = { path = "../cowproof-run" }
-cowproof-prove = { path = "../cowproof-prove" }
-cowproof-report = { path = "../cowproof-report" }
+cowproof-core.workspace = true
+cowproof-host.workspace = true
+cowproof-plan.workspace = true
+cowproof-lint.workspace = true
+cowproof-run.workspace = true
+cowproof-prove.workspace = true
+cowproof-report.workspace = true
 portkit-core.workspace = true
 portkit-cli.workspace = true
 portkit-mcp.workspace = true

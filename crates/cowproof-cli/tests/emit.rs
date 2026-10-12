@@ -36,7 +36,7 @@ impl Session {
 
         match out {
             Ok(output) => String::from_utf8_lossy(&output.stdout).to_string(),
-            Err(_) => panic!("pk-read must be available; it moved to cowproof-cli as of D2"),
+            Err(_) => panic!("pk-read must be available; it is built by the cowproof package (D2)"),
         }
     }
 

@@ -1,8 +1,11 @@
-//! `cowproof report`: aggregate reports over many lanes. The rollup itself lives in
-//! `cowproof_report::rollup`; this is its command line, so the three binaries keep
-//! folding into one (`docs/backlog.md`) instead of a fourth entry point appearing.
+//! `cowproof report`: the handoff report for one lane (`handback`) and the aggregate
+//! reports over many (`rollup`, `port-candidates`). The reports themselves live in
+//! `cowproof_report`; this is their command line. `handback` was the standalone
+//! `cowproof-report` binary until D2 folded it in, so the release ships one `cowproof`
+//! binary (plus `pk` and `pk-read`, which hooks call by name).
 
 use anyhow::Result;
+use cowproof_report::handback::{self, handback};
 use cowproof_report::port_candidates::{self, port_candidates};
 use cowproof_report::rollup::{Options, rollup};
 use std::path::PathBuf;
@@ -15,6 +18,18 @@ pub struct ReportArgs {
 
 #[derive(clap::Subcommand)]
 pub enum ReportAction {
+    /// The handoff report for one finished lane: checks, flaws, assertion loss, verdict hint
+    ///
+    /// Reads `summary.json`, `lane.patch` and the lane's handoff from the lane directory
+    /// (the handoff is found in the patch, at the path `summary.json` names under
+    /// `--repo`, or as `handoff.md` in the lane directory), parses the checks the builder
+    /// reported, runs the flaw rules over the patch and counts removed assertions. The
+    /// verdict hint is one of `apply`, `fix-then-apply`, `escalate` and `rerun`; it is a
+    /// hint for the director, not a ruling. This was the standalone `cowproof-report`
+    /// binary.
+    ///
+    /// Exit codes: 0 printed; 2 the lane could not be read (or a usage error).
+    Handback(HandbackArgs),
     /// First-try pass rate, proved rate and cost per start rung and class, over lanes roots
     ///
     /// Reads only `control/run.json` and `control/verdict.json` one level under each root
@@ -41,6 +56,25 @@ pub enum ReportAction {
     /// Exit codes: 0 printed; 1 a root is not a directory or a draft file exists.
     #[command(name = "port-candidates", long_flag = "port-candidates")]
     PortCandidates(PortCandidatesArgs),
+}
+
+#[derive(clap::Args)]
+pub struct HandbackArgs {
+    /// The lane directory (holds `summary.json` and `lane.patch`)
+    #[arg(value_name = "LANE_DIR")]
+    pub lane_dir: PathBuf,
+    /// The repository to find the handoff and the packet in
+    #[arg(long, value_name = "DIR")]
+    pub repo: Option<PathBuf>,
+    /// The packet file (default: the packet under `--repo` whose header names the lane)
+    #[arg(long, value_name = "FILE")]
+    pub packet: Option<PathBuf>,
+    /// A migration file name; flaw rules about new migrations skip it
+    #[arg(long, value_name = "FILE")]
+    pub baseline: Option<String>,
+    /// Print one JSON document instead of the text report
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(clap::Args)]
@@ -77,6 +111,30 @@ pub struct RollupArgs {
 
 pub fn run(args: ReportArgs) -> Result<()> {
     match args.command {
+        ReportAction::Handback(args) => {
+            let report = handback(&handback::Options {
+                lane: args.lane_dir,
+                repo: args.repo,
+                packet: args.packet,
+                baseline: args.baseline,
+            });
+            match report {
+                Ok(report) if args.json => {
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                    Ok(())
+                }
+                Ok(report) => {
+                    handback::print_report(&report);
+                    Ok(())
+                }
+                Err(err) => {
+                    // The old binary's exit code, so a script that tells "cannot read the
+                    // lane" (2) from a runner failure (1) keeps working.
+                    eprintln!("cowproof report handback: {err:#}");
+                    std::process::exit(2);
+                }
+            }
+        }
         ReportAction::Rollup(args) => {
             let rolled = rollup(
                 &args.roots,

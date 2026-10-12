@@ -8,15 +8,35 @@ Run many AI builders in parallel on one project, each in its own copy-on-write c
 
 ## Install
 
-One install provides three binaries:
+One install provides three binaries: `cowproof`, `pk` (portkit commands) and `pk-read` (session-aware file reading). Everything else is a `cowproof` subcommand (`cowproof report`, `cowproof plan`, `cowproof lint`, ...); `pk` and `pk-read` stay separate because hooks and shells call them by name.
+
+Nothing is published yet. The first release is cut by hand (see [docs/releasing.md](docs/releasing.md)); until then, build from git or from source.
+
+**From crates.io** (after the first release is published):
 
 ```bash
-cargo install --git https://github.com/srmcguirt/cowproof cowproof-cli
+cargo install cowproof
 ```
 
-or, from a checkout, `cargo install --path crates/cowproof-cli`. This installs `cowproof`, `pk` (for portkit commands), and `pk-read` (for session-aware file reading).
+**From a release tarball** (after the first release; macOS arm64 and x86_64, Linux x86_64 and arm64). Download the tarball for your platform and its `.sha256` file from the [GitHub Releases](https://github.com/srmcguirt/cowproof/releases) page, then check and unpack it:
 
-The package is named `cowproof-cli` and is not on crates.io yet; renaming it to `cowproof` is in the backlog.
+```bash
+shasum -a 256 -c cowproof-v0.1.0-aarch64-apple-darwin.tar.gz.sha256
+tar -xzf cowproof-v0.1.0-aarch64-apple-darwin.tar.gz
+cp cowproof-v0.1.0-aarch64-apple-darwin/{cowproof,pk,pk-read} ~/.local/bin/
+```
+
+The Linux binaries need glibc 2.35 or newer.
+
+**From git, today:**
+
+```bash
+cargo install --git https://github.com/srmcguirt/cowproof cowproof
+```
+
+**From a checkout:** `cargo install --path crates/cowproof-cli` (the package is `cowproof`; its directory keeps the old name), or `cargo build --release` and take the three binaries from `target/release/`.
+
+After installing, run `cowproof doctor`.
 
 Status: design stage. Nothing here is ready to use yet. See [docs/design.md](docs/design.md).
 
@@ -371,7 +391,7 @@ It works in the Claude Code CLI, the desktop app's Code tab and the IDE extensio
 The plugin does not include the binaries. Install them as described under Install above:
 
 ```sh
-cargo install --git https://github.com/srmcguirt/cowproof cowproof-cli
+cargo install --git https://github.com/srmcguirt/cowproof cowproof
 ```
 
 See [plugin/README.md](plugin/README.md) for details.

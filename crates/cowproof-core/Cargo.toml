@@ -4,6 +4,8 @@ version.workspace = true
 rust-version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+description = "Shared types for cowproof: lane packets and headers, ownership globs, status, redaction, profiles, held-out checks and the escalation ladder."
 
 [dependencies]
 anyhow.workspace = true

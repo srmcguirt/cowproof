@@ -4,6 +4,7 @@ description = "Session-aware file reader: returns only what the caller does not 
 version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
+repository.workspace = true
 rust-version = "1.90"
 
 [lib]

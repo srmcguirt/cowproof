@@ -2,7 +2,7 @@
 # SessionStart hook: tell the session when the cowproof binary is missing or older
 # than this plugin's version. It always exits 0 and prints nothing when all is well.
 
-INSTALL='cargo install --git https://github.com/srmcguirt/cowproof cowproof-cli'
+INSTALL='cargo install --git https://github.com/srmcguirt/cowproof cowproof'
 
 plugin_json="${CLAUDE_PLUGIN_ROOT:-.}/.claude-plugin/plugin.json"
 if [ ! -f "$plugin_json" ]; then

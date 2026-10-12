@@ -28,6 +28,7 @@ mod host_agent;
 mod host_setup;
 mod lane_tools;
 mod openrouter;
+mod plan;
 mod preflight;
 mod remote;
 mod report;
@@ -71,12 +72,14 @@ enum Action {
     /// when a lane could start. Exit codes: 0 no check failed (warnings do not count; a
     /// missing API key is a warning here and a failure for `run`); 1 a check failed.
     Doctor(doctor::DoctorArgs),
-    /// Aggregate reports over lanes: `cowproof report rollup <lanes-root>...` (D23, D28).
+    /// Reports over lanes: `cowproof report handback <lane-dir>` for one lane, `rollup` and `port-candidates` over many (D23, D28).
     Report(report::ReportArgs),
     Lint(LintArgs),
     Host(HostArgs),
     Hosts,
-    Plan(PlanArgs),
+    /// Plan files: `check`, `next`, `board`, `brief` and `set` read and update them; `run`
+    /// and `collect` dispatch ready lanes to hosts and collect what finished.
+    Plan(plan::PlanArgs),
     /// Observe lanes and their escalation events.
     Watch(watch::WatchArgs),
     /// Rule on an open escalation: `cowproof rule <lane-id> <escalation-id> (--answer <text> | --redirect <packet> | --reassign [--model <m>] | --stop) [--lanes-root <dir>]`
@@ -240,26 +243,6 @@ struct NetBridgeArgs {
     /// The command to run once the bridge is ready, as argv (no shell).
     #[arg(last = true)]
     command: Vec<String>,
-}
-#[derive(Parser)]
-struct PlanArgs {
-    #[command(subcommand)]
-    command: PlanAction,
-}
-#[derive(clap::Subcommand)]
-enum PlanAction {
-    Run {
-        #[arg(long, default_value = ".")]
-        repo: PathBuf,
-        #[arg(long)]
-        max: Option<usize>,
-        #[arg(long)]
-        dry_run: bool,
-    },
-    Collect {
-        #[arg(long, default_value = ".")]
-        repo: PathBuf,
-    },
 }
 #[derive(Parser)]
 struct RunOneArgs {
@@ -448,10 +431,7 @@ async fn dispatch(command: Action) -> Result<()> {
         }
         Action::Host(args) => host_command(args.command),
         Action::Hosts => hosts_command(),
-        Action::Plan(args) => match args.command {
-            PlanAction::Run { repo, max, dry_run } => plan_run(&repo, max, dry_run),
-            PlanAction::Collect { repo } => plan_collect(&repo),
-        },
+        Action::Plan(args) => plan::run(args),
         Action::Watch(args) => watch::watch(args).await,
         Action::Rule(args) => rule_command(args).await,
         Action::Note(args) => note_command(args).await,

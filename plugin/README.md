@@ -28,7 +28,7 @@ Cloud sessions are not supported yet. Lanes need a local sandbox and a local `cl
 The plugin does not ship the `cowproof` binary. Install it separately, the way the repository README's Install section says:
 
 ```sh
-cargo install --git https://github.com/srmcguirt/cowproof cowproof-cli
+cargo install --git https://github.com/srmcguirt/cowproof cowproof
 ```
 
 `cowproof run` also needs `claude` on the PATH and `ANTHROPIC_API_KEY` in the environment.

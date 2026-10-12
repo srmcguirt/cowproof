@@ -4,12 +4,13 @@ version.workspace = true
 rust-version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+description = "Plan files for cowproof: reads and checks *.lanes.json, picks the next ready lanes and records status changes."
 
 [dependencies]
 anyhow = "1"
-clap = { version = "4", features = ["derive"] }
 globset = "0.4"
-cowproof-host = { path = "../cowproof-host" }
-cowproof-core = { path = "../cowproof-core" }
+cowproof-host.workspace = true
+cowproof-core.workspace = true
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }

@@ -4,19 +4,17 @@ version.workspace = true
 rust-version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+description = "Reports over cowproof lanes: the per-lane handback report, the rollup of rates and cost, and port candidates."
 
 [lib]
 name = "cowproof_report"
 path = "src/lib.rs"
 
-[[bin]]
-name = "cowproof-report"
-path = "src/main.rs"
-
 [dependencies]
 anyhow = "1"
-cowproof-core = { version = "0.1.0", path = "../cowproof-core" }
-cowproof-prove = { version = "0.1.0", path = "../cowproof-prove" }
+cowproof-core.workspace = true
+cowproof-prove.workspace = true
 portkit-core = { version = "0.1.0", path = "../portkit/core" }
 regex = "1"
 serde = { version = "1", features = ["derive"] }

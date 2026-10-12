@@ -170,7 +170,7 @@ fn the_script_compares_versions_numerically_and_never_fails() {
             "{old}: {said}"
         );
         assert!(
-            said.contains("cargo install --git https://github.com/srmcguirt/cowproof cowproof-cli"),
+            said.contains("cargo install --git https://github.com/srmcguirt/cowproof cowproof"),
             "{old}: {said}"
         );
     }
@@ -181,7 +181,7 @@ fn the_script_compares_versions_numerically_and_never_fails() {
         "{missing}"
     );
     assert!(
-        missing.contains("cargo install --git https://github.com/srmcguirt/cowproof cowproof-cli"),
+        missing.contains("cargo install --git https://github.com/srmcguirt/cowproof cowproof"),
         "{missing}"
     );
 
@@ -205,7 +205,7 @@ fn the_script_compares_versions_numerically_and_never_fails() {
 /// The hook and both READMEs give the one install command the repository README does.
 #[test]
 fn the_install_line_is_the_same_everywhere() {
-    let install = "cargo install --git https://github.com/srmcguirt/cowproof cowproof-cli";
+    let install = "cargo install --git https://github.com/srmcguirt/cowproof cowproof";
     for file in ["README.md", "plugin/README.md", SCRIPT] {
         assert!(read(file).contains(install), "{file} must say `{install}`");
     }

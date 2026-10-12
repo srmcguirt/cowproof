@@ -1,4 +1,10 @@
-#![forbid(unsafe_code)]
+//! `cowproof report handback`: the per-lane handoff report. It reads a finished lane's
+//! `summary.json`, `lane.patch` and handoff, parses the checks the builder reported, runs
+//! the flaw rules over the patch and counts removed assertions, then says whether the
+//! lane looks ready to apply. This was the standalone `cowproof-report` binary; the
+//! command line is now `cowproof report handback <lane-dir> [--repo DIR] [--packet FILE]
+//! [--baseline FILE] [--json]`, wired in `crates/cowproof-cli/src/report.rs`.
+
 use anyhow::{Context, Result, bail};
 use cowproof_prove::flaws::{PatchDelta, check_rules, parse_patch, parse_rules};
 use regex::Regex;
@@ -6,7 +12,7 @@ use serde::Serialize;
 use serde_json::Value;
 use std::{
     collections::{BTreeMap, BTreeSet},
-    env, fs,
+    fs,
     path::{Path, PathBuf},
 };
 
@@ -36,8 +42,9 @@ struct AssertionChange {
     added: usize,
     net_loss: usize,
 }
+/// One lane's report; `serde_json::to_string_pretty` of it is what `--json` prints.
 #[derive(Debug, Serialize)]
-struct Report {
+pub struct Report {
     lane_id: String,
     status: String,
     minutes: Option<u64>,
@@ -440,38 +447,25 @@ fn assertions(s: &str) -> usize {
     let re = Regex::new(r"(?i)\b(assert|expect|RAISE|must fail)\b|#\[test\]").unwrap();
     re.find_iter(s).count()
 }
-fn main_report(args: &[String]) -> Result<Report> {
-    if args.is_empty() {
-        bail!(
-            "usage: lanes-report <lane-dir> [--repo DIR] [--packet FILE] [--baseline FILE] [--json]"
-        );
-    }
-    let lane = PathBuf::from(&args[0]);
-    let mut repo = None;
-    let mut packet_arg = None;
-    let mut baseline = None;
-    let mut i = 1;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--repo" => {
-                i += 1;
-                repo = Some(PathBuf::from(
-                    args.get(i).context("--repo needs a directory")?,
-                ));
-            }
-            "--packet" => {
-                i += 1;
-                packet_arg = Some(PathBuf::from(args.get(i).context("--packet needs a file")?));
-            }
-            "--baseline" => {
-                i += 1;
-                baseline = Some(args.get(i).context("--baseline needs a file")?.clone());
-            }
-            "--json" => {}
-            x => bail!("unknown option: {x}"),
-        }
-        i += 1;
-    }
+/// What `cowproof report handback` was asked to read.
+#[derive(Debug, Default, Clone)]
+pub struct Options {
+    /// The lane directory (holds `summary.json` and `lane.patch`).
+    pub lane: PathBuf,
+    /// The repository to find the handoff and packet in.
+    pub repo: Option<PathBuf>,
+    /// The packet file; found by lane id under `--repo` when absent.
+    pub packet: Option<PathBuf>,
+    /// A migration file name: rules that only apply to new migrations skip this one.
+    pub baseline: Option<String>,
+}
+
+/// Build the report for one lane.
+pub fn handback(options: &Options) -> Result<Report> {
+    let lane = options.lane.clone();
+    let repo = options.repo.clone();
+    let packet_arg = options.packet.clone();
+    let baseline = options.baseline.clone();
     let summary: Value =
         serde_json::from_slice(&fs::read(lane.join("summary.json")).context("read summary.json")?)
             .context("parse summary.json")?;
@@ -612,24 +606,8 @@ fn main_report(args: &[String]) -> Result<Report> {
         sample_handoff: (!handoff.is_empty()).then(|| handoff.chars().take(6000).collect()),
     })
 }
-fn main() {
-    let args: Vec<String> = env::args().skip(1).collect();
-    let json = args.iter().any(|a| a == "--json");
-    match main_report(&args) {
-        Ok(r) => {
-            if json {
-                println!("{}", serde_json::to_string_pretty(&r).unwrap());
-            } else {
-                print_report(&r);
-            }
-        }
-        Err(e) => {
-            eprintln!("lanes-report: {e:#}");
-            std::process::exit(2)
-        }
-    }
-}
-fn print_report(r: &Report) {
+/// The text form of the report, printed when `--json` is not given.
+pub fn print_report(r: &Report) {
     println!(
         "Lane: {} | status: {} | minutes: {}",
         r.lane_id,
@@ -687,15 +665,12 @@ mod tests {
     #[test]
     fn mixed_fixture_reports_checks_assertion_loss_and_handoff_sections() {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mixed");
-        let args = vec![
-            dir.to_string_lossy().to_string(),
-            "--packet".into(),
-            Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("tests/fixtures/mixed/packet.md")
-                .to_string_lossy()
-                .to_string(),
-        ];
-        let r = main_report(&args).unwrap();
+        let options = Options {
+            lane: dir.clone(),
+            packet: Some(dir.join("packet.md")),
+            ..Options::default()
+        };
+        let r = handback(&options).unwrap();
         assert_eq!(r.lane_id, "fixture-lane");
         assert_eq!(r.minutes, Some(2));
         assert_eq!(
@@ -740,12 +715,12 @@ mod tests {
     #[test]
     fn flaw_lane_fixture_runs_all_rules_including_baseline() {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/flaws");
-        let args = vec![
-            dir.to_string_lossy().to_string(),
-            "--baseline".into(),
-            "20260401_existing.sql".into(),
-        ];
-        let report = main_report(&args).unwrap();
+        let options = Options {
+            lane: dir.clone(),
+            baseline: Some("20260401_existing.sql".into()),
+            ..Options::default()
+        };
+        let report = handback(&options).unwrap();
         assert!(
             report.flaws.len() >= 18,
             "reported {} flaws",
@@ -825,8 +800,11 @@ mod tests {
     #[test]
     fn table_format_fixture_matches_snapshot() {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/table");
-        let args = vec![dir.to_string_lossy().to_string()];
-        let r = main_report(&args).unwrap();
+        let options = Options {
+            lane: dir.clone(),
+            ..Options::default()
+        };
+        let r = handback(&options).unwrap();
         let rendered = serde_json::to_string_pretty(&r).unwrap();
         let expected =
             fs::read_to_string(dir.join("expected.json")).expect("expected.json must exist");
@@ -844,8 +822,11 @@ mod tests {
     #[test]
     fn bullet_format_fixture_matches_snapshot() {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/bullet");
-        let args = vec![dir.to_string_lossy().to_string()];
-        let r = main_report(&args).unwrap();
+        let options = Options {
+            lane: dir.clone(),
+            ..Options::default()
+        };
+        let r = handback(&options).unwrap();
         let rendered = serde_json::to_string_pretty(&r).unwrap();
         let expected =
             fs::read_to_string(dir.join("expected.json")).expect("expected.json must exist");
@@ -863,8 +844,11 @@ mod tests {
     #[test]
     fn fenced_format_fixture_matches_snapshot() {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fenced");
-        let args = vec![dir.to_string_lossy().to_string()];
-        let r = main_report(&args).unwrap();
+        let options = Options {
+            lane: dir.clone(),
+            ..Options::default()
+        };
+        let r = handback(&options).unwrap();
         let rendered = serde_json::to_string_pretty(&r).unwrap();
         let expected =
             fs::read_to_string(dir.join("expected.json")).expect("expected.json must exist");
@@ -881,8 +865,11 @@ mod tests {
     #[test]
     fn arrow_format_fixture_matches_snapshot() {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/arrow");
-        let args = vec![dir.to_string_lossy().to_string()];
-        let r = main_report(&args).unwrap();
+        let options = Options {
+            lane: dir.clone(),
+            ..Options::default()
+        };
+        let r = handback(&options).unwrap();
         let rendered = serde_json::to_string_pretty(&r).unwrap();
         let expected =
             fs::read_to_string(dir.join("expected.json")).expect("expected.json must exist");
@@ -899,8 +886,11 @@ mod tests {
     #[test]
     fn questions_fixture_matches_snapshot() {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/questions");
-        let args = vec![dir.to_string_lossy().to_string()];
-        let r = main_report(&args).unwrap();
+        let options = Options {
+            lane: dir.clone(),
+            ..Options::default()
+        };
+        let r = handback(&options).unwrap();
         let rendered = serde_json::to_string_pretty(&r).unwrap();
         let expected =
             fs::read_to_string(dir.join("expected.json")).expect("expected.json must exist");
@@ -915,8 +905,11 @@ mod tests {
     #[test]
     fn limits_fixture_matches_snapshot() {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/limits");
-        let args = vec![dir.to_string_lossy().to_string()];
-        let r = main_report(&args).unwrap();
+        let options = Options {
+            lane: dir.clone(),
+            ..Options::default()
+        };
+        let r = handback(&options).unwrap();
         let rendered = serde_json::to_string_pretty(&r).unwrap();
         let expected =
             fs::read_to_string(dir.join("expected.json")).expect("expected.json must exist");
@@ -932,12 +925,12 @@ mod tests {
     #[test]
     fn baseline_fixture_matches_snapshot() {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/baseline");
-        let args = vec![
-            dir.to_string_lossy().to_string(),
-            "--baseline".into(),
-            "20260401_existing.sql".into(),
-        ];
-        let r = main_report(&args).unwrap();
+        let options = Options {
+            lane: dir.clone(),
+            baseline: Some("20260401_existing.sql".into()),
+            ..Options::default()
+        };
+        let r = handback(&options).unwrap();
         let rendered = serde_json::to_string_pretty(&r).unwrap();
         let expected =
             fs::read_to_string(dir.join("expected.json")).expect("expected.json must exist");

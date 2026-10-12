@@ -8,6 +8,7 @@ resolver = "3"
 [workspace.package]
 edition = "2024"
 license = "MIT"
+repository = "https://github.com/srmcguirt/cowproof"
 version = "0.1.0"
 rust-version = "1.90"
 
@@ -17,6 +18,16 @@ clap = { version = "4", features = ["derive", "env"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["macros", "process", "rt-multi-thread", "time", "io-util", "io-std", "fs", "signal"] }
+
+# The cowproof crates the `cowproof` package depends on. A path dependency needs a version
+# for `cargo publish`; bump these together with `[workspace.package] version`.
+cowproof-core = { version = "0.1.0", path = "crates/cowproof-core" }
+cowproof-run = { version = "0.1.0", path = "crates/cowproof-run" }
+cowproof-prove = { version = "0.1.0", path = "crates/cowproof-prove" }
+cowproof-host = { version = "0.1.0", path = "crates/cowproof-host" }
+cowproof-plan = { version = "0.1.0", path = "crates/cowproof-plan" }
+cowproof-lint = { version = "0.1.0", path = "crates/cowproof-lint" }
+cowproof-report = { version = "0.1.0", path = "crates/cowproof-report" }
 
 # Portkit workspace dependencies
 portkit-core = { version = "0.1.0", path = "crates/portkit/core" }

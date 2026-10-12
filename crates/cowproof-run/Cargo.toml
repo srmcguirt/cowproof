@@ -2,6 +2,8 @@
 name = "cowproof-run"
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+description = "The cowproof lane runner: sandbox policy, egress proxy, builder runtimes (Claude Code, Codex, OpenCode), escalation queue and lane supervision."
 version.workspace = true
 rust-version.workspace = true
 
@@ -20,7 +22,7 @@ bytes = "1"
 uuid = { version = "1", features = ["v4"] }
 sha2.workspace = true
 libc = "0.2"
-cowproof-core = { version = "0.1.0", path = "../cowproof-core" }
+cowproof-core.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

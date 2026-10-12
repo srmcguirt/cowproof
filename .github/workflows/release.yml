@@ -1,0 +1,152 @@
+name: Release
+
+# Runs only when a version tag is pushed (v0.1.0, v0.2.0-rc.1, ...). It builds the three
+# binaries (`cowproof`, `pk`, `pk-read`) for four targets, packs each target as a tarball
+# with a SHA256 file, and attaches them to a GitHub Release. It never publishes to
+# crates.io: that is a manual step (docs/releasing.md).
+
+on:
+  push:
+    tags: ["v*"]
+
+# No token permissions by default; each job asks for what it needs.
+permissions: {}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          # Linux is built on the oldest runner image GitHub still offers, so the binary
+          # needs glibc 2.35 or newer (Ubuntu 22.04, Debian 12 and later).
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          # Native arm64 runner (free for public repositories): no cross-compilation, so
+          # the binary is smoke-tested on the architecture it ships for.
+          - os: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+          # macos-14 and later are Apple silicon.
+          - os: macos-14
+            target: aarch64-apple-darwin
+          # Cross-built on Apple silicon with Apple's toolchain; the smoke test runs it
+          # under Rosetta when the runner has it.
+          - os: macos-14
+            target: x86_64-apple-darwin
+    steps:
+      - uses: actions/checkout@v4.2.2
+
+      - name: Check the tag matches the workspace version
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(sed -n '/^\[workspace\.package\]/,/^\[/{s/^version *= *"\(.*\)"/\1/p;}' Cargo.toml)
+          if [ -z "$version" ]; then
+            echo "could not read [workspace.package] version from Cargo.toml" >&2
+            exit 1
+          fi
+          if [ "${GITHUB_REF_NAME}" != "v${version}" ]; then
+            echo "tag ${GITHUB_REF_NAME} does not match workspace version ${version}" >&2
+            exit 1
+          fi
+
+      - name: Install Rust
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install stable --profile minimal --target "${{ matrix.target }}"
+          rustup default stable
+
+      - name: Build
+        shell: bash
+        run: cargo build --release --locked --workspace --target "${{ matrix.target }}"
+
+      - name: Check the build made exactly cowproof, pk and pk-read
+        shell: bash
+        run: ./scripts/check-release-binaries "target/${{ matrix.target }}/release"
+
+      - name: Smoke test
+        shell: bash
+        run: |
+          set -euo pipefail
+          dir="target/${{ matrix.target }}/release"
+          run_prefix=""
+          if [ "${{ matrix.target }}" = "x86_64-apple-darwin" ]; then
+            if arch -x86_64 /usr/bin/true 2>/dev/null; then
+              run_prefix="arch -x86_64"
+            else
+              echo "no Rosetta on this runner: checking the architecture instead of running"
+              file "$dir/cowproof" | grep -q x86_64
+              exit 0
+            fi
+          fi
+          $run_prefix "$dir/cowproof" --version
+          $run_prefix "$dir/pk" --version
+          $run_prefix "$dir/cowproof" report --help >/dev/null
+          $run_prefix "$dir/cowproof" plan --help >/dev/null
+
+      - name: Pack
+        shell: bash
+        run: |
+          set -euo pipefail
+          name="cowproof-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          mkdir -p "dist/${name}"
+          for bin in cowproof pk pk-read; do
+            cp "target/${{ matrix.target }}/release/${bin}" "dist/${name}/"
+          done
+          cp LICENSE NOTICE README.md "dist/${name}/"
+          tar -C dist -czf "dist/${name}.tar.gz" "${name}"
+          (cd dist && shasum -a 256 "${name}.tar.gz" > "${name}.tar.gz.sha256")
+          cat "dist/${name}.tar.gz.sha256"
+
+      - uses: actions/upload-artifact@v4.6.2
+        with:
+          name: dist-${{ matrix.target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
+          if-no-files-found: error
+
+  release:
+    name: GitHub Release
+    needs: build
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4.3.0
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+
+      - name: Verify every checksum, then create the release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          cd dist
+          tarballs=(./*.tar.gz)
+          echo "found ${#tarballs[@]} tarballs: ${tarballs[*]}"
+          test "${#tarballs[@]}" = 4
+          for sum in ./*.sha256; do shasum -a 256 -c "$sum"; done
+          cat ./*.sha256 > SHA256SUMS
+          flags=()
+          case "${GITHUB_REF_NAME}" in
+            *-*) flags+=(--prerelease) ;;
+          esac
+          gh release create "${GITHUB_REF_NAME}" \
+            --verify-tag \
+            --title "cowproof ${GITHUB_REF_NAME}" \
+            --generate-notes \
+            "${flags[@]}" \
+            ./*.tar.gz ./*.tar.gz.sha256 SHA256SUMS

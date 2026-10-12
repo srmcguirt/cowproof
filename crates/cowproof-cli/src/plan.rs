@@ -1,7 +1,9 @@
-#![forbid(unsafe_code)]
+//! `cowproof plan`: the plan-file commands. `check`, `next`, `board`, `brief` and `set` were
+//! the standalone `cowproof-plan` binary until D2 folded it in (so the release ships one
+//! `cowproof` binary, plus `pk` and `pk-read`); `run` and `collect` dispatch and collect
+//! lanes through hosts. The plan model itself lives in the `cowproof_plan` crate.
 
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
 use cowproof_plan::{
     blocked_by, check_plans, lanes, load_plans, ready_next, set_status, waiting_on_founder,
 };
@@ -10,44 +12,62 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-#[derive(Parser)]
-#[command(
-    name = "lanes-plan",
-    version,
-    about = "Check and prioritize lanes plan files"
-)]
-struct Cli {
+#[derive(clap::Args)]
+pub struct PlanArgs {
     #[command(subcommand)]
-    command: Command,
+    command: PlanAction,
 }
-#[derive(Subcommand)]
-enum Command {
+
+#[derive(clap::Subcommand)]
+enum PlanAction {
+    /// Dispatch ready lanes to hosts (`--dry-run` only prints the choices)
+    Run {
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
+        #[arg(long)]
+        max: Option<usize>,
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Move finished lanes to review and lost ones back to packet
+    Collect {
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
+    },
+    /// Check plan files (all `*.lanes.json` under `--repo`, or the PLAN files named)
+    ///
+    /// Exit codes: 0 every plan is valid; 1 a problem was printed (or a plan could not be read).
     Check {
         #[arg(long, default_value = ".")]
         repo: PathBuf,
         #[arg(value_name = "PLAN")]
         plans: Vec<PathBuf>,
     },
+    /// The lanes that are ready to dispatch, in priority order
     Next {
         #[arg(long, default_value = ".")]
         repo: PathBuf,
         #[arg(long)]
         json: bool,
     },
+    /// Every lane of every plan, with its status, host, reservations and blockers
     Board {
         #[arg(long, default_value = ".")]
         repo: PathBuf,
         #[arg(long)]
         json: bool,
     },
+    /// Running, awaiting review, held, ready and waiting-on-founder lanes in five lines
     Brief {
         #[arg(long, default_value = ".")]
         repo: PathBuf,
+        /// A lanes root: its lane directories refine "running" and "awaiting review"
         #[arg(long)]
         root: Option<PathBuf>,
         #[arg(long)]
         json: bool,
     },
+    /// Set a lane's status (`running` needs `--packet`; `shipped` needs `--commit` and `--release`)
     Set {
         id: String,
         status: String,
@@ -61,15 +81,21 @@ enum Command {
         repo: PathBuf,
     },
 }
-fn main() {
-    if let Err(error) = run() {
-        eprintln!("error: {error:#}");
-        std::process::exit(1);
+
+pub fn run(args: PlanArgs) -> Result<()> {
+    match args.command {
+        PlanAction::Run { repo, max, dry_run } => crate::plan_run(&repo, max, dry_run),
+        PlanAction::Collect { repo } => crate::plan_collect(&repo),
+        command => plan_file_command(command),
     }
 }
-fn run() -> Result<()> {
-    match Cli::parse().command {
-        Command::Check { repo, plans } => {
+
+fn plan_file_command(command: PlanAction) -> Result<()> {
+    match command {
+        PlanAction::Run { .. } | PlanAction::Collect { .. } => {
+            unreachable!("dispatched by `run`")
+        }
+        PlanAction::Check { repo, plans } => {
             let plans = load_plans(&repo, &plans)?;
             let problems = check_plans(&repo, &plans);
             if problems.is_empty() {
@@ -93,7 +119,7 @@ fn run() -> Result<()> {
                 std::process::exit(1);
             }
         }
-        Command::Next {
+        PlanAction::Next {
             repo,
             json: as_json,
         } => {
@@ -122,7 +148,7 @@ fn run() -> Result<()> {
                 }
             }
         }
-        Command::Board {
+        PlanAction::Board {
             repo,
             json: as_json,
         } => {
@@ -153,12 +179,12 @@ fn run() -> Result<()> {
                 }
             }
         }
-        Command::Brief {
+        PlanAction::Brief {
             repo,
             root,
             json: as_json,
         } => brief(&repo, root.as_deref(), as_json)?,
-        Command::Set {
+        PlanAction::Set {
             id,
             status,
             commit,
@@ -361,7 +387,8 @@ mod cli_tests {
 
     #[test]
     fn packet_argument_requires_a_parseable_matching_header() {
-        let root = std::env::temp_dir().join(format!("lanes-plan-packet-{}", std::process::id()));
+        let root =
+            std::env::temp_dir().join(format!("cowproof-plan-packet-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
         fs::write(

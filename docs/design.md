@@ -259,8 +259,8 @@ A Rust workspace. The six `lanes-*` crates were ported on 2026-10-09 as `cowproo
 | `cowproof-prove` | `lanes-report` | verifier, gates, flaw packs, capsule, `verify` |
 | `cowproof-lint` | `lanes-lint` | packet lint |
 | `cowproof-host` | `lanes-host` | host facts; remote hosts later |
-| `cowproof-plan` | `lanes-plan` | plan files, later |
-| `cowproof-cli` | `lanes-cli` | the `cowproof` binary, including `watch` and `watch --events` (folded in by D3) |
+| `cowproof-plan` | `lanes-plan` | plan files; its command line is `cowproof plan` (D2), no separate binary |
+| `cowproof-cli` (directory; the Cargo package is `cowproof`) | `lanes-cli` | the `cowproof` binary, including `watch` and `watch --events` (folded in by D3), `report` and `plan`, and the `pk` and `pk-read` entry points |
 
 Per-repository `cowproof.toml`:
 
@@ -320,7 +320,7 @@ Shipped in the repository, installable as a Claude Code plugin, with an `.agents
 
 ## Distribution Plan
 
-- GitHub Releases with prebuilt binaries for macOS (arm64, x86_64) and Linux (x86_64, arm64), built by a release workflow on tags. `cargo install cowproof` needs every path dependency published; the first release publishes from this workspace (or folds the libraries into the one package), and the `cowproof` crate name is checked before then. A Homebrew tap follows the first release.
+- GitHub Releases with prebuilt binaries for macOS (arm64, x86_64) and Linux (x86_64, arm64), built by a release workflow on tags (`.github/workflows/release.yml`, built 2026-10-12). `cargo install cowproof` needs every path dependency published. Decided 2026-10-12: the first release publishes from this workspace, the 14 publishable crates in dependency order (the six portkit crates, then the seven `cowproof-*` libraries, then `cowproof`), not folded into one package; folding would give up the crate boundaries the design rests on, for a name-space saving. The names were all free on crates.io on 2026-10-12. The publish is a manual step by the owner and the release workflow never does it (`docs/releasing.md`). A Homebrew tap follows the first release.
 - Skills as a Claude Code plugin from the repository's marketplace manifest, plus the `.agents/skills` copy.
 - CI: GitHub Actions runs the test suite on macOS and Linux, `scripts/scrub-check`, replay of the committed parity fixtures (no Node needed), and a capsule replay of a committed sample lane. Recapture from the Node reference is a director step, not a CI job.
 

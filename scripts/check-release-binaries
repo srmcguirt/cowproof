@@ -1,0 +1,38 @@
+#!/bin/sh
+# Fails unless a release build directory holds exactly the three shipped binaries:
+# `cowproof`, `pk` and `pk-read`. Usage: scripts/check-release-binaries [DIR]
+# (default: target/release). The release workflow runs it after every build.
+set -eu
+
+dir=${1:-target/release}
+expected="cowproof
+pk
+pk-read"
+
+if [ ! -d "$dir" ]; then
+  echo "check-release-binaries: $dir is not a directory (run cargo build --release first)" >&2
+  exit 1
+fi
+
+# Executable regular files directly in DIR with no extension: build output such as
+# `*.d`, `*.rlib` and `*.dylib` has a dot in its name and is not a binary.
+found=""
+for f in "$dir"/*; do
+  [ -f "$f" ] && [ -x "$f" ] || continue
+  name=${f##*/}
+  case "$name" in
+    *.*) continue ;;
+  esac
+  found="$found$name
+"
+done
+found=$(printf '%s' "$found" | sort)
+
+if [ "$found" != "$expected" ]; then
+  echo "check-release-binaries: expected exactly these binaries in $dir:" >&2
+  printf '%s\n' "$expected" | sed 's/^/  /' >&2
+  echo "found:" >&2
+  printf '%s\n' "$found" | sed 's/^/  /' >&2
+  exit 1
+fi
+echo "check-release-binaries: ok ($(printf '%s' "$found" | tr '\n' ' '))"

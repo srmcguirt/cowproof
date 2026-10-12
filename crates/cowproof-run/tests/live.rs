@@ -996,19 +996,12 @@ fn cowproof_bin() -> PathBuf {
         let profile_dir = exe.parent().unwrap().parent().unwrap().to_path_buf();
         let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
         let mut build = Command::new(cargo);
-        build.args([
-            "build",
-            "-p",
-            "cowproof-cli",
-            "--bin",
-            "cowproof",
-            "--locked",
-        ]);
+        build.args(["build", "-p", "cowproof", "--bin", "cowproof", "--locked"]);
         if !cfg!(debug_assertions) {
             build.arg("--release");
         }
         let status = build.status().expect("running cargo build for cowproof");
-        assert!(status.success(), "cargo build -p cowproof-cli failed");
+        assert!(status.success(), "cargo build -p cowproof failed");
         let bin = profile_dir.join("cowproof");
         assert!(bin.is_file(), "{} was not built", bin.display());
         bin
