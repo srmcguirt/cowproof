@@ -8,8 +8,13 @@
 //! refuses the ids that would reach more than the caller meant.
 //!
 //! This test reads every `.rs` file under `crates/` and fails, naming the file and the line,
-//! when a line that is not a comment names the program. The patterns below are built from two
+//! when a line that is not a comment names the program. In the published `cowproof` crate
+//! (no `crates/` above it) it reads this crate's own files instead; with
+//! `COWPROOF_WORKSPACE_TESTS=1` (CI) the whole workspace is required. The patterns below are built from two
 //! halves so that this file does not match itself.
+
+#[path = "common/workspace.rs"]
+mod workspace;
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -108,16 +113,28 @@ fn offences(rel: &str, text: &str) -> Vec<String> {
 
 #[test]
 fn no_rust_file_runs_the_kill_program() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .canonicalize()
-        .unwrap();
+    workspace::demand("no_rust_file_runs_the_kill_program");
+    // The workspace: every crate. The published crate: its own sources and tests, named as
+    // they are in the workspace so the allowlist matches.
+    let (scanned, shown_as, minimum) = match workspace::root() {
+        Some(root) => (root.join("crates"), PathBuf::from("crates"), 50),
+        None => (
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .canonicalize()
+                .unwrap(),
+            PathBuf::from("crates/cowproof-cli"),
+            20,
+        ),
+    };
     let mut files = Vec::new();
-    rust_files(&root.join("crates"), &mut files);
-    assert!(files.len() > 50, "found only {} files", files.len());
+    rust_files(&scanned, &mut files);
+    assert!(files.len() > minimum, "found only {} files", files.len());
     let mut found = Vec::new();
     for file in &files {
-        let rel = file.strip_prefix(&root).unwrap().to_string_lossy();
+        let rel = shown_as
+            .join(file.strip_prefix(&scanned).unwrap())
+            .to_string_lossy()
+            .into_owned();
         found.extend(offences(&rel, &fs::read_to_string(file).unwrap()));
     }
     assert!(

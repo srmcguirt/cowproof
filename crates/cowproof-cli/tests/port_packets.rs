@@ -10,9 +10,13 @@
 //! gate meant for it and no other.
 //!
 //! Needs the sandbox like `tests/run.rs` (skipped without it, a failure under
-//! `COWPROOF_REQUIRE_SANDBOX=1`).
+//! `COWPROOF_REQUIRE_SANDBOX=1`). The fixture lives at the repository root (`fixtures/port/`),
+//! outside the published crate, so the tests that use it run in the workspace only (see
+//! `common/workspace.rs`); the README test reads the README the crate packages.
 
 mod common;
+#[path = "common/workspace.rs"]
+mod workspace;
 
 use common::{Lane, run_checks, sandbox_available, text};
 use cowproof_prove::Capsule;
@@ -167,6 +171,9 @@ fn failed(gates: &[Value]) -> Vec<String> {
 
 #[test]
 fn the_committed_packet_lints_clean_against_the_committed_project() {
+    if workspace::skipped("the_committed_packet_lints_clean_against_the_committed_project") {
+        return;
+    }
     // The lint rules read the same files the proof does; no sandbox needed.
     let lane = lane("true");
     let out = lane
@@ -184,6 +191,9 @@ fn the_committed_packet_lints_clean_against_the_committed_project() {
 
 #[test]
 fn a_correct_port_is_proved_and_the_capsule_records_the_replay() {
+    if workspace::skipped("a_correct_port_is_proved_and_the_capsule_records_the_replay") {
+        return;
+    }
     if !sandbox_available() {
         return;
     }
@@ -260,6 +270,9 @@ fn a_correct_port_is_proved_and_the_capsule_records_the_replay() {
 
 #[test]
 fn one_wrong_output_is_refuted_by_port_replay_naming_the_surface() {
+    if workspace::skipped("one_wrong_output_is_refuted_by_port_replay_naming_the_surface") {
+        return;
+    }
     if !sandbox_available() {
         return;
     }
@@ -302,6 +315,9 @@ fn one_wrong_output_is_refuted_by_port_replay_naming_the_surface() {
 
 #[test]
 fn a_tool_missing_from_the_registry_is_refuted_with_not_ported() {
+    if workspace::skipped("a_tool_missing_from_the_registry_is_refuted_with_not_ported") {
+        return;
+    }
     if !sandbox_available() {
         return;
     }
@@ -329,6 +345,11 @@ fn a_tool_missing_from_the_registry_is_refuted_with_not_ported() {
 
 #[test]
 fn control_a_port_that_matches_only_the_visible_fixtures_fails_the_held_out_cases() {
+    if workspace::skipped(
+        "control_a_port_that_matches_only_the_visible_fixtures_fails_the_held_out_cases",
+    ) {
+        return;
+    }
     if !sandbox_available() {
         return;
     }
@@ -359,6 +380,9 @@ fn control_a_port_that_matches_only_the_visible_fixtures_fails_the_held_out_case
 
 #[test]
 fn a_verifier_without_the_reference_runtime_reports_held_out_skipped() {
+    if workspace::skipped("a_verifier_without_the_reference_runtime_reports_held_out_skipped") {
+        return;
+    }
     if !sandbox_available() {
         return;
     }
@@ -395,6 +419,9 @@ fn a_verifier_without_the_reference_runtime_reports_held_out_skipped() {
 
 #[test]
 fn a_changed_base_fixture_and_an_unruled_accepted_difference_are_refuted() {
+    if workspace::skipped("a_changed_base_fixture_and_an_unruled_accepted_difference_are_refuted") {
+        return;
+    }
     if !sandbox_available() {
         return;
     }
@@ -431,6 +458,9 @@ JSON"#;
 
 #[test]
 fn held_out_port_cases_need_a_port_packet_with_a_reference() {
+    if workspace::skipped("held_out_port_cases_need_a_port_packet_with_a_reference") {
+        return;
+    }
     // A work packet handed a held-out file with port cases is stopped before a lane exists.
     let lane = Lane::new("true", json!([]));
     let held = heldout();
@@ -443,8 +473,13 @@ fn held_out_port_cases_need_a_port_packet_with_a_reference() {
 #[test]
 fn the_readme_example_header_is_a_valid_port_header() {
     // The documented example must parse with the strict parser, or the docs lie.
-    let readme =
-        fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../README.md")).unwrap();
+    // The workspace's README, or the copy `cargo package` puts at the crate root.
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let readme = fs::read_to_string(match workspace::root() {
+        Some(root) => root.join("README.md"),
+        None => manifest.join("README.md"),
+    })
+    .unwrap();
     let section = readme
         .split("## Port packets: `kind: port`")
         .nth(1)

@@ -1097,12 +1097,30 @@ fn the_directors_rustup_home_reaches_the_builder_every_check_and_the_verifier() 
     assert_eq!(verdict["verdict"], "proved", "{verdict}");
 }
 
+/// A check command that passes only when reading `path` FAILS and its content does not
+/// appear in what the failed `cat` printed. `! cat path` alone would also pass for a path
+/// that does not exist, so the test pairs it with a control file that does.
+fn hidden_file(path: &Path) -> String {
+    format!(
+        "out=$(cat {0} 2>&1) && exit 1; case \"$out\" in *CANARY*) exit 1;; esac",
+        path.display()
+    )
+}
+
 /// The usual rustup install: the proxies (`cargo`, `rustc`) live in `<home>/.cargo/bin`, the
 /// toolchains in `<home>/.rustup`, and the director's `PATH` starts with the first. Both are
 /// under the real home, which the sandbox hides, so a check that runs a proxy needs that ONE
 /// bin directory on the sandbox `PATH` and readable, and the rustup home named in
 /// `RUSTUP_HOME`. The fake proxy here exits 0 only if `$RUSTUP_HOME/marker` is readable, so
 /// it proves both; it must run in the builder's `run_check` and in the verifier.
+///
+/// The rest of the cargo home must stay hidden. `credentials.toml` is not a sufficient
+/// witness for that: the profile denies it by name after every grant (D18), so it stays
+/// unreadable even if the whole `.cargo` directory were granted (the macOS profile puts
+/// that literal deny last; checked by granting `bin.parent()` instead of `bin`). The
+/// witness is `config.toml`, which only the hidden home covers, and a control file inside
+/// `bin` proves the check can read what is granted (so "cat failed" is not a typo in a path
+/// or a sandbox that hides everything).
 #[test]
 fn a_rustup_proxy_in_the_directors_cargo_bin_runs_in_run_check_and_in_the_verifier() {
     if !sandbox_available() {
@@ -1114,12 +1132,21 @@ fn a_rustup_proxy_in_the_directors_cargo_bin_runs_in_run_check_and_in_the_verifi
     fs::create_dir_all(&bin).unwrap();
     fs::create_dir_all(home.join(".rustup")).unwrap();
     fs::write(home.join(".rustup/marker"), "toolchains live here\n").unwrap();
-    // A secret that lives beside the bin directory, in the cargo home: it must stay hidden.
+    // Secrets that live beside the bin directory, in the cargo home: they must stay hidden.
+    // `credentials.toml` is also denied by name; `config.toml` (registry tokens can live
+    // there too) is covered by the hidden home alone.
     fs::write(
         home.join(".cargo/credentials.toml"),
         "token = \"CANARY-CARGO\"\n",
     )
     .unwrap();
+    fs::write(
+        home.join(".cargo/config.toml"),
+        "[registry]\ntoken = \"CANARY-CONFIG\"\n",
+    )
+    .unwrap();
+    // A control inside the granted directory: readable.
+    fs::write(bin.join("granted.txt"), "readable in the granted bin\n").unwrap();
     {
         let _g = fork_lock();
         let proxy = bin.join("fakerustc");
@@ -1127,12 +1154,14 @@ fn a_rustup_proxy_in_the_directors_cargo_bin_runs_in_run_check_and_in_the_verifi
         fs::set_permissions(&proxy, fs::Permissions::from_mode(0o755)).unwrap();
     }
     let h = Harness::with_packet(
-        &run_checks(&["edit", "proxy", "secret"]),
+        &run_checks(&["edit", "proxy", "control", "config", "creds"]),
         json!(["README.md", "created.txt"]),
         json!([
             {"id": "edit", "command": "grep -q edited README.md"},
             {"id": "proxy", "command": "fakerustc"},
-            {"id": "secret", "command": format!("! cat {}/.cargo/credentials.toml", home.display())},
+            {"id": "control", "command": format!("grep -q readable {}/.cargo/bin/granted.txt", home.display())},
+            {"id": "config", "command": hidden_file(&home.join(".cargo/config.toml"))},
+            {"id": "creds", "command": hidden_file(&home.join(".cargo/credentials.toml"))},
         ]),
     );
     let out = output(
@@ -1152,8 +1181,8 @@ fn a_rustup_proxy_in_the_directors_cargo_bin_runs_in_run_check_and_in_the_verifi
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(
-        passed(&h, 3) && passed(&h, 4) && passed(&h, 5),
-        "the proxy and the hidden credentials check pass in the lane"
+        (3..=7).all(|id| passed(&h, id)),
+        "the proxy, the readable control and both hidden-file checks pass in the lane"
     );
     // The builder's own PATH keeps the bin directory, first, and nothing else of the home.
     let env = h.read("home/fake/env.txt");

@@ -165,7 +165,7 @@ fn plugin_fixture() -> PluginFixture {
         .tempdir_in("/var/tmp")
         .expect("temp dir under /var/tmp");
     let greet = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../portkit/plugin/tests/fixtures/greet.py")
+        .join("tests/fixtures/greet.py")
         .canonicalize()
         .expect("greet.py fixture");
     let good = dir.path().join("good-plugins.toml");

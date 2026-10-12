@@ -1531,11 +1531,11 @@ mod tests {
             .collect()
     }
 
+    /// An empty directory standing for "a repository that has none of the files the fixture
+    /// names". It was the workspace root (`CARGO_MANIFEST_DIR/../..`), which the published
+    /// crate does not sit in; the fixtures only need those paths to be absent.
     fn repository_root() -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../..")
-            .canonicalize()
-            .unwrap()
+        root()
     }
 
     #[test]
@@ -1562,6 +1562,7 @@ mod tests {
                 "error [check-path-missing] line 11: check references missing file \"tools/widget/Cargo.toml\"",
             ]
         );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -1584,11 +1585,13 @@ mod tests {
 
     #[test]
     fn synthetic_clean_secret_name_fixture_has_no_findings() {
+        let root = repository_root();
         let findings = lint_packet(
             include_str!("../tests/fixtures/synthetic-clean-names-secret-variable.md"),
-            &repository_root(),
+            &root,
             &[],
         );
+        fs::remove_dir_all(root).unwrap();
         assert_eq!(
             signatures(&findings),
             vec![

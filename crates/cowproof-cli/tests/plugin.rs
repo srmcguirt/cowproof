@@ -1,5 +1,12 @@
 //! The Claude Code plugin in `plugin/` and the marketplace in `.claude-plugin/`:
 //! its manifests, hook, session-start script and the commands its skills tell Claude to run.
+//!
+//! The plugin, the marketplace and the workspace manifest are repository files the published
+//! `cowproof` crate does not contain, so these tests run in the workspace only (see
+//! `common/workspace.rs`).
+
+#[path = "common/workspace.rs"]
+mod workspace;
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -56,6 +63,9 @@ fn workspace_version() -> String {
 
 #[test]
 fn manifests_agree_with_the_workspace_and_each_other() {
+    if workspace::skipped("manifests_agree_with_the_workspace_and_each_other") {
+        return;
+    }
     let plugin = json("plugin/.claude-plugin/plugin.json");
     assert_eq!(plugin["name"], "cowproof");
     assert_eq!(plugin["version"], workspace_version().as_str());
@@ -85,6 +95,9 @@ fn manifests_agree_with_the_workspace_and_each_other() {
 
 #[test]
 fn the_session_start_hook_runs_the_script() {
+    if workspace::skipped("the_session_start_hook_runs_the_script") {
+        return;
+    }
     let hooks = json("plugin/hooks/hooks.json");
     let groups = hooks["hooks"]["SessionStart"]
         .as_array()
@@ -109,6 +122,9 @@ fn the_session_start_hook_runs_the_script() {
 /// commits, not only on this disk.
 #[test]
 fn the_script_is_executable_in_git_and_on_disk() {
+    if workspace::skipped("the_script_is_executable_in_git_and_on_disk") {
+        return;
+    }
     let staged = Command::new("git")
         .args(["ls-files", "-s", "--", SCRIPT])
         .current_dir(repo_root())
@@ -157,6 +173,9 @@ fn plugin_root_requiring(version: &str) -> tempfile::TempDir {
 
 #[test]
 fn the_script_compares_versions_numerically_and_never_fails() {
+    if workspace::skipped("the_script_compares_versions_numerically_and_never_fails") {
+        return;
+    }
     let root = plugin_root_requiring("0.9.0");
     let says = |version: &str| run_script(root.path(), Some(&format!("echo 'lanes {version}'")));
 
@@ -205,6 +224,9 @@ fn the_script_compares_versions_numerically_and_never_fails() {
 /// The hook and both READMEs give the one install command the repository README does.
 #[test]
 fn the_install_line_is_the_same_everywhere() {
+    if workspace::skipped("the_install_line_is_the_same_everywhere") {
+        return;
+    }
     let install = "cargo install --git https://github.com/srmcguirt/cowproof cowproof";
     for file in ["README.md", "plugin/README.md", SCRIPT] {
         assert!(read(file).contains(install), "{file} must say `{install}`");
@@ -267,6 +289,9 @@ fn cowproof_commands(markdown: &str) -> Vec<String> {
 /// prints help and exits 0.
 #[test]
 fn every_command_in_the_skills_parses_with_the_real_cli() {
+    if workspace::skipped("every_command_in_the_skills_parses_with_the_real_cli") {
+        return;
+    }
     let mut subcommands = std::collections::BTreeSet::new();
     for skill in SKILLS {
         let text = read(&format!("plugin/skills/{skill}/SKILL.md"));
@@ -295,6 +320,9 @@ fn every_command_in_the_skills_parses_with_the_real_cli() {
 /// owns, must lint with no errors and no warnings.
 #[test]
 fn the_example_packet_in_the_dispatch_skill_lints_clean() {
+    if workspace::skipped("the_example_packet_in_the_dispatch_skill_lints_clean") {
+        return;
+    }
     let skill = read("plugin/skills/cowproof-dispatch/SKILL.md");
     let fence = skill
         .split("```markdown\n")
@@ -322,6 +350,9 @@ fn the_example_packet_in_the_dispatch_skill_lints_clean() {
 /// named `cowproof` with command `cowproof` and args `["serve", "--director"]`.
 #[test]
 fn the_mcp_json_declares_the_cowproof_director_server() {
+    if workspace::skipped("the_mcp_json_declares_the_cowproof_director_server") {
+        return;
+    }
     let mcp = json("plugin/.mcp.json");
     assert!(mcp["mcpServers"].is_object(), "mcpServers is an object");
 
@@ -346,6 +377,9 @@ fn the_mcp_json_declares_the_cowproof_director_server() {
 /// director tools. Test by driving the process over stdio with initialize and tools/list.
 #[test]
 fn the_cowproof_binary_serves_the_director_tools_over_stdio() {
+    if workspace::skipped("the_cowproof_binary_serves_the_director_tools_over_stdio") {
+        return;
+    }
     use std::io::Write;
     use std::process::Stdio;
 
@@ -427,6 +461,9 @@ fn the_cowproof_binary_serves_the_director_tools_over_stdio() {
 /// at least one tool reference was found.
 #[test]
 fn every_mcp_tool_named_in_the_skills_is_served() {
+    if workspace::skipped("every_mcp_tool_named_in_the_skills_is_served") {
+        return;
+    }
     use std::collections::HashSet;
     use std::io::Write;
     use std::process::Stdio;

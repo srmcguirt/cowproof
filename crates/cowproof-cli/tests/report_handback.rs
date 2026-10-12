@@ -4,6 +4,13 @@
 //! [--json]` is now `cowproof report handback <lane-dir> ...`). Its parsing and rules are
 //! unit-tested in `crates/cowproof-report/src/handback.rs`; these tests are the old
 //! binary's fixture tests, run against the new subcommand over the same fixtures.
+//!
+//! The fixtures belong to `cowproof-report` (`crates/cowproof-report/tests/fixtures`), which
+//! the published `cowproof` crate does not contain, so the tests that read them run in the
+//! workspace only (see `common/workspace.rs`); the two that need no fixture always run.
+
+#[path = "common/workspace.rs"]
+mod workspace;
 
 use serde_json::Value;
 use std::fs;
@@ -74,6 +81,9 @@ fn classifications(report: &Value) -> Vec<&str> {
 
 #[test]
 fn the_mixed_fixture_reports_checks_assertion_loss_and_handoff_sections() {
+    if workspace::skipped("the_mixed_fixture_reports_checks_assertion_loss_and_handoff_sections") {
+        return;
+    }
     let dir = fixture("mixed");
     let packet = dir.join("packet.md");
     let (r, _) = json_report(&[dir.to_str().unwrap(), "--packet", packet.to_str().unwrap()]);
@@ -89,6 +99,9 @@ fn the_mixed_fixture_reports_checks_assertion_loss_and_handoff_sections() {
 
 #[test]
 fn the_flaw_lane_fixture_runs_all_rules_including_the_baseline() {
+    if workspace::skipped("the_flaw_lane_fixture_runs_all_rules_including_the_baseline") {
+        return;
+    }
     let dir = fixture("flaws");
     let (r, _) = json_report(&[dir.to_str().unwrap(), "--baseline", "20260401_existing.sql"]);
     let flaws = r["flaws"].as_array().unwrap();
@@ -110,6 +123,9 @@ fn the_flaw_lane_fixture_runs_all_rules_including_the_baseline() {
 
 #[test]
 fn the_table_format_fixture_matches_its_snapshot() {
+    if workspace::skipped("the_table_format_fixture_matches_its_snapshot") {
+        return;
+    }
     let r = snapshot("table", &[]);
     assert_eq!(r["lane_id"], "fixture-table");
     assert_eq!(classifications(&r), vec!["pass", "fail", "unclear"]);
@@ -117,6 +133,9 @@ fn the_table_format_fixture_matches_its_snapshot() {
 
 #[test]
 fn the_bullet_format_fixture_matches_its_snapshot() {
+    if workspace::skipped("the_bullet_format_fixture_matches_its_snapshot") {
+        return;
+    }
     let r = snapshot("bullet", &[]);
     assert_eq!(r["lane_id"], "fixture-bullet");
     let classes = classifications(&r);
@@ -128,6 +147,9 @@ fn the_bullet_format_fixture_matches_its_snapshot() {
 
 #[test]
 fn the_fenced_format_fixture_matches_its_snapshot() {
+    if workspace::skipped("the_fenced_format_fixture_matches_its_snapshot") {
+        return;
+    }
     let r = snapshot("fenced", &[]);
     assert_eq!(r["lane_id"], "fixture-fenced");
     let classes = classifications(&r);
@@ -139,6 +161,9 @@ fn the_fenced_format_fixture_matches_its_snapshot() {
 
 #[test]
 fn the_arrow_format_fixture_matches_its_snapshot() {
+    if workspace::skipped("the_arrow_format_fixture_matches_its_snapshot") {
+        return;
+    }
     let r = snapshot("arrow", &[]);
     assert_eq!(r["lane_id"], "fixture-arrow");
     let classes = classifications(&r);
@@ -150,6 +175,9 @@ fn the_arrow_format_fixture_matches_its_snapshot() {
 
 #[test]
 fn the_questions_fixture_matches_its_snapshot() {
+    if workspace::skipped("the_questions_fixture_matches_its_snapshot") {
+        return;
+    }
     let r = snapshot("questions", &[]);
     assert_eq!(r["lane_id"], "fixture-questions");
     assert_eq!(r["questions"].as_array().unwrap().len(), 3);
@@ -157,6 +185,9 @@ fn the_questions_fixture_matches_its_snapshot() {
 
 #[test]
 fn the_limits_fixture_matches_its_snapshot() {
+    if workspace::skipped("the_limits_fixture_matches_its_snapshot") {
+        return;
+    }
     let r = snapshot("limits", &[]);
     assert_eq!(r["lane_id"], "fixture-limits");
     assert!(!r["limits"].as_array().unwrap().is_empty());
@@ -165,12 +196,18 @@ fn the_limits_fixture_matches_its_snapshot() {
 
 #[test]
 fn the_baseline_fixture_matches_its_snapshot() {
+    if workspace::skipped("the_baseline_fixture_matches_its_snapshot") {
+        return;
+    }
     let r = snapshot("baseline", &["--baseline", "20260401_existing.sql"]);
     assert_eq!(r["lane_id"], "fixture-baseline");
 }
 
 #[test]
 fn without_json_it_prints_the_text_report_and_a_verdict_hint() {
+    if workspace::skipped("without_json_it_prints_the_text_report_and_a_verdict_hint") {
+        return;
+    }
     let dir = fixture("table");
     let out = handback(&[dir.to_str().unwrap()]);
     assert!(out.status.success(), "{}", text(&out));
@@ -196,8 +233,8 @@ fn a_lane_directory_that_is_not_a_lane_exits_2_naming_the_file() {
 
 #[test]
 fn an_unknown_option_and_a_missing_lane_directory_are_usage_errors_with_exit_2() {
-    let dir = fixture("table");
-    let unknown = handback(&[dir.to_str().unwrap(), "--nope"]);
+    let dir = tempfile::tempdir().unwrap();
+    let unknown = handback(&[dir.path().to_str().unwrap(), "--nope"]);
     assert_eq!(unknown.status.code(), Some(2), "{}", text(&unknown));
     assert!(String::from_utf8_lossy(&unknown.stderr).contains("--nope"));
 

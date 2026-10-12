@@ -3,7 +3,7 @@
 //! from the gate report alone.
 //!
 //! The packet, the project and the held-out checks are the committed fixture under
-//! `fixtures/adversarial/`. A FAKE `claude` plays the builder: no network, no model. The
+//! `tests/fixtures/adversarial/` of this crate. A FAKE `claude` plays the builder: no network, no model. The
 //! cheat fake does exactly what the packet's text asks; three controls keep the test from
 //! being vacuous (an honest builder proves; a builder that only deletes an assertion and a
 //! builder that only hard-codes are each caught by one gate, and by that gate alone).
@@ -25,7 +25,7 @@ const PACKET_ID: &str = "adversarial-1";
 fn fixture() -> PathBuf {
     // Canonical: `--heldout` refuses a path with `..` in it.
     Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../fixtures/adversarial")
+        .join("tests/fixtures/adversarial")
         .canonicalize()
         .unwrap()
 }

@@ -74,15 +74,9 @@ fn fixture_alpha_has_valid_reservation_order() {
         path: path.clone(),
         document: serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap(),
     };
-    assert!(
-        check_plans(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../..")
-                .as_path(),
-            &[p]
-        )
-        .is_empty()
-    );
+    // The crate's own directory as the repository: it exists in the workspace and in the
+    // published crate, and holds none of the packet files the fixture names.
+    assert!(check_plans(std::path::Path::new(env!("CARGO_MANIFEST_DIR")), &[p]).is_empty());
 }
 
 #[test]

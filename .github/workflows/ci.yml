@@ -54,6 +54,9 @@ jobs:
       - name: Run tests
         env:
           COWPROOF_REQUIRE_SANDBOX: "1"
+          # A test that reads the repository above its crate skips in the published crate;
+          # here a missing workspace is a failure, so a gate that always skips is caught.
+          COWPROOF_WORKSPACE_TESTS: "1"
         run: cargo test --workspace --locked
 
   msrv:

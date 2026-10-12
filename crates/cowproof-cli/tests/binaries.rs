@@ -4,6 +4,9 @@
 //! or a `src/main.rs` in a library crate, adds a fourth binary to `cargo install` and to
 //! the release tarballs, so this test fails until the design is changed on purpose.
 
+#[path = "common/workspace.rs"]
+mod workspace;
+
 use std::process::Command;
 
 #[test]
@@ -58,8 +61,15 @@ fn the_workspace_builds_exactly_cowproof_pk_and_pk_read() {
 /// `cargo publish` rejects a path dependency with no version, and crates.io rejects a crate
 /// with no description. `cargo install cowproof` needs every library it depends on
 /// published (`docs/releasing.md`), so each publishable workspace package carries both.
+/// Workspace-only (see `common/workspace.rs`).
 #[test]
 fn every_publishable_package_has_a_description_and_versioned_path_dependencies() {
+    // Every package of the workspace: the published crate sees only itself.
+    if workspace::skipped(
+        "every_publishable_package_has_a_description_and_versioned_path_dependencies",
+    ) {
+        return;
+    }
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
     let out = Command::new(cargo)
         .args([
