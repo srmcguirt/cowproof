@@ -1408,6 +1408,10 @@ impl Launcher {
         let mut abandoned = false;
         let mut stderr_abandoned = false;
         let mut interrupted = false;
+        // When the group got SIGTERM and whether SIGKILL had to follow, for the one line
+        // that says how long the builder took to go (see `ended_after_term_line`).
+        let mut term_sent_at: Option<Instant> = None;
+        let mut kill_sent = false;
 
         // What is left of the lane's wall-clock limit after the earlier launches.
         let left = self.timeout.saturating_sub(
@@ -1451,6 +1455,13 @@ impl Launcher {
                     }
                     waited = child.wait(), if status.is_none() => {
                         status = Some(waited.context("waiting for the builder")?);
+                        if let Some(sent) = term_sent_at {
+                            eprintln!(
+                                "[{}] {}",
+                                self.lane_id,
+                                ended_after_term_line(sent.elapsed(), kill_sent)
+                            );
+                        }
                         // The leader is gone: end whatever it left running, so
                         // no background child survives or holds the stream open.
                         kill_process_group(pgid);
@@ -1514,6 +1525,7 @@ impl Launcher {
                         if status.is_none() {
                             eprintln!("[{}] interrupted: ending the builder", self.lane_id);
                             terminate_process_group(pgid);
+                            term_sent_at.get_or_insert_with(Instant::now);
                             killed = true;
                             term_at = None;
                             kill_at = Some(TokioInstant::now() + TERM_GRACE);
@@ -1521,12 +1533,14 @@ impl Launcher {
                     }
                     _ = sleep_until_opt(term_at), if term_at.is_some() => {
                         terminate_process_group(pgid);
+                        term_sent_at.get_or_insert_with(Instant::now);
                         killed = true;
                         term_at = None;
                         kill_at = Some(TokioInstant::now() + TERM_GRACE);
                     }
                     _ = sleep_until_opt(kill_at), if kill_at.is_some() => {
                         kill_process_group(pgid);
+                        kill_sent = true;
                         kill_at = None;
                     }
                     _ = sleep_until_opt(drain_until), if drain_until.is_some() && pump_result.is_none() && !abandoned => {
@@ -1543,6 +1557,7 @@ impl Launcher {
                         // The limit wins over whatever else was ending the session.
                         session_end = Some(SessionEnd::Timeout);
                         terminate_process_group(pgid);
+                        term_sent_at.get_or_insert_with(Instant::now);
                         killed = true;
                         timeout_at = None;
                         term_at = None;
@@ -1602,6 +1617,19 @@ impl Launcher {
             estimated_cost_usd,
         })
     }
+}
+
+/// The runner's own account of how long the builder took to go once its group had been sent
+/// SIGTERM, measured from the SIGTERM to the runner reading the leader's exit status. It does
+/// not include anything the runner does after that (the patch, `pk doctor`, `run.json`), which
+/// is where a loaded host spends its time on a stop. A builder that ignores SIGTERM shows up
+/// here as about [`TERM_GRACE`] with `, after SIGKILL`. The tests read this line.
+fn ended_after_term_line(took: Duration, after_sigkill: bool) -> String {
+    let suffix = if after_sigkill { ", after SIGKILL" } else { "" };
+    format!(
+        "the builder ended {} ms after SIGTERM{suffix}",
+        took.as_millis()
+    )
 }
 
 /// How the lane's builder launches ended.

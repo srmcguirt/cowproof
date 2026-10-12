@@ -2299,34 +2299,75 @@ fn assert_first_builder_was_ruled_away(h: &Harness, id: &str) {
     assert_eq!(queue_events(h, "delivered").len(), 1);
 }
 
+/// What the runner's own line "the builder ended N ms after SIGTERM[, after SIGKILL]" says.
+struct EndedAfterTerm {
+    took: Duration,
+    after_sigkill: bool,
+}
+
+/// Wait for that line (at most `within`) and read it. It is printed the moment the runner reads
+/// the leader's exit status, so it is the SIGTERM-to-gone time and nothing else: not the
+/// `cowproof rule` process starting, not this test's polling, and not what the runner does
+/// afterwards (the patch, `pk doctor`, `run.json`).
+fn ended_after_term(run: &mut Watched, within: Duration) -> EndedAfterTerm {
+    run.wait_for_stderr("ms after SIGTERM", within);
+    let stderr = run.stderr();
+    let line = stderr
+        .lines()
+        .find(|l| l.contains("the builder ended "))
+        .unwrap_or_else(|| panic!("no 'the builder ended' line:\n{stderr}"));
+    let ms = line
+        .split("the builder ended ")
+        .nth(1)
+        .and_then(|rest| rest.split(" ms").next())
+        .and_then(|n| n.parse::<u64>().ok())
+        .unwrap_or_else(|| panic!("cannot read the time from {line:?}"));
+    EndedAfterTerm {
+        took: Duration::from_millis(ms),
+        after_sigkill: line.ends_with("after SIGKILL"),
+    }
+}
+
+/// Start a run whose first builder asks NON-blocking, rule `--stop` on it, and read the
+/// runner's account of how long the builder took to go. Returns the run, the escalation id,
+/// the moment the runner said it was ending the builder, and that account.
+fn stop_a_non_blocking_ask(h: &Harness) -> (Watched, String, Instant, EndedAfterTerm) {
+    let mut run = start_watched(h, &[]);
+    let id = wait_for_ask(h, &mut run.child, 1);
+    rule(h, &id, &["--stop"]);
+    run.wait_for_stderr("ending the builder now", RULED_WITHIN);
+    let ending = Instant::now();
+    let ended = ended_after_term(&mut run, RULED_WITHIN);
+    (run, id, ending, ended)
+}
+
 #[test]
 fn a_stop_on_a_non_blocking_ask_ends_the_live_session_and_the_lane() {
     if !sandbox_available() {
         return;
     }
     // The builder dies on SIGTERM, so a stop must not wait out `TERM_GRACE` for a SIGKILL.
-    // The clock starts at the runner's own line saying it is ending the builder, not at the
-    // `cowproof rule` call: how long a loaded host takes to start that process and deliver
-    // the ruling is not what is measured. From that line the runner sends SIGTERM and tears
-    // down; a run that waited the grace out ends about `TERM_GRACE` later, so the bound is
-    // three quarters of it. The waits around it only keep a hang from hanging the test.
+    // What is measured is the runner's own line saying how long the builder took to go after
+    // SIGTERM: the stop's other work (the patch, `pk doctor`, `run.json`) is not the property,
+    // and on a loaded host it took 9 to 11 seconds while the builder went in under a
+    // millisecond. A run that waited the grace out reports about `TERM_GRACE` and says it
+    // took a SIGKILL, so the bound is three quarters of it. The waits around it only keep a
+    // hang from hanging the test.
     let grace = term_grace();
     let bound = grace * 3 / 4;
     let h = owned_packet(&nonblocking_sleeper("Quit?"));
-    let mut run = start_watched(&h, &[]);
-    let id = wait_for_ask(&h, &mut run.child, 1);
-    rule(&h, &id, &["--stop"]);
-    run.wait_for_stderr("ending the builder now", RULED_WITHIN);
-    let ending = Instant::now();
-    let status = exit_within(&mut run, RULED_WITHIN);
-    let took = ending.elapsed();
+    let (mut run, id, _, ended) = stop_a_non_blocking_ask(&h);
     assert!(
-        took < bound,
-        "the stop waited for the SIGTERM grace: exit {took:?} after the runner began ending \
-         the builder, bound {bound:?} of a {grace:?} grace:\n{}",
+        !ended.after_sigkill && ended.took < bound,
+        "the stop waited for the SIGTERM grace: the builder ended {:?} after SIGTERM (SIGKILL \
+         needed: {}), bound {bound:?} of a {grace:?} grace:\n{}",
+        ended.took,
+        ended.after_sigkill,
         run.stderr()
     );
+    let status = exit_within(&mut run, RULED_WITHIN);
     let mut stdout = String::new();
+
     if let Some(mut pipe) = run.child.stdout.take() {
         use std::io::Read;
         let _ = pipe.read_to_string(&mut stdout);
@@ -2339,6 +2380,84 @@ fn a_stop_on_a_non_blocking_ask_ends_the_live_session_and_the_lane() {
     // The work is kept; the lane is not proved.
     assert!(h.read("control/lane.patch").contains("+edited"));
     assert!(!h.lane().join("control/verdict.json").exists());
+}
+
+/// Like [`nonblocking_sleeper`], but the builder (and so everything it starts) ignores SIGTERM,
+/// so only the runner's SIGKILL after `TERM_GRACE` ends it.
+fn nonblocking_stubborn(question: &str) -> String {
+    let mut ask = blocking_ask(question);
+    ask["blocking"] = json!(false);
+    let first = format!(
+        "{}trap '' TERM\n{}while true; do sleep 1; done\n",
+        init_line(),
+        mcp_session("ask.out", &[(3, "ask", ask)])
+    );
+    first_then(&first, &then_checks())
+}
+
+#[test]
+fn a_stop_does_not_count_the_slow_work_after_the_builder_is_gone_as_waiting_for_the_grace() {
+    if !sandbox_available() {
+        return;
+    }
+    // After the builder is reaped the runner still collects the patch, asks `pk doctor` whether
+    // the hooks fired and writes `run.json`. A loaded host spends seconds there (9 to 11 in
+    // a full workspace run, with the builder gone in under a millisecond), and a test that
+    // timed the whole exit read that as a stop that waited out the grace. Here `pk doctor`
+    // takes eight seconds on any host: the exit is later than the bound, the builder's own
+    // time is not, and the test measures the second.
+    let grace = term_grace();
+    let bound = grace * 3 / 4;
+    let h = owned_packet(&nonblocking_sleeper("Quit?"));
+    let pk = h.work.path().join("pk");
+    {
+        let _g = fork_lock();
+        fs::remove_file(&pk).unwrap();
+        fs::write(&pk, "#!/bin/sh\n/bin/sleep 8\necho not json\nexit 3\n").unwrap();
+        fs::set_permissions(&pk, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let (mut run, _id, ending, ended) = stop_a_non_blocking_ask(&h);
+    assert!(
+        !ended.after_sigkill && ended.took < bound,
+        "the builder ended {:?} after SIGTERM:\n{}",
+        ended.took,
+        run.stderr()
+    );
+    let status = exit_within(&mut run, RULED_WITHIN);
+    let exit = ending.elapsed();
+    assert!(
+        exit > bound,
+        "the slow `pk doctor` did not delay the exit ({exit:?}), so this proves nothing:\n{}",
+        run.stderr()
+    );
+    assert_eq!(status.code(), Some(1), "{}", run.stderr());
+    assert_eq!(h.run_json()["status"], "stopped");
+}
+
+#[test]
+fn a_stop_of_a_builder_that_ignores_sigterm_is_reported_as_waiting_for_the_grace() {
+    if !sandbox_available() {
+        return;
+    }
+    // The other half of the stop test's property: when the grace IS waited out, the runner's
+    // line says so, which is what makes the bound in
+    // `a_stop_on_a_non_blocking_ask_ends_the_live_session_and_the_lane` fail for it.
+    let grace = term_grace();
+    let h = owned_packet(&nonblocking_stubborn("Quit?"));
+    let (mut run, _id, _, ended) = stop_a_non_blocking_ask(&h);
+    assert!(
+        ended.after_sigkill,
+        "SIGKILL was needed but the line does not say so:\n{}",
+        run.stderr()
+    );
+    assert!(
+        ended.took >= grace * 3 / 4,
+        "the builder ended {:?} after SIGTERM, well inside a {grace:?} grace:\n{}",
+        ended.took,
+        run.stderr()
+    );
+    let status = exit_within(&mut run, RULED_WITHIN);
+    assert_eq!(status.code(), Some(1), "{}", run.stderr());
 }
 
 #[test]
