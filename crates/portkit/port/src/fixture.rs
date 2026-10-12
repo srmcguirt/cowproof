@@ -2,6 +2,8 @@
 
 use std::path::{Path, PathBuf};
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -37,6 +39,32 @@ pub struct Fixture {
     /// a lowered epsilon that hides everything else too.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub accepted: Vec<AcceptedDifference>,
+    /// The environment the case was captured with, on top of the capture's own (G2). Kept so
+    /// a stale fixture can be regenerated without the capturing machine's shell.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, String>,
+    /// The case is a "must reject" one (G4): the reference failed on it and `expected` is the
+    /// error envelope (see [`crate::error_envelope`]). Replay turns the port's failure into the
+    /// same envelope before it compares.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub expect_error: bool,
+    /// A declared, versioned transform applied to the reference's output before it was
+    /// recorded (G13). A replay refuses a fixture whose transform it does not know.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub normalized: Option<Normalized>,
+}
+
+/// The transform a fixture's `expected` went through, declared like the `normalized` fidelity
+/// class: a name, a version, and what it was told. An unknown name or version is an error at
+/// replay, never a silent pass: a fixture that means whatever the current binary does is not a
+/// contract.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Normalized {
+    pub name: String,
+    pub version: u32,
+    /// The declared roots (`$ROOT`, `$HOME`, `$TMP`, `$SRC`) for `path-roots`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub roots: Vec<String>,
 }
 
 /// A difference the port is allowed to have, and the reason it is allowed.
@@ -92,6 +120,13 @@ pub struct Case {
     pub input: Value,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    /// Environment for this case's reference, on top of the capture's (G2). Later wins.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, String>,
+    /// The reference is expected to fail on this case (G4). Capture records the error envelope
+    /// instead of failing, and fails if the reference succeeds.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub expect_error: bool,
 }
 
 /// Read a JSONL cases file, ignoring blank lines and `#` comments.

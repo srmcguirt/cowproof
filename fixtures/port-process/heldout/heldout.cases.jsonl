@@ -1,0 +1,2 @@
+{"tool":"greet","id":"ada","input":{"argv":["who.txt"],"files":{"who.txt":"Ada"},"shims":{"git":[{"argv":["rev-parse","--short","HEAD"],"stdout":"0000fff\n"}]}}}
+{"tool":"greet","id":"noargs","input":{},"expect_error":true}

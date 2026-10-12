@@ -27,6 +27,9 @@ use serde_json::Value;
 use std::fs;
 use std::path::Path;
 
+/// The tokens a process capture substitutes for a run's directories (`PATH_ROOT_TOKENS`).
+const ROOT_TOKENS: [&str; 4] = ["$ROOT", "$HOME", "$TMP", "$SRC"];
+
 /// The most `port-nondeterministic-output` findings one packet reports.
 const MAX_NONDETERMINISTIC: usize = 20;
 
@@ -387,7 +390,12 @@ fn nondeterministic_output(port: &PortSpec, repo_root: &Path, findings: &mut Vec
             }
             let found = if let Some(m) = heuristics.time.find(&text) {
                 Some(("a time", m.as_str().to_string(), false))
-            } else if let Some(m) = heuristics.path.find(&text) {
+            } else if let Some(m) = heuristics.path.find_iter(&text).find(|m| {
+                // `$ROOT/home/a` is a process capture's own substitution (portkit's
+                // `path-roots`), not a home directory: the heuristic reads the path after the
+                // placeholder, so a placeholder in front of it is not a finding.
+                !ROOT_TOKENS.iter().any(|t| text[..m.start()].ends_with(t))
+            }) {
                 Some(("a temp or home path", m.as_str().to_string(), true))
             } else {
                 heuristics

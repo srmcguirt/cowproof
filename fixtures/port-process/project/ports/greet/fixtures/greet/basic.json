@@ -1,0 +1,71 @@
+{
+  "tool": "greet",
+  "id": "basic",
+  "input": {
+    "argv": [
+      "name.txt"
+    ],
+    "files": {
+      "name.txt": "world\n",
+      "stale.txt": "old\n"
+    },
+    "shims": {
+      "git": [
+        {
+          "argv": [
+            "rev-parse",
+            "--short",
+            "HEAD"
+          ],
+          "stdout": "abc1234\n"
+        }
+      ]
+    }
+  },
+  "expected": {
+    "exit": 0,
+    "stdout": "wrote $ROOT/greeting.txt\n",
+    "stderr": "",
+    "files_after": {
+      "greeting.txt": {
+        "sha256": "bd3bd45de7f6a9785ac1f96e3082fe3c5b78eaced2ab214d5bf0644ed41127a8",
+        "mode": 420,
+        "size": 24,
+        "content": "hello world\nrev abc1234\n"
+      },
+      "name.txt": {
+        "sha256": "e258d248fda94c63753607f7c4494ee0fcbe92f1a76bfdac795c9d84101eb317",
+        "mode": 420,
+        "size": 6,
+        "content": "world\n"
+      }
+    },
+    "deleted": [
+      "stale.txt"
+    ],
+    "calls": [
+      {
+        "program": "git",
+        "argv": [
+          "rev-parse",
+          "--short",
+          "HEAD"
+        ],
+        "env": {},
+        "stdin": null
+      }
+    ]
+  },
+  "captured_at": "2026-10-12T09:03:17.519734Z",
+  "source": "sh \"$PORTKIT_SRC/reference/greet.sh\" (pk port exec, macos)",
+  "note": "reads a file, writes another, deletes one, asks git, prints a path",
+  "normalized": {
+    "name": "path-roots",
+    "version": 1,
+    "roots": [
+      "$HOME",
+      "$ROOT",
+      "$TMP"
+    ]
+  }
+}

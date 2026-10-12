@@ -1,0 +1,64 @@
+{
+  "tool": "greet",
+  "id": "loose",
+  "input": {
+    "argv": [
+      "name.txt"
+    ],
+    "files": {
+      "name.txt": "moon\n"
+    },
+    "shims": {
+      "git": [
+        {
+          "stdout": "def5678\n",
+          "repeat": true
+        }
+      ]
+    }
+  },
+  "expected": {
+    "exit": 0,
+    "stdout": "wrote $ROOT/greeting.txt\n",
+    "stderr": "",
+    "files_after": {
+      "greeting.txt": {
+        "sha256": "d3a4a24c68cd53cc1c06cc24f650d508dde2e559fa0a4bd3d178d7dcbbc09c98",
+        "mode": 420,
+        "size": 23,
+        "content": "hello moon\nrev def5678\n"
+      },
+      "name.txt": {
+        "sha256": "c82a40c8ec36e85554f3a482f98d6c877f454dca96f4b1a501f303aed6b809d5",
+        "mode": 420,
+        "size": 5,
+        "content": "moon\n"
+      }
+    },
+    "deleted": [],
+    "calls": [
+      {
+        "program": "git",
+        "argv": [
+          "rev-parse",
+          "--short",
+          "HEAD"
+        ],
+        "env": {},
+        "stdin": null
+      }
+    ]
+  },
+  "captured_at": "2026-10-12T09:03:17.849095Z",
+  "source": "sh \"$PORTKIT_SRC/reference/greet.sh\" (pk port exec, macos)",
+  "note": "git answers whatever it is asked, so only the recorded calls pin its argv",
+  "normalized": {
+    "name": "path-roots",
+    "version": 1,
+    "roots": [
+      "$HOME",
+      "$ROOT",
+      "$TMP"
+    ]
+  }
+}

@@ -12,6 +12,14 @@
 //! pk port replay  --fixtures fixtures/
 //! ```
 //!
+//! A reference that is a script, not a function, is captured as a whole process:
+//!
+//! ```text
+//! pk port exec --cmd 'sh "$PORTKIT_SRC/backup.sh"' --cases cases.jsonl --out fixtures/
+//! ```
+//!
+//! See [`process`].
+//!
 //! Replay runs through either the registry directly or the MCP `tools/call`
 //! envelope ([`Surface`]), so you can prove an agent gets the same answer the
 //! Python original gave.
@@ -30,13 +38,15 @@
 pub mod adapters;
 pub mod capture;
 pub mod fixture;
+pub mod process;
 pub mod replay;
 pub mod report;
 
-pub use capture::{capture, CaptureOptions, CaptureReport};
-pub use fixture::{load_cases, load_fixtures, AcceptedDifference, Case, Fixture};
+pub use capture::{capture, error_envelope, CaptureOptions, CaptureReport};
+pub use fixture::{load_cases, load_fixtures, AcceptedDifference, Case, Fixture, Normalized};
 pub use replay::{
-    replay, replay_fixtures, CaseOutcome, ReplayOptions, ReplayReport, Status, Surface,
+    error_envelope_of, replay, replay_fixtures, CaseOutcome, ReplayOptions, ReplayReport, Status,
+    Surface,
 };
 pub use report::render;
 

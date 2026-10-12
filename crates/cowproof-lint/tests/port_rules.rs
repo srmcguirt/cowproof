@@ -412,3 +412,40 @@ fn port_nondeterministic_output_is_a_warning_with_declared_exceptions() {
     );
     assert_eq!(rules(&lint(root, &h, BODY)), Vec::<&str>::new());
 }
+
+#[test]
+fn a_process_capture_with_substituted_roots_is_not_flagged_but_a_raw_path_beside_one_is() {
+    // `pk port exec` records a run's directories as `$ROOT`, `$HOME`, `$TMP` and `$SRC`
+    // (portkit's `path-roots` v1). The heuristic reads `/home/..` and `/tmp/..` as the start
+    // of a path, so `$ROOT/home/a` must not be taken for a home directory.
+    let dir = repo();
+    let root = dir.path();
+    let h = header(|_| {});
+    let put_expected = |expected: &str| {
+        put(
+            root,
+            "ports/wc/fixtures/word_count/004.json",
+            &format!(
+                r#"{{"tool":"word_count","id":"004","input":{{}},"expected":{expected},"normalized":{{"name":"path-roots","version":1,"roots":["$ROOT"]}}}}"#
+            ),
+        )
+    };
+    put_expected(
+        r#"{"exit":0,"stdout":"wrote $ROOT/home/a and $HOME/b and $ROOT/tmp/c and $TMP/d and $SRC/e\n","files_after":{"out.txt":{"content":"cwd=$ROOT/tmp/x\n"}}}"#,
+    );
+    assert_eq!(rules(&lint(root, &h, BODY)), Vec::<&str>::new());
+
+    // The same text with a path the substitution missed is still a finding.
+    put_expected(r#"{"stdout":"wrote $ROOT/home/a and /tmp/run-1/out\n"}"#);
+    let findings = lint(root, &h, BODY);
+    assert_eq!(
+        rules(&findings),
+        ["port-nondeterministic-output"],
+        "{findings:?}"
+    );
+    assert!(
+        findings[0].message.contains("/tmp/"),
+        "{}",
+        findings[0].message
+    );
+}

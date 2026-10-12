@@ -88,8 +88,14 @@ where
 
     logging::init(&config.log.level);
 
-    // Built here, after config: `tools/list` must already be grounded.
-    let registry = build(&config);
+    // Built here, after config: `tools/list` must already be grounded. Not for the commands
+    // that never look at it: the process harness re-enters `pk` once per shimmed call, and a
+    // plugin that is `pk port wrap` would otherwise discover itself, forever.
+    let registry = if cli.command.needs_registry() {
+        build(&config)
+    } else {
+        Registry::new()
+    };
 
     match cli.command.execute(registry, &config).await {
         Ok(code) => code,
@@ -267,7 +273,49 @@ pub enum PortCommand {
         /// Stop at the first case the reference fails on.
         #[arg(long)]
         fail_fast: bool,
+
+        /// Directory the reference runs in. Default: where `pk` was started.
+        #[arg(long, value_name = "DIR")]
+        cwd: Option<PathBuf>,
+
+        /// Set a variable for every case, `KEY=VALUE`. Repeatable. A case's own `env` wins.
+        #[arg(long = "env", value_name = "KEY=VALUE")]
+        env: Vec<String>,
+
+        /// Start the reference from an empty environment (only `PATH` is kept) so a fixture
+        /// does not depend on the capturing shell.
+        #[arg(long)]
+        clear_env: bool,
     },
+
+    /// Capture a script (or any executable) as a whole process, in a sandbox with the network denied.
+    ///
+    /// Each case's `input` is `{argv, env, stdin, files, shims, record_env}`; its fixture
+    /// holds `{exit, stdout, stderr, files_after, deleted, calls}`. The command is a shell
+    /// fragment the case's `argv` is appended to; `$PORTKIT_SRC` is the directory the
+    /// reference lives in (`--src`).
+    Exec(ExecArgs),
+
+    /// The Rust port's side of `exec`: run a binary in the same harness and answer the same
+    /// envelope, as a plugin (`[[plugin]] command = "pk", args = ["port", "wrap", ...]`).
+    Wrap(WrapArgs),
+
+    /// Used by the PATH shims the process harness writes. Not for people.
+    #[command(hide = true)]
+    Shim {
+        #[arg(long)]
+        dir: PathBuf,
+        #[arg(long)]
+        state: PathBuf,
+        #[arg(long)]
+        program: String,
+        #[arg(last = true)]
+        args: Vec<String>,
+    },
+
+    /// Used by the harness to show the sandbox denies the network. Not for people.
+    #[command(hide = true)]
+    NetProbe { addr: String },
 
     /// Print or write the capture adapter for a reference language (node, typescript, python).
     ///
@@ -312,6 +360,102 @@ pub enum PortCommand {
     },
 }
 
+/// Options shared by `port exec` and `port wrap`.
+#[derive(clap::Args, Debug)]
+pub struct HarnessArgs {
+    /// Directory the reference lives in (`$PORTKIT_SRC`). Default: where `pk` was started.
+    #[arg(long, value_name = "DIR")]
+    pub src: Option<PathBuf>,
+
+    /// Set a variable for every case, `KEY=VALUE`. Repeatable.
+    #[arg(long = "env", value_name = "KEY=VALUE")]
+    pub env: Vec<String>,
+
+    /// Substitute a run's directory in the output: `$ROOT`, `$HOME`, `$TMP` or `$SRC`.
+    /// Repeatable. Declared in a packet as `port.parity.path_roots`.
+    #[arg(long = "path-root", value_name = "ROOT")]
+    pub path_root: Vec<String>,
+
+    /// The `PATH` after the shims.
+    #[arg(long, value_name = "PATH", default_value = "/usr/bin:/bin")]
+    pub path: String,
+
+    /// How the run is confined: `auto` inherits inside a cowproof sandbox and otherwise uses
+    /// cowproof's own; `own` always uses cowproof's; `inherited` trusts the caller's.
+    #[arg(long, value_enum, default_value_t = SandboxArg::Auto)]
+    pub sandbox: SandboxArg,
+
+    /// Where work directories are made. Default: the system temp directory.
+    #[arg(long, value_name = "DIR")]
+    pub work_dir: Option<PathBuf>,
+
+    /// The longest one run may take, in seconds.
+    #[arg(long, value_name = "SECS")]
+    pub timeout: Option<u64>,
+
+    /// Keep the work directories (to look at what a run did).
+    #[arg(long)]
+    pub keep_work: bool,
+}
+
+#[derive(clap::Args, Debug)]
+pub struct ExecArgs {
+    /// Shell fragment running the reference; the case's `argv` is appended as `"$@"`.
+    #[arg(short = 'C', long, value_name = "COMMAND")]
+    pub cmd: String,
+
+    /// JSONL file of cases, one `{"tool":…,"input":…}` per line.
+    #[arg(long, value_name = "FILE", default_value = "cases.jsonl")]
+    pub cases: PathBuf,
+
+    /// Directory to write fixtures into.
+    #[arg(short, long, value_name = "DIR", default_value = "fixtures")]
+    pub out: PathBuf,
+
+    /// Stop at the first case that fails.
+    #[arg(long)]
+    pub fail_fast: bool,
+
+    /// How many times to run each case, in separate roots; a case whose runs differ is refused.
+    #[arg(long, value_name = "N", default_value_t = 2)]
+    pub repeat: usize,
+
+    #[command(flatten)]
+    pub harness: HarnessArgs,
+}
+
+#[derive(clap::Args, Debug)]
+pub struct WrapArgs {
+    /// The tool name this plugin answers.
+    #[arg(long, value_name = "TOOL")]
+    pub tool: String,
+
+    /// The port's executable (relative paths are taken from where `pk` was started).
+    #[arg(long, value_name = "FILE", conflicts_with = "cmd")]
+    pub exe: Option<PathBuf>,
+
+    /// A shell fragment running the port, as for `exec`.
+    #[arg(short = 'C', long, value_name = "COMMAND")]
+    pub cmd: Option<String>,
+
+    /// Print the tool's spec and exit (the plugin discovery protocol).
+    #[arg(long = "portkit-spec")]
+    pub portkit_spec: bool,
+
+    #[command(flatten)]
+    pub harness: HarnessArgs,
+}
+
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SandboxArg {
+    /// Inherit inside a cowproof sandbox, else use cowproof's own.
+    Auto,
+    /// Always use cowproof's own sandbox.
+    Own,
+    /// The caller has sandboxed this process; the network probe checks it.
+    Inherited,
+}
+
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Transport {
     Stdio,
@@ -337,6 +481,21 @@ pub enum Shell {
 }
 
 impl Command {
+    /// Whether the command reads the tool registry. The process harness commands do not.
+    fn needs_registry(&self) -> bool {
+        !matches!(
+            self,
+            Command::Port {
+                command: PortCommand::Capture { .. }
+                    | PortCommand::Exec(_)
+                    | PortCommand::Wrap(_)
+                    | PortCommand::Shim { .. }
+                    | PortCommand::NetProbe { .. }
+                    | PortCommand::Adapter { .. }
+            }
+        )
+    }
+
     pub async fn execute(
         self,
         registry: Registry,

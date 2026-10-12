@@ -319,11 +319,11 @@ The header parses strictly: `kind` is `work` (the default) or `port`, a `port` o
 | Field | Meaning |
 | --- | --- |
 | `port.lang` | `python`, `node`, `typescript`, `shell`, `ruby`, `perl`, `powershell`, `go` or `other` |
-| `port.adapter` | `function` (an adapter file in the source repository makes a function speak the contract; needs `port.reference.cmd`) or `process` (whole-script capture, a later step). Both are checked and recorded. |
+| `port.adapter` | `function` (an adapter file in the source repository makes a function speak the contract; needs `port.reference.cmd`) or `process` (a whole script or executable captured by `pk port exec`, see "Process capture"; `port.reference.cmd` is then the script's command line). Both are checked and recorded. |
 | `port.reference` | `cmd` (run with `sh -c`; one `{"tool":..,"input":..}` request on stdin, one JSON result on stdout), `cwd`, `env`, and `runtime`, what the verifier must have installed (`node>=22`, `python3`) |
 | `port.cases`, `port.fixtures` | the committed cases file and the fixtures directory (`<tool>/<id>.json`); the builder may write the directory, so `owns` covers it |
 | `port.tools` | the tool names the registry must answer; `not_ported` must be 0 for every one |
-| `port.parity` | `epsilon` (default: `[port] epsilon` in the base `cowproof.toml`, 0 when it has none), `ignore_paths` (JSON Pointers), `unordered_arrays`, `path_roots` |
+| `port.parity` | `epsilon` (default: `[port] epsilon` in the base `cowproof.toml`, 0 when it has none), `ignore_paths` (JSON Pointers), `unordered_arrays`, `path_roots` (the tokens `$ROOT`, `$HOME`, `$TMP`, `$SRC` a process capture substitutes, or plain path prefixes; any other word starting with `$` is an error) |
 
 `cowproof lint` checks seven more rules for a port packet (`--escalations <lane>/control/escalations.jsonl` adds the lane's rulings to `port-accepted-unruled`):
 
@@ -368,15 +368,73 @@ cowproof pk port capture --cmd 'python3 reference/adapter.py reference/shipping.
 | Environment | `TZ=UTC` when unset | `TZ=UTC` when unset; `PYTHONHASHSEED=0` when unset, by restarting once, so `set` and `dict` order of strings repeats |
 | Module output | stdout writes go to stderr | the same |
 
-What an adapter cannot pin: monotonic clocks and timers (`performance.now`, `process.hrtime`, `time.monotonic`, `sleep`), file times, `crypto` and `secrets`/`uuid4`/`os.urandom`, generators a module creates itself without a seed, `Intl`'s own clock, `numpy`. A seeded generator makes a capture repeatable, not portable: Python's Mersenne Twister and Node's mulberry32 differ from each other and from any Rust generator, so a module whose output depends on random draws takes the draws as input. Python 3.12 made `sum()` of floats compensated; capture with the Python version the reference runs on. Effects (files, subprocesses) are not captured by a function adapter; that is whole-process capture, below.
+What an adapter cannot pin: monotonic clocks and timers (`performance.now`, `process.hrtime`, `time.monotonic`, `sleep`), file times, `crypto` and `secrets`/`uuid4`/`os.urandom`, generators a module creates itself without a seed, `Intl`'s own clock, `numpy`. A seeded generator makes a capture repeatable, not portable: Python's Mersenne Twister and Node's mulberry32 differ from each other and from any Rust generator, so a module whose output depends on random draws takes the draws as input. Python 3.12 made `sum()` of floats compensated; capture with the Python version the reference runs on. Effects (files, subprocesses) are not captured by a function adapter; that is process capture, below.
 
-Pin the clock and seed for the held-out capture in the packet: `"reference": {"cmd": "...", "env": {"PORTKIT_NOW": "2026-01-02T03:04:05Z", "PORTKIT_SEED": "1"}, "runtime": "python3"}` (the verifier exports `env` before the command). The director pins the same way at capture time: `PORTKIT_NOW=2026-01-02T03:04:05Z cowproof pk port capture ...`. Parity stays exact: the adapter normalizes the reference's output, not the comparison. `epsilon` is still the project default, usually 0.
+Pin the clock and seed for the held-out capture in the packet: `"reference": {"cmd": "...", "env": {"PORTKIT_NOW": "2026-01-02T03:04:05Z", "PORTKIT_SEED": "1"}, "runtime": "python3"}` (the verifier exports `env` before the command). The director pins the same way at capture time: `cowproof pk port capture --clear-env --env PORTKIT_NOW=2026-01-02T03:04:05Z --cwd reference ...` (`--cwd`, `--env` and `--clear-env` keep a fixture from depending on the capturing shell; a case's own `"env"` is set last and recorded with the fixture). Parity stays exact: the adapter normalizes the reference's output, not the comparison. `epsilon` is still the project default, usually 0.
 
 TypeScript runs through the Node adapter when Node strips types itself: `node adapter.mjs ./module.ts` on Node 22.18+ or 23.6+, `node --experimental-strip-types adapter.mjs ./module.ts` on 22.6 to 22.17 (erasable syntax only: annotations and interfaces, not enums or namespaces). On an older Node, compile and name the output. The runtime a packet asks for is `node>=22` (or `python3`); a verifier without it reports `held-out: skipped`.
 
 `fixtures/port-adapters/` is the worked example, run by `crates/cowproof-cli/tests/port_adapters.rs` against the real `node`, `python3`, `pk` and `rustc`, and for Python through a whole `cowproof run`: a Node module and a Python module each with one trap (JavaScript lists integer-like keys first; Python rounds the tie 0.125 to 0.12 and sums `0.1 + 0.2` to `0.30000000000000004`), the fixtures captured through the adapters, a right Rust port that passes at epsilon 0 and a wrong one that is refuted. Those tests skip with a printed note when `node` or `python3` is missing, and fail under `COWPROOF_REQUIRE_RUNTIMES=1`. The tests that read `fixtures/port-adapters/` run in the workspace only (the published crate does not contain it): without the workspace they print a skip, and fail under `COWPROOF_WORKSPACE_TESTS=1`, which CI sets. The adapter-alone tests take the adapter from the embedded copy (`pk port adapter --out`) and run in the published crate too.
 
-Not built yet: whole-process capture (`pk port exec`) for shell scripts and other languages, with `port.adapter = "process"`; see docs/backlog.md. `fixtures/port/` is a worked example with a shell reference (a Rust port, held-out cases) that `crates/cowproof-cli/tests/port_packets.rs` runs end to end.
+### Process capture: shell scripts and other executables
+
+A script has no function to call, so it is captured as a whole process. `pk port exec` runs the reference once per case in a fresh directory, network denied, and the fixture records everything the process did; `pk port wrap` runs the Rust port in the same harness and answers the same record, so `pk port replay` compares like with like.
+
+```sh
+# reference/greet.sh: reads a file, asks git for a revision, writes a file, deletes one.
+cowproof pk port exec --cmd 'sh "$PORTKIT_SRC/reference/greet.sh"' \
+  --cases ports/greet/cases.jsonl --out ports/greet/fixtures \
+  --path-root '$ROOT' --path-root '$HOME' --path-root '$TMP'
+```
+
+One line of `cases.jsonl`, and what the fixture's `expected` holds for it:
+
+```json
+{"tool":"greet","id":"basic","input":{"argv":["name.txt"],"files":{"name.txt":"world\n","stale.txt":"old\n"},"shims":{"git":[{"argv":["rev-parse","--short","HEAD"],"stdout":"abc1234\n"}]}}}
+{"exit":0,"stdout":"wrote $ROOT/greeting.txt\n","stderr":"",
+ "files_after":{"greeting.txt":{"sha256":"bd3b...","mode":420,"size":24,"content":"hello world\nrev abc1234\n"},"name.txt":{"...":"..."}},
+ "deleted":["stale.txt"],
+ "calls":[{"program":"git","argv":["rev-parse","--short","HEAD"],"env":{},"stdin":null}]}
+```
+
+| `input` field | Meaning |
+| --- | --- |
+| `argv` | arguments after the command (the command is a shell fragment; the arguments are appended as `"$@"`) |
+| `env` | variables on top of the pinned environment (below). `env` on the case itself (outside `input`) is capture-only, recorded beside the fixture |
+| `stdin` | text on the process's stdin |
+| `files` | files written into the root before the run: `"path": "text"` or `"path": {"content": "..", "mode": 493}` (mode defaults to 0o644; paths are relative, no `..`) |
+| `shims` | the external programs the case declares, each with scripted responses `{argv?, exit, stdout, stderr, read_stdin, repeat}` |
+| `record_env` | variable names each recorded call carries |
+
+| `expected` field | Meaning |
+| --- | --- |
+| `exit`, `stdout`, `stderr` | the process's, with the declared path roots substituted |
+| `files_after` | every file in the root after the run: `{sha256, mode, size}` and, up to 4096 bytes of UTF-8, `content`. A symlink is `{"link": target}`, an empty directory `{"dir": true}`. A text file is hashed after the substitution (a file that holds the root's path hashes the same in every run); a binary file as it is. SHA-256, lowercase hex |
+| `deleted` | the files the case materialised that are gone |
+| `calls` | `{program, argv, env, stdin}` for each call to a declared program, in order |
+
+**The harness.** The reference runs with `cwd = $ROOT`, `HOME = $ROOT/home`, `TMPDIR = $ROOT/tmp`, `umask 022`, and an environment that is built, not inherited: `PATH` (the shims, then `/usr/bin:/bin`; `--path` changes the second part), `TZ=UTC`, `LANG=C.UTF-8`, `LC_ALL=C.UTF-8`, `PYTHONHASHSEED=0`, `NODE_OPTIONS=`, `PORTKIT_SRC` (the directory the reference lives in, `--src`), then `--env KEY=VALUE`, the case's `env`, the input's `env`, later winning. It runs under cowproof's own sandbox (the capture policy: writes only to its root, network denied: Seatbelt `(deny network*)` on macOS, bubblewrap `--unshare-net` on Linux), or, when `pk` is already inside one (`COWPROOF_SANDBOXED=1`, as in the verifier), inside that one. Before any case the harness shows the network is gone: a listener on `127.0.0.1` is held outside, and a probe run the way a case is run tries to connect (inside an existing sandbox it checks what that sandbox leaves: no socket on macOS, no interface but loopback on Linux). If the network is reachable, or the probe cannot run, nothing is captured. `--sandbox auto|own|inherited` chooses; there is no way to run unconfined.
+
+**Shims.** Each program a case declares is a small `sh` script first on `PATH` that logs the call to `calls` and answers from the next unused scripted response whose `argv`, when it names one, equals the call's (`repeat: true` never uses a response up). A call nothing answers exits 127 and fails the capture. `date` is shimmed unless the case scripts it: with `PORTKIT_NOW` (RFC 3339) in the case's `env` it answers from that instant in UTC (`date [-u] [+FORMAT]`, with the usual `%Y %m %d %H %M %S %j %a %b %s %F %T` and a few more); without it it fails and the capture is refused.
+
+**Never a flaky fixture.** Each case runs twice (`--repeat N`), in two roots, and is refused if the runs differ after the substitution, naming the first field (`not deterministic: run 1 and run 2 differ at "/stdout"`). A case is also refused if the reference called a program the case did not script, read the clock through `date` with no `PORTKIT_NOW`, exited non-zero without `expect_error`, or exited 0 with it. `expect_error: true` on a case records the failure as its fixture (G4); on `pk port capture` it records `{"error": {"exit": N, "message": "<first line of stderr>"}}`, and a port that fails is compared as the same envelope (`exited with exit status: N: <first stderr line>` read back from the plugin's failure).
+
+**`path_roots`.** `--path-root $ROOT|$HOME|$TMP|$SRC` (declared in a packet as `port.parity.path_roots`) replaces that run's directory with the token wherever it stands as a whole path in stdout, stderr, file text and call arguments. The fixture records `"normalized": {"name": "path-roots", "version": 1, "roots": [..]}`; a replay refuses a fixture whose normalizer or version it does not know (an error, not a pass). `port-nondeterministic-output` does not flag a path written under a token.
+
+**The port.** The Rust port is a normal program that takes the same arguments and works in its current directory. Register it as a plugin that is `pk port wrap`:
+
+```toml
+[[plugin]]
+command = "cowproof"
+args = ["pk", "port", "wrap", "--tool", "greet", "--exe", "target/greet",
+        "--path-root", "$ROOT", "--path-root", "$HOME", "--path-root", "$TMP"]
+```
+
+`wrap` materialises the case's `files`, puts the same shims first on `PATH` (so the port must call `git` through `PATH`), runs the port once, and prints the envelope. A port that writes another file, calls `git` with other arguments or exits with another status is refuted on `/files_after/...`, `/calls/0/argv/...` or `/exit`. A packet that uses it: `"lang": "shell"`, `"adapter": "process"`, `"reference": {"cmd": "sh \"$PORTKIT_SRC/reference/greet.sh\""}`, `"parity": {"path_roots": ["$ROOT", "$HOME", "$TMP"]}`; the verifier captures the director's held-out cases with `pk port exec` in its own sandbox and replays them through the plugin.
+
+**Platforms.** Linux and macOS, the same flow. What differs: the utilities are the host's (BSD on macOS, GNU on Linux; the shell is `/bin/sh`, dash on Debian and Ubuntu), so a script that depends on their output is captured on the platform it will be verified on (each fixture's `source` names the OS); on macOS the clock cannot be pinned for system binaries (System Integrity Protection blocks interposition), so only the `date` shim pins it and a script that reads the clock any other way (`find -newer`, `ls -l`, `printf '%(..)T'`, a program that calls `time()`) is caught only by the run-twice comparison, which can miss a clock that moves slowly; `sandbox-exec` cannot nest, so inside the verifier the run inherits the sandbox. `$RANDOM`, `mktemp` names and process ids are not pinned: a script that prints them is refused by the run-twice comparison. Windows is not supported.
+
+Tests: `crates/cowproof-cli/tests/port_process.rs`, on `fixtures/port-process/` (the script, its three cases and fixtures, a held-out set and the packet): capture with files, deletions, a scripted `git`, a substituted path and a must-reject case; a right Rust port passing on both surfaces and wrong ones refuted on `files_after`, `calls` and `exit`; the network probe; the refusals; and a whole `cowproof run` that proves the packet and one that refutes a wrong port. They need `sandbox-exec` or `bwrap` (skipped with a note without; `COWPROOF_REQUIRE_SANDBOX=1` makes that a failure), and the example runs in the workspace only. `fixtures/port/` is the older worked example with a shell reference captured as a function (`pk port capture`) that `crates/cowproof-cli/tests/port_packets.rs` runs end to end.
 
 ## Run a lane on another machine
 

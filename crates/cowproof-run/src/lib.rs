@@ -436,6 +436,11 @@ impl SandboxPolicy {
     /// Apply `env_set` to a child environment, replacing an existing value for
     /// the same key.
     pub fn apply_env(&self, env: &mut Vec<(String, String)>) {
+        // A process in a sandbox says so: a tool that wants a confinement of its own (the
+        // process harness of `pk port exec`) inherits this one instead of nesting a second,
+        // which macOS does not allow, and then shows the network is gone.
+        env.retain(|(k, _)| k != SANDBOXED_ENV);
+        env.push((SANDBOXED_ENV.to_string(), "1".to_string()));
         for (k, v) in self.env_set.iter().chain(self.rustup.vars().iter()) {
             match env.iter_mut().find(|(ek, _)| ek == k) {
                 Some(slot) => slot.1 = v.clone(),
@@ -444,6 +449,9 @@ impl SandboxPolicy {
         }
     }
 }
+
+/// Set to `1` in the environment of every process a [`SandboxPolicy`] starts.
+pub const SANDBOXED_ENV: &str = "COWPROOF_SANDBOXED";
 
 /// The directories of a fetched `CARGO_HOME` that the verifier gets (D6): the
 /// registry index, `.crate` files and unpacked sources, and git dependencies.
@@ -1560,7 +1568,26 @@ mod tests {
         // The real value is replaced, not duplicated; the policy's other
         // variables (the temp directories) are added once each.
         assert_eq!(env.iter().filter(|(k, _)| k == "CARGO_HOME").count(), 1);
-        assert_eq!(env.len(), 2 + policy.env_set.len() - 1);
+        // The sandbox marker is added once as well.
+        assert_eq!(env.len(), 2 + policy.env_set.len() - 1 + 1);
+        assert_eq!(env.iter().filter(|(k, _)| k == SANDBOXED_ENV).count(), 1);
+    }
+
+    #[test]
+    fn every_sandboxed_process_is_told_it_is_in_one() {
+        let lane = test_lane();
+        for policy in [
+            SandboxPolicy::builder(&lane, NetworkMode::None),
+            SandboxPolicy::capture(&lane),
+            SandboxPolicy::verifier(&lane, Path::new("/nonexistent-cp/cache")),
+            SandboxPolicy::run_check(&lane),
+        ] {
+            // Whatever the caller had, the value is `1`, and there is one of it.
+            let mut env = vec![(SANDBOXED_ENV.to_string(), "0".to_string())];
+            policy.apply_env(&mut env);
+            let marks: Vec<_> = env.iter().filter(|(k, _)| k == SANDBOXED_ENV).collect();
+            assert_eq!(marks, [&(SANDBOXED_ENV.to_string(), "1".to_string())]);
+        }
     }
 
     // The director's rustup home reaches every sandbox that may run Rust tools.

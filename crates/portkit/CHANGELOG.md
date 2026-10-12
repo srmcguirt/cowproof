@@ -6,6 +6,30 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- `pk port exec`: capture a script or any executable as a whole process, in a fresh
+  root with the network denied, a built environment, `umask 022`, PATH shims with
+  scripted responses for the external programs a case declares, and a `date` shim
+  pinned by `PORTKIT_NOW`. The fixture records
+  `{exit, stdout, stderr, files_after, deleted, calls}`. Each case runs twice and a
+  case whose runs differ is refused. `pk port wrap` runs a Rust port in the same
+  harness as a plugin, so `pk port replay` compares like with like.
+- `path_roots` substitution for process captures (`path-roots` v1: `$ROOT`, `$HOME`,
+  `$TMP`, `$SRC`), recorded in the fixture as `normalized` and refused at replay when
+  the name or version is unknown.
+- `pk port capture --cwd`, `--env` and `--clear-env`, and `env` on a case (recorded
+  with the fixture), so a fixture does not depend on the capturing shell.
+- `expect_error` on a case: a reference that fails on a "must reject" case is recorded
+  as `{"error": {"exit": N, "message": ".."}}`, and a port's failure is compared as the
+  same envelope.
+
+### Changed
+
+- The commands that never read the registry (`port capture`, `port exec`, `port wrap`,
+  `port adapter` and the harness's own) no longer build it, so a plugin that is
+  `pk port wrap` cannot discover itself.
+
 ## [0.1.0]
 
 Initial release.

@@ -1,0 +1,30 @@
+{
+  "tool": "greet",
+  "id": "missing",
+  "input": {
+    "argv": [
+      "absent.txt"
+    ]
+  },
+  "expected": {
+    "exit": 2,
+    "stdout": "",
+    "stderr": "no such file: absent.txt\n",
+    "files_after": {},
+    "deleted": [],
+    "calls": []
+  },
+  "captured_at": "2026-10-12T09:03:17.879302Z",
+  "source": "sh \"$PORTKIT_SRC/reference/greet.sh\" (pk port exec, macos)",
+  "note": "a must-reject case: the script exits 2",
+  "expect_error": true,
+  "normalized": {
+    "name": "path-roots",
+    "version": 1,
+    "roots": [
+      "$HOME",
+      "$ROOT",
+      "$TMP"
+    ]
+  }
+}

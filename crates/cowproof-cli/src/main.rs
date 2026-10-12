@@ -397,7 +397,7 @@ enum HostAction {
 async fn main() -> std::process::ExitCode {
     match Args::parse().command {
         // The portkit commands own their exit codes, so they bypass `dispatch`.
-        Action::Pk { args } => cowproof_cli::pk::run(args).await,
+        Action::Pk { args } => cowproof_cli::pk::run_via_cowproof(args).await,
         Action::Read { args } => portkit_read::run(args),
         command => match dispatch(command).await {
             Ok(()) => std::process::ExitCode::SUCCESS,

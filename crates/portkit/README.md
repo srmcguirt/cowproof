@@ -515,7 +515,9 @@ Or in `claude_desktop_config.json`:
 | `pk schema <tool>` | Print a tool's JSON Schema |
 | `pk run <tool>` | Call a tool (`--input`, `-a k=v`, `--through-mcp`) |
 | `pk serve` | Serve MCP over stdio |
-| `pk port capture` | Record fixtures from the reference implementation |
+| `pk port capture` | Record fixtures from the reference implementation (`--cwd`, `--env`, `--clear-env`) |
+| `pk port exec` | Record fixtures from a script or executable as a whole process (files, calls, exit; network denied) |
+| `pk port wrap` | Run a Rust port in the same harness, as a plugin |
 | `pk port replay` | Replay fixtures (`--surface`, `--epsilon`, `--json`) |
 | `pk config` | Show effective configuration |
 | `pk completion <shell>` | Generate a completion script |

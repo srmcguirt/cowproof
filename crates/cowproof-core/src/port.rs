@@ -37,9 +37,16 @@ pub const PORT_LANGS: [&str; 9] = [
 
 /// The capture adapters (`port.adapter`): `function` is an adapter file in the source
 /// repository that makes a function speak portkit's JSON contract, so the reference command is
-/// required; `process` captures a whole script (a later step, see the backlog). Both are
-/// recorded and checked; capture itself runs `reference.cmd` through `sh -c` either way.
+/// required; `process` captures a whole script or executable with `pk port exec` (the
+/// reference command is the script's command line, the cases' `input` is `{argv, env, stdin,
+/// files, shims}`, and the port is replayed through `pk port wrap`).
 pub const PORT_ADAPTERS: [&str; 2] = ["function", "process"];
+
+/// The `port.parity.path_roots` tokens a process capture substitutes in its output (portkit's
+/// `path-roots` v1): `$ROOT` the directory the process ran in, `$HOME` and `$TMP` its `home/`
+/// and `tmp/`, `$SRC` the directory the reference lives in. Any other entry is a plain path
+/// prefix (read by lint only); an entry that starts with `$` and is not one of these is an error.
+pub const PATH_ROOT_TOKENS: [&str; 4] = ["$ROOT", "$HOME", "$TMP", "$SRC"];
 
 /// The project's default epsilon when `cowproof.toml` has no `[port] epsilon`: exact.
 pub const DEFAULT_PORT_EPSILON: f64 = 0.0;
@@ -96,8 +103,10 @@ pub struct PortParity {
     pub ignore_paths: Vec<String>,
     /// Compare arrays as multisets.
     pub unordered_arrays: bool,
-    /// Path prefixes (or `$ROOT`, `$HOME`, `$TMP`) a process adapter substitutes in outputs.
-    /// Today they only tell lint that a path in a fixture is declared.
+    /// Path prefixes, or the tokens `$ROOT`, `$HOME`, `$TMP`, `$SRC`
+    /// ([`PATH_ROOT_TOKENS`]). The tokens are what `pk port exec` substitutes in a process
+    /// capture (`path-roots` v1) and what the port's `pk port wrap` substitutes the same way;
+    /// lint reads all of them as declared paths.
     pub path_roots: Vec<String>,
 }
 
@@ -182,6 +191,12 @@ impl PortSpec {
         for root in &self.parity.path_roots {
             if root.is_empty() {
                 bail!("port.parity.path_roots must not hold an empty entry");
+            }
+            if root.starts_with('$') && !PATH_ROOT_TOKENS.contains(&root.as_str()) {
+                bail!(
+                    "port.parity.path_roots: {root:?} is not a root this version substitutes ({}); a path prefix does not start with $",
+                    PATH_ROOT_TOKENS.join(", ")
+                );
             }
         }
         Ok(())

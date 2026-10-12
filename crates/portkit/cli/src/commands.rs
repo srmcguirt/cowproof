@@ -18,6 +18,7 @@ use portkit_core::trace::{
 };
 use portkit_core::{Config, Error, Registry, Result};
 use portkit_mcp::{McpServer, ServerInfo};
+use portkit_port::process::exec::{capture_process, ExecConfig};
 use portkit_port::{capture, replay, CaptureOptions, ReplayOptions, ReplayReport, Surface};
 
 use crate::{Cli, PortCommand, Shell, SurfaceArg, Transport};
@@ -189,11 +190,17 @@ pub async fn port(registry: &Registry, config: &Config, command: PortCommand) ->
             cases,
             out,
             fail_fast,
+            cwd,
+            env,
+            clear_env,
         } => {
-            let opts = CaptureOptions {
-                command: cmd,
-                fail_fast,
-            };
+            let mut opts = CaptureOptions::new(cmd).with_clear_env(clear_env);
+            opts.fail_fast = fail_fast;
+            opts.cwd = cwd;
+            for pair in &env {
+                let (key, value) = split_env(pair)?;
+                opts = opts.with_env(key, value);
+            }
             let report = capture(&cases, &out, &opts).await?;
 
             for case in &report.captured {
@@ -214,6 +221,24 @@ pub async fn port(registry: &Registry, config: &Config, command: PortCommand) ->
 
             Ok(exit_code(report.is_success()))
         }
+
+        PortCommand::Exec(args) => port_exec(args).await,
+
+        PortCommand::Wrap(args) => port_wrap(args).await,
+
+        PortCommand::Shim {
+            dir,
+            state,
+            program,
+            args,
+        } => {
+            let status = portkit_port::process::shim::run_shim(&dir, &state, &program, &args)?;
+            Ok(ExitCode::from(u8::try_from(status).unwrap_or(1)))
+        }
+
+        PortCommand::NetProbe { addr } => Ok(ExitCode::from(
+            u8::try_from(portkit_port::process::exec::net_probe(&addr)).unwrap_or(1),
+        )),
 
         PortCommand::Adapter { lang, out, force } => port_adapter(&lang, out, force),
 
@@ -445,6 +470,100 @@ fn unknown_tool(registry: &Registry, tool: &str) -> Error {
 }
 
 /// `pk port adapter`: the shipped capture adapter for `lang`, on stdout or in `out`.
+fn split_env(pair: &str) -> Result<(String, String)> {
+    match pair.split_once('=') {
+        Some((key, value)) if !key.is_empty() => Ok((key.to_string(), value.to_string())),
+        _ => Err(Error::other(format!(
+            "--env {pair:?}: expected KEY=VALUE with a non-empty KEY"
+        ))),
+    }
+}
+
+/// The harness configuration the command line asks for.
+fn harness_config(command: String, args: &crate::HarnessArgs) -> Result<ExecConfig> {
+    use portkit_port::process::exec::{confinement_for, SandboxMode};
+
+    let cwd = std::env::current_dir()?;
+    let src = match &args.src {
+        Some(src) if src.is_absolute() => src.clone(),
+        Some(src) => cwd.join(src),
+        None => cwd,
+    };
+    let src = src
+        .canonicalize()
+        .map_err(|e| Error::other(format!("--src {}: {e}", src.display())))?;
+    let mode = match args.sandbox {
+        crate::SandboxArg::Auto => SandboxMode::Auto,
+        crate::SandboxArg::Own => SandboxMode::Own,
+        crate::SandboxArg::Inherited => SandboxMode::Inherited,
+    };
+    let confinement = confinement_for(mode).map_err(Error::other)?;
+    let mut cfg = ExecConfig::new(command, src, confinement);
+    cfg.path = args.path.clone();
+    cfg.path_roots = args.path_root.clone();
+    for pair in &args.env {
+        cfg.env.push(split_env(pair)?);
+    }
+    if let Some(dir) = &args.work_dir {
+        cfg.work_parent = dir.clone();
+    }
+    if let Some(secs) = args.timeout {
+        cfg.timeout = std::time::Duration::from_secs(secs.max(1));
+    }
+    cfg.keep_work = args.keep_work;
+    cfg.validate().map_err(Error::other)?;
+    Ok(cfg)
+}
+
+async fn port_exec(args: crate::ExecArgs) -> Result<ExitCode> {
+    let cfg = harness_config(args.cmd.clone(), &args.harness)?;
+    let report = capture_process(&args.cases, &args.out, &cfg, args.repeat, args.fail_fast).await?;
+    for case in &report.captured {
+        println!("  captured  {}/{}", case.tool, case.id);
+    }
+    for failure in &report.failures {
+        eprintln!(
+            "  FAILED    {}/{} — {}",
+            failure.tool, failure.id, failure.reason
+        );
+    }
+    println!(
+        "\n  {} captured, {} failed → {}",
+        report.captured.len(),
+        report.failures.len(),
+        args.out.display()
+    );
+    Ok(exit_code(report.is_success()))
+}
+
+async fn port_wrap(args: crate::WrapArgs) -> Result<ExitCode> {
+    if args.portkit_spec {
+        portkit_port::process::exec::print_json(&portkit_port::process::exec::wrap_spec(
+            &args.tool,
+        ))?;
+        return Ok(ExitCode::SUCCESS);
+    }
+    let command = match (&args.exe, &args.cmd) {
+        (Some(exe), None) => {
+            let exe = exe
+                .canonicalize()
+                .map_err(|e| Error::other(format!("--exe {}: {e}", exe.display())))?;
+            format!("'{}'", exe.to_string_lossy().replace('\'', "'\\''"))
+        }
+        (None, Some(cmd)) => cmd.clone(),
+        _ => {
+            return Err(Error::other(
+                "pk port wrap needs the port: --exe <file> or --cmd <command>",
+            ))
+        }
+    };
+    let cfg = harness_config(command, &args.harness)?;
+    let request = portkit_port::process::exec::read_stdin()?;
+    let envelope = portkit_port::process::exec::serve_request(&cfg, &request).await?;
+    portkit_port::process::exec::print_json(&envelope)?;
+    Ok(ExitCode::SUCCESS)
+}
+
 fn port_adapter(lang: &str, out: Option<PathBuf>, force: bool) -> Result<ExitCode> {
     let Some(adapter) = portkit_port::adapters::adapter_for(lang) else {
         let known: Vec<&str> = portkit_port::adapters::ADAPTERS

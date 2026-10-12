@@ -260,3 +260,24 @@ fn held_out_port_cases_name_a_file_beside_the_held_out_file() {
         assert!(load(&path).is_err(), "{bad}");
     }
 }
+
+#[test]
+fn path_roots_are_prefixes_or_the_tokens_a_process_capture_substitutes() {
+    // The four tokens, and plain prefixes, are accepted.
+    let mut header = full();
+    header["port"]["parity"]["path_roots"] = json!(["$ROOT", "$HOME", "$TMP", "$SRC", "/usr/lib"]);
+    let spec = parse_header(&text(&header)).unwrap().port.unwrap();
+    assert_eq!(spec.parity.path_roots.len(), 5);
+
+    // A `$` word that is not one of them would be a substitution nobody implements.
+    for bad in ["$ELSEWHERE", "$root", "$"] {
+        let mut header = full();
+        header["port"]["parity"]["path_roots"] = json!([bad]);
+        let error = error_of(&header);
+        assert!(
+            error.contains("path_roots") && error.contains(bad),
+            "{bad}: {error}"
+        );
+        assert!(error.contains("$ROOT, $HOME, $TMP, $SRC"), "{error}");
+    }
+}

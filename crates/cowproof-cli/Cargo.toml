@@ -44,6 +44,7 @@ portkit-core.workspace = true
 portkit-cli.workspace = true
 portkit-mcp.workspace = true
 portkit-plugin.workspace = true
+portkit-port.workspace = true
 portkit-read.workspace = true
 tempfile.workspace = true
 

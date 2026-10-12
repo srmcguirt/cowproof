@@ -1,0 +1,7 @@
+# The generic flaw pack is on, so the flaws gate really runs over every patch.
+[proof]
+packs = ["generic"]
+
+# Port packets compare exactly unless a packet says otherwise (and lint refuses a looser one).
+[port]
+epsilon = 0.0

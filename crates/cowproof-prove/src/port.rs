@@ -68,6 +68,10 @@ pub struct PortCapsule {
     pub epsilon: f64,
     pub ignore_paths: Vec<String>,
     pub unordered_arrays: bool,
+    /// The declared `path_roots` of a process capture: what the held-out cases are captured
+    /// with (`--path-root`), so they are substituted the way the fixtures were.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub path_roots: Vec<String>,
     /// What the replay found. `None` until the verifier has run.
     #[serde(default)]
     pub result: Option<PortResult>,
@@ -85,6 +89,7 @@ impl PortCapsule {
             epsilon,
             ignore_paths: spec.parity.ignore_paths.clone(),
             unordered_arrays: spec.parity.unordered_arrays,
+            path_roots: spec.parity.path_roots.clone(),
             result: None,
         }
     }
@@ -219,7 +224,7 @@ pub fn fixture_set_hash(dir: &Path) -> std::io::Result<(String, usize)> {
 }
 
 /// `word` as one shell word, single-quoted.
-fn sh_quote(word: &str) -> String {
+pub(crate) fn sh_quote(word: &str) -> String {
     format!("'{}'", word.replace('\'', "'\\''"))
 }
 
@@ -721,13 +726,18 @@ async fn held_out(run: &PortRun<'_>) -> Result<PortHeldOut, VerifyError> {
         .map_err(|e| infra(format!("{HELDOUT_PORT_CASES_FILE}: {e}")))?;
     let fixtures = out_dir.join("heldout-fixtures");
     let _ = fs::remove_dir_all(&fixtures);
-    let capture = format!(
-        "{} pk port capture --cmd {} --cases {} --out {}",
-        sh_quote(&run.pk_exe.to_string_lossy()),
-        sh_quote(&reference_command(reference)),
-        sh_quote(&cases.to_string_lossy()),
-        sh_quote(&fixtures.to_string_lossy()),
-    );
+    let capture = if run.spec.adapter == "process" {
+        // A script is captured whole, by `pk port exec` (port_exec.rs).
+        crate::port_exec::capture_command(run.spec, reference, run.pk_exe, &cases, &fixtures)
+    } else {
+        format!(
+            "{} pk port capture --cmd {} --cases {} --out {}",
+            sh_quote(&run.pk_exe.to_string_lossy()),
+            sh_quote(&reference_command(reference)),
+            sh_quote(&cases.to_string_lossy()),
+            sh_quote(&fixtures.to_string_lossy()),
+        )
+    };
     let outcome = run
         .runner
         .run(run.tree, &capture, run.timeout)

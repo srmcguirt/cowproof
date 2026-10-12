@@ -1,0 +1,3 @@
+{"tool":"greet","id":"basic","input":{"argv":["name.txt"],"files":{"name.txt":"world\n","stale.txt":"old\n"},"shims":{"git":[{"argv":["rev-parse","--short","HEAD"],"stdout":"abc1234\n"}]}},"note":"reads a file, writes another, deletes one, asks git, prints a path"}
+{"tool":"greet","id":"loose","input":{"argv":["name.txt"],"files":{"name.txt":"moon\n"},"shims":{"git":[{"stdout":"def5678\n","repeat":true}]}},"note":"git answers whatever it is asked, so only the recorded calls pin its argv"}
+{"tool":"greet","id":"missing","input":{"argv":["absent.txt"]},"expect_error":true,"note":"a must-reject case: the script exits 2"}
