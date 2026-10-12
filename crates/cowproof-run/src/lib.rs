@@ -12,6 +12,7 @@
 //! any caller edits to the policy, and only the resolved path is emitted.
 
 pub mod bridge;
+pub mod cache;
 pub mod claude;
 pub mod codex;
 pub mod deps;

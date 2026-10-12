@@ -25,10 +25,14 @@
 //! * **Cache root**: `~/.cache/cowproof`, or the directory named by the environment
 //!   variable `COWPROOF_CACHE_ROOT` ([`CACHE_ROOT_ENV`]). Tests set it so they never touch
 //!   the real cache.
+//! * **Upkeep**: every hit and install takes a lease and touches a use marker in the entry,
+//!   and `cowproof cache prune` removes the unused (see [`crate::cache`]); a fetch also
+//!   clears the stale work directories of interrupted runs.
 //! * **What is covered**: Cargo only. A tree with a `Cargo.lock` is fetched; a tree
 //!   without one has nothing to fetch and no cache entry. npm and the others are in the
 //!   backlog, not here.
 
+use crate::cache::{self, Alive};
 use crate::{
     LaneLayout, NetworkMode, REGISTRY_CONFIGS, SandboxPolicy, dependency_cache_key,
     render_macos_profile, sandbox_command,
@@ -223,27 +227,52 @@ pub fn prefetch(
     network: FetchNetwork,
     tools: &FetchTools,
     timeout: Duration,
+    alive: Alive,
 ) -> Result<Option<Prefetch>> {
     let work_root = cache_root.join("deps-work");
     fs::create_dir_all(&work_root).context("creating the dependency work directory")?;
     fs::create_dir_all(cache_root.join("deps")).context("creating the dependency cache")?;
+    // A `cowproof` that was interrupted left its work directory behind (nothing removes it
+    // but the run that made it): clear the ones whose process is gone. Best effort, and
+    // never a directory whose process is alive.
+    let _ = cache::remove_stale_work(cache_root, &lane.real_home, alive);
     let stamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
     let work = work_root.join(format!("{}-{stamp}", std::process::id()));
     fs::create_dir(&work).context("creating the dependency work directory")?;
-    let result = prefetch_in(&work, rebuild, cache_root, lane, network, tools, timeout);
+    let run = FetchRun {
+        lane,
+        network,
+        tools,
+        timeout,
+        alive,
+    };
+    let result = prefetch_in(&work, rebuild, cache_root, &run);
     let _ = fs::remove_dir_all(&work);
     result
+}
+
+/// What one [`prefetch`] call runs with.
+struct FetchRun<'a> {
+    lane: &'a LaneLayout,
+    network: FetchNetwork,
+    tools: &'a FetchTools,
+    timeout: Duration,
+    alive: Alive<'a>,
 }
 
 fn prefetch_in(
     work: &Path,
     rebuild: impl FnOnce(&Path) -> Result<()>,
     cache_root: &Path,
-    lane: &LaneLayout,
-    network: FetchNetwork,
-    tools: &FetchTools,
-    timeout: Duration,
+    run: &FetchRun,
 ) -> Result<Option<Prefetch>> {
+    let FetchRun {
+        lane,
+        network,
+        tools,
+        timeout,
+        alive,
+    } = *run;
     let tree = work.join("tree");
     fs::create_dir(&tree)?;
     rebuild(&tree).context("rebuilding the tree to fetch dependencies for")?;
@@ -260,26 +289,48 @@ fn prefetch_in(
         }))
     };
 
-    match entry_state(&dir) {
-        EntryState::Complete => return done(FetchOutcome::Hit),
-        EntryState::Absent => {}
-        EntryState::Incomplete => {
-            return done(FetchOutcome::Failed(format!(
-                "the cache entry {} exists but is incomplete; remove it",
-                dir.display()
-            )));
+    // A hit or an install is a USE of the entry: it takes this process's lease and
+    // touches the use marker (`cache::claim`), so a prune neither removes an entry a run is
+    // about to mount nor mistakes it for unused. `cowproof run` and `cowproof verify` both
+    // mount what this function returns, so this is the one place.
+    let claim = || cache::claim(&dir, std::process::id(), alive);
+    // An entry a prune removed between the look and the claim is looked at again.
+    for _ in 0..3 {
+        match entry_state(&dir) {
+            EntryState::Complete => match claim() {
+                Ok(()) => return done(FetchOutcome::Hit),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return done(FetchOutcome::Failed(claim_failure(&dir, &e))),
+            },
+            EntryState::Absent => break,
+            EntryState::Incomplete => {
+                return done(FetchOutcome::Failed(format!(
+                    "the cache entry {} exists but is incomplete; remove it",
+                    dir.display()
+                )));
+            }
         }
     }
 
     let fresh = work.join("new");
     let outcome = match fetch_cargo(work, &tree, &fresh, lane, network, tools, timeout) {
         Ok(()) => match install(&fresh, &dir) {
-            Ok(outcome) => outcome,
+            Ok(outcome) => match claim() {
+                Ok(()) => outcome,
+                Err(e) => FetchOutcome::Failed(claim_failure(&dir, &e)),
+            },
             Err(e) => FetchOutcome::Failed(format!("{e:#}")),
         },
         Err(e) => FetchOutcome::Failed(format!("{e:#}")),
     };
     done(outcome)
+}
+
+fn claim_failure(dir: &Path, e: &std::io::Error) -> String {
+    format!(
+        "could not record the use of the cache entry {}: {e}",
+        dir.display()
+    )
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -647,6 +698,7 @@ mod tests {
             FetchNetwork::None,
             &tools,
             Duration::from_secs(5),
+            &|_| true,
         )
         .unwrap();
         assert!(got.is_none());
@@ -698,11 +750,62 @@ mod tests {
             FetchNetwork::None,
             &tools,
             Duration::from_secs(5),
+            &|_| true,
         )
         .unwrap()
         .unwrap();
         assert_eq!(got.outcome, FetchOutcome::Hit);
         assert_eq!(got.key, key);
         assert_eq!(got.dir, cache_dir(&root, &key));
+        // The hit is a use: this process holds a lease and the marker is fresh.
+        let entry = cache_dir(&root, &key);
+        assert!(
+            entry
+                .join(cache::LEASES)
+                .join(std::process::id().to_string())
+                .is_file()
+        );
+        let used = fs::metadata(entry.join(cache::LAST_USED))
+            .unwrap()
+            .modified()
+            .unwrap();
+        assert!(SystemTime::now().duration_since(used).unwrap() < Duration::from_secs(60));
+    }
+
+    #[test]
+    fn a_fetch_clears_the_work_directory_of_an_interrupted_run_and_only_that() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("cache");
+        let lane = LaneLayout {
+            clone: tmp.path().join("lane/clone"),
+            home: tmp.path().join("lane/home"),
+            scratch: tmp.path().join("lane/scratch"),
+            control: tmp.path().join("lane/control"),
+            real_home: tmp.path().join("home"),
+            sock: tmp.path().join("lane/sock/runner.sock"),
+            lanes_root: tmp.path().to_path_buf(),
+        };
+        let (dead, live) = (4_000_002u32, std::process::id());
+        let work = root.join("deps-work");
+        for name in [format!("{dead}-1"), format!("{live}-1")] {
+            fs::create_dir_all(work.join(name).join("tree")).unwrap();
+        }
+        let tools = FetchTools {
+            path: String::new(),
+            cargo: None,
+        };
+        let got = prefetch(
+            |_| Ok(()),
+            &root,
+            &lane,
+            FetchNetwork::None,
+            &tools,
+            Duration::from_secs(5),
+            &|pid| pid == live,
+        )
+        .unwrap();
+        assert!(got.is_none());
+        assert!(!work.join(format!("{dead}-1")).exists());
+        assert!(work.join(format!("{live}-1/tree")).is_dir());
     }
 }

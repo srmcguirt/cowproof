@@ -440,6 +440,22 @@ args = ["pk", "port", "wrap", "--tool", "greet", "--exe", "target/greet",
 
 Tests: `crates/cowproof-cli/tests/port_process.rs`, on `fixtures/port-process/` (the script, its three cases and fixtures, a held-out set and the packet): capture with files, deletions, a scripted `git`, a substituted path and a must-reject case; a right Rust port passing on both surfaces and wrong ones refuted on `files_after`, `calls` and `exit`; the network probe; the refusals; and a whole `cowproof run` that proves the packet and one that refutes a wrong port. They need `sandbox-exec` or `bwrap` (skipped with a note without; `COWPROOF_REQUIRE_SANDBOX=1` makes that a failure), and the example runs in the workspace only. `fixtures/port/` is the older worked example with a shell reference captured as a function (`pk port capture`) that `crates/cowproof-cli/tests/port_packets.rs` runs end to end.
 
+## The dependency cache: `cowproof cache`
+
+Before verify runs, `cowproof run` and `cowproof verify` fetch a lane's Cargo dependencies into a cache that the verifier mounts read-only: `~/.cache/cowproof/deps/<key>/`, or `$COWPROOF_CACHE_ROOT/deps/<key>/`. Nothing else removes an entry, so prune it.
+
+```
+cowproof cache                 # same as `cache ls`: root, entry count, total size, oldest last use
+cowproof cache ls
+cowproof cache prune [--older-than <days>] [--max-size <GiB>] [--dry-run]
+```
+
+- `prune` removes entries not used for `--older-than` days (default 30). With `--max-size`, it then removes the least recently used entries until the cache fits (fractions of a GiB are fine). `--dry-run` prints what it would remove and the bytes, and removes nothing.
+- An entry's **last use** is the modification time of `deps/<key>/.last-used`, touched whenever a fetch hits the entry, installs it, or hands it to a verifier. An entry from before the marker counts as last used when its directory was modified.
+- **A live run is never pruned.** Each use also writes a lease, `deps/<key>/leases/<pid>`, kept for the life of that `cowproof` process. `prune` skips an entry whose lease pid is alive (it prints `kept <key>: in use by pid N`), and a lease whose process is gone protects nothing. If the system cannot say whether a pid is alive, the lease counts as alive.
+- **Interrupted runs.** A directory in `deps-work/` is named `<pid>-<time>`. `prune` removes the ones whose pid is gone, and so does every fetch before it starts; one whose pid is alive is never touched.
+- Safety: it removes only under `<root>/deps` and `<root>/deps-work`, never follows a symlink (a link is removed as a link and its target is left alone), and refuses a cache root that is `/`, the home directory or not an absolute path. Exit 0 done; 1 refused or an entry could not be removed.
+
 ## Run a lane on another machine
 
 `cowproof run packet.md --host buildbox` runs the builder, and the checks it asks for, on another machine over SSH. Your machine stays the director: it keeps the escalation queue and your rulings, the egress proxy and so the API key, the held-out checks, the proof and the capsule. The host runs only what runs sandboxed. The key never leaves the director: no argument, spec, bundle or environment sent to the host holds it, and the builder on the host presents the lane's own `placeholder-...` key, which only your proxy accepts, through two sockets that SSH forwards from the host back to you.

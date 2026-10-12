@@ -185,6 +185,7 @@ pub(crate) async fn fetch_dependencies(
             network,
             &FetchTools { path, cargo },
             FETCH_TIMEOUT,
+            &crate::cache::alive,
         )
     })
     .await

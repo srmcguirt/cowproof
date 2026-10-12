@@ -21,6 +21,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+mod cache;
 mod codex;
 mod director_tools;
 mod doctor;
@@ -76,6 +77,11 @@ enum Action {
     /// when a lane could start. Exit codes: 0 no check failed (warnings do not count; a
     /// missing API key is a warning here and a failure for `run`); 1 a check failed.
     Doctor(doctor::DoctorArgs),
+    /// The dependency cache: `cowproof cache` (or `cache ls`) shows its size, `cache prune` removes the unused.
+    ///
+    /// `~/.cache/cowproof/deps`, or `$COWPROOF_CACHE_ROOT/deps`. Exit codes: 0 done; 1 the
+    /// cache root was refused or an entry could not be removed.
+    Cache(cache::CacheArgs),
     /// Reports over lanes: `cowproof report handback <lane-dir>` for one lane, `rollup` and `port-candidates` over many (D23, D28).
     Report(report::ReportArgs),
     Lint(LintArgs),
@@ -436,6 +442,13 @@ async fn dispatch(command: Action) -> Result<()> {
         }
         Action::Doctor(args) => {
             let code = doctor::doctor(args).await?;
+            if code != 0 {
+                std::process::exit(code);
+            }
+            Ok(())
+        }
+        Action::Cache(args) => {
+            let code = cache::run(args)?;
             if code != 0 {
                 std::process::exit(code);
             }
