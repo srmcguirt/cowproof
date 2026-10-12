@@ -18,7 +18,7 @@ mod common;
 #[path = "common/workspace.rs"]
 mod workspace;
 
-use common::{Lane, run_checks, sandbox_available, text};
+use common::{Lane, copy_tree, run_checks, sandbox_available, text, var_tmp};
 use cowproof_prove::Capsule;
 use serde_json::{Value, json};
 use std::fs;
@@ -415,6 +415,90 @@ fn a_verifier_without_the_reference_runtime_reports_held_out_skipped() {
     let result = capsule.port.unwrap().result.unwrap();
     assert_eq!(result.held_out.state, "skipped");
     assert_eq!(result.held_out.cases, 0);
+}
+
+/// The held-out port cases need a runtime nobody has, so the verifier skips them. The base
+/// commit's `cowproof.toml` is the fixture's, with `require_heldout = <value>` added under its
+/// `[proof]` table when `setting` is given.
+fn skipped_heldout_lane(setting: Option<bool>) -> Lane {
+    let project = var_tmp("cp-port-project-");
+    copy_tree(&fixture().join("project"), project.path());
+    let config = project.path().join("cowproof.toml");
+    let text = fs::read_to_string(&config).unwrap();
+    assert!(text.contains("[proof]\n"));
+    if let Some(value) = setting {
+        let line = format!("[proof]\nrequire_heldout = {value}\n");
+        fs::write(&config, text.replace("[proof]\n", &line)).unwrap();
+    }
+    // `from_project` copies and commits the tree before it returns; `project` can go after.
+    Lane::from_project(&honest(), project.path(), &|id| {
+        packet(id, &|t| {
+            t.replace(
+                "\"runtime\":\"sh\"",
+                "\"runtime\":\"no-such-runtime-cowproof>=1\"",
+            )
+        })
+    })
+}
+
+#[test]
+fn require_heldout_refuses_a_port_lane_whose_held_out_cases_were_skipped() {
+    if workspace::skipped("require_heldout_refuses_a_port_lane_whose_held_out_cases_were_skipped") {
+        return;
+    }
+    if !sandbox_available() {
+        return;
+    }
+    let lane = skipped_heldout_lane(Some(true));
+    let out = run(&lane);
+    assert_eq!(out.status.code(), Some(2), "{}", text(&out));
+    let verdict = lane.verdict();
+    assert_eq!(verdict["verdict"], "refuted", "{verdict}");
+    assert_eq!(verdict["failedGates"], json!(["held_out"]), "{verdict}");
+    let report = stdout(&out);
+    assert!(
+        report
+            .contains("held-out: skipped (the verifier's sandbox has no no-such-runtime-cowproof"),
+        "{report}"
+    );
+    assert!(report.contains("require_heldout"), "{report}");
+
+    // gates.json alone tells the truth: the held-out gate failed and names the skip.
+    let gates = gates(&lane);
+    assert_eq!(failed(&gates), vec!["held_out"], "{gates:?}");
+    let held = gate(&gates, "held_out");
+    assert_eq!(held["warned"], false, "{held}");
+    let evidence = held["evidence"].to_string();
+    assert!(evidence.contains("held-out: skipped"), "{evidence}");
+    assert!(evidence.contains("require_heldout"), "{evidence}");
+    // The port itself replayed green: only the setting refuses it.
+    assert_eq!(gate(&gates, "port_replay")["passed"], true);
+    let capsule = Capsule::read(&lane.capsule_dir()).unwrap();
+    assert_eq!(
+        capsule.port.unwrap().result.unwrap().held_out.state,
+        "skipped"
+    );
+}
+
+#[test]
+fn without_require_heldout_the_same_skip_is_only_a_warning() {
+    if workspace::skipped("without_require_heldout_the_same_skip_is_only_a_warning") {
+        return;
+    }
+    if !sandbox_available() {
+        return;
+    }
+    // No setting, and `require_heldout = false`, behave alike; the explicit one is run here
+    // and the unset case is `a_verifier_without_the_reference_runtime_reports_held_out_skipped`.
+    let lane = skipped_heldout_lane(Some(false));
+    let out = run(&lane);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    assert_eq!(lane.verdict()["verdict"], "proved");
+    let gates = gates(&lane);
+    assert!(failed(&gates).is_empty(), "{gates:?}");
+    let held = gate(&gates, "held_out");
+    assert_eq!(held["warned"], true, "{held}");
+    assert!(!held["evidence"].to_string().contains("require_heldout"));
 }
 
 #[test]

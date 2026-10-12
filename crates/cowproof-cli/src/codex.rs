@@ -368,6 +368,36 @@ pub(crate) struct CodexLaunch<'a> {
     pub unsandboxed: bool,
 }
 
+/// The clone's directories Codex would read project settings from, to be hidden from it: its
+/// `.codex` directory when the clone has one.
+///
+/// Codex 0.157.0 reads the clone's `.codex/` whatever the lane's own flags say: `config.toml`
+/// (the `[mcp_servers.*]` it names are started, programs the repository chose and the director
+/// did not), `hooks.json`, `agents/*.toml`, `rules/*.rules` and `skills/*/SKILL.md`. No switch
+/// turns that off. Denying only `config.toml` makes Codex exit ("Failed to read project config
+/// file: Operation not permitted"), but a denied or empty directory reads as absent and Codex
+/// runs as if the clone had none, so the whole directory is denied (read and write) in the
+/// builder's sandbox. The patch is taken from outside the sandbox and the checks and the
+/// verifier have their own policies, so they still see the directory; a lane cannot edit
+/// `.codex/` files, which a Codex lane has no business doing.
+///
+/// A `.codex` that is a symlink is refused: the sandbox resolves a deny to its target, which
+/// the repository chose. One that is a plain file is not read as a directory and is left alone.
+/// Without the OS sandbox (`unsandboxed`) nothing can be hidden.
+pub(crate) fn hidden_project_dirs(clone: &Path) -> Result<Vec<PathBuf>> {
+    let dir = clone.join(".codex");
+    match fs::symlink_metadata(&dir) {
+        Ok(meta) if meta.is_symlink() => bail!(
+            "{} is a symlink: the codex runtime hides the clone's .codex directory from the builder and will not follow a link a repository chose; remove the link or run the lane on another runtime",
+            dir.display()
+        ),
+        Ok(meta) if meta.is_dir() => Ok(vec![dir]),
+        Ok(_) => Ok(Vec::new()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(e) => Err(e).with_context(|| format!("inspecting {}", dir.display())),
+    }
+}
+
 /// The builder's command for a `codex` rung: the bridge wrapper, then Codex, under the builder
 /// sandbox policy with exactly the lane's environment. Not yet started. Writes the config and
 /// the prompt into the lane home first; a launch does so before EVERY start. The prompt file is
@@ -393,6 +423,7 @@ pub(crate) fn codex_builder_command(l: &CodexLaunch<'_>) -> Result<Command> {
     write_lane_files(&spec, &assembled.system_append, l.prompt)?;
 
     let invocation = codex_command(&spec)?;
+    let hidden = hidden_project_dirs(&l.layout.clone)?;
     runtime_command(
         &RuntimeSandbox {
             layout: l.layout,
@@ -402,6 +433,7 @@ pub(crate) fn codex_builder_command(l: &CodexLaunch<'_>) -> Result<Command> {
             network: l.network.clone(),
             runner_socket: l.runner_socket,
             port_base: l.port_base,
+            deny: &hidden,
             unsandboxed: l.unsandboxed,
         },
         l.codex_bin,
@@ -587,6 +619,27 @@ source = "a quote"
             )
             .is_empty()
         );
+    }
+
+    #[test]
+    fn the_clones_codex_directory_is_hidden_when_it_is_a_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let clone = dir.path();
+        assert!(hidden_project_dirs(clone).unwrap().is_empty(), "no .codex");
+        // A plain file named `.codex` is not a project directory to Codex.
+        fs::write(clone.join(".codex"), "x").unwrap();
+        assert!(hidden_project_dirs(clone).unwrap().is_empty());
+        fs::remove_file(clone.join(".codex")).unwrap();
+        fs::create_dir_all(clone.join(".codex")).unwrap();
+        assert_eq!(
+            hidden_project_dirs(clone).unwrap(),
+            vec![clone.join(".codex")]
+        );
+        // A link is refused, whatever it points at.
+        fs::remove_dir_all(clone.join(".codex")).unwrap();
+        std::os::unix::fs::symlink("/usr", clone.join(".codex")).unwrap();
+        let err = hidden_project_dirs(clone).unwrap_err().to_string();
+        assert!(err.contains("is a symlink"), "{err}");
     }
 
     #[test]

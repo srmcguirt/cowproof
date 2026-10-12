@@ -440,7 +440,7 @@ exit 0
 
 /// Copy the directory `from` to `to`, recursively (regular files and directories only).
 #[allow(dead_code)] // `Lane::from_project` uses it; the other test crates that share this module do not
-fn copy_tree(from: &Path, to: &Path) {
+pub fn copy_tree(from: &Path, to: &Path) {
     fs::create_dir_all(to).unwrap();
     for entry in fs::read_dir(from).unwrap() {
         let entry = entry.unwrap();

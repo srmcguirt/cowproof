@@ -170,7 +170,7 @@ The builder is untrusted. It may have read hostile content in the repository, an
 | Append-only | deleted assertions, emptied test files | exists |
 | Protected paths | edits to tests, fixtures or policies the packet must not touch | new |
 | Verifier re-run | checks the builder claimed but that fail when run independently | new |
-| Held-out checks | work that satisfies only the visible checks (idea: EvilGenie, SpecBench). A packet without held-out checks gets a warning, not a failure, unless the repository sets `require_heldout = true` | new |
+| Held-out checks | work that satisfies only the visible checks (idea: EvilGenie, SpecBench). A packet without held-out checks gets a warning, not a failure, unless the repository sets `require_heldout = true` (which also refuses a port lane whose held-out cases were skipped for want of the reference runtime) | new |
 | Flaw rules | known gaming patterns: swallowed exceptions in assertions, always-true policies, test-only code in production paths, secrets in URLs | exists as `lanes-report` `flaws.toml`; split into a generic pack and project packs |
 | Claimed vs. run | handoff checks the verifier never saw | exists in part |
 

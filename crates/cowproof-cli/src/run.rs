@@ -875,6 +875,9 @@ pub(crate) struct RuntimeSandbox<'a> {
     /// The builder tools socket, canonical (`COWPROOF_RUNNER_SOCKET`).
     pub runner_socket: &'a Path,
     pub port_base: u16,
+    /// Directories of the clone the runtime must not see, added to the builder policy's
+    /// denied paths (neither readable nor writable). Each must exist.
+    pub deny: &'a [PathBuf],
     /// Launch without the OS sandbox (trusted local experiments only).
     pub unsandboxed: bool,
 }
@@ -906,8 +909,9 @@ pub(crate) fn runtime_command(
 
     // The builder may execute the runtime and cowproof (the bridge wrapper and the MCP server).
     let executables = vec![bin.to_path_buf(), s.cowproof_exe.to_path_buf()];
-    let policy =
+    let mut policy =
         SandboxPolicy::builder_with_executables(s.layout, s.network.clone(), &executables)?;
+    policy.deny_paths.extend(s.deny.iter().cloned());
     let mut command = if s.unsandboxed {
         let mut env = process.env;
         policy.apply_env(&mut env);
@@ -4525,7 +4529,13 @@ async fn replay_and_gate(
     };
     match verify(&capsule_dir, input.repo, &verify_dir, &runner, options).await {
         Ok(report) => {
-            if let Err(e) = record_verify_results(&capsule_dir, &mut capsule, &report, evidence) {
+            if let Err(e) = record_verify_results(
+                &capsule_dir,
+                &mut capsule,
+                &report,
+                packet.require_heldout,
+                evidence,
+            ) {
                 evidence
                     .infrastructure
                     .push(format!("recording the verifier's results failed: {e:#}"));
@@ -4567,6 +4577,7 @@ fn record_verify_results(
     capsule_dir: &Path,
     capsule: &mut Capsule,
     report: &cowproof_prove::VerifyReport,
+    require_heldout: bool,
     evidence: &mut Evidence,
 ) -> Result<()> {
     if report.heldout.is_empty() && report.port.is_none() {
@@ -4579,7 +4590,12 @@ fn record_verify_results(
     };
     let mut gates: cowproof_prove::GateReport =
         serde_json::from_str(&text).context("reading gates.json")?;
-    cowproof_prove::record_verify_results(&mut gates, &report.heldout, report.port.as_ref());
+    cowproof_prove::record_verify_results(
+        &mut gates,
+        &report.heldout,
+        report.port.as_ref(),
+        require_heldout,
+    );
     fs::write(&path, serde_json::to_vec_pretty(&gates)?).context("writing gates.json")?;
     if let Some(port) = &report.port {
         if let Some(entry) = capsule.port.as_mut() {
@@ -4592,6 +4608,16 @@ fn record_verify_results(
             });
         }
         evidence.notes.extend(port.skipped_note());
+        // `[proof] require_heldout = true` in the base: held-out cases that were skipped gave
+        // no evidence, so the lane is refused, not only warned.
+        if require_heldout && let Some(note) = port.skipped_note() {
+            evidence.failed_gates.push(GateFailure {
+                name: "held_out".to_string(),
+                evidence: vec![format!(
+                    "{note}; [proof] require_heldout is set, so skipped held-out port cases refuse the lane"
+                )],
+            });
+        }
     }
     capsule
         .write(capsule_dir)

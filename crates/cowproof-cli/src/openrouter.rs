@@ -243,6 +243,7 @@ pub(crate) fn opencode_builder_command(l: &OpencodeLaunch<'_>) -> Result<Command
             network: l.network.clone(),
             runner_socket: l.runner_socket,
             port_base: l.port_base,
+            deny: &[],
             unsandboxed: l.unsandboxed,
         },
         l.opencode_bin,

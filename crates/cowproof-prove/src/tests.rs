@@ -2546,6 +2546,7 @@ fn test_the_held_out_gate_carries_each_checks_pass_or_fail() {
         &mut report,
         &[held("one", true), held("two", false)],
         None,
+        false,
     );
     let gate = report.gates.iter().find(|g| g.name == "held_out").unwrap();
     assert!(!gate.passed);
@@ -2563,10 +2564,70 @@ fn test_the_held_out_gate_carries_each_checks_pass_or_fail() {
 
     // All passing: the gate stays green and says so.
     let mut green = gate_report(true);
-    crate::gates::record_verify_results(&mut green, &[held("one", true), held("two", true)], None);
+    crate::gates::record_verify_results(
+        &mut green,
+        &[held("one", true), held("two", true)],
+        None,
+        false,
+    );
     assert!(green.gates.iter().all(|g| g.passed));
     assert!(!green.any_failed);
     assert!(green.gates[1].evidence[2].ends_with("\"two\": passed"));
+}
+
+#[test]
+fn test_require_heldout_makes_skipped_held_out_port_cases_fail_the_gate() {
+    let outcome = crate::port::PortOutcome {
+        result: port_entry(true, "skipped").result.unwrap(),
+    };
+    // Required: the skip fails the held-out gate, says why, and is not only a warning.
+    let mut required = gate_report(true);
+    crate::gates::record_verify_results(&mut required, &[], Some(&outcome), true);
+    let gate = required
+        .gates
+        .iter()
+        .find(|g| g.name == "held_out")
+        .unwrap();
+    assert!(!gate.passed);
+    assert!(!gate.warned);
+    assert!(
+        gate.evidence
+            .iter()
+            .any(|e| e == "held-out: skipped (no node)")
+    );
+    assert!(
+        gate.evidence
+            .iter()
+            .any(|e| e.contains("skipped") && e.contains("require_heldout"))
+    );
+    assert!(required.any_failed);
+    // The port replay itself still passed: only the held-out gate refuses.
+    assert!(
+        required
+            .gates
+            .iter()
+            .any(|g| g.name == "port_replay" && g.passed)
+    );
+
+    // Not required: the same skip stays a warning.
+    let mut optional = gate_report(true);
+    crate::gates::record_verify_results(&mut optional, &[], Some(&outcome), false);
+    let gate = optional
+        .gates
+        .iter()
+        .find(|g| g.name == "held_out")
+        .unwrap();
+    assert!(gate.passed);
+    assert!(gate.warned);
+    assert!(!optional.any_failed);
+
+    // Required, but the held-out cases ran: nothing changes.
+    let ran = crate::port::PortOutcome {
+        result: port_entry(true, "passed").result.unwrap(),
+    };
+    let mut passed = gate_report(true);
+    crate::gates::record_verify_results(&mut passed, &[], Some(&ran), true);
+    assert!(!passed.any_failed);
 }
 
 #[test]
@@ -2580,7 +2641,7 @@ fn test_a_port_capsule_adds_the_port_replay_gate_and_records_the_held_out_state(
         let outcome = crate::port::PortOutcome {
             result: port_entry(success, held_out).result.unwrap(),
         };
-        crate::gates::record_verify_results(&mut report, &[], Some(&outcome));
+        crate::gates::record_verify_results(&mut report, &[], Some(&outcome), false);
         let port = report.gates.last().unwrap();
         assert_eq!(port.name, "port_replay");
         assert_eq!(port.passed, success, "{held_out}");

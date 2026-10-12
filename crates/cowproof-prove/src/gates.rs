@@ -92,13 +92,16 @@ pub fn run_gates(
 /// `run_gates` runs before the tree is rebuilt, so its `held_out` gate can only say the
 /// checks are present. Once `verify` has run them, each held-out check's pass or fail is
 /// added to that gate's evidence and the gate fails if any check did; the port packet's
-/// held-out cases are recorded the same way (a skipped one warns). A `kind: port` capsule
+/// held-out cases are recorded the same way (a skipped one warns, or fails the gate when
+/// `require_heldout` is set: the base `cowproof.toml` asked for held-out evidence and the
+/// skipped cases gave none). A `kind: port` capsule
 /// also gets a `port_replay` gate. `any_failed` is recomputed. `verdict.json` is not built
 /// from this: it keeps listing held-out failures under `heldOutFailed`.
 pub fn record_verify_results(
     report: &mut GateReport,
     heldout: &[HeldOutOutcome],
     port: Option<&PortOutcome>,
+    require_heldout: bool,
 ) {
     if let Some(gate) = report.gates.iter_mut().find(|g| g.name == "held_out") {
         for outcome in heldout {
@@ -128,7 +131,15 @@ pub fn record_verify_results(
                         "held-out: skipped ({})",
                         held.reason.as_deref().unwrap_or("no reason")
                     ));
-                    gate.warned = true;
+                    if require_heldout {
+                        gate.evidence.push(
+                            "held-out port cases skipped but [proof] require_heldout is set"
+                                .to_string(),
+                        );
+                        gate.passed = false;
+                    } else {
+                        gate.warned = true;
+                    }
                 }
                 _ => {}
             }
