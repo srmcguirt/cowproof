@@ -3,7 +3,7 @@
 use std::fmt;
 use std::path::Path;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tracing::debug;
 
@@ -17,7 +17,7 @@ use crate::fixture::{load_fixtures, Fixture};
 /// Both should agree. Running `Mcp` in CI is what catches the envelope itself
 /// distorting results — a tool that is correct but unreachable through the
 /// agent surface is still a broken port.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Surface {
     /// Call the registry directly.
@@ -45,31 +45,31 @@ pub struct ReplayOptions {
     pub only_tool: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CaseOutcome {
     pub tool: String,
     pub id: String,
     pub surface: Surface,
     pub status: Status,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub differences: Vec<Difference>,
     /// Differences the fixture explicitly accepts, carried through so a
     /// report shows what the port is knowingly diverging on.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub accepted: Vec<AcceptedNote>,
     /// Set when the tool errored rather than merely disagreeing.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
 
 /// One tolerated difference, paired with the reason it is tolerated.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AcceptedNote {
     pub path: String,
     pub reason: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Status {
     /// Output matched the reference within tolerance.
@@ -85,7 +85,7 @@ pub enum Status {
     NotPorted,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReplayReport {
     pub outcomes: Vec<CaseOutcome>,
     pub passed: usize,

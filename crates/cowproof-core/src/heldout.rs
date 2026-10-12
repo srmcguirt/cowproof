@@ -17,6 +17,30 @@ pub struct Check {
 pub struct HeldOut {
     #[serde(default)]
     pub check: Vec<Check>,
+    /// The director's held-out cases for a `kind: port` packet: `[port] cases = "<file>"`,
+    /// a JSONL file beside this one. The verifier captures them against the reference at
+    /// verification time and replays them, so a port that special-cases the visible fixtures
+    /// fails.
+    #[serde(default)]
+    pub port: Option<crate::port::HeldOutPort>,
+}
+
+impl HeldOut {
+    /// Whether the file holds anything to run: a check, or port cases.
+    pub fn is_empty(&self) -> bool {
+        self.check.is_empty() && self.port.is_none()
+    }
+
+    /// The port cases file beside `toml_path`, when the file names one.
+    pub fn port_cases_path(&self, toml_path: &Path) -> Option<PathBuf> {
+        let port = self.port.as_ref()?;
+        Some(
+            toml_path
+                .parent()
+                .unwrap_or(Path::new("."))
+                .join(&port.cases),
+        )
+    }
 }
 
 /// Validates repository and lane IDs to ensure they only contain allowed characters.
@@ -238,6 +262,11 @@ pub fn load(path: &Path) -> Result<HeldOut> {
 
     let heldout: HeldOut =
         toml::from_str(&content).context(format!("parsing TOML from {}", path.display()))?;
+
+    if let Some(port) = &heldout.port {
+        port.validate()
+            .context(format!("in held-out file {}", path.display()))?;
+    }
 
     // Check for duplicate IDs
     let mut seen = HashSet::new();

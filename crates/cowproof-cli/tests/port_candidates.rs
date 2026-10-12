@@ -281,6 +281,8 @@ fn repo(base: &Path) -> PathBuf {
     let repo = base.join("repo");
     fs::create_dir_all(repo.join("docs").join("handoffs")).unwrap();
     fs::create_dir_all(repo.join("crates")).unwrap();
+    // The plugin manifest the packet owns lives here once a repository uses portkit.
+    fs::create_dir_all(repo.join(".portkit")).unwrap();
     repo
 }
 
@@ -337,13 +339,16 @@ fn draft_writes_a_marked_packet_per_candidate_that_lints_with_only_the_fill_erro
         let linted = lint(&repo, &path);
         assert_eq!(linted.status.code(), Some(1), "{}", text(&linted));
         // Exactly the placeholders: the crate's source file and the cases file have no
-        // folder yet, and the replay check names a fixtures directory that does not exist.
+        // folder yet, the fixtures glob matches nothing, the cases file the port names is not
+        // there, and the replay check names a fixtures directory that does not exist.
         assert_eq!(
             error_rules(&linted),
             [
                 "check-path-missing",
                 "owns-parent-missing",
-                "owns-parent-missing"
+                "owns-parent-missing",
+                "owns-unmatched",
+                "port-cases-missing"
             ],
             "{}",
             text(&linted)
@@ -379,8 +384,27 @@ fn a_draft_with_its_placeholders_filled_lints_clean() {
     fs::write(&path, filled).unwrap();
     fs::create_dir_all(repo.join("crates").join("pk-cargo-test").join("src")).unwrap();
     fs::create_dir_all(repo.join("tests/ports/cargo-test/fixtures")).unwrap();
+    fs::write(
+        repo.join("tests/ports/cargo-test/cases.jsonl"),
+        "{\"tool\":\"cargo_test\",\"input\":{}}\n",
+    )
+    .unwrap();
     let linted = lint(&repo, &path);
     assert!(linted.status.success(), "{}", text(&linted));
+
+    // And it is a valid port header: the kind and the strictly parsed `port` object.
+    let header = cowproof_core::parse_header(&fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(header.kind, cowproof_core::PacketKind::Port);
+    assert_eq!(header.class_name, "rust");
+    let port = header.port.expect("a port object");
+    assert_eq!(port.tools, ["cargo_test"]);
+    assert_eq!(port.cases, "tests/ports/cargo-test/cases.jsonl");
+    assert_eq!(port.fixtures, "tests/ports/cargo-test/fixtures");
+    assert!(
+        header
+            .owns
+            .contains(&"tests/ports/cargo-test/fixtures/**".to_string())
+    );
 }
 
 #[test]

@@ -488,6 +488,14 @@ fn a_draft_is_marked_draft_and_its_header_parses() {
             .unwrap_or_else(|e| panic!("{}: {e:#}", draft.id));
         assert_eq!(header.id, draft.id);
         assert_eq!(header.class_name, "rust");
+        // A valid port header, strictly parsed: `kind: port` with a `port` object and the
+        // fixtures and the plugin manifest owned, so the lint rules for ports can pass.
+        assert_eq!(header.kind, cowproof_core::PacketKind::Port);
+        let port = header.port.as_ref().expect("a port object");
+        assert_eq!(port.adapter, "process");
+        assert!(port.reference.is_none(), "the director sets the reference");
+        assert!(header.owns.iter().any(|o| o.ends_with("/fixtures/**")));
+        assert!(header.owns.iter().any(|o| o == ".portkit/plugins.toml"));
         assert!(draft.text.contains("# DRAFT: port"), "{}", draft.text);
         assert!(draft.text.contains("is not dispatched"), "{}", draft.text);
         assert!(

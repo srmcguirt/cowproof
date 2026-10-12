@@ -313,6 +313,15 @@ pub async fn verify_capsule(args: VerifyArgs) -> Result<i32> {
     let capsule = Capsule::read(&capsule_dir).ok();
     let mut options = VerifyOptions::default();
     let mut runner = verifier_runner(&layout, &verify_dir, deps_dir.as_deref())?;
+    // A port capsule's replay runs `cowproof pk port replay` in the sandbox: this executable
+    // must be reachable there.
+    if capsule.as_ref().is_some_and(|c| c.port.is_some()) {
+        let exe = std::env::current_exe()
+            .and_then(|p| p.canonicalize())
+            .context("locating the cowproof executable for the port replay")?;
+        runner = runner.with_executable(exe.clone());
+        options.pk_exe = Some(exe);
+    }
     let _slot = match &capsule {
         Some(capsule) => {
             let slot_dir = args.slot_dir.clone().unwrap_or_else(get_slot_dir);
@@ -346,23 +355,36 @@ pub async fn verify_capsule(args: VerifyArgs) -> Result<i32> {
     };
 
     let code = match verify(&capsule_dir, &repo, &verify_dir, &runner, options).await {
-        Ok(report) => match report.result {
-            VerifyResult::Reproduced => {
-                println!("reproduced");
-                0
+        Ok(report) => {
+            // A skipped held-out port case is said out loud, whatever else is.
+            if let Some(note) = report.port.as_ref().and_then(|p| p.skipped_note()) {
+                println!("{note}");
             }
-            VerifyResult::Diverged { check_ids } => {
-                println!("diverged: check {}", quote_ids(&check_ids));
-                for id in report.heldout.iter().filter(|o| !o.passed) {
-                    println!("held-out check {:?} failed", id.check_id);
+            match report.result {
+                VerifyResult::Reproduced => {
+                    println!("reproduced");
+                    0
                 }
-                2
+                VerifyResult::Diverged { check_ids } => {
+                    println!("diverged: check {}", quote_ids(&check_ids));
+                    for id in report.heldout.iter().filter(|o| !o.passed) {
+                        println!("held-out check {:?} failed", id.check_id);
+                    }
+                    2
+                }
+                VerifyResult::HeldOutFailed { check_ids } => {
+                    println!("diverged: held-out check {} failed", quote_ids(&check_ids));
+                    2
+                }
+                VerifyResult::PortFailed { failures } => {
+                    println!("diverged: the port replay failed");
+                    for failure in failures {
+                        println!("port: {failure}");
+                    }
+                    2
+                }
             }
-            VerifyResult::HeldOutFailed { check_ids } => {
-                println!("diverged: held-out check {} failed", quote_ids(&check_ids));
-                2
-            }
-        },
+        }
         Err(VerifyError::Capsule(e)) => {
             eprintln!("refused: the capsule was tampered with or is damaged: {e}");
             4

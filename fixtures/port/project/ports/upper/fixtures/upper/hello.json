@@ -1,0 +1,11 @@
+{
+  "tool": "upper",
+  "id": "hello",
+  "input": {
+    "text": "hello"
+  },
+  "expected": {
+    "result": "HELLO"
+  },
+  "source": "sh reference/text.sh"
+}

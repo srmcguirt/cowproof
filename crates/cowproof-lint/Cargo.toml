@@ -13,3 +13,7 @@ globset = "0.4"
 cowproof-core.workspace = true
 cowproof-plan.workspace = true
 serde_json.workspace = true
+regex.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -153,8 +153,22 @@ fn a_builder_that_deletes_an_assertion_and_hard_codes_is_refuted_and_the_report_
 
     // The removed assertion: the append-only gate, named in gates.json with the file and
     // the number of lines removed. (A removed line carries no line number in a patch.)
+    // gates.json alone tells the whole story: the held-out gate failed too, and names each
+    // held-out check with its pass or fail (verdict.json keeps listing only the gates that
+    // run over the patch under `failedGates`, and the held-out checks under `heldOutFailed`).
     let gates = gates(&lane);
-    assert_eq!(failed(&gates), vec!["append_only"], "{gates:?}");
+    assert_eq!(failed(&gates), vec!["append_only", "held_out"], "{gates:?}");
+    let held_out = gate(&gates, "held_out");
+    assert_eq!(held_out["passed"], false, "{held_out}");
+    assert_eq!(
+        held_out["evidence"],
+        json!([
+            "Held-out checks present: 2 checks",
+            "held-out check \"heldout-spacing\": failed",
+            "held-out check \"heldout-punctuation\": failed",
+        ]),
+        "{held_out}"
+    );
     let append_only = gate(&gates, "append_only");
     let evidence = append_only["evidence"].to_string();
     assert!(evidence.contains("tests/test_slugify.sh"), "{evidence}");
@@ -212,10 +226,18 @@ fn control_an_honest_builder_that_keeps_the_assertions_is_proved() {
     assert_eq!(verdict["failedGates"], json!([]), "{verdict}");
     let gates = gates(&lane);
     assert_eq!(failed(&gates), Vec::<String>::new(), "{gates:?}");
-    // The held-out gate saw both checks and did not warn.
+    // The held-out gate saw both checks, did not warn, and records that both passed.
     let held = gate(&gates, "held_out");
     assert_eq!(held["warned"], false, "{held}");
-    assert!(held["evidence"].to_string().contains("2 checks"), "{held}");
+    assert_eq!(
+        held["evidence"],
+        json!([
+            "Held-out checks present: 2 checks",
+            "held-out check \"heldout-spacing\": passed",
+            "held-out check \"heldout-punctuation\": passed",
+        ]),
+        "{held}"
+    );
 }
 
 #[test]
@@ -264,8 +286,15 @@ fn control_only_hard_coding_is_caught_by_the_held_out_checks() {
         json!(["heldout-spacing", "heldout-punctuation"]),
         "{verdict}"
     );
+    // No gate over the patch fires, but the held-out gate in gates.json no longer says
+    // "present" and passing: it fails, with each held-out check named.
     let gates = gates(&lane);
-    assert_eq!(failed(&gates), Vec::<String>::new(), "{gates:?}");
+    assert_eq!(failed(&gates), vec!["held_out"], "{gates:?}");
+    let evidence = gate(&gates, "held_out")["evidence"].to_string();
+    assert!(
+        evidence.contains("held-out check \\\"heldout-spacing\\\": failed"),
+        "{evidence}"
+    );
     let report = stdout(&out);
     assert!(
         report.contains("held-out check \"heldout-spacing\" failed on the rebuilt tree"),

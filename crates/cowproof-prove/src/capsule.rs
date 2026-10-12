@@ -276,6 +276,13 @@ pub struct Capsule {
     /// nothing else. Sealed in `capsule.json`; absent in older capsules, which read as null.
     #[serde(default)]
     pub host: Option<String>,
+    /// For a `kind: port` packet: how the fixtures are replayed (tools, fixtures directory,
+    /// reference command, epsilon) and, once the verifier has run, what the replay found:
+    /// the fixture-set hash, the source commit, the failing and accepted outcomes per
+    /// surface and the held-out state. Sealed in `capsule.json`; absent in older capsules and
+    /// in every capsule of ordinary work, which read as null and still verify.
+    #[serde(default)]
+    pub port: Option<crate::port::PortCapsule>,
     /// Paths removed during the launch baseline, relative and sorted. Verify replays
     /// them by deleting these exact paths from the rebuilt tree. Stored in the hashed
     /// `launch_removed.json`, not in `capsule.json`, so editing it after `write`
@@ -332,6 +339,7 @@ impl Capsule {
             traced: false,
             trace_totals: None,
             host: None,
+            port: None,
             launch_removed: Vec::new(),
         }
     }

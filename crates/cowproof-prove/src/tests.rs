@@ -396,6 +396,7 @@ fn test_opts(work: &Path) -> VerifyOptions {
         default_timeout: Duration::from_secs(60),
         held_slot_path: None,
         allow_unsandboxed: false,
+        pk_exe: None,
     }
 }
 
@@ -1518,6 +1519,7 @@ async fn test_class_slot_caps_concurrent_verifications() {
         default_timeout: Duration::from_secs(60),
         held_slot_path: None,
         allow_unsandboxed: false,
+        pk_exe: None,
     };
 
     let (a, b, d) = tokio::join!(
@@ -2422,4 +2424,177 @@ fn test_a_capsule_written_before_trace_totals_still_reads() {
     let read = Capsule::read(dir.path()).expect("an older capsule reads");
     assert_eq!(read.trace_totals, None);
     assert_eq!(read.base_commit, "abc");
+}
+
+// ============================================================================
+// Port capsules (`kind: port`): the entry, the held-out gate in gates.json
+// ============================================================================
+
+fn port_entry(success: bool, held_out: &str) -> crate::port::PortCapsule {
+    let mut entry: crate::port::PortCapsule = serde_json::from_value(serde_json::json!({
+        "lang": "node", "adapter": "function",
+        "reference": {"cmd": "node ref.mjs", "env": {"TZ": "UTC"}, "runtime": "node>=22"},
+        "fixtures": "ports/x/fixtures", "tools": ["upper"],
+        "epsilon": 0.0, "ignore_paths": [], "unordered_arrays": false,
+    }))
+    .unwrap();
+    entry.result = Some(crate::port::PortResult {
+        source_commit: "abc".to_string(),
+        fixture_hash: "f".repeat(64),
+        fixture_count: 3,
+        success,
+        surfaces: std::collections::BTreeMap::new(),
+        held_out: crate::port::PortHeldOut {
+            state: held_out.to_string(),
+            reason: (held_out == "skipped").then(|| "no node".to_string()),
+            cases: 2,
+            surfaces: std::collections::BTreeMap::new(),
+        },
+        failures: if success {
+            vec![]
+        } else {
+            vec!["direct upper/hello: differs".to_string()]
+        },
+    });
+    entry
+}
+
+#[test]
+fn test_the_port_entry_round_trips_and_is_sealed() {
+    let dir = TempDir::new().unwrap();
+    let mut capsule = Capsule::new(
+        "abc".to_string(),
+        "def".to_string(),
+        fingerprint(),
+        "claude:haiku".to_string(),
+        "api-key".to_string(),
+    );
+    capsule.port = Some(port_entry(true, "passed"));
+    capsule.write(dir.path()).unwrap();
+
+    let read = Capsule::read(dir.path()).unwrap();
+    let port = read.port.expect("the entry is read back");
+    assert_eq!(port.reference.as_ref().unwrap().cmd, "node ref.mjs");
+    let result = port.result.unwrap();
+    assert_eq!(result.source_commit, "abc");
+    assert_eq!(result.fixture_hash, "f".repeat(64));
+    assert_eq!(result.held_out.state, "passed");
+
+    // The seal covers it: the hash of the fixture set cannot be edited after the fact.
+    edit_capsule_json(dir.path(), &"f".repeat(64), &"e".repeat(64));
+    assert_capsule_json_mismatch(dir.path());
+}
+
+#[test]
+fn test_a_capsule_written_before_port_packets_still_reads_and_has_no_port_entry() {
+    let dir = TempDir::new().unwrap();
+    let mut capsule = Capsule::new(
+        "abc".to_string(),
+        "def".to_string(),
+        fingerprint(),
+        "claude:haiku".to_string(),
+        "api-key".to_string(),
+    );
+    capsule.port = Some(port_entry(true, "none"));
+    capsule.write(dir.path()).unwrap();
+
+    // An older capsule has no `port` key; seal it as the older writer would have.
+    let path = dir.path().join("capsule.json");
+    let mut json: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert!(json.as_object_mut().unwrap().remove("port").is_some());
+    let raw = serde_json::to_vec_pretty(&json).unwrap();
+    std::fs::write(&path, &raw).unwrap();
+    std::fs::write(dir.path().join("capsule.sha256"), Capsule::hash_bytes(&raw)).unwrap();
+
+    let read = Capsule::read(dir.path()).expect("an older capsule reads");
+    assert!(read.port.is_none());
+    assert_eq!(read.base_commit, "abc");
+}
+
+fn gate_report(held_out_passed: bool) -> crate::gates::GateReport {
+    let gate = |name: &str, passed: bool, evidence: &[&str]| crate::gates::GateResult {
+        name: name.to_string(),
+        passed,
+        warned: false,
+        evidence: evidence.iter().map(|e| e.to_string()).collect(),
+    };
+    crate::gates::GateReport {
+        gates: vec![
+            gate("ownership", true, &[]),
+            gate(
+                "held_out",
+                held_out_passed,
+                &["Held-out checks present: 2 checks"],
+            ),
+        ],
+        any_failed: !held_out_passed,
+    }
+}
+
+fn held(id: &str, passed: bool) -> crate::verify::HeldOutOutcome {
+    crate::verify::HeldOutOutcome {
+        check_id: id.to_string(),
+        passed,
+    }
+}
+
+#[test]
+fn test_the_held_out_gate_carries_each_checks_pass_or_fail() {
+    let mut report = gate_report(true);
+    crate::gates::record_verify_results(
+        &mut report,
+        &[held("one", true), held("two", false)],
+        None,
+    );
+    let gate = report.gates.iter().find(|g| g.name == "held_out").unwrap();
+    assert!(!gate.passed);
+    assert_eq!(
+        gate.evidence,
+        [
+            "Held-out checks present: 2 checks",
+            "held-out check \"one\": passed",
+            "held-out check \"two\": failed",
+        ]
+    );
+    assert!(report.any_failed);
+    // No port gate for ordinary work.
+    assert!(report.gates.iter().all(|g| g.name != "port_replay"));
+
+    // All passing: the gate stays green and says so.
+    let mut green = gate_report(true);
+    crate::gates::record_verify_results(&mut green, &[held("one", true), held("two", true)], None);
+    assert!(green.gates.iter().all(|g| g.passed));
+    assert!(!green.any_failed);
+    assert!(green.gates[1].evidence[2].ends_with("\"two\": passed"));
+}
+
+#[test]
+fn test_a_port_capsule_adds_the_port_replay_gate_and_records_the_held_out_state() {
+    for (success, held_out, gate_passes, warned) in [
+        (true, "passed", true, false),
+        (true, "skipped", true, true),
+        (false, "failed", false, false),
+    ] {
+        let mut report = gate_report(true);
+        let outcome = crate::port::PortOutcome {
+            result: port_entry(success, held_out).result.unwrap(),
+        };
+        crate::gates::record_verify_results(&mut report, &[], Some(&outcome));
+        let port = report.gates.last().unwrap();
+        assert_eq!(port.name, "port_replay");
+        assert_eq!(port.passed, success, "{held_out}");
+        if !success {
+            assert_eq!(port.evidence, ["direct upper/hello: differs"]);
+        }
+        let held = report.gates.iter().find(|g| g.name == "held_out").unwrap();
+        assert_eq!(held.passed, gate_passes, "{held_out}");
+        assert_eq!(held.warned, warned, "{held_out}");
+        assert!(
+            held.evidence.iter().any(|e| e.contains(held_out)),
+            "{held_out}: {:?}",
+            held.evidence
+        );
+        assert_eq!(report.any_failed, !success);
+    }
 }

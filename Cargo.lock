@@ -495,7 +495,9 @@ dependencies = [
  "cowproof-core",
  "cowproof-plan",
  "globset",
+ "regex",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]
@@ -520,6 +522,7 @@ dependencies = [
  "cowproof-core",
  "cowproof-run",
  "libc",
+ "portkit-port",
  "predicates",
  "regex",
  "serde",

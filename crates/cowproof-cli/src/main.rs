@@ -6,7 +6,7 @@ use cowproof_host::{
     SystemRunner, collect_facts, enforce_disk_floor, ensure_safe_to_stop, lane_status,
     parse_df_free, read_host_config, stop_lane,
 };
-use cowproof_lint::{Finding, Severity, lint_packet};
+use cowproof_lint::{Finding, LintOptions, Severity, lint_packet_with};
 use cowproof_plan::{
     HostCapacity, LaneStateUpdate, PlanHostRunner, check_plans, choose_host, collect_running,
     duplicate_running_id, lanes as plan_lanes, load_plans, ready_next, set_lane_state,
@@ -353,6 +353,10 @@ struct RunOneArgs {
 struct LintArgs {
     #[arg(long)]
     repo: Option<PathBuf>,
+    /// A lane's `escalations.jsonl` (`<lane>/control/escalations.jsonl`): a `kind: port`
+    /// packet's accepted differences must then cite a ruling a director's answer in it carries
+    #[arg(long, value_name = "FILE")]
+    escalations: Option<PathBuf>,
     #[arg(required = true)]
     packets: Vec<PathBuf>,
 }
@@ -593,7 +597,10 @@ fn lint_command(args: LintArgs) -> Result<()> {
         let text = fs::read_to_string(&path)
             .with_context(|| format!("reading packet {}", path.display()))?;
         let plans = load_plans(&repo, &[])?;
-        let findings = lint_packet(&text, &repo, &plans);
+        let options = LintOptions {
+            escalations: args.escalations.as_deref(),
+        };
+        let findings = lint_packet_with(&text, &repo, &plans, &options);
         print_findings(&path, &findings);
         errors += findings
             .iter()

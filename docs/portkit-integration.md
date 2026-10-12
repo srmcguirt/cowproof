@@ -181,7 +181,7 @@ A `kind: port` packet names the source language, the adapter command, the cases 
 
 ### 3e. Parity reports inside the capsule
 
-Yes. `ReplayReport` serialises (`port/src/replay.rs` L88-97) and `pk port replay --json` emits a map keyed by surface (`cli/src/commands.rs` L246-251). The capsule entry for a port packet is: the reference command and the source commit the fixtures were captured from, a content hash of the fixture set (gap G11: the report does not carry one today), the per-surface report with only failing and accepted outcomes in full and pass counts otherwise (bounded with portkit's own budget), and the `accepted` list verbatim with reasons so a reviewer sees the divergences without rerunning. `cowproof verify <capsule>` replays the fixtures at the recorded hash.
+Yes. `ReplayReport` serialises (`port/src/replay.rs` L88-97) and `pk port replay --json` emits a map keyed by surface (`cli/src/commands.rs` L246-251). The capsule entry for a port packet is: the reference command and the source commit the fixtures were captured from, a content hash of the fixture set (gap G11: the report does not carry one; cowproof computes it, a sha256 over the sorted paths and bytes of the fixtures directory, in `cowproof-prove::port::fixture_set_hash`), the per-surface report with only failing and accepted outcomes in full and pass counts otherwise (bounded with portkit's own budget), and the `accepted` list verbatim with reasons so a reviewer sees the divergences without rerunning. `cowproof verify <capsule>` replays the fixtures at the recorded hash.
 
 ## 4. Bringing portkit into the cowproof workspace
 
@@ -249,7 +249,7 @@ Each is a concrete change with a one-line rationale. None is made in the standal
 | G8 | DONE: hook command strings generated with an absolute executable path | cowproof side, `cowproof-cli/src/run.rs` `builder_settings` and `sibling_pk` | `which("pk")` inside a sandboxed shell is not guaranteed |
 | G9 | watcher tool names and the suggested replacement call configurable (`Thresholds` gains `read_tools`, `suggest_sym_call`) | `core/src/watch.rs` L70-72 and the message builder; `tests/hook.rs` L119-122 | the advice must name a tool the builder can run (`mcp__cowproof__sym`) |
 | G10 | `index`: feature `symbols`, remove the `pkx` bin, keep the lib | `index/Cargo.toml`, `index/src/main.rs` | prototype binary not wanted in the release; the tools are |
-| G11 | `ReplayReport` carries a fixture-set hash and the reference `source` and capture commit; `--json` includes them | `port/src/replay.rs` L88-97; `port/src/fixture.rs` L23-27 | the capsule pins what was replayed (3e) |
+| G11 | DONE in cowproof (the hash is computed by `cowproof-prove`, not carried by `ReplayReport`): `ReplayReport` carries a fixture-set hash and the reference `source` and capture commit; `--json` includes them | `port/src/replay.rs` L88-97; `port/src/fixture.rs` L23-27 | the capsule pins what was replayed (3e) |
 | G12 | `pk port check-fresh <committed> <fresh>` in Rust comparing `tool`, `id`, `input`, `expected` | replaces `scripts/check_fixtures_fresh.py` | no Python in cowproof CI |
 | G13 | normalisers for process captures: `path_roots` substitution (`$ROOT`, `$HOME`, `$TMP`), declared and versioned like the `normalized` fidelity class | `core/src/fidelity.rs`, `port/src/process.rs` | temp roots differ per run; a declared transform is checkable, a vague one is not (`README.md` L344-359) |
 | G14 | `tests/parity.rs` "every tool has at least one fixture" (L20-33) generalised to the cowproof registry | `tests/parity.rs` | a tool with no fixtures passes vacuously |
@@ -305,6 +305,12 @@ Signals, timers and process groups (step 13) do not fit any of the three; they a
 
 ### 6.4 Port packets in cowproof's processes
 
+**Status (2026-10-12): done for the first release (lane/port-packets).** The header, the seven lint rules, the replay gate, the held-out port cases and the capsule entry are built; the adapters (6.1) are the next step (docs/backlog.md). Where cowproof's implementation differs from the text below, the difference is named at the item:
+
+- `kind` and `port` are parsed by `cowproof-core` (`Header`, `PortSpec`), strictly: an unknown key in `port`, `port.reference` or `port.parity` is an error; `kind: port` needs the object and a work packet may not have one. `cowproof-lint` runs the rules (`crates/cowproof-lint/src/port.rs`).
+- `port.parity.unordered_arrays` is a boolean (portkit's own option); `path_roots` is a list of path prefixes or `$ROOT`, `$HOME`, `$TMP`, used by lint today and by the process adapter later. The `epsilon` default is `[port] epsilon` in the base `cowproof.toml` (0 when it has none); the lane's base commit is read, so a patch cannot raise it. The replay also passes `epsilon_rel = 0`.
+- The tool registry is portkit's plugin manifest: `.portkit/plugins.toml` in the repository, one `[[plugin]]` per tool. "Registered" means an entry there, so `port-tool-unregistered` wants the packet text to name that manifest and `owns` to cover it.
+
 Packet header additions (`kind: port` is validated by `cowproof-lint`):
 
 | Field | Meaning |
@@ -317,7 +323,7 @@ Packet header additions (`kind: port` is validated by `cowproof-lint`):
 | `port.tools` | the tool names the Rust registry must answer; the replay's `not_ported` count must be zero |
 | `port.parity` | `epsilon`, `ignore_paths`, `unordered_arrays`, `path_roots`; `epsilon` defaults to 0 for non-numeric ports |
 
-Lint rules (added to `lanes-lint`'s rule table, `docs/packet-lint.md`):
+Lint rules (added to `lanes-lint`'s rule table, `docs/packet-lint.md`). *Done: `crates/cowproof-lint/src/port.rs`. The old Node runner's `lint_command_permission` is `lint_command_permission` and `BASE_ALLOW` in `cowproof-lint/src/lib.rs`; `CLAUDE.md`'s "never loosen epsilon" becomes the base `cowproof.toml` `[port] epsilon`; the lane's escalation log is `<lane>/control/escalations.jsonl` (a ruling id is `ruling:<id>` in the text of an `answer`), read through `cowproof lint --escalations` and, at proof time, from the capsule's copy.*
 
 | Rule | Catches |
 | --- | --- |
@@ -329,7 +335,7 @@ Lint rules (added to `lanes-lint`'s rule table, `docs/packet-lint.md`):
 | `port-epsilon-loosened` | a packet or fixture that raises `epsilon` above the project default (`CLAUDE.md` L36-41 forbids it) |
 | `port-nondeterministic-output` | heuristic: a case output containing an RFC 3339 time, a `/tmp` or home path, or a hostname with no matching `ignore_paths` or `path_roots` entry |
 
-Verifier gate: in the fresh clone, `cowproof pk port replay --fixtures <dir> --surface both --json`; fail on `is_success() == false`; then capture and replay the held-out cases if `runtime` is present; record both reports in the capsule (3e). The claimed-versus-run gate (design L136) compares the builder's reported replay line against the verifier's.
+*Done (`crates/cowproof-prove/src/port.rs`): `port_replay` in `gates.json`, run inside `verify`, after the recorded checks, with `--config <pk.toml> ... --epsilon <e> --json` added to the command below. Held-out cases are a `[port] cases = "<file>"` table in the held-out TOML naming a JSONL file beside it; the capsule keeps it as `packets/heldout.cases.jsonl`.* Verifier gate: in the fresh clone, `cowproof pk port replay --fixtures <dir> --surface both --json`; fail on `is_success() == false`; then capture and replay the held-out cases if `runtime` is present; record both reports in the capsule (3e). The claimed-versus-run gate (design L136) compares the builder's reported replay line against the verifier's.
 
 Escalation when parity cannot be reached: the builder never edits `accepted` or `epsilon` on its own. It raises `ask` with `kind: "design"`, the fixture id and JSON Pointer, what it tried, and options `a` fix the port, `b` accept with a written reason, `c` the reference is wrong (fix the reference and recapture), with a recommendation. The director's `answer` carries the reason text and a ruling id; the builder writes `accepted: [{path, reason: "ruling:<id> ..."}]`, and `port-accepted-unruled` plus the capsule's escalation log tie the two together mechanically. Escalate-early (design L112) applies: two failed replays on the same fixture force the ask.
 

@@ -359,6 +359,9 @@ pub struct SandboxedRunner {
     /// The first port of the lane's block (`COWPROOF_PORT_BASE`, with
     /// `COWPROOF_PORT_COUNT`), when the lane holds a class slot. `None` sets neither.
     port_base: Option<u16>,
+    /// Executable files the sandbox may read and run besides the system directories (see
+    /// [`SandboxedRunner::with_executable`]).
+    executables: Vec<PathBuf>,
     /// Resolved once, here, in the caller's environment and outside any sandbox. An
     /// unusable `PATH` is reported when the first check runs.
     path: Result<String, InfraError>,
@@ -385,6 +388,7 @@ impl SandboxedRunner {
             platform,
             deps_cache: None,
             port_base: None,
+            executables: Vec::new(),
         }
     }
 
@@ -393,6 +397,15 @@ impl SandboxedRunner {
     /// (`cowproof_run::link_dependency_cache`).
     pub fn with_dependency_cache(mut self, deps_dir: PathBuf) -> Self {
         self.deps_cache = Some(deps_dir);
+        self
+    }
+
+    /// Let every check read and run the executable at `exe`, read-only. A `kind: port` replay
+    /// runs `cowproof pk port replay` inside the sandbox, and a `cowproof` installed under the
+    /// hidden home (`~/.cargo/bin`) would otherwise not be reachable there. The path must be
+    /// absolute and outside the lanes root; the sandbox refuses anything else.
+    pub fn with_executable(mut self, exe: PathBuf) -> Self {
+        self.executables.push(exe);
         self
     }
 
@@ -422,6 +435,7 @@ impl CheckRunner for SandboxedRunner {
         if let Some(deps) = &self.deps_cache {
             policy = policy.with_dependency_cache(deps);
         }
+        policy.executables.extend(self.executables.iter().cloned());
 
         // On macOS, write the profile to a temp file outside the clone. It lives until
         // the check has finished.

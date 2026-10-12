@@ -722,6 +722,8 @@ fn draft_text(id: &str, cand: &Candidate, report: &PortCandidates) -> String {
         "owns": [
             "crates/pk-FILL-NAME/src/lib.rs",
             "FILL-FIXTURES-DIR/cases.jsonl",
+            "FILL-FIXTURES-DIR/fixtures/**",
+            ".portkit/plugins.toml",
             format!("docs/handoffs/handoff-{id}.md"),
         ],
         "allow": ["cargo test*", "cowproof pk port *"],
@@ -782,10 +784,12 @@ target: look for a smaller question the lanes are really asking.
 
 ## Port target
 
-A compact `pk` tool, registered as `FILL-TOOL-NAME` in a crate under `crates/` (named
-`pk-FILL-NAME` in this draft), that answers what lanes ask of this command with a short
-JSON answer in place of its full output. Decide what the answer holds from the example
-invocations; the target is fewer bytes into context and less wall time on every call.
+A compact `pk` tool, `FILL-TOOL-NAME`, in a crate under `crates/` (named `pk-FILL-NAME` in
+this draft) and registered as a plugin in `.portkit/plugins.toml` (the packet owns that
+manifest; `cowproof pk port replay` finds the tool there), that answers what lanes ask of
+this command with a short JSON answer in place of its full output. Decide what the answer
+holds from the example invocations; the target is fewer bytes into context and less wall
+time on every call.
 
 Reuse before building: search the workspace (`rg`) for an existing `pk` tool, helper or
 script that already answers it, and say in the handoff what was reused. A second
@@ -797,7 +801,9 @@ The parity harness records the reference's behavior before any port is written. 
 director records the fixtures first, with `cowproof pk port capture` against the original
 command (`--cmd FILL-REFERENCE-COMMAND --cases FILL-FIXTURES-DIR/cases.jsonl --out
 FILL-FIXTURES-DIR/fixtures`), then sets the `port.reference` and the held-out cases. The
-builder does not write fixtures by hand and does not edit `accepted` or `epsilon`.
+builder does not write fixtures by hand, does not change a recorded `input` or `expected`
+(the proof refuses it), never edits `epsilon`, and adds an `accepted` difference only after a
+director's ruling, citing it as `ruling:<id>` in the reason.
 
 ## Checks
 

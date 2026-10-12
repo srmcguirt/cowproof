@@ -7,7 +7,10 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+mod port;
 mod profile;
+
+pub use port::LintOptions;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Severity {
@@ -62,6 +65,16 @@ impl std::fmt::Display for Finding {
 
 /// Lint a lane packet against its target repository and any loaded plan files.
 pub fn lint_packet(packet_text: &str, repo_root: &Path, plans: &[Plan]) -> Vec<Finding> {
+    lint_packet_with(packet_text, repo_root, plans, &LintOptions::default())
+}
+
+/// [`lint_packet`] with the extra inputs some rules can use (see [`LintOptions`]).
+pub fn lint_packet_with(
+    packet_text: &str,
+    repo_root: &Path,
+    plans: &[Plan],
+    options: &LintOptions,
+) -> Vec<Finding> {
     let mut findings = Vec::new();
     let header = match parse_header(packet_text) {
         Ok(header) => Some(header),
@@ -77,6 +90,7 @@ pub fn lint_packet(packet_text: &str, repo_root: &Path, plans: &[Plan]) -> Vec<F
         lint_header_checks(header, packet_text, &mut findings);
         lint_rung(header, repo_root, &mut findings);
         lint_profile(header, packet_text, repo_root, &mut findings);
+        port::lint_port(header, packet_text, repo_root, options, &mut findings);
     }
     lint_secrets(packet_text, &mut findings);
     if let Some((start, section)) = checks_section(packet_text) {

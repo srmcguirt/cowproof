@@ -1,0 +1,11 @@
+{
+  "tool": "upper",
+  "id": "mixed",
+  "input": {
+    "text": "Rust 2024"
+  },
+  "expected": {
+    "result": "RUST 2024"
+  },
+  "source": "sh reference/text.sh"
+}

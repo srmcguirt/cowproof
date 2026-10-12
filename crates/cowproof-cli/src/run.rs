@@ -49,6 +49,7 @@ use cowproof_core::{
     release_slot, valid_model_name,
 };
 use cowproof_prove::{
+    PortCapsule,
     capsule::HELDOUT_FILE,
     capsule::{Capsule, CheckResult, EnvironmentFingerprint, TraceTotals},
     gates::{GatePacket, base_requires_heldout, run_gates},
@@ -3269,6 +3270,7 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
     // The held-out checks (D5) are found before any lane exists: a path inside the
     // repository, or one that is unreadable, stops the run here.
     let heldout = resolve_heldout(args.heldout.as_deref(), &repo, &real_home, &header.id)?;
+    check_heldout_port(heldout.as_deref(), &header)?;
     let path = builder_path(&director_path, &real_home);
     let claude_bin = match claude_bin {
         Some(bin) if remote_host.is_none() => Some(
@@ -4000,6 +4002,9 @@ struct Evidence {
     no_checks_declared: bool,
     /// Held-out checks that failed on the verifier's rebuilt tree.
     heldout_failed: Vec<String>,
+    /// What the proof wants the director to see that is neither a failure nor a pass, for
+    /// instance `held-out: skipped (...)` on a port packet. Printed after the verdict line.
+    notes: Vec<String>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -4150,13 +4155,46 @@ fn resolve_heldout(
         return Ok(None);
     }
     let checks = cowproof_core::heldout::load(&path)?;
-    if checks.check.is_empty() {
+    if checks.is_empty() {
         bail!(
             "the held-out checks file {} holds no checks",
             path.display()
         );
     }
     Ok(Some(path))
+}
+
+/// Port cases in the held-out file need a `kind: port` packet with a reference command to
+/// capture them from, and a cases file beside the held-out file; anything else stops the run
+/// before a lane exists. A port packet without held-out cases is fine: the visible fixtures
+/// are replayed, and the gate says it had no held-out cases.
+fn check_heldout_port(heldout: Option<&Path>, header: &cowproof_core::Header) -> Result<()> {
+    let Some(path) = heldout else {
+        return Ok(());
+    };
+    let file = cowproof_core::heldout::load(path)?;
+    let Some(cases) = file.port_cases_path(path) else {
+        return Ok(());
+    };
+    let reference = header
+        .port
+        .as_ref()
+        .and_then(|port| port.reference.as_ref());
+    if reference.is_none() {
+        bail!(
+            "the held-out file {} has port cases, so the packet must be \"kind\": \"port\" with a port.reference.cmd to capture them from",
+            path.display()
+        );
+    }
+    let meta = fs::symlink_metadata(&cases)
+        .with_context(|| format!("the held-out port cases file {}", cases.display()))?;
+    if !meta.is_file() {
+        bail!(
+            "the held-out port cases file {} is not a regular file",
+            cases.display()
+        );
+    }
+    Ok(())
 }
 
 /// Prove the lane after the builder exits: capsule, gates, verify, verdict.
@@ -4243,6 +4281,9 @@ async fn prove_lane(
         )
     };
     println!("{line}");
+    for note in &evidence.notes {
+        println!("{}: {}", header.id, one_line(note));
+    }
     Ok(verdict)
 }
 
@@ -4354,6 +4395,17 @@ async fn replay_and_gate(
     capsule.traced = input.trace["traced"].as_bool().unwrap_or(false);
     capsule.trace_totals = input.trace_totals.clone();
     capsule.host = input.host.map(str::to_string);
+    if let Some(port) = &header.port {
+        // The packet's own epsilon, else the project's at the base commit: a patch cannot
+        // raise it.
+        let epsilon = match port.parity.epsilon {
+            Some(epsilon) => epsilon,
+            None => {
+                cowproof_core::project_epsilon_at_commit(input.repo, &input.prepared.base_commit)?
+            }
+        };
+        capsule.port = Some(PortCapsule::from_spec(port, epsilon));
+    }
 
     // Fetch the dependencies the checks need before verify runs (D6, D11, D14), on the
     // rebuilt tree, outside any builder. The capsule records the cache key and what the
@@ -4404,6 +4456,15 @@ async fn replay_and_gate(
         fs::create_dir_all(dest.parent().context("packets path has no parent")?)?;
         fs::copy(heldout, &dest)
             .with_context(|| format!("copying the held-out checks {}", heldout.display()))?;
+        // The director's port cases sit beside the held-out file; they are hashed in
+        // `packets/` like it and, like it, never enter the lane.
+        if let Some(cases) = cowproof_core::heldout::load(heldout)?.port_cases_path(heldout) {
+            fs::copy(
+                &cases,
+                capsule_dir.join(cowproof_core::port::HELDOUT_PORT_CASES_FILE),
+            )
+            .with_context(|| format!("copying the held-out port cases {}", cases.display()))?;
+        }
     }
     let escalations = layout.control.join("escalations.jsonl");
     if escalations.is_file() {
@@ -4436,8 +4497,19 @@ async fn replay_and_gate(
         return Ok(());
     }
     let verify_dir = layout.scratch.join("verify");
-    let runner =
+    let mut runner =
         verifier_runner(layout, &verify_dir, deps_dir.as_deref())?.with_port_block(input.port_base);
+    // A port packet's replay runs `cowproof pk port replay` in the verifier's sandbox: this
+    // executable must be reachable there.
+    let pk_exe = if header.port.is_some() {
+        let exe = std::env::current_exe()
+            .and_then(|p| p.canonicalize())
+            .context("locating the cowproof executable for the port replay")?;
+        runner = runner.with_executable(exe.clone());
+        Some(exe)
+    } else {
+        None
+    };
     // The verifier holds the lane's class slot (D12) by reusing the one this run holds:
     // `verify` takes none of its own.
     let options = VerifyOptions {
@@ -4448,10 +4520,16 @@ async fn replay_and_gate(
         // This run's own check of its lane. The replay is sandboxed as always; only the
         // refusal of an unsandboxed capsule is skipped, which `cowproof verify` keeps.
         allow_unsandboxed: input.unsandboxed,
+        pk_exe,
         ..VerifyOptions::default()
     };
     match verify(&capsule_dir, input.repo, &verify_dir, &runner, options).await {
         Ok(report) => {
+            if let Err(e) = record_verify_results(&capsule_dir, &mut capsule, &report, evidence) {
+                evidence
+                    .infrastructure
+                    .push(format!("recording the verifier's results failed: {e:#}"));
+            }
             evidence.heldout_failed.extend(
                 report
                     .heldout
@@ -4477,6 +4555,47 @@ async fn replay_and_gate(
             .infrastructure
             .push(format!("verify could not run: {e}")),
     }
+    Ok(())
+}
+
+/// Put what `verify` found into the sealed files: `gates.json` gets each held-out check's pass
+/// or fail and, for a port packet, the `port_replay` gate; the capsule's `port` entry gets the
+/// replay's result. The capsule is sealed again over the new bytes. A failed `port_replay`
+/// joins the failed gates, so the verdict lists it; held-out failures stay where they were
+/// (`heldOutFailed`), so `verdict.json` keeps its shape.
+fn record_verify_results(
+    capsule_dir: &Path,
+    capsule: &mut Capsule,
+    report: &cowproof_prove::VerifyReport,
+    evidence: &mut Evidence,
+) -> Result<()> {
+    if report.heldout.is_empty() && report.port.is_none() {
+        return Ok(());
+    }
+    // `gates.json` is absent when the gates could not run, which is already infrastructure.
+    let path = capsule_dir.join("gates.json");
+    let Ok(text) = fs::read_to_string(&path) else {
+        return Ok(());
+    };
+    let mut gates: cowproof_prove::GateReport =
+        serde_json::from_str(&text).context("reading gates.json")?;
+    cowproof_prove::record_verify_results(&mut gates, &report.heldout, report.port.as_ref());
+    fs::write(&path, serde_json::to_vec_pretty(&gates)?).context("writing gates.json")?;
+    if let Some(port) = &report.port {
+        if let Some(entry) = capsule.port.as_mut() {
+            entry.result = Some(port.result.clone());
+        }
+        if !port.passed() {
+            evidence.failed_gates.push(GateFailure {
+                name: "port_replay".to_string(),
+                evidence: port.result.failures.clone(),
+            });
+        }
+        evidence.notes.extend(port.skipped_note());
+    }
+    capsule
+        .write(capsule_dir)
+        .context("sealing the capsule again")?;
     Ok(())
 }
 
@@ -5388,6 +5507,7 @@ body"#;
             infrastructure: vec![],
             no_checks_declared: false,
             heldout_failed: vec!["hidden-edge".into()],
+            notes: vec![],
         };
         let (outcome, reasons) = reasons_of(&e);
         assert_eq!(outcome, Outcome::Refuted);

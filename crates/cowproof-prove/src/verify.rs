@@ -1,4 +1,5 @@
 use crate::capsule::{Capsule, CapsuleError, CheckResult, HELDOUT_FILE};
+use crate::port::{PortOutcome, PortRun, run_port};
 use crate::runner::{CheckRunner, acquire_slot};
 use cowproof_core::get_slot_dir;
 use std::collections::{BTreeMap, HashSet};
@@ -29,6 +30,10 @@ pub struct VerifyOptions {
     /// `cowproof verify` refuses such a capsule: one from a builder that ran unconfined is
     /// not a proof to hand to someone else.
     pub allow_unsandboxed: bool,
+    /// The `cowproof` executable whose `pk port replay` the verifier runs for a `kind: port`
+    /// capsule. `None` is the running executable (`std::env::current_exe`). It must be
+    /// reachable inside the verifier's sandbox (`SandboxedRunner::with_executable`).
+    pub pk_exe: Option<PathBuf>,
 }
 
 impl Default for VerifyOptions {
@@ -42,6 +47,7 @@ impl Default for VerifyOptions {
             default_timeout: Duration::from_secs(20 * 60),
             held_slot_path: None,
             allow_unsandboxed: false,
+            pk_exe: None,
         }
     }
 }
@@ -83,6 +89,10 @@ pub enum VerifyResult {
     Diverged { check_ids: Vec<String> },
     /// Every recorded check matched, but a held-out check failed on the rebuilt tree.
     HeldOutFailed { check_ids: Vec<String> },
+    /// Checks and held-out checks passed, but the `port_replay` gate of a `kind: port` capsule
+    /// failed: a fixture differs, a tool is not ported, a base fixture was altered, an accepted
+    /// difference has no ruling, or a held-out port case failed. One line each.
+    PortFailed { failures: Vec<String> },
 }
 
 #[derive(Debug)]
@@ -92,6 +102,8 @@ pub struct VerifyReport {
     /// The held-out checks, in file order. Empty when the capsule holds none. Filled
     /// even when a recorded check diverged, so a refutation names every failure.
     pub heldout: Vec<HeldOutOutcome>,
+    /// What the replay of a `kind: port` capsule found. `None` for every other capsule.
+    pub port: Option<PortOutcome>,
 }
 
 const FLAKY_ATTEMPTS: u32 = 3;
@@ -222,8 +234,9 @@ pub async fn verify(
         });
     }
 
+    let heldout_file = load_heldout(capsule_dir)?;
     let mut heldout_outcomes = Vec::new();
-    for check in load_heldout(capsule_dir)? {
+    for check in heldout_file.check.iter().cloned() {
         let outcome = runner
             .run(&tree, &check.command, opts.default_timeout)
             .await
@@ -239,6 +252,33 @@ pub async fn verify(
         .map(|o| o.check_id.clone())
         .collect();
 
+    // A port capsule: portkit's replay of the fixtures and of the director's held-out cases,
+    // after the checks, in the same tree.
+    let port = match &capsule.port {
+        None => None,
+        Some(spec) => {
+            let pk_exe = match &opts.pk_exe {
+                Some(exe) => exe.clone(),
+                None => std::env::current_exe()
+                    .map_err(|e| infra(format!("cannot find the cowproof executable: {e}")))?,
+            };
+            Some(
+                run_port(PortRun {
+                    capsule_dir,
+                    capsule: &capsule,
+                    spec,
+                    heldout: &heldout_file,
+                    tree: &tree,
+                    workdir,
+                    pk_exe: &pk_exe,
+                    runner,
+                    timeout: opts.default_timeout,
+                })
+                .await?,
+            )
+        }
+    };
+
     let result = if !diverged_ids.is_empty() {
         VerifyResult::Diverged {
             check_ids: diverged_ids,
@@ -246,6 +286,10 @@ pub async fn verify(
     } else if !heldout_failed.is_empty() {
         VerifyResult::HeldOutFailed {
             check_ids: heldout_failed,
+        }
+    } else if let Some(port) = port.as_ref().filter(|p| !p.passed()) {
+        VerifyResult::PortFailed {
+            failures: port.result.failures.clone(),
         }
     } else {
         VerifyResult::Reproduced
@@ -255,10 +299,11 @@ pub async fn verify(
         result,
         checks: check_matches,
         heldout: heldout_outcomes,
+        port,
     })
 }
 
-fn infra(msg: String) -> VerifyError {
+pub(crate) fn infra(msg: String) -> VerifyError {
     VerifyError::Infrastructure(msg)
 }
 
@@ -291,20 +336,18 @@ pub(crate) fn load_checks(
     Ok(checks)
 }
 
-/// The held-out checks the capsule carries, in file order; none when it has no
-/// `packets/heldout.toml`. The file is hashed, so `Capsule::read` has already proved
-/// it is the one the lane was gated on.
-fn load_heldout(capsule_dir: &Path) -> Result<Vec<cowproof_core::heldout::Check>, VerifyError> {
+/// The held-out file the capsule carries (its checks in file order, and the `[port]` table);
+/// empty when it has no `packets/heldout.toml`. The file is hashed, so `Capsule::read` has
+/// already proved it is the one the lane was gated on.
+fn load_heldout(capsule_dir: &Path) -> Result<cowproof_core::heldout::HeldOut, VerifyError> {
     let path = capsule_dir.join(HELDOUT_FILE);
     if !path.exists() {
-        return Ok(Vec::new());
+        return Ok(cowproof_core::heldout::HeldOut::default());
     }
-    cowproof_core::heldout::load(&path)
-        .map(|h| h.check)
-        .map_err(|e| infra(format!("{HELDOUT_FILE}: {e:#}")))
+    cowproof_core::heldout::load(&path).map_err(|e| infra(format!("{HELDOUT_FILE}: {e:#}")))
 }
 
-async fn git(dir: &Path, args: &[&str]) -> Result<String, VerifyError> {
+pub(crate) async fn git(dir: &Path, args: &[&str]) -> Result<String, VerifyError> {
     let output = Command::new("git")
         .args(["-c", "core.hooksPath=/dev/null", "-C"])
         .arg(dir)

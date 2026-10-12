@@ -4,6 +4,8 @@
 //! This prevents a patch from weakening its own checks.
 
 use crate::flaws::{check_rules, parse_rules};
+use crate::port::PortOutcome;
+use crate::verify::HeldOutOutcome;
 use anyhow::{Context, Result, bail};
 use cowproof_core::{
     git_show_optional, glob_matches, outside_ownership, parse_patch, removed_lines,
@@ -83,6 +85,73 @@ pub fn run_gates(
     let any_failed = gates.iter().any(|g| !g.passed);
 
     Ok(GateReport { gates, any_failed })
+}
+
+/// Write what the verifier found into the gate report, so `gates.json` alone tells the truth.
+///
+/// `run_gates` runs before the tree is rebuilt, so its `held_out` gate can only say the
+/// checks are present. Once `verify` has run them, each held-out check's pass or fail is
+/// added to that gate's evidence and the gate fails if any check did; the port packet's
+/// held-out cases are recorded the same way (a skipped one warns). A `kind: port` capsule
+/// also gets a `port_replay` gate. `any_failed` is recomputed. `verdict.json` is not built
+/// from this: it keeps listing held-out failures under `heldOutFailed`.
+pub fn record_verify_results(
+    report: &mut GateReport,
+    heldout: &[HeldOutOutcome],
+    port: Option<&PortOutcome>,
+) {
+    if let Some(gate) = report.gates.iter_mut().find(|g| g.name == "held_out") {
+        for outcome in heldout {
+            gate.evidence.push(format!(
+                "held-out check {:?}: {}",
+                outcome.check_id,
+                if outcome.passed { "passed" } else { "failed" }
+            ));
+            gate.passed &= outcome.passed;
+        }
+        if let Some(port) = port {
+            let held = &port.result.held_out;
+            match held.state.as_str() {
+                "passed" => gate.evidence.push(format!(
+                    "held-out port cases: {} captured against the reference, all passed",
+                    held.cases
+                )),
+                "failed" => {
+                    gate.evidence.push(format!(
+                        "held-out port cases: failed ({})",
+                        held.reason.as_deref().unwrap_or("see the capsule")
+                    ));
+                    gate.passed = false;
+                }
+                "skipped" => {
+                    gate.evidence.push(format!(
+                        "held-out: skipped ({})",
+                        held.reason.as_deref().unwrap_or("no reason")
+                    ));
+                    gate.warned = true;
+                }
+                _ => {}
+            }
+        }
+    }
+    if let Some(port) = port {
+        let result = &port.result;
+        let evidence = if result.success {
+            vec![format!(
+                "replayed {} fixture file(s) on the direct and mcp surfaces; fixture set sha256 {}",
+                result.fixture_count, result.fixture_hash
+            )]
+        } else {
+            result.failures.clone()
+        };
+        report.gates.push(GateResult {
+            name: "port_replay".to_string(),
+            passed: result.success,
+            warned: false,
+            evidence,
+        });
+    }
+    report.any_failed = report.gates.iter().any(|g| !g.passed);
 }
 
 /// The protected globs from `lanes.config.json` as committed at `base_commit`, or the
@@ -290,18 +359,24 @@ fn check_heldout(packet: &GatePacket, base_repo: &Path) -> GateResult {
                     match cowproof_core::heldout::load(&path_canonical) {
                         Ok(heldout) => {
                             let check_count = heldout.check.len();
-                            if check_count == 0 {
+                            if heldout.is_empty() {
                                 (
                                     false,
                                     false,
                                     vec!["Held-out checks file is empty".to_string()],
                                 )
                             } else {
-                                let evidence = vec![format!(
-                                    "Held-out checks present: {} check{}",
-                                    check_count,
-                                    if check_count == 1 { "" } else { "s" }
-                                )];
+                                let mut evidence = Vec::new();
+                                if check_count > 0 {
+                                    evidence.push(format!(
+                                        "Held-out checks present: {} check{}",
+                                        check_count,
+                                        if check_count == 1 { "" } else { "s" }
+                                    ));
+                                }
+                                if heldout.port.is_some() {
+                                    evidence.push("Held-out port cases present".to_string());
+                                }
                                 (true, false, evidence)
                             }
                         }

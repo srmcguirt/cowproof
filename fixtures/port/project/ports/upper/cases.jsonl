@@ -1,0 +1,3 @@
+{"tool":"upper","id":"hello","input":{"text":"hello"}}
+{"tool":"upper","id":"mixed","input":{"text":"Rust 2024"}}
+{"tool":"shout","id":"hi","input":{"text":"hi there"}}

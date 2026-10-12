@@ -1,0 +1,11 @@
+{
+  "tool": "shout",
+  "id": "hi",
+  "input": {
+    "text": "hi there"
+  },
+  "expected": {
+    "result": "HI THERE!"
+  },
+  "source": "sh reference/text.sh"
+}

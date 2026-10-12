@@ -292,6 +292,59 @@ What it reads and how it counts:
 - **Score** = (calls / most calls) x (bytes / most bytes) x (time / most time), each maximum over all candidates, so no unit dominates. Ties go to more calls, more bytes, then the name.
 - **Nothing sensitive is printed or written:** the head is redacted (`cowproof_core::redact`) and its control characters turned into spaces before anything else is done with it, and a word naming `.env`, an SSH key or `credentials.json` is masked. Example invocations are those redacted heads.
 
+## Port packets: `kind: port`
+
+A port packet asks a builder to replace a script (shell, Node, Python, anything that can answer a JSON request on stdin) with a Rust tool, and proves it with portkit's parity replay instead of a claim. The director records what the original does on a set of cases (`cowproof pk port capture`), commits those fixtures, and writes the packet. The builder writes the Rust tool and registers it as a plugin in `.portkit/plugins.toml`; the verifier then replays every fixture against the rebuilt tree, in its sandbox, on both the direct and the MCP surface.
+
+```text
+<!-- lane {
+  "id": "port-lanes", "kind": "port", "class": "rust",
+  "owns": ["crates/pk-lanes/**", "ports/lanes/fixtures/**", ".portkit/plugins.toml"],
+  "allow": ["cargo test*", "cowproof pk port *"],
+  "port": {
+    "lang": "node",
+    "adapter": "function",
+    "reference": {"cmd": "node reference/adapter.mjs", "cwd": ".", "env": {"TZ": "UTC"}, "runtime": "node>=22"},
+    "cases": "ports/lanes/cases.jsonl",
+    "fixtures": "ports/lanes/fixtures",
+    "tools": ["parse_header", "glob_matches"],
+    "parity": {"epsilon": 0, "ignore_paths": ["/meta/generated_at"], "unordered_arrays": false, "path_roots": ["$ROOT"]}
+  },
+  "checks": [{"id": "tests", "command": "cargo test --locked -p pk-lanes"}]
+} -->
+```
+
+The header parses strictly: `kind` is `work` (the default) or `port`, a `port` object belongs to a `port` packet and only to one, and an unknown key in `port`, `port.reference` or `port.parity` is an error, not a dropped field.
+
+| Field | Meaning |
+| --- | --- |
+| `port.lang` | `python`, `node`, `typescript`, `shell`, `ruby`, `perl`, `powershell`, `go` or `other` |
+| `port.adapter` | `function` (an adapter file in the source repository makes a function speak the contract; needs `port.reference.cmd`) or `process` (whole-script capture, a later step). Both are checked and recorded. |
+| `port.reference` | `cmd` (run with `sh -c`; one `{"tool":..,"input":..}` request on stdin, one JSON result on stdout), `cwd`, `env`, and `runtime`, what the verifier must have installed (`node>=22`, `python3`) |
+| `port.cases`, `port.fixtures` | the committed cases file and the fixtures directory (`<tool>/<id>.json`); the builder may write the directory, so `owns` covers it |
+| `port.tools` | the tool names the registry must answer; `not_ported` must be 0 for every one |
+| `port.parity` | `epsilon` (default: `[port] epsilon` in the base `cowproof.toml`, 0 when it has none), `ignore_paths` (JSON Pointers), `unordered_arrays`, `path_roots` |
+
+`cowproof lint` checks seven more rules for a port packet (`--escalations <lane>/control/escalations.jsonl` adds the lane's rulings to `port-accepted-unruled`):
+
+| Rule | Level | Fires when |
+| --- | --- | --- |
+| `port-cases-missing` | error | `port.cases` is not a file in the repository |
+| `port-fixtures-not-owned` | error | `owns` does not reach `<fixtures>/<tool>/<id>.json` for some tool |
+| `port-reference-not-allowed` | error | a `wide: false` packet has a check that runs `port.reference.cmd` and no `allow` entry (or base allowlist entry) matches it |
+| `port-tool-unregistered` | error | the packet text does not name a tool in `port.tools`, or names no plugin manifest (`.portkit/plugins.toml`) that `owns` covers |
+| `port-accepted-unruled` | error | an `accepted` entry in a fixture has a `reason` with no `ruling:<id>`; given the escalation log, also one whose id no director answer in it carries |
+| `port-epsilon-loosened` | error | the packet, or a fixture, sets epsilon above the project default |
+| `port-nondeterministic-output` | warn | a fixture's expected output has an RFC 3339 time, a temp or home path or a `.local`-style host name that no `ignore_paths`, `accepted` or `path_roots` entry covers |
+
+**The proof.** After the packet's recorded checks, in the same rebuilt tree and sandbox, the verifier runs `cowproof pk --config <pk.toml> port replay --fixtures <port.fixtures> --surface both --epsilon <e> --json` and judges the report itself. The `port_replay` gate in `gates.json` passes only if the command exited 0, both surfaces replayed, every surface's `ReplayReport::is_success()` holds, `not_ported` is 0, every tool in `port.tools` has fixtures that were replayed, and the lane left the fixtures alone: a fixture of the base keeps its `tool`, `id`, `input` and `expected` (the builder may add fixtures and, with a ruling, `accepted` entries; only a director recaptures), and each `accepted` difference the lane added cites `ruling:<id>` in the reason with the id carried by an `answer` in the lane's escalation log. A refusal names the surface, the tool and the fixture, for instance `direct shout/hi: differs from the reference at "/result"`, or `not ported (no tool answers it)`.
+
+**Held-out cases.** The director's second set of cases lives outside the repository, beside the held-out file: `cowproof run packet.md --heldout ~/.cowproof/heldout/<repo-id>/<lane>.toml`, with `[port] cases = "<lane>.cases.jsonl"` in it naming a JSONL file in the same directory (the same `{"tool":..,"id":..,"input":..}` lines as `port.cases`). The cases file is copied into the capsule's `packets/` (hashed there, never in the clone). At verification the verifier captures them against the reference (`port.reference`, run in the sandbox) and replays them, so a port that only matches the visible fixtures fails. If `port.reference.runtime` is not in the verifier's sandbox, or is older than asked, the held-out cases are not run: `cowproof run` and `cowproof verify` print `held-out: skipped (<why>)`, `gates.json` records it with `warned: true`, and the capsule says `skipped`. It is never a silent pass. A held-out file with port cases needs a `kind: port` packet with a `port.reference.cmd`; `cowproof run` refuses anything else before a lane exists.
+
+**The capsule.** A port capsule carries a sealed `port` entry (older capsules have none and still verify): the reference command, the source commit (the lane's base commit), a `sha256` over the fixtures directory of the rebuilt tree (every file path and its bytes, in path order), per surface the counts and only the failing and accepted outcomes, and the held-out state. `gates.json` lists each held-out check with its pass or fail on any lane, not only on port packets.
+
+Not built yet: the per-language capture adapters (Node and Python function shims, then whole-process capture for shell scripts), which `adapter` and `lang` already name. Today the reference command is any program that speaks the contract. `fixtures/port/` is a worked example (a shell reference with two tools, a Rust port, held-out cases) that `crates/cowproof-cli/tests/port_packets.rs` runs end to end.
+
 ## Run a lane on another machine
 
 `cowproof run packet.md --host buildbox` runs the builder, and the checks it asks for, on another machine over SSH. Your machine stays the director: it keeps the escalation queue and your rulings, the egress proxy and so the API key, the held-out checks, the proof and the capsule. The host runs only what runs sandboxed. The key never leaves the director: no argument, spec, bundle or environment sent to the host holds it, and the builder on the host presents the lane's own `placeholder-...` key, which only your proxy accepts, through two sockets that SSH forwards from the host back to you.

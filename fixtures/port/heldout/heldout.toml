@@ -1,0 +1,6 @@
+# The director's held-out port cases. The builder never sees them: keep this file and the
+# cases file beside it outside the repository and pass it with --heldout. The verifier
+# captures the cases against the reference and replays them, so a port that only matches
+# the visible fixtures fails.
+[port]
+cases = "heldout.cases.jsonl"

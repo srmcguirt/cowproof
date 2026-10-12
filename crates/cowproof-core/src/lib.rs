@@ -11,6 +11,7 @@ pub mod git_show;
 pub mod heldout;
 pub mod ladder;
 pub mod patch;
+pub mod port;
 pub mod profiles;
 pub mod redact;
 pub mod status;
@@ -18,6 +19,9 @@ pub mod status;
 pub use git_show::{LinkedFile, git_show_following_links, git_show_optional};
 pub use ladder::{PACKET_CLASSES, Routing, Rung, RungSource, Runtime, valid_model_name};
 pub use patch::{PatchDelta, parse_patch};
+pub use port::{
+    PacketKind, PortParity, PortReference, PortSpec, project_epsilon, project_epsilon_at_commit,
+};
 pub use profiles::{Profiles, Requirement};
 pub use redact::redact;
 pub use status::{LaneStatus, StatusClass, StatusFacts, classify_opencode, classify_status};
@@ -129,6 +133,13 @@ pub struct Header {
     pub web_search: bool,
     #[serde(default)]
     pub checks: Vec<Check>,
+    /// What the packet is for: `work` (the default) or `port`, a script ported to Rust and
+    /// proved by portkit's replay (`port`).
+    #[serde(default)]
+    pub kind: PacketKind,
+    /// The `kind: port` object. Present exactly when `kind` is `port`; parsed strictly.
+    #[serde(default)]
+    pub port: Option<PortSpec>,
 }
 
 fn default_runner() -> String {
@@ -202,8 +213,12 @@ pub fn parse_header(text: &str) -> Result<Header> {
     {
         v["runner"] = Value::String("opencode".into());
     }
-    let raw_id = v.get("id").and_then(Value::as_str).unwrap_or_default();
-    if !valid_id(raw_id) {
+    let raw_id = v
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    if !valid_id(&raw_id) {
         bail!("lane id must be lowercase letters, digits and dashes");
     }
     if !v
@@ -213,7 +228,19 @@ pub fn parse_header(text: &str) -> Result<Header> {
     {
         bail!("lane {raw_id}: owns must list at least one path");
     }
-    let h: Header = serde_json::from_value(v)?;
+    let h: Header = serde_json::from_value(v).map_err(|e| anyhow::anyhow!("lane {raw_id}: {e}"))?;
+    match (h.kind, &h.port) {
+        (PacketKind::Port, None) => bail!("lane {}: kind \"port\" needs a \"port\" object", h.id),
+        (PacketKind::Work, Some(_)) => bail!(
+            "lane {}: a \"port\" object belongs to a packet with \"kind\": \"port\"",
+            h.id
+        ),
+        _ => {}
+    }
+    if let Some(port) = &h.port {
+        port.validate()
+            .with_context(|| format!("lane {}: the header's \"port\"", h.id))?;
+    }
     if !["opencode", "codex"].contains(&h.runner.as_str()) {
         bail!("lane {}: runner must be opencode or codex (legacy)", h.id);
     }
@@ -222,8 +249,9 @@ pub fn parse_header(text: &str) -> Result<Header> {
     }
     if !PACKET_CLASSES.contains(&h.class_name.as_str()) {
         bail!(
-            "lane {}: class must be one of rust, crate, pg, light, port",
-            h.id
+            "lane {}: class must be one of {}",
+            h.id,
+            PACKET_CLASSES.join(", ")
         );
     }
     if let Some(model) = &h.model {

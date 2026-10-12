@@ -12,12 +12,16 @@
 pub mod capsule;
 pub mod flaws;
 pub mod gates;
+pub mod port;
 pub mod runner;
 pub mod verify;
 
 pub use capsule::{Capsule, CapsuleError, HELDOUT_FILE, SEAL_FILE, ToolTotals, TraceTotals};
 pub use flaws::{FlawFinding, FlawRule, PatchDelta, RuleFile};
-pub use gates::{GatePacket, GateReport, GateResult, run_gates};
+pub use gates::{GatePacket, GateReport, GateResult, record_verify_results, run_gates};
+pub use port::{
+    PortCapsule, PortHeldOut, PortOutcome, PortResult, SurfaceSummary, fixture_set_hash,
+};
 pub use runner::{
     CheckOutcome, CheckRunner, InfraError, SandboxedRunner, SlotGuard, acquire_slot, host_platform,
 };
