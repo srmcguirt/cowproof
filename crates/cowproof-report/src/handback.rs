@@ -677,7 +677,25 @@ fn load_packs(options: &Options) -> Result<(Vec<FlawRule>, Vec<String>)> {
                 {
                     bail!("flaw pack {name} in cowproof.toml must be a path inside the repository");
                 }
-                let full = base.map_or_else(|| path.to_path_buf(), |b| b.join(path));
+                let full = base
+                    .as_ref()
+                    .map_or_else(|| path.to_path_buf(), |b| b.join(path));
+                // A pack named by the repository's own config stays inside it, symlinks
+                // included: a parse error quotes the file, so an escaping link would print
+                // part of a file from outside the repository into the report.
+                if let Some(base) = base {
+                    let root = base
+                        .canonicalize()
+                        .with_context(|| format!("resolve the repository {}", base.display()))?;
+                    let real = full
+                        .canonicalize()
+                        .with_context(|| format!("read flaw pack {name} ({})", full.display()))?;
+                    if !real.starts_with(&root) {
+                        bail!(
+                            "flaw pack {name} in cowproof.toml must be a path inside the repository"
+                        );
+                    }
+                }
                 fs::read_to_string(&full)
                     .with_context(|| format!("read flaw pack {name} ({})", full.display()))?
             }
@@ -1117,6 +1135,29 @@ mod tests {
             format!("{err:#}").contains("inside the repository"),
             "{err:#}"
         );
+
+        // An absolute path, and a link inside the repository that leads out of it.
+        let outside = tempfile::tempdir_in("/var/tmp").unwrap();
+        let secret = outside.path().join("secret.toml");
+        fs::write(&secret, "not = [toml\n").unwrap();
+        std::os::unix::fs::symlink(&secret, dir.path().join("linked.toml")).unwrap();
+        for named in [secret.to_str().unwrap(), "linked.toml"] {
+            fs::write(
+                dir.path().join("cowproof.toml"),
+                format!("[proof]\npacks = [{named:?}]\n"),
+            )
+            .unwrap();
+            let err = handback(&Options {
+                lane: flaw_lane(),
+                repo: Some(dir.path().to_path_buf()),
+                ..Options::default()
+            })
+            .unwrap_err();
+            assert!(
+                format!("{err:#}").contains("inside the repository"),
+                "{named}: {err:#}"
+            );
+        }
     }
     #[test]
     fn flaw_lane_fixture_runs_all_rules_including_baseline() {
