@@ -5524,3 +5524,203 @@ fn a_check_is_ended_when_the_builder_exits_and_the_lane_parks_before_any_ruling(
     let status = exit_within(&mut run, SESSION_END_WITHIN);
     assert_eq!(status.code(), Some(7), "{}", run.stderr());
 }
+
+// ---- A signal in the proof ends the run gracefully ---------------------------
+//
+// Past the builder the runner captures the patch and proves the lane. A signal there used to
+// end the process at once, with no record: a check the verifier was running kept going, and
+// `run.json` was the finished one or absent. Now the verifier's check groups are listed in
+// the runner's `GroupSet`, so the signal ends exactly those (SIGTERM, a grace, SIGKILL), and
+// `run.json` says `interrupted` with the phase, whatever the checks came to.
+//
+// The check passes at once when the builder runs it, and is a hold in the verifier, told
+// apart by its `TMPDIR` (`scratch/tmp` for the builder, `scratch/verify/tmp` for the
+// verifier). The hold keeps a background heartbeat in the verifier's temp directory and
+// records its pid there, so the test knows the proof is in the check.
+
+/// What the hold does when the verifier's check is sent SIGTERM: `exit 0` after leaving a
+/// marker (the check would then agree with the builder's recorded pass, which is how a
+/// signalled proof could come out `proved`), or nothing at all (`trap '' TERM`).
+fn proof_hold_check(on_term: &str) -> String {
+    format!(
+        "case \"$TMPDIR\" in */verify/tmp) {on_term}; \
+         ( while :; do echo . >> \"$TMPDIR/beat\"; sleep 0.5; done ) & \
+         echo $! > \"$TMPDIR/bgpid\"; \
+         while :; do sleep 1 & wait $!; done ;; *) true ;; esac"
+    )
+}
+
+/// The check, once it has been sent SIGTERM, leaves a marker and exits 0: the verifier would
+/// call that a pass, and it matches the builder's recorded one.
+const TERM_EXITS_ZERO: &str = "trap 'echo termed > \"$TMPDIR/termed\"; exit 0' TERM";
+
+fn proof_harness(on_term: &str) -> Harness {
+    Harness::with_packet(
+        &run_checks(&["hold"]),
+        json!(["README.md", "created.txt"]),
+        json!([{"id": "hold", "command": proof_hold_check(on_term)}]),
+    )
+}
+
+/// The verifier's temp directory, where the hold keeps its files.
+fn proof_tmp(h: &Harness) -> PathBuf {
+    h.lane().join("scratch/verify/tmp")
+}
+
+/// What a run signalled in the proof must leave, whatever the check did: exit 130, `run.json`
+/// `interrupted` in the `proof` phase, whole (no temporary file beside it), no verdict, no
+/// socket.
+fn assert_interrupted_in_the_proof(
+    h: &Harness,
+    status: std::process::ExitStatus,
+    run: &Watched,
+    signal_name: &str,
+) {
+    assert_eq!(status.code(), Some(130), "{}", run.stderr());
+    let run_json = h.run_json();
+    assert_eq!(run_json["status"], "interrupted", "{run_json}");
+    assert_eq!(run_json["phase"], "proof", "{run_json}");
+    assert_eq!(run_json["signal"], signal_name, "{run_json}");
+    assert_eq!(run_json["exitCode"], 130, "{run_json}");
+    assert!(
+        !h.lane().join("control/run.json.tmp").exists(),
+        "a temporary run.json is left behind"
+    );
+    assert!(
+        !h.lane().join("control/verdict.json").exists(),
+        "a lane signalled in the proof has a verdict: {}",
+        h.read("control/verdict.json")
+    );
+    for socket in lane_sockets(h) {
+        assert!(
+            std::fs::symlink_metadata(&socket).is_err(),
+            "{} still exists",
+            socket.display()
+        );
+    }
+}
+
+fn a_signal_in_the_proof_ends_the_verifiers_check_gracefully(signal: &str) {
+    let h = proof_harness(TERM_EXITS_ZERO);
+    let mut run = start_watched(&h, &[]);
+    wait_for_file(&mut run, &proof_tmp(&h).join("bgpid"));
+    // The builder's own run of the check passed, so the proof is what is running.
+    assert!(passed(&h, 3), "the builder's run of the hold must pass");
+    assert!(
+        !h.lane().join("control/verdict.json").exists(),
+        "the proof is still in its check"
+    );
+
+    send_signal(signal, &run.child);
+    let status = exit_within(&mut run, INTERRUPT_EXIT_WITHIN);
+    assert_interrupted_in_the_proof(
+        &h,
+        status,
+        &run,
+        if signal == "INT" { "SIGINT" } else { "SIGTERM" },
+    );
+    // The check was sent SIGTERM before it was killed (a SIGKILL leaves no marker), and its
+    // clean exit did not make the lane proved.
+    assert_eq!(
+        fs::read_to_string(proof_tmp(&h).join("termed")).unwrap_or_default(),
+        "termed\n",
+        "the check was killed without a SIGTERM first:\n{}",
+        run.stderr()
+    );
+    assert_heartbeat_stopped(
+        &proof_tmp(&h).join("beat"),
+        Duration::ZERO,
+        "the verifier's check",
+    );
+    if cfg!(target_os = "macos") {
+        assert_pid_gone(
+            fs::read_to_string(proof_tmp(&h).join("bgpid"))
+                .unwrap()
+                .trim(),
+        );
+    }
+    assert_eq!(h.launches(), 1, "an interrupted run never relaunches");
+}
+
+#[test]
+fn sigint_in_the_proof_ends_the_verifiers_check_with_sigterm_and_records_interrupted() {
+    if !sandbox_available() {
+        return;
+    }
+    a_signal_in_the_proof_ends_the_verifiers_check_gracefully("INT");
+}
+
+#[test]
+fn sigterm_in_the_proof_ends_the_verifiers_check_with_sigterm_and_records_interrupted() {
+    if !sandbox_available() {
+        return;
+    }
+    a_signal_in_the_proof_ends_the_verifiers_check_gracefully("TERM");
+}
+
+#[test]
+fn a_verifier_check_that_ignores_sigterm_is_killed_after_the_grace() {
+    if !sandbox_available() {
+        return;
+    }
+    let h = proof_harness("trap '' TERM");
+    let mut run = start_watched(&h, &[]);
+    wait_for_file(&mut run, &proof_tmp(&h).join("bgpid"));
+
+    let signalled = Instant::now();
+    send_signal("INT", &run.child);
+    let status = exit_within(&mut run, check_term_grace() + INTERRUPT_EXIT_WITHIN);
+    let took = signalled.elapsed();
+    assert_interrupted_in_the_proof(&h, status, &run, "SIGINT");
+    // The check ignores SIGTERM: it was given the grace, and only then killed.
+    assert!(
+        took >= check_term_grace(),
+        "the check was killed after {took:?}, before its {:?} grace:\n{}",
+        check_term_grace(),
+        run.stderr()
+    );
+    assert_heartbeat_stopped(
+        &proof_tmp(&h).join("beat"),
+        Duration::ZERO,
+        "the verifier's check",
+    );
+}
+
+#[test]
+fn a_second_signal_in_the_proof_kills_the_check_at_once() {
+    if !sandbox_available() {
+        return;
+    }
+    // The check ignores SIGTERM, so the first signal alone takes `CHECK_TERM_GRACE` to become
+    // a SIGKILL. The second must not wait for it: three quarters of the grace clears the
+    // runner's teardown on a slow host and still fails a wait for the grace.
+    let grace = check_term_grace();
+    let bound = grace * 3 / 4;
+    let h = proof_harness("trap '' TERM");
+    let mut run = start_watched(&h, &[]);
+    wait_for_file(&mut run, &proof_tmp(&h).join("bgpid"));
+
+    send_signal("INT", &run.child);
+    run.wait_for_stderr("in the proof phase: ending the run", INTERRUPT_EXIT_WITHIN);
+    let second = Instant::now();
+    send_signal("INT", &run.child);
+    let status = exit_within(&mut run, grace + INTERRUPT_EXIT_WITHIN);
+    let took = second.elapsed();
+    assert!(
+        took < bound,
+        "the second signal waited for the check's grace: exit {took:?} after it, bound \
+         {bound:?} of a {grace:?} grace:\n{}",
+        run.stderr()
+    );
+    assert_interrupted_in_the_proof(&h, status, &run, "SIGINT");
+    assert!(
+        run.stderr().contains("SIGINT again: not waiting"),
+        "{}",
+        run.stderr()
+    );
+    assert_heartbeat_stopped(
+        &proof_tmp(&h).join("beat"),
+        Duration::ZERO,
+        "the verifier's check",
+    );
+}

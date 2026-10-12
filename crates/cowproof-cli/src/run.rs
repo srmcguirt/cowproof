@@ -48,7 +48,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use cowproof_core::{
     LinkedFile, PORT_CLASS, Profiles, Routing, Rung, Runtime, class_limit_at_commit, get_slot_dir,
     git_show_following_links, parse_header, port_base_for_slot, port_block_env, redact,
-    release_slot, valid_model_name,
+    valid_model_name,
 };
 use cowproof_prove::{
     PortCapsule,
@@ -597,6 +597,12 @@ impl Interrupt {
 
     fn raise(&self) {
         self.raised.send_replace(true);
+    }
+
+    /// Whether the first signal has come. The proof reads it just before it writes its
+    /// verdict, so a run signalled in the proof never leaves one.
+    fn is_raised(&self) -> bool {
+        *self.raised.borrow()
     }
 
     fn subscribe(&self) -> watch::Receiver<bool> {
@@ -2897,6 +2903,8 @@ async fn next_signal(sigint: &mut Signal, sigterm: &mut Signal) -> &'static str 
 /// How a run was set up, for the record an interrupted run leaves.
 #[derive(Clone, Copy)]
 struct RunKind<'a> {
+    /// Where the run was when it was signalled.
+    phase: Phase,
     unsandboxed: bool,
     /// The credential mode the lane was started with, recorded as `authMode` (D28 clause 6).
     credential: Credential,
@@ -2904,10 +2912,37 @@ struct RunKind<'a> {
     host: Option<&'a str>,
 }
 
+/// Where a run was when the signal came, recorded in `run.json` as `phase`: waiting for a
+/// `slot`, setting up the `remote` host, with the `builder` running (or parked), capturing the
+/// patch (`capture`) or proving the lane (`proof`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Phase {
+    Slot,
+    Remote,
+    Builder,
+    Capture,
+    Proof,
+}
+
+impl Phase {
+    fn name(self) -> &'static str {
+        match self {
+            Phase::Slot => "slot",
+            Phase::Remote => "remote",
+            Phase::Builder => "builder",
+            Phase::Capture => "capture",
+            Phase::Proof => "proof",
+        }
+    }
+}
+
 /// What an interrupted run leaves behind, after the servers are stopped: the
 /// builder's group ended for good (a no-op when the launcher already did it),
-/// the three sockets removed and `run.json` saying `interrupted`. Nothing here
-/// waits, so a second signal never has to cut it short.
+/// the three sockets removed and `run.json` saying `interrupted` and in which
+/// [`Phase`]. `run.json` is written whole to a temporary file and renamed over the
+/// old one, so a reader sees the finished record of a run that got that far or this
+/// one, never half of either. Nothing here waits, so a second signal never has to cut
+/// it short.
 fn record_interrupted(
     layout: &LaneLayout,
     lane_id: &str,
@@ -2933,15 +2968,28 @@ fn record_interrupted(
         // Every credential stays in the director's proxy (D24): no lane holds one.
         "credentialInLane": false,
         "signal": signal_name,
+        "phase": kind.phase.name(),
         "exitCode": INTERRUPTED_EXIT_CODE,
         "durationMs": started.elapsed().as_millis() as u64,
     });
-    if let Err(e) = fs::write(
-        layout.control.join("run.json"),
-        serde_json::to_vec_pretty(&run).unwrap_or_default(),
+    if let Err(e) = write_atomically(
+        &layout.control.join("run.json"),
+        &serde_json::to_vec_pretty(&run).unwrap_or_default(),
     ) {
         eprintln!("[{lane_id}] writing run.json: {e}");
     }
+}
+
+/// Write `bytes` to `path` so no reader sees a partial file: to a sibling temporary file,
+/// then renamed over `path` (one directory, so one filesystem).
+fn write_atomically(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let mut temporary = path.as_os_str().to_owned();
+    temporary.push(".tmp");
+    let temporary = PathBuf::from(temporary);
+    fs::write(&temporary, bytes)?;
+    fs::rename(&temporary, path).inspect_err(|_| {
+        let _ = fs::remove_file(&temporary);
+    })
 }
 
 /// What a run that stopped before the builder started leaves behind: the sockets removed and
@@ -2966,9 +3014,9 @@ fn record_stopped(
     if let (Some(run), Some(fields)) = (run.as_object_mut(), fields.as_object()) {
         run.extend(fields.clone());
     }
-    if let Err(e) = fs::write(
-        layout.control.join("run.json"),
-        serde_json::to_vec_pretty(&run).unwrap_or_default(),
+    if let Err(e) = write_atomically(
+        &layout.control.join("run.json"),
+        &serde_json::to_vec_pretty(&run).unwrap_or_default(),
     ) {
         eprintln!("[{lane_id}] writing run.json: {e}");
     }
@@ -3495,38 +3543,38 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
     for (slot_class, limit) in [(class, class_limit), (PORT_CLASS, port_limit)] {
         let wait_started = Instant::now();
         let slot = tokio::select! {
-            slot = acquire_slot_notifying(slot_class, limit, &slot_dir, || {
-                eprintln!("[{}] waiting for a {slot_class} slot (limit {limit})", header.id);
-            }) => slot.with_context(|| {
-                format!("taking a {slot_class} slot in {}", slot_dir.display())
-            })?,
-            name = next_signal(&mut sigint, &mut sigterm) => {
-                eprintln!(
-                    "[{}] {name} while waiting for a {slot_class} slot: ending the run",
-                    header.id
-                );
-                // `taken` drops here and gives back the class slot, if it was held.
-                record_interrupted(
-                    &layout,
-                    &header.id,
-                    name,
-                    None,
-                    &layout.control.join("proxy.sock"),
-                    started,
-                    RunKind {
-                        unsandboxed: args.unsandboxed,
-                        credential,
-                        host: None,
-                    },
-                );
-                return Ok(INTERRUPTED_EXIT_CODE);
-            }
-        };
+                    slot = acquire_slot_notifying(slot_class, limit, &slot_dir, || {
+                        eprintln!("[{}] waiting for a {slot_class} slot (limit {limit})", header.id);
+                    }) => slot.with_context(|| {
+                        format!("taking a {slot_class} slot in {}", slot_dir.display())
+                    })?,
+                    name = next_signal(&mut sigint, &mut sigterm) => {
+                        eprintln!(
+                            "[{}] {name} while waiting for a {slot_class} slot: ending the run",
+                            header.id
+                        );
+                        // `taken` drops here and gives back the class slot, if it was held.
+                        record_interrupted(
+                            &layout,
+                            &header.id,
+                            name,
+                            None,
+                            &layout.control.join("proxy.sock"),
+                            started,
+                            RunKind {
+                                phase: Phase::Slot,
+        unsandboxed: args.unsandboxed,
+                                credential,
+                                host: None,
+                            },
+                        );
+                        return Ok(INTERRUPTED_EXIT_CODE);
+                    }
+                };
         taken.push((slot, wait_started.elapsed()));
     }
     let (port_slot, port_wait) = taken.pop().context("the port slot")?;
     let (slot, slot_wait) = taken.pop().context("the class slot")?;
-    let slot_paths = [slot.path().to_path_buf(), port_slot.path().to_path_buf()];
     let port_base = port_base_for_slot(port_slot.path())
         .with_context(|| format!("the slot {} has no number", port_slot.path().display()))?;
 
@@ -3699,6 +3747,7 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
                     &endpoint.socket,
                     started,
                     RunKind {
+                        phase: Phase::Remote,
                         unsandboxed: args.unsandboxed,
                         credential,
                         host: Some(remote.alias()),
@@ -3848,6 +3897,7 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
                 &proxy_sock,
                 started,
                 RunKind {
+                    phase: Phase::Builder,
                     unsandboxed: args.unsandboxed,
                     credential,
                     host: remote.as_ref().map(|r| r.alias()),
@@ -3856,293 +3906,340 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
             return Ok(INTERRUPTED_EXIT_CODE);
         }
     };
-    // Past the builder, a signal ends the process at once, as it did before
-    // the handlers existed (the tokio handlers would otherwise swallow it).
-    let exit_remote = remote.clone();
-    let exit_checks = check_groups.clone();
-    tokio::spawn(async move {
-        next_signal(&mut sigint, &mut sigterm).await;
-        // `exit` runs no destructors, and the group guards are destructors.
-        exit_checks.kill_all();
-        // `exit` runs no destructors: give both slots back first, and remove the host's lane.
-        for slot_path in &slot_paths {
-            release_slot(Some(slot_path));
-        }
-        if let Some(remote) = exit_remote {
-            remote.finish_blocking();
-        }
-        std::process::exit(INTERRUPTED_EXIT_CODE);
-    });
-    let status = lane_run.status;
-    let stats = &lane_run.stats;
-    let end = &lane_run.end;
-    let status_name = end.name(status.success());
+    // 6. and 7., the patch and the proof, as one future that is raced against the next
+    // signal. Past the builder a signal used to end the process at once, without a record;
+    // now it ends what is running (the proof's check groups, TERM then KILL), writes
+    // `run.json` as `interrupted` with the phase it came in, gives the slots back by
+    // returning, and exits 130. The future sets `phase` as it goes and the
+    // signal arm reads it, both on this one task, so a `Cell` is enough.
+    let phase = std::cell::Cell::new(Phase::Capture);
+    let after_builder = async {
+        let status = lane_run.status;
+        let stats = &lane_run.stats;
+        let end = &lane_run.end;
+        let status_name = end.name(status.success());
 
-    // 6. The lane is over (finished, stopped, out of time or cost): end any check still
-    // running, then stop serving, then capture.
-    check_groups.end_all(CHECK_TERM_GRACE).await;
-    drop(_tools);
-    drop(_proxy);
-    // A remote lane's patch comes from the host (`host-agent patch`, the very same
-    // `capture_patch` there), and the host is done with once it has it.
-    let patch = match &remote {
-        Some(remote) => remote.fetch_patch().await,
-        None => capture_patch(&layout, &prepared.launch_commit, &path).await,
+        // 6. The lane is over (finished, stopped, out of time or cost): end any check still
+        // running, then stop serving, then capture.
+        check_groups.end_all(CHECK_TERM_GRACE).await;
+        drop(_tools);
+        drop(_proxy);
+        // A remote lane's patch comes from the host (`host-agent patch`, the very same
+        // `capture_patch` there), and the host is done with once it has it.
+        let patch = match &remote {
+            Some(remote) => remote.fetch_patch().await,
+            None => capture_patch(&layout, &prepared.launch_commit, &path).await,
+        };
+        let remote_dir = remote.as_ref().and_then(|r| r.remote_dir());
+        if let Some(remote) = &remote {
+            remote.finish().await;
+        }
+        let patch_path = layout.control.join("lane.patch");
+        let patch_bytes = match &patch {
+            Ok(bytes) => {
+                fs::write(&patch_path, bytes)?;
+                Some(bytes.len())
+            }
+            Err(_) => None,
+        };
+
+        // The last launch's meter stands for the single-launch fields; totals add
+        // every launch up.
+        let summary = lane_run
+            .summaries
+            .last()
+            .context("the builder never ran")?
+            .clone();
+        let total_turns: usize = lane_run.summaries.iter().map(|s| s.turns.len()).sum();
+        let total_tokens: u64 = lane_run
+            .summaries
+            .iter()
+            .map(|s| {
+                s.total_input_tokens
+                    + s.total_output_tokens
+                    + s.total_cache_read_tokens
+                    + s.total_cache_creation_tokens
+            })
+            .sum();
+        let total_cost_usd: f64 = lane_run
+            .summaries
+            .iter()
+            .filter_map(|s| s.total_cost_usd)
+            .sum();
+        let estimated_cost_usd: f64 = lane_run
+            .segments
+            .iter()
+            .filter_map(|s| s["estimatedCostUsd"].as_f64())
+            .sum();
+
+        // The builder is gone: ask `pk doctor` whether its hooks fired (D5). The
+        // verdict is information about the lane and never changes the proof's.
+        let ran_other_runtime = lane_run
+            .segments
+            .iter()
+            .any(|s| s["runtime"].as_str() != Some(Runtime::Claude.name()));
+        let trace = if remote.is_some() {
+            untraced(
+                "the builder ran on a remote host, which has no portkit hooks".to_string(),
+                json!([]),
+            )
+        } else if ran_other_runtime {
+            untraced(
+                "a segment ran on a runtime with no portkit hooks (openrouter or codex)"
+                    .to_string(),
+                json!([]),
+            )
+        } else {
+            lane_trace_verdict(
+                launcher.pk_exe.as_deref(),
+                &layout,
+                &portkit_dir,
+                &header.id,
+            )
+            .await
+        };
+
+        // The usage monitor's totals (D5, D23): read from the lane's trace files, only for a lane
+        // `pk doctor` found traced. They describe how the lane was watched and never change the
+        // verdict.
+        let trace_totals: Option<TraceTotals> = if trace["traced"].as_bool() == Some(true) {
+            cowproof_report::traces::lane_trace_totals(&lane)
+        } else {
+            None
+        };
+
+        let mut run = json!({
+            "id": header.id,
+            "host": remote.as_ref().map(|r| r.alias()),
+            "remoteLaneDir": remote_dir,
+            "bridgePort": launcher.bridge_port,
+            "status": status_name,
+            "unsandboxed": launcher.unsandboxed,
+            "estimatedCostUsd": estimated_cost_usd,
+            "costIsEstimate": true,
+            "costCapUsd": launcher.cost_cap_usd,
+            "timeoutSecs": launcher.timeout.as_secs(),
+            "activeMs": launcher
+                .active
+                .lock()
+                .map_or(0, |a| a.as_millis() as u64),
+            "error": match end {
+                LaneEnd::Refused(why) => json!(why),
+                _ => serde_json::Value::Null,
+            },
+            "exitCode": status.code(),
+            "signal": status.signal(),
+            "runtime": lane_run.runtime.name(),
+            "runtimeVersion": launcher.runtime_version(lane_run.runtime),
+            // The OpenCode the lane could use, and the director's override of the OpenRouter
+            // upstream when there is one (null otherwise: the default host is not a setting).
+            "opencodeVersion": launcher.opencode.as_ref().map(|o| o.version.as_str()),
+            "openrouterUpstream": openrouter_upstream_overridden.then_some(openrouter_upstream.as_str()),
+            "model": lane_run.model,
+            "startRung": first_rung.to_string(),
+            "rungSource": rung_source.name(),
+            "turns": total_turns,
+            "sessionId": lane_run.session_id,
+            "meter": summary,
+            "segments": lane_run.segments,
+            "stream": {
+                "metered": stats.metered,
+                "unparsed": stats.unparsed,
+                "oversized": stats.oversized,
+            },
+            "baseCommit": prepared.base_commit,
+            "launchCommit": prepared.launch_commit,
+            "patchBytes": patch_bytes,
+            "patchError": patch.as_ref().err().map(|e| format!("{e:#}")),
+            "durationMs": started.elapsed().as_millis() as u64,
+            "classSlot": {
+                "class": class,
+                "limit": class_limit,
+                "waitMs": slot_wait.as_millis() as u64,
+            },
+            "portSlot": {
+                "limit": port_limit,
+                "portBase": port_base,
+                "waitMs": port_wait.as_millis() as u64,
+            },
+            "lane": {
+                "dir": lane,
+                "clone": layout.clone,
+                "control": layout.control,
+                "stream": layout.control.join("stream.jsonl"),
+                "patch": patch_path,
+                "stderr": layout.control.join("builder.stderr"),
+            },
+            "prefixVersion": &launcher.prefix_version,
+            "projectInstructionsSha256": &launcher.project_instructions_sha256,
+            "trace": trace,
+            "traceTotals": trace_totals,
+        });
+        // The Codex the lane could use, and the director's override of the OpenAI upstream.
+        run["codexVersion"] = json!(launcher.codex.as_ref().map(|c| c.version.as_str()));
+        run["openaiUpstream"] =
+            json!(openai_upstream_overridden.then_some(openai_upstream.as_str()));
+        // The credential mode (D28 clause 6), recorded beside `unsandboxed`: the mode, the kind of
+        // credential the proxy holds for a subscription lane, and whether any credential is inside
+        // the lane. None is: the proxy holds the real one (D24).
+        run["authMode"] = json!(launcher.credential.name());
+        run["credentialKind"] = json!(launcher.credential.kind());
+        run["credentialInLane"] = json!(false);
+        // The director's override of the Anthropic upstream (null otherwise).
+        run["anthropicUpstream"] =
+            json!(anthropic_upstream_overridden.then_some(anthropic_upstream.as_str()));
+        // What the egress proxy refused or could not forward: nothing but the allowed requests
+        // should reach it, so an entry here is a runtime doing something it should not.
+        run["proxyRefused"] = proxy_refused(&launcher.metrics);
+        write_atomically(
+            &layout.control.join("run.json"),
+            &serde_json::to_vec_pretty(&run)?,
+        )?;
+
+        println!(
+            "{}: {}, exit {}, {} turns, patch {} bytes, lane {}",
+            header.id,
+            status_name,
+            status
+                .code()
+                .map_or_else(|| "signal".to_string(), |c| c.to_string()),
+            total_turns,
+            patch_bytes.map_or_else(|| "none".to_string(), |n| n.to_string()),
+            lane.display()
+        );
+        patch?;
+        match end {
+            LaneEnd::Builder => {}
+            LaneEnd::Stopped => {
+                eprintln!(
+                    "the director stopped lane {}; its work is kept and nothing is proved",
+                    header.id
+                );
+                return Ok(STOPPED_EXIT_CODE);
+            }
+            LaneEnd::EscalationLimit => {
+                eprintln!(
+                    "lane {} ended as escalation-limit; its work is kept and nothing is proved",
+                    header.id
+                );
+                return Ok(ESCALATION_LIMIT_EXIT_CODE);
+            }
+            LaneEnd::Timeout => return Ok(TIMEOUT_EXIT_CODE),
+            LaneEnd::CostCap => return Ok(COST_CAP_EXIT_CODE),
+            LaneEnd::Refused(why) => bail!("{why}"),
+        }
+        if !status.success() {
+            bail!("the builder exited with {status}");
+        }
+
+        // 7. Prove the lane: replay the recorded results, run the gates, judge.
+        // The results come from the very `Queue` the tools server recorded into;
+        // a second `Queue` on the same directory would know none of them.
+        let results = queue
+            .lock()
+            .map(|q| q.check_results(&header.id))
+            .map_err(|_| {
+                "the escalation queue is unavailable, so the recorded check results are lost"
+                    .to_string()
+            });
+        let runs = queue
+            .lock()
+            .map(|q| q.check_runs(&header.id))
+            .unwrap_or_default();
+        // The gates, the checks and the capsule come from the header of the last packet version
+        // delivered to the builder, never from the original when a redirect replaced it.
+        let proof_header = final_header(&header, &lane_run.packet_versions)?;
+        phase.set(Phase::Proof);
+        let verdict = prove_lane(
+            &ProofInput {
+                interrupt: &interrupt,
+                groups: check_groups.clone(),
+                layout: &layout,
+                repo: &repo,
+                prepared: &prepared,
+                header: &proof_header,
+                runtime: lane_run.runtime.name(),
+                runtime_version: launcher.runtime_version(lane_run.runtime),
+                openrouter_price: launcher
+                    .openrouter_price(lane_run.runtime, &lane_run.model)
+                    .map(PriceRecord::to_json),
+                codex_price: launcher
+                    .codex_price(lane_run.runtime, &lane_run.model)
+                    .map(CodexPrice::to_json),
+                model: &lane_run.model,
+                rung_source: rung_source.name(),
+                cost_usd: total_cost_usd,
+                tokens: total_tokens,
+                heldout_path: heldout.as_deref(),
+                prefix_version: launcher.prefix_version.clone(),
+                project_instructions_sha256: launcher.project_instructions_sha256.clone(),
+                builder_slot: slot.path(),
+                slot_dir: &slot_dir,
+                class_limit,
+                port_base,
+                unsandboxed: launcher.unsandboxed,
+                credential: launcher.credential,
+                trace: trace.clone(),
+                trace_totals: trace_totals.clone(),
+                host: remote.as_ref().map(|r| r.alias()),
+                runs: &runs,
+                packet_versions: &lane_run.packet_versions,
+            },
+            results,
+        )
+        .await?;
+        Ok::<i32, anyhow::Error>(verdict.outcome.exit_code())
     };
-    let remote_dir = remote.as_ref().and_then(|r| r.remote_dir());
+    let mut after_builder = Box::pin(after_builder);
+    let finished = tokio::select! {
+        result = &mut after_builder => Ok(result),
+        name = next_signal(&mut sigint, &mut sigterm) => Err(name),
+    };
+    let signal_name = match finished {
+        Ok(result) => return result,
+        Err(name) => name,
+    };
+    eprintln!(
+        "[{}] {signal_name} in the {} phase: ending the run",
+        header.id,
+        phase.get().name()
+    );
+    interrupt.raise();
+    // The proof's checks (and the builder's, if the capture was cut short) are groups of
+    // their own: TERM, a grace, then KILL, or KILL at once on a second signal. The
+    // future keeps being polled meanwhile, so each command's own code reaps its group and
+    // delists it, which is what ends the wait early. Whatever the proof starts after
+    // that is dropped with the future, and dropping SIGKILLs a group.
+    tokio::select! {
+        biased;
+        second = next_signal(&mut sigint, &mut sigterm) => {
+            eprintln!("[{}] {second} again: not waiting", header.id);
+            check_groups.kill_all();
+        }
+        _ = check_groups.end_all(CHECK_TERM_GRACE) => {}
+        _ = &mut after_builder => {}
+    }
+    drop(after_builder);
+    check_groups.kill_all();
+    drop(_director);
     if let Some(remote) = &remote {
         remote.finish().await;
     }
-    let patch_path = layout.control.join("lane.patch");
-    let patch_bytes = match &patch {
-        Ok(bytes) => {
-            fs::write(&patch_path, bytes)?;
-            Some(bytes.len())
-        }
-        Err(_) => None,
-    };
-
-    // The last launch's meter stands for the single-launch fields; totals add
-    // every launch up.
-    let summary = lane_run
-        .summaries
-        .last()
-        .context("the builder never ran")?
-        .clone();
-    let total_turns: usize = lane_run.summaries.iter().map(|s| s.turns.len()).sum();
-    let total_tokens: u64 = lane_run
-        .summaries
-        .iter()
-        .map(|s| {
-            s.total_input_tokens
-                + s.total_output_tokens
-                + s.total_cache_read_tokens
-                + s.total_cache_creation_tokens
-        })
-        .sum();
-    let total_cost_usd: f64 = lane_run
-        .summaries
-        .iter()
-        .filter_map(|s| s.total_cost_usd)
-        .sum();
-    let estimated_cost_usd: f64 = lane_run
-        .segments
-        .iter()
-        .filter_map(|s| s["estimatedCostUsd"].as_f64())
-        .sum();
-
-    // The builder is gone: ask `pk doctor` whether its hooks fired (D5). The
-    // verdict is information about the lane and never changes the proof's.
-    let ran_other_runtime = lane_run
-        .segments
-        .iter()
-        .any(|s| s["runtime"].as_str() != Some(Runtime::Claude.name()));
-    let trace = if remote.is_some() {
-        untraced(
-            "the builder ran on a remote host, which has no portkit hooks".to_string(),
-            json!([]),
-        )
-    } else if ran_other_runtime {
-        untraced(
-            "a segment ran on a runtime with no portkit hooks (openrouter or codex)".to_string(),
-            json!([]),
-        )
-    } else {
-        lane_trace_verdict(
-            launcher.pk_exe.as_deref(),
-            &layout,
-            &portkit_dir,
-            &header.id,
-        )
-        .await
-    };
-
-    // The usage monitor's totals (D5, D23): read from the lane's trace files, only for a lane
-    // `pk doctor` found traced. They describe how the lane was watched and never change the
-    // verdict.
-    let trace_totals: Option<TraceTotals> = if trace["traced"].as_bool() == Some(true) {
-        cowproof_report::traces::lane_trace_totals(&lane)
-    } else {
-        None
-    };
-
-    let mut run = json!({
-        "id": header.id,
-        "host": remote.as_ref().map(|r| r.alias()),
-        "remoteLaneDir": remote_dir,
-        "bridgePort": launcher.bridge_port,
-        "status": status_name,
-        "unsandboxed": launcher.unsandboxed,
-        "estimatedCostUsd": estimated_cost_usd,
-        "costIsEstimate": true,
-        "costCapUsd": launcher.cost_cap_usd,
-        "timeoutSecs": launcher.timeout.as_secs(),
-        "activeMs": launcher
-            .active
-            .lock()
-            .map_or(0, |a| a.as_millis() as u64),
-        "error": match end {
-            LaneEnd::Refused(why) => json!(why),
-            _ => serde_json::Value::Null,
-        },
-        "exitCode": status.code(),
-        "signal": status.signal(),
-        "runtime": lane_run.runtime.name(),
-        "runtimeVersion": launcher.runtime_version(lane_run.runtime),
-        // The OpenCode the lane could use, and the director's override of the OpenRouter
-        // upstream when there is one (null otherwise: the default host is not a setting).
-        "opencodeVersion": launcher.opencode.as_ref().map(|o| o.version.as_str()),
-        "openrouterUpstream": openrouter_upstream_overridden.then_some(openrouter_upstream.as_str()),
-        "model": lane_run.model,
-        "startRung": first_rung.to_string(),
-        "rungSource": rung_source.name(),
-        "turns": total_turns,
-        "sessionId": lane_run.session_id,
-        "meter": summary,
-        "segments": lane_run.segments,
-        "stream": {
-            "metered": stats.metered,
-            "unparsed": stats.unparsed,
-            "oversized": stats.oversized,
-        },
-        "baseCommit": prepared.base_commit,
-        "launchCommit": prepared.launch_commit,
-        "patchBytes": patch_bytes,
-        "patchError": patch.as_ref().err().map(|e| format!("{e:#}")),
-        "durationMs": started.elapsed().as_millis() as u64,
-        "classSlot": {
-            "class": class,
-            "limit": class_limit,
-            "waitMs": slot_wait.as_millis() as u64,
-        },
-        "portSlot": {
-            "limit": port_limit,
-            "portBase": port_base,
-            "waitMs": port_wait.as_millis() as u64,
-        },
-        "lane": {
-            "dir": lane,
-            "clone": layout.clone,
-            "control": layout.control,
-            "stream": layout.control.join("stream.jsonl"),
-            "patch": patch_path,
-            "stderr": layout.control.join("builder.stderr"),
-        },
-        "prefixVersion": &launcher.prefix_version,
-        "projectInstructionsSha256": &launcher.project_instructions_sha256,
-        "trace": trace,
-        "traceTotals": trace_totals,
-    });
-    // The Codex the lane could use, and the director's override of the OpenAI upstream.
-    run["codexVersion"] = json!(launcher.codex.as_ref().map(|c| c.version.as_str()));
-    run["openaiUpstream"] = json!(openai_upstream_overridden.then_some(openai_upstream.as_str()));
-    // The credential mode (D28 clause 6), recorded beside `unsandboxed`: the mode, the kind of
-    // credential the proxy holds for a subscription lane, and whether any credential is inside
-    // the lane. None is: the proxy holds the real one (D24).
-    run["authMode"] = json!(launcher.credential.name());
-    run["credentialKind"] = json!(launcher.credential.kind());
-    run["credentialInLane"] = json!(false);
-    // The director's override of the Anthropic upstream (null otherwise).
-    run["anthropicUpstream"] =
-        json!(anthropic_upstream_overridden.then_some(anthropic_upstream.as_str()));
-    // What the egress proxy refused or could not forward: nothing but the allowed requests
-    // should reach it, so an entry here is a runtime doing something it should not.
-    run["proxyRefused"] = proxy_refused(&launcher.metrics);
-    fs::write(
-        layout.control.join("run.json"),
-        serde_json::to_vec_pretty(&run)?,
-    )?;
-
-    println!(
-        "{}: {}, exit {}, {} turns, patch {} bytes, lane {}",
-        header.id,
-        status_name,
-        status
-            .code()
-            .map_or_else(|| "signal".to_string(), |c| c.to_string()),
-        total_turns,
-        patch_bytes.map_or_else(|| "none".to_string(), |n| n.to_string()),
-        lane.display()
-    );
-    patch?;
-    match end {
-        LaneEnd::Builder => {}
-        LaneEnd::Stopped => {
-            eprintln!(
-                "the director stopped lane {}; its work is kept and nothing is proved",
-                header.id
-            );
-            return Ok(STOPPED_EXIT_CODE);
-        }
-        LaneEnd::EscalationLimit => {
-            eprintln!(
-                "lane {} ended as escalation-limit; its work is kept and nothing is proved",
-                header.id
-            );
-            return Ok(ESCALATION_LIMIT_EXIT_CODE);
-        }
-        LaneEnd::Timeout => return Ok(TIMEOUT_EXIT_CODE),
-        LaneEnd::CostCap => return Ok(COST_CAP_EXIT_CODE),
-        LaneEnd::Refused(why) => bail!("{why}"),
-    }
-    if !status.success() {
-        bail!("the builder exited with {status}");
-    }
-
-    // 7. Prove the lane: replay the recorded results, run the gates, judge.
-    // The results come from the very `Queue` the tools server recorded into;
-    // a second `Queue` on the same directory would know none of them.
-    let results = queue
-        .lock()
-        .map(|q| q.check_results(&header.id))
-        .map_err(|_| {
-            "the escalation queue is unavailable, so the recorded check results are lost"
-                .to_string()
-        });
-    let runs = queue
-        .lock()
-        .map(|q| q.check_runs(&header.id))
-        .unwrap_or_default();
-    // The gates, the checks and the capsule come from the header of the last packet version
-    // delivered to the builder, never from the original when a redirect replaced it.
-    let proof_header = final_header(&header, &lane_run.packet_versions)?;
-    let verdict = prove_lane(
-        &ProofInput {
-            layout: &layout,
-            repo: &repo,
-            prepared: &prepared,
-            header: &proof_header,
-            runtime: lane_run.runtime.name(),
-            runtime_version: launcher.runtime_version(lane_run.runtime),
-            openrouter_price: launcher
-                .openrouter_price(lane_run.runtime, &lane_run.model)
-                .map(PriceRecord::to_json),
-            codex_price: launcher
-                .codex_price(lane_run.runtime, &lane_run.model)
-                .map(CodexPrice::to_json),
-            model: &lane_run.model,
-            rung_source: rung_source.name(),
-            cost_usd: total_cost_usd,
-            tokens: total_tokens,
-            heldout_path: heldout.as_deref(),
-            prefix_version: launcher.prefix_version.clone(),
-            project_instructions_sha256: launcher.project_instructions_sha256.clone(),
-            builder_slot: slot.path(),
-            slot_dir: &slot_dir,
-            class_limit,
-            port_base,
-            unsandboxed: launcher.unsandboxed,
-            credential: launcher.credential,
-            trace: trace.clone(),
-            trace_totals: trace_totals.clone(),
+    record_interrupted(
+        &layout,
+        &header.id,
+        signal_name,
+        None,
+        &proxy_sock,
+        started,
+        RunKind {
+            phase: phase.get(),
+            unsandboxed: args.unsandboxed,
+            credential,
             host: remote.as_ref().map(|r| r.alias()),
-            runs: &runs,
-            packet_versions: &lane_run.packet_versions,
         },
-        results,
-    )
-    .await?;
-    Ok(verdict.outcome.exit_code())
+    );
+    Ok(INTERRUPTED_EXIT_CODE)
 }
 
 /// The header the lane is proved by: the one in the last packet version delivered to the
@@ -4315,6 +4412,11 @@ fn one_line(text: &str) -> String {
 
 /// What the proof needs from the run.
 struct ProofInput<'a> {
+    /// Raised by the first signal. The proof stops short of writing a verdict once it is.
+    interrupt: &'a Interrupt,
+    /// The groups of the verifier's checks are listed here while they run, so a signal can
+    /// end them (the same set the builder's `run_check` commands use).
+    groups: Arc<GroupSet>,
     layout: &'a LaneLayout,
     repo: &'a Path,
     prepared: &'a cowproof_run::lane::PreparedLane,
@@ -4465,6 +4567,13 @@ async fn prove_lane(
 
     if let Err(e) = replay_and_gate(input, &ran, &mut evidence).await {
         evidence.infrastructure.push(format!("{e:#}"));
+    }
+    // A signal ended a check, so what the verifier saw is not a result. Nothing is judged,
+    // and nothing is written, once the run has been told to stop: the caller records
+    // `interrupted`. (Nothing between this test and the write below can wait, so the signal
+    // cannot arrive in between.)
+    if input.interrupt.is_raised() {
+        return Err(Interrupted.into());
     }
     let verdict = judge(&evidence, input.unsandboxed);
 
@@ -4737,8 +4846,9 @@ async fn replay_and_gate(
         return Ok(());
     }
     let verify_dir = layout.scratch.join("verify");
-    let mut runner =
-        verifier_runner(layout, &verify_dir, deps_dir.as_deref())?.with_port_block(input.port_base);
+    let mut runner = verifier_runner(layout, &verify_dir, deps_dir.as_deref())?
+        .with_port_block(input.port_base)
+        .with_groups(input.groups.clone());
     // A port packet's replay runs `cowproof pk port replay` in the verifier's sandbox: this
     // executable must be reachable there.
     let pk_exe = if header.port.is_some() {

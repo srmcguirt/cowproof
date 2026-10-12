@@ -327,13 +327,15 @@ async fn wait_group_gone(pgid: u32) {
     }
 }
 
-/// The verifier's use of [`run_in_group`]: SIGKILL on expiry (no grace), `InfraError`s.
+/// The verifier's use of [`run_in_group`]: SIGKILL on expiry (no grace), `InfraError`s. The
+/// command's group is listed in `set` while it runs, when the runner has one.
 async fn run_with_timeout(
     cmd: Command,
     command: &str,
     timeout: Duration,
+    set: Option<&GroupSet>,
 ) -> Result<CheckOutcome, InfraError> {
-    let ran = run_in_group(cmd, timeout, Duration::ZERO, None)
+    let ran = run_in_group(cmd, timeout, Duration::ZERO, set)
         .await
         .map_err(|e| match e {
             GroupError::Spawn(e) => InfraError::SpawnError(format!("spawn failed: {e}")),
@@ -495,7 +497,7 @@ impl CheckRunner for ProcessRunner {
     ) -> Result<CheckOutcome, InfraError> {
         let mut cmd = Command::new("sh");
         cmd.arg("-c").arg(command).current_dir(tree);
-        run_with_timeout(cmd, command, timeout).await
+        run_with_timeout(cmd, command, timeout, None).await
     }
 }
 
@@ -596,6 +598,9 @@ pub struct SandboxedRunner {
     /// Executable files the sandbox may read and run besides the system directories (see
     /// [`SandboxedRunner::with_executable`]).
     executables: Vec<PathBuf>,
+    /// Where every check's process group is listed while it runs, so the caller can end
+    /// them when it is interrupted ([`SandboxedRunner::with_groups`]). `None` lists none.
+    groups: Option<std::sync::Arc<GroupSet>>,
     /// Resolved once, here, in the caller's environment and outside any sandbox. An
     /// unusable `PATH` is reported when the first check runs.
     path: Result<String, InfraError>,
@@ -623,6 +628,7 @@ impl SandboxedRunner {
             deps_cache: None,
             port_base: None,
             executables: Vec::new(),
+            groups: None,
         }
     }
 
@@ -640,6 +646,14 @@ impl SandboxedRunner {
     /// absolute and outside the lanes root; the sandbox refuses anything else.
     pub fn with_executable(mut self, exe: PathBuf) -> Self {
         self.executables.push(exe);
+        self
+    }
+
+    /// List the process group of every check in `groups` while it runs. The caller that owns
+    /// the set ends exactly those groups ([`GroupSet::end_all`]) when it is signalled, which
+    /// is how `cowproof run` stops the proof without waiting for a check to finish.
+    pub fn with_groups(mut self, groups: std::sync::Arc<GroupSet>) -> Self {
+        self.groups = Some(groups);
         self
     }
 
@@ -709,7 +723,7 @@ impl CheckRunner for SandboxedRunner {
             .current_dir(tree)
             .env_clear()
             .envs(env);
-        run_with_timeout(cmd, command, timeout).await
+        run_with_timeout(cmd, command, timeout, self.groups.as_deref()).await
     }
 }
 

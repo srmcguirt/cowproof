@@ -453,6 +453,58 @@ fn the_slot_is_released_after_sigint_and_the_exit_is_130() {
     assert_released_and_reusable(slots.path(), "SIGINT");
 }
 
+/// A signal after the builder, in the proof, ends the run gracefully: the verifier's check
+/// (a hold, told apart from the builder's run of it by its `TMPDIR`) is ended, `run.json` says
+/// `interrupted` in the `proof` phase, both slots are given back by the run's own return (no
+/// `process::exit` to skip a destructor) and the next run starts at once.
+fn a_signal_in_the_proof_releases_the_slots(signal: &str, name: &str) {
+    let slots = var_tmp("cp-slots-");
+    let hold = "case \"$TMPDIR\" in */verify/tmp) echo $$ > \"$TMPDIR/held\"; sleep 300 ;; *) true ;; esac";
+    let lane = lane(
+        slots.path(),
+        "light",
+        Some("[classes]\nlight = 1\n"),
+        &run_checks(&["hold"]),
+        json!([{"id": "hold", "command": hold}]),
+    );
+    let mut run = start_run(&lane, "run", &[]);
+    run.wait_for_file(
+        &lane.lane_dir().join("scratch/verify/tmp/held"),
+        Duration::from_secs(60),
+    );
+    // The proof holds the builder's two slots: it takes none of its own.
+    assert_eq!(held(slots.path()), ["light-0", "port-0"]);
+
+    run.signal(signal);
+    let status = run.wait_exit(Duration::from_secs(30));
+    assert_eq!(status.code(), Some(130), "{}", run.stderr());
+    let record = run_json(&lane);
+    assert_eq!(record["status"], "interrupted", "{record}");
+    assert_eq!(record["phase"], "proof", "{record}");
+    assert_eq!(record["signal"], name, "{record}");
+    assert!(
+        !lane.lane_dir().join("control/verdict.json").exists(),
+        "a lane signalled in the proof has a verdict"
+    );
+    assert_released_and_reusable(slots.path(), name);
+}
+
+#[test]
+fn the_slots_are_released_after_sigint_in_the_proof() {
+    if !sandbox_available() {
+        return;
+    }
+    a_signal_in_the_proof_releases_the_slots("INT", "SIGINT");
+}
+
+#[test]
+fn the_slots_are_released_after_sigterm_in_the_proof() {
+    if !sandbox_available() {
+        return;
+    }
+    a_signal_in_the_proof_releases_the_slots("TERM", "SIGTERM");
+}
+
 /// A run still waiting for a slot ends on SIGINT too: 130, `interrupted`, no slot of its
 /// own, and the run that holds the slot is not disturbed.
 #[test]
