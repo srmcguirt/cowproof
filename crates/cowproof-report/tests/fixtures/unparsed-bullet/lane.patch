@@ -1,0 +1,24 @@
+diff --git a/docs/handoffs/handoff-fixture-unparsed-bullet.md b/docs/handoffs/handoff-fixture-unparsed-bullet.md
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/docs/handoffs/handoff-fixture-unparsed-bullet.md
+@@ -0,0 +1,11 @@
++# Verification Results
++
++- `cargo test` - 12 passed
++- `git diff --check` clean, no output
++- `npm run lint`: failed with 3 errors
++1. `cargo build` completed with exit 0
++
++# Notes
++
++- Ran git rebase onto main before the first check.
++- `src/lib.rs` - wired the module
+diff --git a/src/lib.rs b/src/lib.rs
+new file mode 100644
+index 0000000..6666666
+--- /dev/null
++++ b/src/lib.rs
+@@ -0,0 +1,1 @@
++pub fn unparsed() {}

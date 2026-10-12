@@ -1,0 +1,34 @@
+{
+  "lane_id": "fixture-unparsed-fenced",
+  "status": "finished",
+  "minutes": 1,
+  "files_changed": 2,
+  "lines_added": 26,
+  "lines_removed": 0,
+  "outside_ownership_count": 0,
+  "checks": [
+    {
+      "command": "cargo test",
+      "result": "12 passed, 0 failed.",
+      "classification": "pass"
+    }
+  ],
+  "packet_commands_unreported": [],
+  "unparsed": [
+    {
+      "line": 14,
+      "text": "cargo clippy --all-targets",
+      "reason": "fenced command outside the checks section"
+    }
+  ],
+  "flaws": [],
+  "removed_assertions": [],
+  "limits": [],
+  "unverified": [],
+  "questions": [],
+  "verdict_hint": "escalate",
+  "verdict_reasons": [
+    "1 handoff line(s) look like check claims but did not parse; the check list may be incomplete"
+  ],
+  "sample_handoff": "# Checks\n\n```\ncargo test\n```\n\n12 passed, 0 failed.\n\n# Notes\n\nI also ran this once by hand:\n\n```\ncargo clippy --all-targets\n```\n\nPassed with no warnings.\n\nTo reproduce, run:\n\n```\nnpm run build\n```\n\nThen open the page.\n"
+}

@@ -26,16 +26,15 @@
       "command": "npm run lint",
       "result": "Linting failed with errors.",
       "classification": "fail"
+    },
+    {
+      "command": "cargo build",
+      "result": "Build completed.",
+      "classification": "unclear"
     }
   ],
   "packet_commands_unreported": [],
-  "unparsed": [
-    {
-      "line": 25,
-      "text": "cargo build",
-      "reason": "fenced command outside checks section"
-    }
-  ],
+  "unparsed": [],
   "flaws": [],
   "removed_assertions": [],
   "limits": [],

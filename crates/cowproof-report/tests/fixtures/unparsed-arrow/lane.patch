@@ -1,0 +1,24 @@
+diff --git a/docs/handoffs/handoff-fixture-unparsed-arrow.md b/docs/handoffs/handoff-fixture-unparsed-arrow.md
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/docs/handoffs/handoff-fixture-unparsed-arrow.md
+@@ -0,0 +1,11 @@
++# Verification Status
++
++cargo fmt --all -- --check  ->  clean (exit 0)
++cargo test -> 12 passed
++npm run build->done
++cargo clippy --all-targets ->
++
++# Notes
++
++The last three lines each break the arrow format.
++Plain prose that mentions an arrow -> is not a check.
+diff --git a/src/lib.rs b/src/lib.rs
+new file mode 100644
+index 0000000..6666666
+--- /dev/null
++++ b/src/lib.rs
+@@ -0,0 +1,1 @@
++pub fn unparsed() {}

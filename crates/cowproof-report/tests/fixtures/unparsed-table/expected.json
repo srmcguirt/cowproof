@@ -1,0 +1,44 @@
+{
+  "lane_id": "fixture-unparsed-table",
+  "status": "finished",
+  "minutes": 1,
+  "files_changed": 2,
+  "lines_added": 13,
+  "lines_removed": 0,
+  "outside_ownership_count": 0,
+  "checks": [
+    {
+      "command": "cargo test",
+      "result": "passed, 12 passed, 0 failed",
+      "classification": "pass"
+    },
+    {
+      "command": "cargo fmt",
+      "result": "exit 0",
+      "classification": "pass"
+    }
+  ],
+  "packet_commands_unreported": [],
+  "unparsed": [
+    {
+      "line": 6,
+      "text": "| | exit 0 |",
+      "reason": "table row has empty cells"
+    },
+    {
+      "line": 7,
+      "text": "| `npm run lint` | |",
+      "reason": "table row has empty cells"
+    }
+  ],
+  "flaws": [],
+  "removed_assertions": [],
+  "limits": [],
+  "unverified": [],
+  "questions": [],
+  "verdict_hint": "escalate",
+  "verdict_reasons": [
+    "2 handoff line(s) look like check claims but did not parse; the check list may be incomplete"
+  ],
+  "sample_handoff": "# Checks\n\n| Command | Result |\n| --- | --- |\n| `cargo test` | passed, 12 passed, 0 failed |\n| | exit 0 |\n| `npm run lint` | |\n| `cargo fmt` | exit 0 |\n\n# Notes\n\nThe second and third rows have an empty cell.\n"
+}

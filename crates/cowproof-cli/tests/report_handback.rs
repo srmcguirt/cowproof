@@ -153,7 +153,8 @@ fn the_fenced_format_fixture_matches_its_snapshot() {
     let r = snapshot("fenced", &[]);
     assert_eq!(r["lane_id"], "fixture-fenced");
     let classes = classifications(&r);
-    assert_eq!(classes.len(), 4);
+    assert_eq!(classes.len(), 5);
+    assert!(r["unparsed"].as_array().unwrap().is_empty());
     for want in ["pass", "fail"] {
         assert!(classes.contains(&want), "{classes:?} lacks {want}");
     }
@@ -218,6 +219,53 @@ fn without_json_it_prints_the_text_report_and_a_verdict_hint() {
     );
     assert!(stdout.contains("\nChecks:\n"), "{stdout}");
     assert!(stdout.contains("\nVerdict hint: "), "{stdout}");
+}
+
+/// The four ways a check claim used to vanish, each in its own fixture beside valid lines.
+#[test]
+fn malformed_check_claims_are_listed_as_unparsed_with_their_line_numbers() {
+    if workspace::skipped("malformed_check_claims_are_listed_as_unparsed_with_their_line_numbers") {
+        return;
+    }
+    for (name, lines) in [
+        ("unparsed-table", vec![6, 7]),
+        ("unparsed-bullet", vec![4, 5, 6]),
+        ("unparsed-arrow", vec![4, 5, 6]),
+        ("unparsed-fenced", vec![14]),
+    ] {
+        let r = snapshot(name, &[]);
+        let got: Vec<u64> = r["unparsed"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|u| u["line"].as_u64().unwrap())
+            .collect();
+        assert_eq!(got, lines, "{name}: {r}");
+        assert!(!r["unparsed"][0]["reason"].as_str().unwrap().is_empty());
+        assert_ne!(r["verdict_hint"], "apply", "{name}");
+    }
+}
+
+#[test]
+fn a_text_report_with_unparsed_lines_says_so_before_anything_else() {
+    if workspace::skipped("a_text_report_with_unparsed_lines_says_so_before_anything_else") {
+        return;
+    }
+    let dir = fixture("unparsed-arrow");
+    let out = handback(&[dir.to_str().unwrap()]);
+    assert!(out.status.success(), "{}", text(&out));
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        stdout.starts_with("WARNING: 3 handoff line(s) look like check claims but did not parse."),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("\n- line 4: cargo test -> 12 passed (arrow line needs two spaces"),
+        "{stdout}"
+    );
+    let warning = stdout.find("WARNING").unwrap();
+    assert!(warning < stdout.find("Lane: ").unwrap(), "{stdout}");
+    assert!(stdout.contains("Verdict hint: escalate"), "{stdout}");
 }
 
 #[test]

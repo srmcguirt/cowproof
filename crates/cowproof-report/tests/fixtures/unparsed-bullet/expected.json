@@ -1,0 +1,44 @@
+{
+  "lane_id": "fixture-unparsed-bullet",
+  "status": "finished",
+  "minutes": 1,
+  "files_changed": 2,
+  "lines_added": 12,
+  "lines_removed": 0,
+  "outside_ownership_count": 0,
+  "checks": [
+    {
+      "command": "cargo test",
+      "result": "12 passed",
+      "classification": "pass"
+    }
+  ],
+  "packet_commands_unreported": [],
+  "unparsed": [
+    {
+      "line": 4,
+      "text": "- `git diff --check` clean, no output",
+      "reason": "list item has a command but no dash or em dash between it and its result"
+    },
+    {
+      "line": 5,
+      "text": "- `npm run lint`: failed with 3 errors",
+      "reason": "list item has a command but no dash or em dash between it and its result"
+    },
+    {
+      "line": 6,
+      "text": "1. `cargo build` completed with exit 0",
+      "reason": "list item has a command but no dash or em dash between it and its result"
+    }
+  ],
+  "flaws": [],
+  "removed_assertions": [],
+  "limits": [],
+  "unverified": [],
+  "questions": [],
+  "verdict_hint": "escalate",
+  "verdict_reasons": [
+    "3 handoff line(s) look like check claims but did not parse; the check list may be incomplete"
+  ],
+  "sample_handoff": "# Verification Results\n\n- `cargo test` - 12 passed\n- `git diff --check` clean, no output\n- `npm run lint`: failed with 3 errors\n1. `cargo build` completed with exit 0\n\n# Notes\n\n- Ran git rebase onto main before the first check.\n- `src/lib.rs` - wired the module\n"
+}
