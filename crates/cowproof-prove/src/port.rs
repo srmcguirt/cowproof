@@ -10,7 +10,8 @@
 //! and judges the report itself, never the builder's account of it. The `port_replay` gate
 //! passes only when the command exited 0, both surfaces replayed, every surface's
 //! `ReplayReport::is_success()` holds, `not_ported` is 0 for every surface and every tool in
-//! `port.tools` has fixtures that were replayed. Two checks the replay cannot make for itself
+//! `port.tools` has fixtures that were replayed, and every outcome the report holds is for a
+//! fixture on disk. The report is read the moment the replay's process group is gone. Two checks the replay cannot make for itself
 //! come with it: a fixture of the base must still say what it said (`tool`, `id`, `input`,
 //! `expected`), because the builder may write the fixtures directory and a changed expectation
 //! is the easiest way to make a port pass; and an `accepted` difference the lane added must
@@ -33,7 +34,7 @@ use portkit_port::{CaseOutcome, ReplayReport, Status};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -263,11 +264,27 @@ struct Replay<'a> {
     timeout: Duration,
 }
 
+/// What one replay left: the command's exit status and output, and the report it wrote.
+struct Ran {
+    exit_status: i32,
+    output: String,
+    /// The report file's text, read the moment the replay's process group was gone, or why it
+    /// could not be read.
+    report: Result<String, String>,
+}
+
 impl Replay<'_> {
     /// Run the replay of the fixtures at `fixtures` (a directory the sandbox can read),
-    /// writing the JSON report to `report`. `Ok` carries the command's exit status and its
-    /// stderr.
-    async fn run(&self, fixtures: &Path, report: &Path) -> Result<(i32, String), VerifyError> {
+    /// writing the JSON report to `report`.
+    ///
+    /// The runner puts the replay in its own process group (`run_in_group`) and returns only
+    /// once everything in that group is dead, so nothing the replay or a plugin of the rebuilt
+    /// tree started can write after this returns. The report is read into memory as the next
+    /// step: the text judged is what the file held when the replay ended, and a file written
+    /// later, or a report from before this run, is never what is read. A process that
+    /// escaped the group (`setsid`) can still write the path afterwards; the copy already in
+    /// memory is not the file, and on Linux the sandbox's pid namespace ends it with the group.
+    async fn run(&self, fixtures: &Path, report: &Path) -> Result<Ran, VerifyError> {
         let command = format!(
             "{} pk --config {} port replay --fixtures {} --surface both --epsilon {} --json > {}",
             sh_quote(&self.pk_exe.to_string_lossy()),
@@ -281,6 +298,7 @@ impl Replay<'_> {
             .run(self.tree, &command, self.timeout)
             .await
             .map_err(|e: InfraError| infra(format!("port replay: {e}")))?;
+        let report = fs::read_to_string(report).map_err(|e| e.to_string());
         // 126 and 127 are the shell saying it could not run the command: the verifier's own
         // trouble (the executable is not reachable in the sandbox), never a verdict on the
         // lane.
@@ -291,7 +309,11 @@ impl Replay<'_> {
                 first_line(&outcome.output)
             )));
         }
-        Ok((outcome.exit_status, outcome.output))
+        Ok(Ran {
+            exit_status: outcome.exit_status,
+            output: outcome.output,
+            report,
+        })
     }
 }
 
@@ -313,17 +335,18 @@ struct Replayed {
     failures: Vec<String>,
 }
 
-fn read_report(report: &Path, exit_status: i32, stderr: &str) -> Replayed {
+fn read_report(ran: &Ran) -> Replayed {
     let mut failures = Vec::new();
-    let reports: BTreeMap<String, ReplayReport> = match fs::read_to_string(report)
-        .map_err(|e| e.to_string())
+    let reports: BTreeMap<String, ReplayReport> = match ran
+        .report
+        .clone()
         .and_then(|text| serde_json::from_str(&text).map_err(|e| e.to_string()))
     {
         Ok(reports) => reports,
         Err(why) => {
             failures.push(format!(
                 "the replay wrote no report ({why}); it said: {}",
-                first_line(stderr)
+                first_line(&ran.output)
             ));
             return Replayed {
                 reports: BTreeMap::new(),
@@ -331,8 +354,8 @@ fn read_report(report: &Path, exit_status: i32, stderr: &str) -> Replayed {
             };
         }
     };
-    if exit_status != 0 {
-        failures.push(format!("the replay exited with status {exit_status}"));
+    if ran.exit_status != 0 {
+        failures.push(format!("the replay exited with status {}", ran.exit_status));
     }
     Replayed { reports, failures }
 }
@@ -348,8 +371,27 @@ fn tools_with_fixtures(dir: &Path) -> Vec<String> {
         .collect()
 }
 
+/// The `(tool, id)` of every fixture file the directory holds: the names a replay reports its
+/// outcomes under (it reads them from the files, not from the directory names).
+fn fixture_cases(dir: &Path) -> BTreeSet<(String, String)> {
+    read_fixture_files(dir)
+        .into_iter()
+        .filter_map(|(_, value)| {
+            let tool = value.get("tool")?.as_str()?.to_string();
+            let id = value.get("id")?.as_str()?.to_string();
+            Some((tool, id))
+        })
+        .collect()
+}
+
 /// Judge a replay: its failures in words, naming surface, tool and fixture.
-fn judge(label: &str, replayed: &mut Replayed, tools: &[String], on_disk: &[String]) {
+fn judge(
+    label: &str,
+    replayed: &mut Replayed,
+    tools: &[String],
+    on_disk: &[String],
+    cases: &BTreeSet<(String, String)>,
+) {
     for surface in ["direct", "mcp"] {
         if !replayed.reports.contains_key(surface) {
             replayed
@@ -370,6 +412,16 @@ fn judge(label: &str, replayed: &mut Replayed, tools: &[String], on_disk: &[Stri
             ));
         }
         let before = replayed.failures.len();
+        // A report is the replay's own account; coverage it claims for a case that has no
+        // fixture in the directory is invented, whatever its status.
+        for outcome in &report.outcomes {
+            if !cases.contains(&(outcome.tool.clone(), outcome.id.clone())) {
+                replayed.failures.push(format!(
+                    "{label}{surface} {}/{}: the report has an outcome for a case with no fixture on disk",
+                    outcome.tool, outcome.id
+                ));
+            }
+        }
         for outcome in &report.outcomes {
             let what = match outcome.status {
                 Status::Pass | Status::Accepted => continue,
@@ -645,10 +697,16 @@ pub(crate) async fn run_port(run: PortRun<'_>) -> Result<PortOutcome, VerifyErro
         spec,
         timeout,
     };
-    let (status, stderr) = replay.run(&fixtures_dir, &report_path).await?;
-    let mut visible = read_report(&report_path, status, &stderr);
+    let ran = replay.run(&fixtures_dir, &report_path).await?;
+    let mut visible = read_report(&ran);
     let on_disk = tools_with_fixtures(&fixtures_dir);
-    judge("", &mut visible, &spec.tools, &on_disk);
+    judge(
+        "",
+        &mut visible,
+        &spec.tools,
+        &on_disk,
+        &fixture_cases(&fixtures_dir),
+    );
     failures.append(&mut visible.failures);
 
     // Base fixtures kept as they were, and accepted differences ruled.
@@ -760,12 +818,18 @@ async fn held_out(run: &PortRun<'_>) -> Result<PortHeldOut, VerifyError> {
         spec: run.spec,
         timeout: run.timeout,
     };
-    let (status, stderr) = replay.run(&fixtures, &report_path).await?;
-    let mut replayed = read_report(&report_path, status, &stderr);
+    let ran = replay.run(&fixtures, &report_path).await?;
+    let mut replayed = read_report(&ran);
     let held_tools = tools_with_fixtures(&fixtures);
     // The held-out cases may cover fewer tools than the packet names; each tool they do cover
     // must be ported, and the replay's own report says which are not.
-    judge("held-out ", &mut replayed, &[], &held_tools);
+    judge(
+        "held-out ",
+        &mut replayed,
+        &[],
+        &held_tools,
+        &fixture_cases(&fixtures),
+    );
     let cases_count = fixture_set_hash(&fixtures).map(|(_, n)| n).unwrap_or(0);
     let failed = !replayed.failures.is_empty();
     Ok(PortHeldOut {
@@ -887,6 +951,13 @@ mod tests {
         .unwrap()
     }
 
+    fn cases(pairs: &[(&str, &str)]) -> BTreeSet<(String, String)> {
+        pairs
+            .iter()
+            .map(|(t, i)| (t.to_string(), i.to_string()))
+            .collect()
+    }
+
     fn replayed(outcomes: Vec<CaseOutcome>) -> Replayed {
         let r = report(outcomes);
         Replayed {
@@ -901,7 +972,13 @@ mod tests {
             outcome("t", "1", Status::Pass),
             outcome("t", "2", Status::Accepted),
         ]);
-        judge("", &mut r, &["t".to_string()], &["t".to_string()]);
+        judge(
+            "",
+            &mut r,
+            &["t".to_string()],
+            &["t".to_string()],
+            &cases(&[("t", "1"), ("t", "2")]),
+        );
         assert_eq!(r.failures, Vec::<String>::new());
     }
 
@@ -911,7 +988,13 @@ mod tests {
             outcome("t", "1", Status::Pass),
             outcome("gone", "1", Status::NotPorted),
         ]);
-        judge("", &mut r, &["t".to_string()], &["t".to_string()]);
+        judge(
+            "",
+            &mut r,
+            &["t".to_string()],
+            &["t".to_string()],
+            &cases(&[("t", "1"), ("gone", "1")]),
+        );
         let text = r.failures.join("\n");
         assert!(text.contains("direct gone/1: not ported"), "{text}");
         assert!(text.contains("mcp gone/1: not ported"), "{text}");
@@ -926,6 +1009,7 @@ mod tests {
             &mut r,
             &["t".to_string(), "silent".to_string()],
             &["t".to_string()],
+            &cases(&[("t", "1")]),
         );
         let text = r.failures.join("\n");
         assert!(
@@ -939,7 +1023,13 @@ mod tests {
             report.failed = 0;
             report.passed = 1;
         }
-        judge("", &mut forged, &["t".to_string()], &["t".to_string()]);
+        judge(
+            "",
+            &mut forged,
+            &["t".to_string()],
+            &["t".to_string()],
+            &cases(&[("t", "1")]),
+        );
         let text = forged.failures.join("\n");
         assert!(text.contains("counts disagree"), "{text}");
         assert!(text.contains("t/1: differs"), "{text}");
@@ -949,7 +1039,13 @@ mod tests {
     fn a_missing_surface_fails() {
         let mut r = replayed(vec![outcome("t", "1", Status::Pass)]);
         r.reports.remove("mcp");
-        judge("", &mut r, &["t".to_string()], &["t".to_string()]);
+        judge(
+            "",
+            &mut r,
+            &["t".to_string()],
+            &["t".to_string()],
+            &cases(&[("t", "1")]),
+        );
         assert!(r.failures.join("\n").contains("no `mcp` surface"));
     }
 
@@ -1015,5 +1111,155 @@ mod tests {
                 assert!(found[0].contains("port-accepted-unruled"), "{found:?}");
             }
         }
+    }
+
+    // The replay and the report it leaves. The fake `pk` is a script the test writes under
+    // /var/tmp; it stands in for the executable the verifier runs in the sandbox, and the
+    // runner is the test runner, which is `run_in_group` as well.
+
+    fn spec() -> PortCapsule {
+        serde_json::from_value(serde_json::json!({
+            "lang": "shell", "adapter": "process", "fixtures": "fx", "tools": ["t"],
+            "epsilon": 0.0, "ignore_paths": [], "unordered_arrays": false,
+            "path_roots": [],
+        }))
+        .unwrap()
+    }
+
+    fn fake_pk(dir: &Path, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("fake-pk.sh");
+        fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    async fn replay_with(dir: &Path, pk: &Path, report: &Path) -> Ran {
+        let runner = crate::runner::ProcessRunner::new();
+        let spec = spec();
+        let fixtures = dir.join("fx");
+        fs::create_dir_all(&fixtures).unwrap();
+        Replay {
+            runner: &runner,
+            tree: dir,
+            pk_exe: pk,
+            config: dir.join("pk.toml"),
+            spec: &spec,
+            timeout: Duration::from_secs(30),
+        }
+        .run(&fixtures, report)
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_process_the_replay_leaves_behind_cannot_change_the_report_after_it_ends() {
+        let dir = tempfile::TempDir::new_in("/var/tmp").unwrap();
+        let report = dir.path().join("replay.json");
+        let mark = dir.path().join("background-ran");
+        // The replay prints its report, starts a background process that rewrites the report
+        // 200 ms later and marks that it ran, and exits 0 at once.
+        let pk = fake_pk(
+            dir.path(),
+            &format!(
+                "printf '%s' '{{\"genuine\":true}}'\n\
+                 ( sleep 0.2; printf '%s' forged > '{r}'; : > '{m}' ) &\n\
+                 exit 0",
+                r = report.display(),
+                m = mark.display(),
+            ),
+        );
+        let ran = replay_with(dir.path(), &pk, &report).await;
+        assert_eq!(ran.exit_status, 0);
+        assert_eq!(ran.report, Ok("{\"genuine\":true}".to_string()));
+        // Well past the delay: the background process is gone, so it wrote nothing.
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert!(!mark.exists(), "the background process outlived the replay");
+        assert_eq!(
+            fs::read_to_string(&report).unwrap(),
+            "{\"genuine\":true}",
+            "the report on disk changed after the replay ended"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_report_that_claims_a_case_with_no_fixture_fails_the_gate() {
+        let dir = tempfile::TempDir::new_in("/var/tmp").unwrap();
+        let report = dir.path().join("replay.json");
+        // The fixtures hold t/1 only; the report also passes `ghost/1` on both surfaces.
+        let claimed = replayed(vec![
+            outcome("t", "1", Status::Pass),
+            outcome("ghost", "1", Status::Pass),
+        ]);
+        fs::write(
+            dir.path().join("claimed.json"),
+            serde_json::to_string(&claimed.reports).unwrap(),
+        )
+        .unwrap();
+        let pk = fake_pk(
+            dir.path(),
+            &format!("cat '{}'", dir.path().join("claimed.json").display()),
+        );
+        let ran = replay_with(dir.path(), &pk, &report).await;
+        let fixtures = dir.path().join("fx");
+        write(
+            &fixtures,
+            "t/1.json",
+            r#"{"tool":"t","id":"1","input":{},"expected":{}}"#,
+        );
+        let mut replayed = read_report(&ran);
+        assert_eq!(replayed.failures, Vec::<String>::new());
+        judge(
+            "",
+            &mut replayed,
+            &["t".to_string()],
+            &tools_with_fixtures(&fixtures),
+            &fixture_cases(&fixtures),
+        );
+        let text = replayed.failures.join("\n");
+        assert!(
+            text.contains(
+                "direct ghost/1: the report has an outcome for a case with no fixture on disk"
+            ),
+            "{text}"
+        );
+        assert!(text.contains("mcp ghost/1"), "{text}");
+        assert!(!text.contains(" t/1"), "{text}");
+    }
+
+    #[test]
+    fn an_outcome_for_an_unknown_id_of_a_known_tool_fails_too() {
+        let mut r = replayed(vec![
+            outcome("t", "1", Status::Pass),
+            outcome("t", "9", Status::Accepted),
+        ]);
+        judge(
+            "held-out ",
+            &mut r,
+            &[],
+            &["t".to_string()],
+            &cases(&[("t", "1")]),
+        );
+        let text = r.failures.join("\n");
+        assert!(
+            text.contains(
+                "held-out direct t/9: the report has an outcome for a case with no fixture on disk"
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("t/1"), "{text}");
+    }
+
+    #[test]
+    fn the_fixture_cases_are_the_tool_and_id_the_files_hold() {
+        let dir = tempfile::TempDir::new_in("/var/tmp").unwrap();
+        write(dir.path(), "a/1.json", r#"{"tool":"a","id":"1"}"#);
+        write(dir.path(), "a/two.json", r#"{"tool":"a","id":"2"}"#);
+        write(dir.path(), "b/x.json", r#"{"tool":"renamed","id":"x"}"#);
+        write(dir.path(), "b/bad.json", r#"{"tool":1}"#);
+        assert_eq!(
+            fixture_cases(dir.path()),
+            cases(&[("a", "1"), ("a", "2"), ("renamed", "x")])
+        );
     }
 }

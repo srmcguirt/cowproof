@@ -60,6 +60,14 @@ pub trait CheckRunner: Send + Sync {
 /// open for ever; the read is abandoned after this and what was read stands.
 const GROUP_DRAIN: Duration = Duration::from_millis(2_000);
 
+/// How long [`run_in_group`] waits, after the leader has exited and the group has been sent
+/// SIGKILL, for the kernel to show the group empty. SIGKILL is delivered asynchronously, so
+/// without this a member still on a CPU could finish a `write(2)` after the caller has
+/// already read what the command left behind. The wait ends early when the group is empty;
+/// a zombie nobody reaps (a container without an init) keeps a group listed and costs the
+/// whole bound, which is why it is short.
+const GROUP_GONE: Duration = Duration::from_millis(1_000);
+
 /// The process groups one runner started and has not finished with.
 ///
 /// A command run through [`run_in_group`] is its own group leader, and its group is listed
@@ -279,6 +287,9 @@ pub async fn run_in_group(
 
     match finished {
         Ok(Ok(Some(status))) => {
+            // The group was sent SIGKILL when the leader exited; return only once it is
+            // empty, so nothing it ran can still change a file the caller reads next.
+            wait_group_gone(pgid).await;
             live.finish();
             Ok(GroupOutput {
                 end: GroupEnd::Exited(status),
@@ -305,6 +316,14 @@ pub async fn run_in_group(
                 stderr: err,
             })
         }
+    }
+}
+
+/// Wait, up to [`GROUP_GONE`], until no process is left in the group `pgid`.
+async fn wait_group_gone(pgid: u32) {
+    let deadline = tokio::time::Instant::now() + GROUP_GONE;
+    while group_exists(pgid) == Some(true) && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(2)).await;
     }
 }
 
