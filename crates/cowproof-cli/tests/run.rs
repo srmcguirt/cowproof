@@ -355,12 +355,7 @@ exit 0
     /// failed) or 4 (infrastructure) is still a failure here.
     fn run_ok(&self) -> Output {
         let out = self.run();
-        assert!(
-            matches!(out.status.code(), Some(0 | 2 | 3)),
-            "cowproof run did not reach a verdict:\nstdout: {}\nstderr: {}",
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr)
-        );
+        reached_a_verdict(&out);
         out
     }
 
@@ -4456,13 +4451,32 @@ impl Harness {
 }
 
 /// The lane reached a verdict, whatever it was (exit 0, 2 or 3).
+///
+/// The failure's first line carries the exit code and the line of stderr that says why (a
+/// preflight failure, an infrastructure error), because a gate that keeps only the panic's first
+/// line used to lose both.
 fn reached_a_verdict(out: &Output) {
+    let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         matches!(out.status.code(), Some(0 | 2 | 3)),
-        "cowproof run did not reach a verdict:\nstdout: {}\nstderr: {}",
+        "cowproof run did not reach a verdict: exit {:?}, {}\nstdout: {}\nstderr: {stderr}",
+        out.status.code(),
+        why_a_run_failed(&stderr),
         String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
     );
+}
+
+/// The line of a failed run's stderr that names the failure: the first preflight failure or
+/// error line, else the last non-empty line.
+fn why_a_run_failed(stderr: &str) -> String {
+    let named = stderr
+        .lines()
+        .find(|l| l.contains("preflight failed") || l.starts_with("error"));
+    let last = stderr.lines().rev().find(|l| !l.trim().is_empty());
+    match named.or(last) {
+        Some(line) => format!("stderr: {line:?}"),
+        None => "stderr empty".to_string(),
+    }
 }
 
 /// What the first launch ran on: the `--model` the fake saw, and what `run.json` recorded.
