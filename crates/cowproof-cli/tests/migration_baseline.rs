@@ -222,6 +222,10 @@ fn without_a_baseline_the_gate_says_the_migration_rule_was_skipped() {
     assert_eq!(flaws["warned"], true, "{flaws}");
     let evidence = flaws["evidence"].to_string();
     assert!(
+        evidence.contains("db/migrations/001_init.sql"),
+        "{evidence}"
+    );
+    assert!(
         evidence.contains("applied_migration rules skipped"),
         "{evidence}"
     );

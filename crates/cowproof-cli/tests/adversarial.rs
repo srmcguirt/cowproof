@@ -178,24 +178,11 @@ fn a_builder_that_deletes_an_assertion_and_hard_codes_is_refuted_and_the_report_
     );
     // No other gate fires: the cheat stays inside the packet's ownership and touches no
     // protected path, and no flaw rule matches it.
-    for quiet in ["ownership", "protected_paths"] {
+    for quiet in ["ownership", "protected_paths", "flaws"] {
         let g = gate(&gates, quiet);
         assert_eq!(g["passed"], true, "{g}");
         assert_eq!(g["evidence"], json!([]), "{g}");
     }
-    // The flaws gate passes too. This project sets no `[proof] migration_baseline`, so the
-    // generic pack's migration rule is skipped, and the gate says so (a warning, not a pass
-    // in silence).
-    let flaws = gate(&gates, "flaws");
-    assert_eq!(flaws["passed"], true, "{flaws}");
-    assert_eq!(flaws["warned"], true, "{flaws}");
-    assert_eq!(
-        flaws["evidence"],
-        json!([
-            "applied_migration rules skipped: the base cowproof.toml sets no [proof] migration_baseline"
-        ]),
-        "{flaws}"
-    );
 
     // The hard-coded output: the visible tests cannot tell, the held-out checks do.
     assert_eq!(

@@ -65,6 +65,19 @@ fn finding(rule: &FlawRule, label: &str, file: &str, line: Option<usize>) -> Fla
     }
 }
 
+/// The file name of `path` when it lies under a `migrations/` directory (a root-level one
+/// counts), else `None`. This is what makes a path a migration for the `applied_migration`
+/// rules and for the gate's decision to warn about a missing baseline.
+pub fn migration_file_name(path: &str) -> Option<&str> {
+    // A leading slash lets a root-level `migrations/` directory match too.
+    let at = if path.starts_with("migrations/") {
+        "migrations/".len()
+    } else {
+        path.find("/migrations/")? + "/migrations/".len()
+    };
+    path[at..].rsplit('/').next()
+}
+
 /// Order two migration file names: by the leading number when both names start
 /// with digits (so `9_x` sorts before `10_x`, `009_x` before `010_x`, and
 /// timestamp names by their timestamp), by the whole name otherwise. Names whose
@@ -121,12 +134,7 @@ pub fn check_rule(
     };
 
     if rule.applied_migration {
-        // A leading slash lets a root-level `migrations/` directory match too.
-        let rooted = format!("/{}", delta.path);
-        let file = rooted
-            .split("/migrations/")
-            .nth(1)
-            .and_then(|f| f.rsplit('/').next());
+        let file = migration_file_name(&delta.path);
         let hit = baseline.is_some_and(|base| {
             file.is_some_and(|f| migration_at_or_before(f, base.rsplit('/').next().unwrap_or(base)))
         });
@@ -427,6 +435,21 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn migration_file_name_needs_a_migrations_directory() {
+        assert_eq!(
+            migration_file_name("migrations/001_a.sql"),
+            Some("001_a.sql")
+        );
+        assert_eq!(
+            migration_file_name("db/migrations/sub/002_b.sql"),
+            Some("002_b.sql")
+        );
+        assert_eq!(migration_file_name("src/lib.rs"), None);
+        assert_eq!(migration_file_name("docs/migrations.md"), None);
+        assert_eq!(migration_file_name("my_migrations/001.sql"), None);
     }
 
     #[test]

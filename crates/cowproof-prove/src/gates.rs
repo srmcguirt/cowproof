@@ -515,12 +515,27 @@ fn check_flaws(base_repo: &Path, base_commit: &str, lane_patch: &str) -> Result<
                  (from the base cowproof.toml)"
             )),
             None => {
-                warned = true;
-                evidence.push(
-                    "applied_migration rules skipped: the base cowproof.toml sets no \
-                     [proof] migration_baseline"
-                        .to_string(),
-                );
+                // Warn only when it matters: the patch touches a migration that an
+                // `applied_migration` rule covers. A patch that touches none passes quietly.
+                let touched: Vec<&str> = deltas
+                    .iter()
+                    .filter(|d| {
+                        crate::flaws::migration_file_name(&d.path).is_some()
+                            && rules
+                                .iter()
+                                .filter(|r| r.applied_migration)
+                                .any(|r| r.files.iter().any(|g| glob_matches(g, &d.path)))
+                    })
+                    .map(|d| d.path.as_str())
+                    .collect();
+                if !touched.is_empty() {
+                    warned = true;
+                    evidence.push(format!(
+                        "applied_migration rules skipped for {}: the base cowproof.toml sets no \
+                         [proof] migration_baseline",
+                        touched.join(", ")
+                    ));
+                }
             }
         }
     }
@@ -1486,6 +1501,7 @@ explanation = "This has a broken pattern."
                 .evidence
                 .iter()
                 .any(|e| e.contains("applied_migration rules skipped")
+                    && e.contains("db/migrations/001_init.sql")
                     && e.contains("migration_baseline")),
             "{:?}",
             result.evidence
@@ -1495,6 +1511,31 @@ explanation = "This has a broken pattern."
         quiet.write("test.rs", "fn ok() {}\n")?;
         let result = check_flaws(quiet.path(), &quiet.base, &quiet.patch()?)?;
         assert!(result.evidence.is_empty() && !result.warned);
+        Ok(())
+    }
+
+    #[test]
+    fn no_baseline_and_no_migration_in_the_patch_passes_without_a_warning() -> Result<()> {
+        // The generic pack's migration rule matches every path (`**/*`), but the patch
+        // touches no file under a `migrations/` directory, so there is nothing to warn about.
+        let repo = TestRepo::with_config(&["generic"])?;
+        repo.write("src/lib.rs", "fn ok() {}\n")?;
+        repo.write("docs/migrations.md", "notes\n")?;
+        let patch = repo.patch()?;
+
+        let result = check_flaws(repo.path(), &repo.base, &patch)?;
+        assert!(result.passed, "{:?}", result.evidence);
+        assert!(!result.warned, "{:?}", result.evidence);
+        assert!(result.evidence.is_empty(), "{:?}", result.evidence);
+        // And through the whole gate run.
+        let report = run_gates(
+            repo.path(),
+            &repo.base,
+            &patch,
+            &packet(&["src/**", "docs/**"]),
+        )?;
+        let flaws = gate(&report, "flaws");
+        assert!(flaws.passed && !flaws.warned && flaws.evidence.is_empty());
         Ok(())
     }
 
