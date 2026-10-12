@@ -837,12 +837,13 @@ mod tests {
     async fn a_case_runs_in_its_root_with_a_built_environment() {
         let base = scratch("env");
         let mut c = cfg(
-            "sh -c 'printf \"%s|%s|%s|%s|%s|%s\" \"$(pwd)\" \"$HOME\" \"$TMPDIR\" \"$TZ\" \"$FROM_CASE\" \"$PORTKIT_SRC\"; echo \"$AMBIENT_TEST_VAR\" >&2'",
+            "sh -c 'printf \"%s|%s|%s|%s|%s|%s\" \"$(pwd)\" \"$HOME\" \"$TMPDIR\" \"$TZ\" \"$FROM_CASE\" \"$PORTKIT_SRC\"; echo \"$CARGO_MANIFEST_DIR\" >&2'",
             &base,
             &base,
         );
         c.path_roots = vec!["$ROOT".into(), "$HOME".into(), "$TMP".into(), "$SRC".into()];
-        std::env::set_var("AMBIENT_TEST_VAR", "leaked");
+        // Cargo sets this for every test process; it must not reach the case.
+        assert!(std::env::var_os("CARGO_MANIFEST_DIR").is_some());
         let out = run_once(
             &c,
             &input(json!({"env": {"FROM_CASE": "yes"}})),

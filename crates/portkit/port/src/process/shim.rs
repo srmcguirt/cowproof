@@ -201,11 +201,23 @@ pub fn read_flags(state: &Path) -> io::Result<(Vec<String>, bool)> {
 /// Run one shim: `program` called with `args`. Returns the exit status to exit with.
 /// `dir` and `state` are the run's shims and state directories.
 pub fn run_shim(dir: &Path, state: &Path, program: &str, args: &[String]) -> io::Result<i32> {
+    run_shim_with(dir, state, program, args, &|name| std::env::var(name).ok())
+}
+
+/// [`run_shim`], reading the environment through `env`, so tests need not change the
+/// process environment other tests read at the same time.
+fn run_shim_with(
+    dir: &Path,
+    state: &Path,
+    program: &str,
+    args: &[String],
+    env: &dyn Fn(&str) -> Option<String>,
+) -> io::Result<i32> {
     let config: ShimConfig =
         serde_json::from_slice(&fs::read(dir.join(CONFIG_FILE))?).map_err(io::Error::other)?;
     let Some(scripted) = config.programs.get(program) else {
         if program == "date" {
-            return date_shim(state, args);
+            return date_shim(state, args, env);
         }
         eprintln!("portkit shim: `{program}` is not declared in this run");
         return Ok(UNSCRIPTED_EXIT);
@@ -221,15 +233,15 @@ pub fn run_shim(dir: &Path, state: &Path, program: &str, args: &[String]) -> io:
     } else {
         None
     };
-    let env: BTreeMap<String, Option<String>> = config
+    let recorded: BTreeMap<String, Option<String>> = config
         .record_env
         .iter()
-        .map(|name| (name.clone(), std::env::var(name).ok()))
+        .map(|name| (name.clone(), env(name)))
         .collect();
     let call = Call {
         program: program.to_string(),
         argv: args.to_vec(),
-        env,
+        env: recorded,
         stdin,
     };
     let mut line = serde_json::to_string(&call).map_err(io::Error::other)?;
@@ -272,7 +284,11 @@ fn claim(state: &Path, program: &str, index: usize) -> bool {
 // ---- date ----------------------------------------------------------------------------------
 
 /// The `date` shim: `date [-u] [+FORMAT]` at the instant `PORTKIT_NOW` names, in UTC.
-fn date_shim(state: &Path, args: &[String]) -> io::Result<i32> {
+fn date_shim(
+    state: &Path,
+    args: &[String],
+    env: &dyn Fn(&str) -> Option<String>,
+) -> io::Result<i32> {
     let mut format: Option<&str> = None;
     for arg in args {
         match arg.as_str() {
@@ -284,9 +300,7 @@ fn date_shim(state: &Path, args: &[String]) -> io::Result<i32> {
             }
         }
     }
-    let now = std::env::var("PORTKIT_NOW")
-        .ok()
-        .and_then(|text| OffsetDateTime::parse(&text, &Rfc3339).ok());
+    let now = env("PORTKIT_NOW").and_then(|text| OffsetDateTime::parse(&text, &Rfc3339).ok());
     let Some(now) = now else {
         fs::write(state.join(CLOCK_MARKER), b"")?;
         eprintln!("portkit date shim: PORTKIT_NOW is not set to an RFC 3339 time; the clock is not pinned");
@@ -566,21 +580,20 @@ mod tests {
             programs,
             &["PK_SHIM_TEST_VAR", "PK_SHIM_UNSET_VAR"],
         );
-        std::env::set_var("PK_SHIM_TEST_VAR", "value");
-        std::env::remove_var("PK_SHIM_UNSET_VAR");
+        let env = |name: &str| (name == "PK_SHIM_TEST_VAR").then(|| "value".to_string());
 
         // The first call matches the named argv, the second falls to the catch-all, the third
         // finds nothing left.
         assert_eq!(
-            run_shim(&dir, &state, "git", &argv(&["rev-parse", "HEAD"])).unwrap(),
+            run_shim_with(&dir, &state, "git", &argv(&["rev-parse", "HEAD"]), &env).unwrap(),
             0
         );
         assert_eq!(
-            run_shim(&dir, &state, "git", &argv(&["push", "--force"])).unwrap(),
+            run_shim_with(&dir, &state, "git", &argv(&["push", "--force"]), &env).unwrap(),
             3
         );
         assert_eq!(
-            run_shim(&dir, &state, "git", &argv(&["status"])).unwrap(),
+            run_shim_with(&dir, &state, "git", &argv(&["status"]), &env).unwrap(),
             UNSCRIPTED_EXIT
         );
 
@@ -635,11 +648,11 @@ mod tests {
     #[test]
     fn the_date_shim_refuses_to_guess_the_time() {
         let base = scratch("date");
-        std::env::remove_var("PORTKIT_NOW");
-        assert_eq!(date_shim(&base, &argv(&["+%s"])).unwrap(), 1);
+        let unset = |_: &str| None;
+        assert_eq!(date_shim(&base, &argv(&["+%s"]), &unset).unwrap(), 1);
         assert!(base.join(CLOCK_MARKER).exists());
         // An option it does not implement is a refusal, not a wrong answer.
-        assert_eq!(date_shim(&base, &argv(&["-d", "@0"])).unwrap(), 2);
+        assert_eq!(date_shim(&base, &argv(&["-d", "@0"]), &unset).unwrap(), 2);
         let _ = fs::remove_dir_all(base);
     }
 }
