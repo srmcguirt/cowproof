@@ -218,8 +218,37 @@ pub(crate) fn collect_lanes(lanes_root: &Path) -> Result<Vec<PathBuf>> {
     Ok(lanes)
 }
 
-/// Get the state of a lane from its control/run.json file.
+/// The verdict named in `control/verdict.json` (`proved`, `refuted`, `incomplete`,
+/// `infrastructure`, or `finished` for an unsandboxed lane), when the lane has been proved.
+/// The file is read without following a link and only up to a bound; anything else is none.
+fn lane_verdict(lane_dir: &Path) -> Option<String> {
+    let path = lane_dir.join("control/verdict.json");
+    let meta = fs::symlink_metadata(&path).ok()?;
+    if !meta.is_file() || meta.len() > 1024 * 1024 {
+        return None;
+    }
+    let mut text = String::new();
+    fs::File::open(&path)
+        .ok()?
+        .take(1024 * 1024)
+        .read_to_string(&mut text)
+        .ok()?;
+    let doc: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let name = doc.get("verdict")?.as_str()?;
+    // A label out of a file the builder cannot write, printed in a table: bound it anyway.
+    (!name.is_empty()
+        && name.len() <= 32
+        && name.chars().all(|c| c.is_ascii_lowercase() || c == '-'))
+    .then(|| name.to_string())
+}
+
+/// Get the state of a lane: its verdict when it has one (`control/verdict.json`), otherwise
+/// the status in `control/run.json`, otherwise `running`. `run.json` alone says `finished` for
+/// a builder that exited, however the proof went.
 fn get_lane_state(lane_dir: &Path) -> String {
+    if let Some(verdict) = lane_verdict(lane_dir) {
+        return verdict;
+    }
     let run_json = lane_dir.join("control/run.json");
     if !run_json.exists() {
         return "running".to_string();
@@ -228,7 +257,7 @@ fn get_lane_state(lane_dir: &Path) -> String {
     match fs::read_to_string(&run_json) {
         Ok(content) => match serde_json::from_str::<serde_json::Value>(&content) {
             Ok(obj) => {
-                // Check for status field (stopped, proved, refuted, incomplete, infrastructure)
+                // Check for status field (stopped, failed, timeout, finished, ...)
                 if let Some(status) = obj.get("status").and_then(|v| v.as_str()) {
                     return status.to_string();
                 }

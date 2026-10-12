@@ -76,7 +76,12 @@ The requirements are a closed set. Each is a plain check of the packet text, wit
 error [profile]: mutations: profile "strict" for rung claude:haiku (the header chose it) requires mutations; add a "## Mutations" section with at least one item: ...
 ```
 
-`cowproof run` lints first and stops on a lint error, so a packet that lacks a requirement of its rung's profile does not start: no lane directory exists. Lint has no `--model`, so it checks the rung the header, the class route or the default names. `cowproof run --model` can start the lane on another rung, and lint does not check that rung's profile. A `reassign` onto a higher rung does not re-lint the packet either.
+`cowproof run` lints first and stops on lint errors, with one exception. Lint has no `--model`, so its `profile` findings about unmet requirements may name a rung the lane will not use (`--model sonnet` onto a rung with no profile, while the header names a strict one). Inside `run` those findings are dropped, and `run` checks the profile of the rung it actually uses, with the same checker, in two places. A `profile` finding about a broken configuration (a `[profiles]` or `[routing.profiles]` that does not parse, or a route naming an undefined profile) is still a lint error that stops the run, whichever rung it would use. `cowproof lint` run directly reports both, as before.
+
+- **At the start.** After the starting rung is resolved from every source (`--model` included), that rung's profile is checked against the packet text. An unmet profile is exit 4 with "nothing was started", naming the rung, who chose it, the profile and each missing requirement: `rung claude:sonnet refused (flag chose it): the packet does not meet profile "strict" for that rung (tests: add a "## Tests" section ...; mutations: ...)`.
+- **On a reassign.** Before the lane launches on the rung a `reassign` picks (the next on the ladder, or the one the ruling names), that rung's profile is checked against the packet the lane is running. An unmet profile refuses the reassign like a rung with no adapter: the lane ends `failed`, its work is kept, the ruling stays recorded and undelivered, and `run.json`'s `error` names the rung, the profile and the missing requirements.
+
+`run.json` records the check per segment as `profile`: `{rung, name, requires, met, missing}`, or null for a rung with no profile.
 
 ## OpenRouter models through OpenCode
 
@@ -193,9 +198,25 @@ What it reads and how it counts:
 - **First-try pass** means the lane is proved, has zero reassigns, and ended on the rung it started on. **Proved** means the verdict is `proved`. Lanes are grouped by the rung they started on, so a lane that climbed from haiku to sonnet counts against haiku.
 - **Unsandboxed lanes** (they can end `finished`, never `proved`) are left out of the rates and counted. `--include-unsandboxed` counts them, and a `finished` verdict from an unsandboxed lane then counts as proved.
 - **Cost** is the runner's estimate (`estimatedCostUsd`), not a bill. `$/prov` is the group's whole cost, failures included, over its proved lanes.
+- **Context delivered** is `traceTotals.deliveredBytes` of `run.json` (see [Trace totals](#trace-totals-per-lane)), averaged over the proved lanes of each start rung that were traced, and printed under the table as `Context delivered (mean bytes per proved traced lane)` with how many proved lanes it covers. An untraced proved lane (Codex, OpenRouter, a remote host, or no hooks) is not in the mean, and the section is left out when no proved lane was traced.
 - **Remote lanes** are counted in the rates like any other and noted in the footer; `rungSource` shows how many starting rungs came from a flag, a header, a class route or the default.
 
-`--json` prints the same numbers as one document (`counts`, `groups`, `climbed`, and one `lanes` row per counted lane with its first and final rung, class, cost, turns, reassigns, `host` and `unsandboxed`). Exit 0 when it prints; exit 1 when a root is not a directory. The plain table is at most 80 columns wide.
+`--json` prints the same numbers as one document (`counts`, `groups`, `climbed`, `delivered`, and one `lanes` row per counted lane with its first and final rung, class, cost, turns, reassigns, `host` and `unsandboxed`). Exit 0 when it prints; exit 1 when a root is not a directory. The plain table is at most 80 columns wide.
+
+## Trace totals per lane
+
+A Claude lane's builder runs with portkit's hooks, which record every tool call it makes to `<lane>/portkit/traces/*.jsonl`. When the builder has exited and `pk doctor` finds the lane traced, the runner adds those records up and writes the totals to `control/run.json` as `traceTotals` and to the capsule as `trace_totals` (sealed with the rest of `capsule.json`; an older capsule has none and still verifies):
+
+```json
+"traceTotals": {
+  "calls": 6, "deliveredBytes": 1145, "producedBytes": 1145,
+  "byTool": {"Bash": {"calls": 3, "deliveredBytes": 110}, "Read": {"calls": 3, "deliveredBytes": 1035}},
+  "pkRead": {"calls": 2, "deliveredBytes": 10},
+  "malformedLines": 1
+}
+```
+
+`deliveredBytes` is what reached the builder's context. `pkRead` counts the `Bash` calls whose command head is `pk-read` and the bytes they delivered. The trace keeps no output, so an `UNCHANGED` answer from `pk-read` cannot be told from a full read; only the totals are known, not the split. An untraced lane (no hooks, a remote host, a Codex or OpenRouter segment) records `null`, with no error. The totals describe how the lane was watched and never enter the verdict; the builder can write its own trace directory, so they are its own account. The walk is the same safe one `port-candidates` uses: no symlink is followed and a line that is not a record is counted, not fatal.
 
 ## Find what to port: `cowproof report port-candidates`
 

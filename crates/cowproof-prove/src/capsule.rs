@@ -1,7 +1,7 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 use thiserror::Error;
@@ -148,6 +148,37 @@ pub struct PacketVersion {
     pub packet_json: String,
 }
 
+/// Calls and the bytes they delivered into context, for one tool.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolTotals {
+    pub calls: u64,
+    pub delivered_bytes: u64,
+}
+
+/// What portkit's trace of one lane adds up to (D5, D23): the usage monitor's totals. They are
+/// read from `<lane>/portkit/traces/*.jsonl` at lane end and describe how the lane was
+/// watched; they never enter the verdict. The builder can write its own trace directory, so
+/// the figures are the builder's own account, not a measurement the runner made.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TraceTotals {
+    /// Records read.
+    pub calls: u64,
+    /// Bytes that reached the builder's context (`delivered_bytes`), summed.
+    pub delivered_bytes: u64,
+    /// Bytes the tools produced before any budget (`produced_bytes`), summed.
+    pub produced_bytes: u64,
+    /// Calls and delivered bytes by tool name.
+    pub by_tool: BTreeMap<String, ToolTotals>,
+    /// `Bash` calls whose command head is `pk-read`, and what they delivered. The trace keeps
+    /// no output, so an `UNCHANGED` answer cannot be told from a full read: only the totals
+    /// are known.
+    pub pk_read: ToolTotals,
+    /// Lines of a trace file that were not records.
+    pub malformed_lines: u64,
+}
+
 /// The main capsule structure.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Capsule {
@@ -222,6 +253,11 @@ pub struct Capsule {
     /// read as false.
     #[serde(default)]
     pub traced: bool,
+    /// What the lane's portkit trace adds up to (calls by tool, bytes delivered into context),
+    /// present exactly when `traced` is true. Sealed in `capsule.json`; absent in older
+    /// capsules, which read as null and still verify.
+    #[serde(default)]
+    pub trace_totals: Option<TraceTotals>,
     /// The alias of the remote host that ran the builder (D27), or null for a lane run on the
     /// director's own machine. The proof is always local: the director rebuilt the tree from
     /// the base and the patch the host returned, so this says where the work was done and
@@ -280,6 +316,7 @@ impl Capsule {
             project_instructions_sha256: None,
             class: "light".to_string(),
             traced: false,
+            trace_totals: None,
             host: None,
             launch_removed: Vec::new(),
         }

@@ -44,13 +44,13 @@ use crate::root::resolve_executable;
 use crate::verify::{Rebuild, fetch_dependencies, verifier_runner};
 use anyhow::{Context, Result, anyhow, bail};
 use cowproof_core::{
-    LinkedFile, PORT_CLASS, Routing, Rung, Runtime, class_limit_at_commit, get_slot_dir,
+    LinkedFile, PORT_CLASS, Profiles, Routing, Rung, Runtime, class_limit_at_commit, get_slot_dir,
     git_show_following_links, parse_header, port_base_for_slot, port_block_env, redact,
     release_slot, valid_model_name,
 };
 use cowproof_prove::{
     capsule::HELDOUT_FILE,
-    capsule::{Capsule, CheckResult, EnvironmentFingerprint},
+    capsule::{Capsule, CheckResult, EnvironmentFingerprint, TraceTotals},
     gates::{GatePacket, base_requires_heldout, run_gates},
     runner::{acquire_slot_notifying, kill_process_group, terminate_process_group},
     verify::{VerifyOptions, verify},
@@ -1580,6 +1580,9 @@ enum Fallback {
 struct Drive<'a> {
     /// The ladder `reassign` climbs: the base commit's, read once before the lane existed.
     routing: &'a Routing,
+    /// The packet profiles of the base commit: what each rung needs from the packet (D28
+    /// clause 5), checked again for every rung a `reassign` lands on.
+    profiles: &'a Profiles,
     launcher: &'a Launcher,
     queue: &'a Arc<Mutex<Queue>>,
     lane_id: &'a str,
@@ -1699,7 +1702,7 @@ impl Drive<'_> {
                 header.id, self.lane_id
             ));
         }
-        let errors: Vec<String> = cowproof_lint::lint_packet(&text, self.repo, self.plans)
+        let errors: Vec<String> = lint_for_run(&text, self.repo, self.plans)
             .iter()
             .filter(|f| f.severity == cowproof_lint::Severity::Error)
             .map(|f| one_line(&f.to_string()))
@@ -1717,10 +1720,14 @@ impl Drive<'_> {
         seg: &SegmentRun,
         runtime_version: Option<&str>,
         price: Option<serde_json::Value>,
+        profile: serde_json::Value,
     ) -> serde_json::Value {
         json!({
             "index": index,
             "runtime": launch.runtime.name(),
+            // The packet profile of the segment's rung and whether the packet met it (D28
+            // clause 5): null when the rung has none.
+            "profile": profile,
             // The figures the lane's cost was computed at: what OpenRouter's model list said
             // (fetched at preflight) or what the director's cowproof.toml said for Codex, with
             // where they came from (null for Claude).
@@ -1818,6 +1825,7 @@ impl Drive<'_> {
                 &seg,
                 self.launcher.runtime_version(launch.runtime),
                 self.launcher.price_json(launch.runtime, &launch.model),
+                profile_record(self.profiles, &rung, &launch.packet),
             );
             // A hard limit ended the launch: no fallback, no relaunch, no proof.
             let hard_end = match seg.session_end {
@@ -1993,6 +2001,17 @@ impl Drive<'_> {
                             status,
                         );
                     }
+                    // The packet must meet the profile of the rung it lands on (D28 clause 5), as
+                    // it had to at the start: refused the same way, the work kept and the ruling
+                    // left recorded and undelivered.
+                    if let Some(refusal) = profile_refusal(self.profiles, &to, &packet) {
+                        break (
+                            LaneEnd::Refused(format!(
+                                "reassign for {id} refused: {to} is the next rung, but {refusal}"
+                            )),
+                            status,
+                        );
+                    }
                     // An `openrouter` rung the preflight did not price (a model the ruling
                     // named, off the ladder) has no price, so the cost cap could not act on it.
                     if to.runtime == Runtime::Openrouter
@@ -2057,6 +2076,65 @@ impl Drive<'_> {
             session_id,
             end,
         })
+    }
+}
+
+/// The lint findings that can stop a run. Lint resolves the starting rung without `--model`, so
+/// its `profile` findings about unmet requirements may name a rung the lane will not use (a
+/// `--model` onto a rung with no profile). Those are dropped here, and `run` checks the profile
+/// of the rung it really resolved itself (`profile_refusal`). A `profile` finding about a broken
+/// configuration (`FindingKind::ProfileConfig`) stays: it is wrong whichever rung is used.
+/// `cowproof lint` on its own is unchanged.
+fn lint_for_run(
+    packet_text: &str,
+    repo: &Path,
+    plans: &[cowproof_plan::Plan],
+) -> Vec<cowproof_lint::Finding> {
+    cowproof_lint::lint_packet(packet_text, repo, plans)
+        .into_iter()
+        .filter(|f| f.kind != cowproof_lint::FindingKind::ProfileUnmet)
+        .collect()
+}
+
+/// The text of the unmet requirements of `rung`'s profile for `packet`, or `None` when the rung
+/// has no profile or the packet meets it. One checker for lint, the start and a reassign:
+/// `cowproof_lint::check_profile`.
+fn profile_refusal(profiles: &Profiles, rung: &Rung, packet: &str) -> Option<String> {
+    let header = match parse_header(packet) {
+        Ok(header) => header,
+        Err(e) => return Some(format!("the packet's header does not parse ({e})")),
+    };
+    let check = cowproof_lint::check_profile(profiles, rung, packet, &header)?;
+    if check.is_met() {
+        return None;
+    }
+    let missing: Vec<String> = check
+        .unmet
+        .iter()
+        .map(|(requirement, need)| format!("{requirement}: {need}"))
+        .collect();
+    Some(format!(
+        "the packet does not meet profile \"{}\" for that rung ({})",
+        check.name,
+        missing.join("; ")
+    ))
+}
+
+/// The `profile` entry of a segment in `run.json`: the rung checked, the profile, what it
+/// requires and what the packet lacked. Null when the rung has no profile.
+fn profile_record(profiles: &Profiles, rung: &Rung, packet: &str) -> serde_json::Value {
+    let Ok(header) = parse_header(packet) else {
+        return serde_json::Value::Null;
+    };
+    match cowproof_lint::check_profile(profiles, rung, packet, &header) {
+        None => serde_json::Value::Null,
+        Some(check) => json!({
+            "rung": rung.to_string(),
+            "name": check.name,
+            "requires": check.required.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            "met": check.is_met(),
+            "missing": check.unmet.iter().map(|(r, _)| r.to_string()).collect::<Vec<_>>(),
+        }),
     }
 }
 
@@ -2683,7 +2761,7 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
         .canonicalize()
         .with_context(|| format!("opening repository {}", repo.display()))?;
     let plans = cowproof_plan::load_plans(&repo, &[])?;
-    let findings = cowproof_lint::lint_packet(&packet_text, &repo, &plans);
+    let findings = lint_for_run(&packet_text, &repo, &plans);
     for finding in &findings {
         eprintln!("{finding}");
     }
@@ -2801,6 +2879,26 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
         }
     };
     if let Some(refusal) = first_rung.runtime.adapter_refusal() {
+        eprintln!(
+            "rung {first_rung} refused ({} chose it): {refusal}",
+            rung_source.name()
+        );
+        eprintln!("nothing was started");
+        return Ok(INFRASTRUCTURE_EXIT_CODE);
+    }
+
+    // 2b'. The packet profile of the rung the lane starts on, whichever source chose it
+    // (`--model` included, which `cowproof lint` cannot see): the same checker as lint, on the
+    // same base commit. An unmet profile stops the run here (exit 4), before any lane exists.
+    let profiles = match Profiles::at_commit(&repo, "HEAD", &routing) {
+        Ok(profiles) => profiles,
+        Err(e) => {
+            eprintln!("the packet profiles cannot be read: {e:#}");
+            eprintln!("nothing was started");
+            return Ok(INFRASTRUCTURE_EXIT_CODE);
+        }
+    };
+    if let Some(refusal) = profile_refusal(&profiles, &first_rung, &packet_text) {
         eprintln!(
             "rung {first_rung} refused ({} chose it): {refusal}",
             rung_source.name()
@@ -3304,6 +3402,7 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
     };
     let drive = Drive {
         routing: &routing,
+        profiles: &profiles,
         launcher: &launcher,
         queue: &queue,
         lane_id: &header.id,
@@ -3459,6 +3558,15 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
         .await
     };
 
+    // The usage monitor's totals (D5, D23): read from the lane's trace files, only for a lane
+    // `pk doctor` found traced. They describe how the lane was watched and never change the
+    // verdict.
+    let trace_totals: Option<TraceTotals> = if trace["traced"].as_bool() == Some(true) {
+        cowproof_report::traces::lane_trace_totals(&lane)
+    } else {
+        None
+    };
+
     let mut run = json!({
         "id": header.id,
         "host": remote.as_ref().map(|r| r.alias()),
@@ -3524,6 +3632,7 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
         "prefixVersion": &launcher.prefix_version,
         "projectInstructionsSha256": &launcher.project_instructions_sha256,
         "trace": trace,
+        "traceTotals": trace_totals,
     });
     // The Codex the lane could use, and the director's override of the OpenAI upstream.
     run["codexVersion"] = json!(launcher.codex.as_ref().map(|c| c.version.as_str()));
@@ -3600,6 +3709,7 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
             port_base,
             unsandboxed: launcher.unsandboxed,
             trace: trace.clone(),
+            trace_totals: trace_totals.clone(),
             host: remote.as_ref().map(|r| r.alias()),
         },
         results,
@@ -3795,6 +3905,8 @@ struct ProofInput<'a> {
     unsandboxed: bool,
     /// The portkit trace verdict: whether the lane was traced (D5).
     trace: Value,
+    /// What the lane's trace adds up to; `Some` exactly when `trace` says traced.
+    trace_totals: Option<TraceTotals>,
     /// The remote host that ran the builder (D27); the proof itself is always local.
     host: Option<&'a str>,
 }
@@ -4011,6 +4123,7 @@ async fn replay_and_gate(
     capsule.project_instructions_sha256 = input.project_instructions_sha256.clone();
     capsule.class = header.class_name.clone();
     capsule.traced = input.trace["traced"].as_bool().unwrap_or(false);
+    capsule.trace_totals = input.trace_totals.clone();
     capsule.host = input.host.map(str::to_string);
 
     // Fetch the dependencies the checks need before verify runs (D6, D11, D14), on the

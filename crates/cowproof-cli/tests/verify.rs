@@ -164,6 +164,36 @@ fn a_capsule_without_the_runtime_and_rung_source_fields_still_reproduces() {
     assert_eq!(stdout(&out).trim(), "reproduced");
 }
 
+/// A capsule written before the trace totals has no `trace_totals`. Sealed again over those
+/// bytes, as the older writer would have sealed it, it still reproduces.
+#[test]
+fn a_capsule_without_trace_totals_still_reproduces() {
+    if !sandbox_available() {
+        return;
+    }
+    let lane = lane();
+    run_expecting(&lane, &[], 0);
+    let capsule = lane.capsule_dir();
+    let path = capsule.join("capsule.json");
+    let mut json: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    assert!(
+        json.as_object_mut()
+            .unwrap()
+            .remove("trace_totals")
+            .is_some(),
+        "the new run writes the key"
+    );
+    let raw = serde_json::to_vec_pretty(&json).unwrap();
+    fs::write(&path, &raw).unwrap();
+    fs::write(capsule.join("capsule.sha256"), Capsule::hash_bytes(&raw)).unwrap();
+
+    let old = Capsule::read(&capsule).expect("an older capsule reads");
+    assert_eq!(old.trace_totals, None);
+    let out = replay(&lane);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    assert_eq!(stdout(&out).trim(), "reproduced");
+}
+
 /// The capsule is read byte for byte: a hand edit to `capsule.json` and to `lane.patch`
 /// are each refused and named, and the untouched capsule still reproduces.
 #[test]

@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use cowproof_core::{Header, Profiles, Routing, parse_header};
+use cowproof_core::{Header, Profiles, Requirement, Routing, Rung, parse_header};
 use cowproof_plan::{Plan, check_packet_reservations};
 use globset::Glob;
 use std::collections::BTreeSet;
@@ -24,12 +24,30 @@ impl std::fmt::Display for Severity {
     }
 }
 
+/// What a finding is about, for a caller that must treat some findings differently from the
+/// rest without reading their message text.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FindingKind {
+    /// Every finding that is not one of the two below.
+    #[default]
+    General,
+    /// Rule `profile`: a `[profiles]` or `[routing.profiles]` that does not parse, or a route
+    /// that names a profile `[profiles]` does not define. The configuration is broken
+    /// whichever rung a lane starts on.
+    ProfileConfig,
+    /// Rule `profile`: the packet lacks a requirement of the profile of the rung lint
+    /// resolved (without `--model`). Whether it matters depends on the rung a run really uses,
+    /// which `cowproof run` checks itself.
+    ProfileUnmet,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Finding {
     pub severity: Severity,
     pub rule: &'static str,
     pub line: Option<usize>,
     pub message: String,
+    pub kind: FindingKind,
 }
 
 impl std::fmt::Display for Finding {
@@ -81,6 +99,7 @@ fn error(rule: &'static str, line: Option<usize>, message: impl Into<String>) ->
         rule,
         line,
         message: message.into(),
+        kind: FindingKind::General,
     }
 }
 
@@ -90,6 +109,7 @@ fn warn(rule: &'static str, line: Option<usize>, message: impl Into<String>) -> 
         rule,
         line,
         message: message.into(),
+        kind: FindingKind::General,
     }
 }
 
@@ -125,14 +145,54 @@ fn has_head(repo_root: &Path) -> bool {
         .is_ok_and(|out| out.status.success())
 }
 
+/// A profile a packet was checked against: the profile's name, what it requires and what the
+/// packet text lacks (D28 clause 5).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProfileCheck {
+    pub name: String,
+    pub required: Vec<Requirement>,
+    /// Each requirement the packet does not meet, with the sentence to add to the packet.
+    pub unmet: Vec<(Requirement, &'static str)>,
+}
+
+impl ProfileCheck {
+    pub fn is_met(&self) -> bool {
+        self.unmet.is_empty()
+    }
+}
+
+/// Check `packet_text` against the profile `rung` is routed to. `None` is a rung with no
+/// profile. This is the one checker: `cowproof lint` calls it for the rung it resolves, and
+/// `cowproof run` calls it for the rung it starts on and for each rung a `reassign` lands on.
+pub fn check_profile(
+    profiles: &Profiles,
+    rung: &Rung,
+    packet_text: &str,
+    header: &Header,
+) -> Option<ProfileCheck> {
+    let (name, required) = profiles.for_rung(rung)?;
+    let unmet = required
+        .iter()
+        .filter_map(|requirement| {
+            profile::missing(*requirement, packet_text, header).map(|need| (*requirement, need))
+        })
+        .collect();
+    Some(ProfileCheck {
+        name: name.to_string(),
+        required: required.to_vec(),
+        unmet,
+    })
+}
+
 /// The packet profile of the starting rung (D28 clause 5). The rung is resolved as `cowproof
 /// run` resolves it without `--model`: the header's `rung`, else the class route, else the
 /// default, on the base commit's ladder. Each requirement of that rung's profile the packet
 /// does not meet is an error, `profile`, whose message starts with the requirement's name.
-/// `cowproof run --model` can start the lane on another rung, which lint cannot see. No
-/// repository or commit, an unreadable ladder or a rung off it are left to rule `rung` and to
-/// the run's own refusal. A `[profiles]` or `[routing.profiles]` that does not parse is an
-/// error here, so a broken profile configuration stops a run.
+/// `cowproof run --model` can start the lane on another rung, which lint cannot see; `run`
+/// checks the rung it actually starts on (and each rung a `reassign` lands on) with
+/// [`check_profile`] itself. No repository or commit, an unreadable ladder or a rung off it
+/// are left to rule `rung` and to the run's own refusal. A `[profiles]` or `[routing.profiles]`
+/// that does not parse is an error here, so a broken profile configuration stops a run.
 fn lint_profile(header: &Header, packet_text: &str, repo_root: &Path, findings: &mut Vec<Finding>) {
     if !has_head(repo_root) {
         return;
@@ -143,27 +203,32 @@ fn lint_profile(header: &Header, packet_text: &str, repo_root: &Path, findings: 
     let profiles = match Profiles::at_commit(repo_root, "HEAD", &routing) {
         Ok(profiles) => profiles,
         Err(e) => {
-            findings.push(error("profile", None, format!("{e:#}")));
+            findings.push(Finding {
+                kind: FindingKind::ProfileConfig,
+                ..error("profile", None, format!("{e:#}"))
+            });
             return;
         }
     };
     let Ok((rung, source)) = routing.start(None, header.rung.as_deref(), &header.class_name) else {
         return;
     };
-    let Some((name, required)) = profiles.for_rung(&rung) else {
+    let Some(check) = check_profile(&profiles, &rung, packet_text, header) else {
         return;
     };
-    for requirement in required {
-        if let Some(need) = profile::missing(*requirement, packet_text, header) {
-            findings.push(error(
+    for (requirement, need) in &check.unmet {
+        findings.push(Finding {
+            kind: FindingKind::ProfileUnmet,
+            ..error(
                 "profile",
                 None,
                 format!(
-                    "{requirement}: profile \"{name}\" for rung {rung} (the {} chose it) requires {requirement}; {need}",
+                    "{requirement}: profile \"{}\" for rung {rung} (the {} chose it) requires {requirement}; {need}",
+                    check.name,
                     source.name()
                 ),
-            ));
-        }
+            )
+        });
     }
 }
 
@@ -881,6 +946,7 @@ fn lint_packet_restates_protocol(packet_text: &str, findings: &mut Vec<Finding>)
                      Do not paste Ask schema, escalate-early rules, or other protocol text into the packet.",
                     marker
                 ),
+                kind: FindingKind::General,
             });
             return; // Report once per packet
         }
@@ -1026,6 +1092,77 @@ mod tests {
 
     fn profile_packet(header: &str, body: &str) -> String {
         format!("<!-- lane {header} -->\n{body}")
+    }
+
+    #[test]
+    fn check_profile_is_the_one_checker_for_any_rung() {
+        let routing = Routing::parse(Some(PROFILE_CONFIG)).unwrap();
+        let profiles = Profiles::parse(Some(PROFILE_CONFIG), &routing).unwrap();
+        let text = profile_packet(r#"{"id":"lane-x","owns":["README.md"]}"#, "\nBody.\n");
+        let header = parse_header(&text).unwrap();
+        let rung = |s: &str| Rung::parse(s).unwrap();
+
+        // Whatever rung is asked about: the strict one lists all three, in order.
+        let strict = check_profile(&profiles, &rung("claude:haiku"), &text, &header).unwrap();
+        assert_eq!(strict.name, "strict");
+        assert!(!strict.is_met());
+        let unmet: Vec<Requirement> = strict.unmet.iter().map(|(r, _)| *r).collect();
+        assert_eq!(
+            unmet,
+            [
+                Requirement::Tests,
+                Requirement::Mutations,
+                Requirement::DoneChecklist
+            ]
+        );
+        // The standard one needs checks, which this header lacks.
+        let standard = check_profile(&profiles, &rung("sonnet"), &text, &header).unwrap();
+        assert_eq!(standard.unmet.len(), 1);
+        // A rung with no profile has no check; a packet that meets the profile is met.
+        assert_eq!(
+            check_profile(&profiles, &rung("opus"), &text, &header),
+            None
+        );
+        let full = profile_packet(r#"{"id":"lane-x","owns":["README.md"]}"#, FULL_BODY);
+        let met = check_profile(
+            &profiles,
+            &rung("haiku"),
+            &full,
+            &parse_header(&full).unwrap(),
+        )
+        .unwrap();
+        assert!(met.is_met());
+        assert_eq!(met.required.len(), 3);
+    }
+
+    #[test]
+    fn profile_findings_say_whether_they_are_unmet_requirements_or_a_broken_config() {
+        let dir = repo_with_config(Some(PROFILE_CONFIG));
+        let bare = profile_packet(
+            r#"{"id":"lane-x","owns":["README.md"],"rung":"claude:haiku"}"#,
+            "\nBody.\n",
+        );
+        let findings = lint_packet(&bare, &dir, &[]);
+        let profile: Vec<&Finding> = findings.iter().filter(|f| f.rule == "profile").collect();
+        assert_eq!(profile.len(), 3);
+        assert!(profile.iter().all(|f| f.kind == FindingKind::ProfileUnmet));
+        // Every other finding is general.
+        assert!(
+            findings
+                .iter()
+                .filter(|f| f.rule != "profile")
+                .all(|f| f.kind == FindingKind::General)
+        );
+        fs::remove_dir_all(dir).unwrap();
+
+        let broken = repo_with_config(Some(
+            "[ladder]\nrungs = [\"claude:haiku\"]\n[profiles.strict]\nrequire = [\"coverage\"]\n",
+        ));
+        let findings = lint_packet(&bare, &broken, &[]);
+        let profile: Vec<&Finding> = findings.iter().filter(|f| f.rule == "profile").collect();
+        assert_eq!(profile.len(), 1, "{findings:?}");
+        assert_eq!(profile[0].kind, FindingKind::ProfileConfig);
+        fs::remove_dir_all(broken).unwrap();
     }
 
     fn profile_messages(findings: &[Finding]) -> Vec<&str> {

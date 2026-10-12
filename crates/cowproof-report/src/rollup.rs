@@ -56,6 +56,8 @@ pub struct Rollup {
     pub counts: Counts,
     pub groups: Vec<Group>,
     pub climbed: Vec<Climbed>,
+    /// Context bytes delivered per proved traced lane, by start rung (D23).
+    pub delivered: Vec<Delivered>,
     pub lanes: Vec<LaneRow>,
 }
 
@@ -115,6 +117,20 @@ pub struct Climbed {
     pub ended_on: BTreeMap<String, usize>,
 }
 
+/// The usage monitor's figure for the lanes that started on a rung: of the proved lanes whose
+/// `run.json` carries `traceTotals` (traced Claude lanes), the mean `deliveredBytes`, the
+/// bytes that reached the builder's context. Untraced proved lanes are not in it.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Delivered {
+    pub start_rung: String,
+    /// Proved lanes of the rung, traced or not.
+    pub proved_lanes: usize,
+    /// Of those, the lanes with trace totals: the mean is over these.
+    pub traced_proved_lanes: usize,
+    pub mean_delivered_bytes: Option<f64>,
+}
+
 /// One lane that was read (not running, not skipped).
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -133,6 +149,8 @@ pub struct LaneRow {
     pub cost_usd: Option<f64>,
     pub cost_is_estimate: bool,
     pub turns: Option<u64>,
+    /// `traceTotals.deliveredBytes` of `run.json`, for a traced lane.
+    pub delivered_bytes: Option<u64>,
     pub reassigns: usize,
     pub rung_source: Option<String>,
     pub remote: bool,
@@ -223,12 +241,30 @@ pub fn rollup(roots: &[PathBuf], options: &Options) -> Result<Rollup> {
         *c.ended_on.entry(row.final_rung.clone()).or_default() += 1;
     }
 
+    let mut delivered: BTreeMap<&str, (usize, Vec<u64>)> = BTreeMap::new();
+    for row in rows.iter().filter(|r| r.state == "counted" && r.proved) {
+        let entry = delivered.entry(row.first_rung.as_str()).or_default();
+        entry.0 += 1;
+        entry.1.extend(row.delivered_bytes);
+    }
+    let delivered: Vec<Delivered> = delivered
+        .into_iter()
+        .map(|(rung, (proved, bytes))| Delivered {
+            start_rung: rung.to_string(),
+            proved_lanes: proved,
+            traced_proved_lanes: bytes.len(),
+            mean_delivered_bytes: (!bytes.is_empty())
+                .then(|| bytes.iter().sum::<u64>() as f64 / bytes.len() as f64),
+        })
+        .collect();
+
     Ok(Rollup {
         include_unsandboxed: options.include_unsandboxed,
         roots: roots.len(),
         counts,
         groups,
         climbed: by_start.into_values().collect(),
+        delivered,
         lanes: rows,
     })
 }
@@ -420,6 +456,10 @@ fn read_lane(dir: &Path, id: &str, root: &Path, options: &Options) -> Found {
         cost_usd,
         cost_is_estimate,
         turns: turns_of(&run),
+        delivered_bytes: run
+            .get("traceTotals")
+            .and_then(|t| t.get("deliveredBytes"))
+            .and_then(Value::as_u64),
         reassigns: rungs.reassigns,
         rung_source: str_of(&run, "rungSource"),
         remote: host.is_some(),
@@ -631,6 +671,22 @@ impl Rollup {
                 for (label, n) in ends {
                     out.push_str(&format!("  {label:<wide$} {n:>4}\n"));
                 }
+            }
+        }
+
+        if self.delivered.iter().any(|d| d.traced_proved_lanes > 0) {
+            out.push_str("\nContext delivered (mean bytes per proved traced lane)\n");
+            for d in &self.delivered {
+                let mean = d
+                    .mean_delivered_bytes
+                    .map_or("-".to_string(), |m| format!("{m:.0}"));
+                out.push_str(&format!(
+                    "  {:<36} {:>9} bytes, {} of {} proved traced\n",
+                    clip(&d.start_rung, 36),
+                    mean,
+                    d.traced_proved_lanes,
+                    d.proved_lanes
+                ));
             }
         }
 

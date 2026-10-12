@@ -4,3 +4,4 @@
 
 pub mod port_candidates;
 pub mod rollup;
+pub mod traces;

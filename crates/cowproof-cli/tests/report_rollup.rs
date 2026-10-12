@@ -267,3 +267,66 @@ fn a_real_lane_rolls_up_to_what_its_own_files_say() {
     );
     assert!(table.contains("1/1 100%"), "{table}");
 }
+
+/// Give an already written lane `traceTotals.deliveredBytes`, the way a traced lane's
+/// `run.json` has it.
+fn trace(root: &Path, id: &str, delivered_bytes: u64) {
+    let path = root.join(id).join("control/run.json");
+    let mut run: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    run["traceTotals"] = json!({"calls": 3, "deliveredBytes": delivered_bytes});
+    fs::write(&path, run.to_string()).unwrap();
+}
+
+#[test]
+fn the_rollup_shows_mean_delivered_bytes_per_proved_traced_lane_by_start_rung() {
+    let dir = var_tmp("cp-rollcli-delivered-");
+    let root = dir.path();
+    put(root, "a", ("claude", "haiku"), "rust", "proved", false);
+    put(root, "b", ("claude", "haiku"), "light", "proved", false);
+    put(root, "c", ("claude", "haiku"), "light", "proved", false);
+    // Refuted: traced, but not a proved lane, so not in the mean.
+    put(root, "d", ("claude", "haiku"), "light", "refuted", false);
+    put(root, "e", ("claude", "sonnet"), "light", "proved", false);
+    trace(root, "a", 1000);
+    trace(root, "b", 3000);
+    trace(root, "d", 99_999);
+
+    let out = rollup(&["--json"], &[root]);
+    assert!(out.status.success(), "{}", text(&out));
+    let doc: Value = serde_json::from_str(&stdout(&out)).unwrap();
+    assert_eq!(
+        doc["delivered"],
+        json!([
+            {"startRung": "claude:haiku", "provedLanes": 3, "tracedProvedLanes": 2,
+             "meanDeliveredBytes": 2000.0},
+            {"startRung": "claude:sonnet", "provedLanes": 1, "tracedProvedLanes": 0,
+             "meanDeliveredBytes": null},
+        ])
+    );
+
+    let table = stdout(&rollup(&[], &[root]));
+    assert!(
+        table.contains("Context delivered (mean bytes per proved traced lane)"),
+        "{table}"
+    );
+    let row = table
+        .lines()
+        .find(|l| l.contains("claude:haiku") && l.contains("2000 bytes"))
+        .unwrap_or_else(|| panic!("no delivered row in:\n{table}"));
+    assert!(row.contains("2 of 3 proved traced"), "{row}");
+    for line in table.lines() {
+        assert!(line.chars().count() <= 80, "{line:?}");
+    }
+
+    // With no traced lane at all the section is not printed.
+    let none = var_tmp("cp-rollcli-delivered-none-");
+    put(
+        none.path(),
+        "a",
+        ("claude", "haiku"),
+        "rust",
+        "proved",
+        false,
+    );
+    assert!(!stdout(&rollup(&[], &[none.path()])).contains("Context delivered"));
+}

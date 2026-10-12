@@ -63,6 +63,7 @@
 //! measured time. Ties go to more calls, then more bytes, then the fingerprint.
 
 use crate::rollup::{clip, median, wrap};
+use crate::traces::{LaneState, read_lane_traces};
 use anyhow::{Context, Result, bail};
 use cowproof_core::redact;
 use portkit_core::trace::{CallRecord, Surface};
@@ -71,14 +72,12 @@ use serde::Serialize;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 /// The widest line `render` prints.
 const WIDTH: usize = 80;
-/// A trace file larger than this is unreadable (a day of one lane is KBs).
-const MAX_FILE_BYTES: u64 = 32 * 1024 * 1024;
 /// The most example invocations kept per fingerprint.
 const MAX_EXAMPLES: usize = 3;
 /// The longest text taken from a trace record, in characters, after redaction.
@@ -308,130 +307,67 @@ fn is_link(kind: &fs::FileType) -> bool {
     kind.is_symlink()
 }
 
-/// `<lane>/portkit/traces/*.jsonl`, with no link followed at any step.
+/// One lane's trace, through the shared reader (`crate::traces`), into the counters and the
+/// per-fingerprint aggregates.
 fn read_lane(
     dir: &Path,
     lane: &(usize, String),
     counts: &mut Counts,
     by_fingerprint: &mut BTreeMap<String, Agg>,
 ) {
-    let mut traces = dir.to_path_buf();
-    for part in ["portkit", "traces"] {
-        traces.push(part);
-        match fs::symlink_metadata(&traces) {
-            Ok(m) if is_link(&m.file_type()) => {
-                counts.symlinked += 1;
-                return;
-            }
-            Ok(m) if m.is_dir() => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                counts.lanes_untraced += 1;
-                return;
-            }
-            _ => {
-                counts.unreadable += 1;
-                return;
-            }
+    let traces = read_lane_traces(dir);
+    counts.symlinked += traces.symlinked;
+    counts.unreadable += traces.unreadable;
+    counts.trace_files += traces.files;
+    counts.malformed_lines += traces.malformed_lines;
+    match traces.state {
+        LaneState::Skipped => return,
+        LaneState::Untraced => {
+            counts.lanes_untraced += 1;
+            return;
         }
+        LaneState::Traced => counts.lanes_traced += 1,
     }
-    let Ok(read) = fs::read_dir(&traces) else {
-        counts.unreadable += 1;
-        return;
-    };
-    let mut files: Vec<_> = read.filter_map(Result::ok).collect();
-    files.sort_by_key(|e| e.file_name());
-    let mut read_any = false;
-    for file in files {
-        let path = file.path();
-        if path.extension().is_none_or(|ext| ext != "jsonl") {
-            continue;
-        }
-        let Ok(kind) = file.file_type() else {
-            counts.unreadable += 1;
-            continue;
-        };
-        if is_link(&kind) {
-            counts.symlinked += 1;
-            continue;
-        }
-        if !kind.is_file() {
-            continue;
-        }
-        match read_bounded(&path) {
-            Some(bytes) => {
-                read_any = true;
-                counts.trace_files += 1;
-                read_records(&bytes, lane, counts, by_fingerprint);
-            }
-            None => counts.unreadable += 1,
-        }
-    }
-    if read_any {
-        counts.lanes_traced += 1;
-    } else {
-        counts.lanes_untraced += 1;
+    for record in &traces.records {
+        read_record(record, lane, counts, by_fingerprint);
     }
 }
 
-/// The file, or none when it is too large or cannot be read. The read is bounded as well
-/// as the size checked: a file can grow between the two.
-fn read_bounded(path: &Path) -> Option<Vec<u8>> {
-    if fs::metadata(path).ok()?.len() > MAX_FILE_BYTES {
-        return None;
-    }
-    let mut bytes = Vec::new();
-    fs::File::open(path)
-        .ok()?
-        .take(MAX_FILE_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .ok()?;
-    (bytes.len() as u64 <= MAX_FILE_BYTES).then_some(bytes)
-}
-
-fn read_records(
-    bytes: &[u8],
+fn read_record(
+    record: &CallRecord,
     lane: &(usize, String),
     counts: &mut Counts,
     by_fingerprint: &mut BTreeMap<String, Agg>,
 ) {
-    for line in bytes.split(|b| *b == b'\n') {
-        if line.iter().all(u8::is_ascii_whitespace) {
-            continue;
-        }
-        let Ok(record) = serde_json::from_slice::<CallRecord>(line) else {
-            counts.malformed_lines += 1;
-            continue;
-        };
-        counts.records += 1;
-        let target = match (&record.surface, record.tool.as_str(), &record.target) {
-            (Surface::Agent, "Bash", Some(target)) => target,
-            _ => {
-                counts.not_commands += 1;
-                continue;
-            }
-        };
-        let Some(fingerprint) = fingerprint(target) else {
+    counts.records += 1;
+    let target = match (&record.surface, record.tool.as_str(), &record.target) {
+        (Surface::Agent, "Bash", Some(target)) => target,
+        _ => {
             counts.not_commands += 1;
-            continue;
-        };
-        counts.commands += 1;
-        let agg = by_fingerprint.entry(fingerprint).or_default();
-        agg.calls += 1;
-        agg.lanes.insert(lane.clone());
-        agg.bytes = agg.bytes.saturating_add(record.delivered_bytes as u64);
-        let ms = record.duration_ms;
-        if ms.is_finite() && ms > 0.0 {
-            agg.total_ms += ms;
-            agg.effective_ms += ms.max(MIN_CALL_MS);
-            agg.timed.push(ms);
-        } else {
-            agg.effective_ms += MIN_CALL_MS;
+            return;
         }
-        if agg.examples.len() < MAX_EXAMPLES {
-            let example = head_tokens(target).join(" ").replace('`', "'");
-            if !example.is_empty() && !agg.examples.contains(&example) {
-                agg.examples.push(example);
-            }
+    };
+    let Some(fingerprint) = fingerprint(target) else {
+        counts.not_commands += 1;
+        return;
+    };
+    counts.commands += 1;
+    let agg = by_fingerprint.entry(fingerprint).or_default();
+    agg.calls += 1;
+    agg.lanes.insert(lane.clone());
+    agg.bytes = agg.bytes.saturating_add(record.delivered_bytes as u64);
+    let ms = record.duration_ms;
+    if ms.is_finite() && ms > 0.0 {
+        agg.total_ms += ms;
+        agg.effective_ms += ms.max(MIN_CALL_MS);
+        agg.timed.push(ms);
+    } else {
+        agg.effective_ms += MIN_CALL_MS;
+    }
+    if agg.examples.len() < MAX_EXAMPLES {
+        let example = head_tokens(target).join(" ").replace('`', "'");
+        if !example.is_empty() && !agg.examples.contains(&example) {
+            agg.examples.push(example);
         }
     }
 }

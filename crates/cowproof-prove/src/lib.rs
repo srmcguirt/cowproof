@@ -15,7 +15,7 @@ pub mod gates;
 pub mod runner;
 pub mod verify;
 
-pub use capsule::{Capsule, CapsuleError, HELDOUT_FILE, SEAL_FILE};
+pub use capsule::{Capsule, CapsuleError, HELDOUT_FILE, SEAL_FILE, ToolTotals, TraceTotals};
 pub use flaws::{FlawFinding, FlawRule, PatchDelta, RuleFile};
 pub use gates::{GatePacket, GateReport, GateResult, run_gates};
 pub use runner::{

@@ -4163,3 +4163,312 @@ fn the_capsule_records_the_runtime_the_model_and_where_the_rung_came_from() {
     assert_eq!(run["rungSource"], "class");
     assert_eq!(run["runtime"], "claude");
 }
+
+// ----------------------------------------------------------------------------------------
+// Packet profiles for the rung the lane actually uses (D28 clause 5): `--model` and a
+// `reassign` can land a packet on a rung whose profile `cowproof lint` never resolved.
+// ----------------------------------------------------------------------------------------
+
+/// `sonnet` needs a strict profile; `haiku` (the default start) and `opus` need none.
+const PROFILE_CONFIG: &str = "[ladder]\nrungs = [\"claude:haiku\", \"claude:sonnet\", \"claude:opus\"]\n\n\
+[profiles.strict]\nrequire = [\"tests\", \"mutations\", \"done-checklist\"]\n\n\
+[routing.profiles]\n\"claude:sonnet\" = \"strict\"\n";
+
+/// `beta`, the rung above the default start `alpha`, needs tests and mutations.
+const REASSIGN_PROFILE_CONFIG: &str = "[ladder]\nrungs = [\"claude:alpha\", \"claude:beta\"]\n\n\
+[profiles.strict]\nrequire = [\"tests\", \"mutations\"]\n\n\
+[routing.profiles]\n\"claude:beta\" = \"strict\"\n";
+
+const PROFILE_TESTS: &str =
+    "\n## Tests\n\n- `a_bad_rung_is_refused` asserts that the run stops before any lane exists.\n";
+const PROFILE_MUTATIONS: &str =
+    "\n## Mutations\n\n- (a) make the parser accept any rung, then run the tests\n";
+const PROFILE_DONE: &str = "\n## Done checklist\n\n1. every test passes\n2. fmt is clean\n";
+
+impl Harness {
+    /// Append `text` to the packet, on disk and in `packet_text`.
+    fn append_body(&mut self, text: &str) {
+        self.packet_text.push_str(text);
+        fs::write(&self.packet, &self.packet_text).unwrap();
+    }
+}
+
+#[test]
+fn a_strict_profile_rung_reached_only_by_the_flag_is_refused_at_start_naming_what_is_missing() {
+    if !sandbox_available() {
+        return;
+    }
+    // Lint resolves `haiku` (no profile), so only the run can see that `--model sonnet`
+    // lands on the strict profile.
+    let h = Harness::new("");
+    h.commit_config(PROFILE_CONFIG);
+    let out = h.run_with(&["--model", "sonnet"]);
+    assert_refused_before_start(&h, &out, "rung claude:sonnet refused (flag chose it)");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("profile \"strict\""), "{stderr}");
+    for requirement in ["tests: add", "mutations: add", "done-checklist: add"] {
+        assert!(stderr.contains(requirement), "{requirement} in {stderr}");
+    }
+    assert_eq!(h.launches_dir_entries(), 0, "the builder never ran");
+
+    // A packet that has two of the three names only the third.
+    let mut partial = Harness::new("");
+    partial.commit_config(PROFILE_CONFIG);
+    partial.append_body(&format!("{PROFILE_TESTS}{PROFILE_DONE}"));
+    let out = partial.run_with(&["--model", "sonnet"]);
+    assert_refused_before_start(&partial, &out, "mutations: add");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!stderr.contains("tests: add"), "{stderr}");
+    assert!(!stderr.contains("done-checklist: add"), "{stderr}");
+
+    // The same packet, started where lint looked (`haiku`, no profile), runs: the check is
+    // about the rung used, not about the packet.
+    let unrouted = Harness::new("");
+    unrouted.commit_config(PROFILE_CONFIG);
+    reached_a_verdict(&unrouted.run_with(&[]));
+    started_on(&unrouted, "haiku", "default");
+    assert_eq!(unrouted.run_json()["segments"][0]["profile"], Value::Null);
+}
+
+impl Harness {
+    /// How many entries the lanes root holds: none when a run was refused before it began.
+    fn launches_dir_entries(&self) -> usize {
+        fs::read_dir(self.lanes.path()).unwrap().count()
+    }
+}
+
+/// `haiku` (the header's rung) needs the strict profile; `sonnet` needs none.
+const HEADER_STRICT_CONFIG: &str = "[ladder]\nrungs = [\"claude:haiku\", \"claude:sonnet\", \"claude:opus\"]\n\n\
+[profiles.strict]\nrequire = [\"tests\", \"mutations\", \"done-checklist\"]\n\n\
+[routing.profiles]\n\"claude:haiku\" = \"strict\"\n";
+
+#[test]
+fn a_packet_routed_to_a_strict_rung_runs_when_the_flag_moves_it_to_a_rung_with_no_profile() {
+    if !sandbox_available() {
+        return;
+    }
+    // The header names `haiku`, whose strict profile the packet lacks: lint, which has no
+    // `--model`, says so. Inside `run` that finding must not stop a lane that `--model` puts
+    // on `sonnet`, which needs nothing.
+    let mut h = owned_packet(&run_checks(&["edit", "made"]));
+    h.set_header_field("rung", json!("claude:haiku"));
+    h.commit_config(HEADER_STRICT_CONFIG);
+    let out = h.run_with(&["--model", "sonnet"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stdout_of(&out));
+    assert!(
+        !String::from_utf8_lossy(&out.stderr).contains("[profile]"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(h.verdict()["verdict"], "proved");
+    started_on(&h, "sonnet", "flag");
+    assert_eq!(h.run_json()["segments"][0]["profile"], Value::Null);
+}
+
+#[test]
+fn the_same_packet_without_the_flag_is_refused_by_runs_own_start_check() {
+    if !sandbox_available() {
+        return;
+    }
+    let mut h = owned_packet(&run_checks(&["edit", "made"]));
+    h.set_header_field("rung", json!("claude:haiku"));
+    h.commit_config(HEADER_STRICT_CONFIG);
+    let out = h.run_with(&[]);
+    // Exit 4 from the start check, not exit 1 from lint.
+    assert_refused_before_start(&h, &out, "rung claude:haiku refused (header chose it)");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("profile \"strict\""), "{stderr}");
+    for requirement in ["tests: add", "mutations: add", "done-checklist: add"] {
+        assert!(stderr.contains(requirement), "{requirement} in {stderr}");
+    }
+    assert!(!stderr.contains("packet lint found errors"), "{stderr}");
+    assert!(!stderr.contains("error [profile]"), "{stderr}");
+}
+
+#[test]
+fn a_broken_profiles_config_still_stops_a_run_that_has_a_flag() {
+    if !sandbox_available() {
+        return;
+    }
+    let h = owned_packet(&run_checks(&["edit", "made"]));
+    h.commit_config(
+        "[ladder]\nrungs = [\"claude:haiku\", \"claude:sonnet\"]\n\n\
+         [profiles.strict]\nrequire = [\"coverage\"]\n",
+    );
+    let out = h.run_with(&["--model", "sonnet"]);
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("error [profile]"), "{stderr}");
+    assert!(stderr.contains("packet lint found errors"), "{stderr}");
+    assert!(!h.lane().exists(), "no lane directory may exist");
+}
+
+#[test]
+fn a_packet_with_the_complete_profile_proves_on_the_strict_rung_and_run_json_records_it() {
+    if !sandbox_available() {
+        return;
+    }
+    let mut h = owned_packet(&run_checks(&["edit", "made"]));
+    h.append_body(&format!("{PROFILE_TESTS}{PROFILE_MUTATIONS}{PROFILE_DONE}"));
+    h.commit_config(PROFILE_CONFIG);
+    let out = h.run_with(&["--model", "sonnet"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stdout_of(&out));
+    assert_eq!(h.verdict()["verdict"], "proved");
+    started_on(&h, "sonnet", "flag");
+    assert_eq!(
+        h.run_json()["segments"][0]["profile"],
+        json!({
+            "rung": "claude:sonnet",
+            "name": "strict",
+            "requires": ["tests", "mutations", "done-checklist"],
+            "met": true,
+            "missing": [],
+        })
+    );
+}
+
+#[test]
+fn a_reassign_onto_a_rung_whose_profile_the_packet_lacks_ends_the_lane_refused_with_the_work_kept()
+{
+    if !sandbox_available() {
+        return;
+    }
+    let h = owned_packet(&asks_until(9, &then_checks()));
+    h.commit_config(REASSIGN_PROFILE_CONFIG);
+    let mut child = start(&h);
+    let first = wait_for_ask(&h, &mut child, 1);
+    rule(&h, &first, &["--reassign"]);
+    let out = finish(child);
+    // The same end as a rung with no adapter: failed, patch kept, no verdict, no capsule,
+    // the ruling recorded and never delivered.
+    assert_reassign_refused(&h, &out, "profile \"strict\"", 1, 0);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("claude:beta is the next rung"), "{stderr}");
+    assert!(stderr.contains("tests: add"), "{stderr}");
+    assert!(stderr.contains("mutations: add"), "{stderr}");
+    assert_eq!(queue_events(&h, "ruled").len(), 1);
+    let segs = segments(&h);
+    assert_eq!(segs.len(), 1);
+    assert_eq!(segs[0]["profile"], Value::Null, "alpha has no profile");
+}
+
+#[test]
+fn a_reassign_onto_a_profiled_rung_goes_ahead_when_the_packet_meets_it() {
+    if !sandbox_available() {
+        return;
+    }
+    let mut h = owned_packet(&asks_until(1, &then_checks()));
+    h.append_body(&format!("{PROFILE_TESTS}{PROFILE_MUTATIONS}"));
+    h.commit_config(REASSIGN_PROFILE_CONFIG);
+    let mut child = start(&h);
+    let first = wait_for_ask(&h, &mut child, 1);
+    rule(&h, &first, &["--reassign"]);
+    let out = finish(child);
+    assert_eq!(out.status.code(), Some(0), "{}", stdout_of(&out));
+    assert_eq!(h.launches(), 2);
+    assert_eq!(h.seg(2, "model"), "beta");
+    assert_eq!(h.verdict()["verdict"], "proved");
+    let segs = segments(&h);
+    assert_eq!(segs[0]["profile"], Value::Null);
+    assert_eq!(
+        segs[1]["profile"],
+        json!({
+            "rung": "claude:beta",
+            "name": "strict",
+            "requires": ["tests", "mutations"],
+            "met": true,
+            "missing": [],
+        })
+    );
+}
+
+// ----------------------------------------------------------------------------------------
+// Trace totals (D5, D23): the usage monitor's per-lane sums, in run.json and the capsule.
+// ----------------------------------------------------------------------------------------
+
+/// Shell for a fake that fires `pk hook post-tool-use` for each `(tool, input, output length)`.
+fn hooks(calls: &[(&str, Value, usize)]) -> String {
+    calls
+        .iter()
+        .map(|(tool, input, len)| {
+            let payload = json!({
+                "session_id": "s1",
+                "hook_event_name": "PostToolUse",
+                "tool_name": tool,
+                "tool_input": input,
+                "tool_output": "x".repeat(*len),
+            });
+            format!("printf '%s' '{payload}' | \"$(dirname \"$cp_bin\")/pk\" hook post-tool-use\n")
+        })
+        .collect()
+}
+
+/// An earlier trace file of the same lane (named to sort before today's) with one record and
+/// one line that is not a record. The totals must add both files up.
+const EARLIER_TRACE: &str = r#"mkdir -p "$PORTKIT_STATE_DIR/traces"
+printf '%s\n%s\n' '{"tool":"Read","surface":"agent","outcome":"ok","at":"1999-01-01T00:00:00Z","duration_ms":0.0,"input_bytes":1,"produced_bytes":1000,"delivered_bytes":1000,"target":"old.md"}' 'not a record' > "$PORTKIT_STATE_DIR/traces/1999-01-01-earlier.jsonl"
+"#;
+
+#[test]
+fn a_traced_lane_records_exact_trace_totals_in_run_json_and_the_capsule() {
+    if !sandbox_available() {
+        return;
+    }
+    let body = format!(
+        "{EARLIER_TRACE}{}{}",
+        hooks(&[
+            ("Read", json!({"file_path": "a.md"}), 10),
+            ("Read", json!({"file_path": "b.md"}), 25),
+            ("Bash", json!({"command": "cargo test --all"}), 100),
+            (
+                "Bash",
+                json!({"command": "pk-read src/lib.rs --range 1:5"}),
+                7
+            ),
+            ("Bash", json!({"command": "pk-read src/lib.rs"}), 3),
+        ]),
+        run_checks(&["edit", "made"])
+    );
+    let h = owned_packet(&body);
+    h.run_expecting(0);
+    assert_eq!(h.verdict()["verdict"], "proved");
+    assert_eq!(h.run_json()["trace"]["traced"], true);
+
+    // Six records over two files: the earlier file's Read (1000) and the five hooks.
+    let expected = json!({
+        "calls": 6,
+        "deliveredBytes": 1145,
+        "producedBytes": 1145,
+        "byTool": {
+            "Bash": {"calls": 3, "deliveredBytes": 110},
+            "Read": {"calls": 3, "deliveredBytes": 1035},
+        },
+        "pkRead": {"calls": 2, "deliveredBytes": 10},
+        "malformedLines": 1,
+    });
+    assert_eq!(h.run_json()["traceTotals"], expected);
+    let raw: Value = serde_json::from_str(&h.read("control/capsule/capsule.json")).unwrap();
+    assert_eq!(raw["trace_totals"], expected);
+    let capsule = Capsule::read(&h.lane().join("control/capsule")).unwrap();
+    assert_eq!(
+        serde_json::to_value(capsule.trace_totals.as_ref().unwrap()).unwrap(),
+        expected
+    );
+}
+
+#[test]
+fn an_untraced_lane_records_no_trace_totals_and_is_still_proved() {
+    if !sandbox_available() {
+        return;
+    }
+    let h = owned_packet(&run_checks(&["edit", "made"]));
+    h.run_expecting(0);
+    assert_eq!(h.verdict()["verdict"], "proved");
+    let run = h.run_json();
+    assert_eq!(run["trace"]["traced"], false, "{run}");
+    assert!(run.get("traceTotals").is_some_and(Value::is_null), "{run}");
+    let raw: Value = serde_json::from_str(&h.read("control/capsule/capsule.json")).unwrap();
+    assert!(raw.get("trace_totals").is_some_and(Value::is_null), "{raw}");
+    let capsule = Capsule::read(&h.lane().join("control/capsule")).unwrap();
+    assert_eq!(capsule.trace_totals, None);
+}

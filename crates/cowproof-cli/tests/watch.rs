@@ -441,3 +441,108 @@ fn test_watch_events_includes_rfc3339_timestamps() {
         "Should include RFC3339 format timestamps"
     );
 }
+
+// The table shows the verdict of a proved lane, not the `finished` its builder ended with.
+
+/// `cowproof watch` over `lanes_root`: the STATE column by lane id.
+fn watch_states(lanes_root: &std::path::Path) -> std::collections::BTreeMap<String, String> {
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_cowproof"))
+        .args(["watch", "--lanes-root"])
+        .arg(lanes_root)
+        .args(["--cache-ttl", "1h"])
+        .output()
+        .expect("failed to run cowproof watch");
+    assert!(out.status.success(), "{out:?}");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let mut lines = stdout.lines();
+    assert_eq!(
+        lines.next().unwrap(),
+        "LANE\tSTATE\tPARKED\tAGE\tNOTES\tLAST EVENT"
+    );
+    lines
+        .map(|line| {
+            let cols: Vec<&str> = line.split('\t').collect();
+            assert_eq!(cols.len(), 6, "{line}");
+            (cols[0].to_string(), cols[1].to_string())
+        })
+        .collect()
+}
+
+/// A lane whose builder exited (`run.json` says `finished`), with `verdict` if it was proved.
+fn lane_with(root: &std::path::Path, id: &str, run: Option<&str>, verdict: Option<&str>) {
+    let control = root.join(id).join("control");
+    fs::create_dir_all(&control).unwrap();
+    if let Some(run) = run {
+        fs::write(control.join("run.json"), run).unwrap();
+    }
+    if let Some(verdict) = verdict {
+        fs::write(control.join("verdict.json"), verdict).unwrap();
+    }
+}
+
+#[test]
+fn watch_shows_each_lanes_verdict_and_the_existing_state_when_it_has_none() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    let finished = r#"{"status":"finished","exitCode":0}"#;
+    lane_with(
+        root,
+        "a-proved",
+        Some(finished),
+        Some(r#"{"verdict":"proved"}"#),
+    );
+    lane_with(
+        root,
+        "b-refuted",
+        Some(finished),
+        Some(r#"{"verdict":"refuted"}"#),
+    );
+    lane_with(
+        root,
+        "c-incomplete",
+        Some(finished),
+        Some(r#"{"verdict":"incomplete"}"#),
+    );
+    lane_with(
+        root,
+        "d-infra",
+        Some(finished),
+        Some(r#"{"verdict":"infrastructure"}"#),
+    );
+    // Ended without a proof: the run.json status stands.
+    lane_with(root, "e-stopped", Some(r#"{"status":"stopped"}"#), None);
+    // A builder that exited and a proof not yet written: `finished`, as before.
+    lane_with(root, "f-finished", Some(finished), None);
+    // A builder still going: no run.json.
+    lane_with(root, "g-running", None, None);
+    // A verdict file that is not a verdict does not hide the status.
+    lane_with(root, "h-garbled", Some(finished), Some("not json"));
+
+    let states = watch_states(root);
+    let expected = [
+        ("a-proved", "proved"),
+        ("b-refuted", "refuted"),
+        ("c-incomplete", "incomplete"),
+        ("d-infra", "infrastructure"),
+        ("e-stopped", "stopped"),
+        ("f-finished", "finished"),
+        ("g-running", "running"),
+        ("h-garbled", "finished"),
+    ];
+    for (lane, state) in expected {
+        assert_eq!(states.get(lane).map(String::as_str), Some(state), "{lane}");
+    }
+    assert_eq!(states.len(), expected.len());
+}
+
+#[test]
+fn watch_does_not_follow_a_verdict_symlink() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    lane_with(root, "linked", Some(r#"{"status":"finished"}"#), None);
+    let target = dir.path().join("elsewhere.json");
+    fs::write(&target, r#"{"verdict":"proved"}"#).unwrap();
+    std::os::unix::fs::symlink(&target, root.join("linked/control/verdict.json")).unwrap();
+    let states = watch_states(root);
+    assert_eq!(states["linked"], "finished");
+}

@@ -2348,3 +2348,78 @@ async fn a_sealed_capsule_still_verifies() {
     assert_eq!(report.checks.len(), 1);
     assert_eq!(report.checks[0].check_id, "visible");
 }
+
+/// The trace totals are in `capsule.json`, which the seal covers, and an older capsule without
+/// them still reads (D5, D23).
+#[test]
+fn test_trace_totals_round_trip_are_sealed_and_older_capsules_still_read() {
+    use crate::capsule::{ToolTotals, TraceTotals};
+    let dir = TempDir::new().unwrap();
+    let mut capsule = Capsule::new(
+        "abc".to_string(),
+        "def".to_string(),
+        fingerprint(),
+        "claude:haiku".to_string(),
+        "api-key".to_string(),
+    );
+    let mut totals = TraceTotals {
+        calls: 3,
+        delivered_bytes: 4242,
+        produced_bytes: 5000,
+        ..TraceTotals::default()
+    };
+    totals.by_tool.insert(
+        "Read".to_string(),
+        ToolTotals {
+            calls: 3,
+            delivered_bytes: 4242,
+        },
+    );
+    capsule.traced = true;
+    capsule.trace_totals = Some(totals.clone());
+    capsule.write(dir.path()).unwrap();
+
+    assert_eq!(
+        Capsule::read(dir.path()).unwrap().trace_totals,
+        Some(totals)
+    );
+    let raw: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.path().join("capsule.json")).unwrap()).unwrap();
+    assert_eq!(raw["trace_totals"]["deliveredBytes"], 4242);
+    assert_eq!(raw["trace_totals"]["byTool"]["Read"]["calls"], 3);
+
+    // The seal covers them: a hand edit is refused.
+    edit_capsule_json(dir.path(), "4242", "1");
+    assert_capsule_json_mismatch(dir.path());
+}
+
+#[test]
+fn test_a_capsule_written_before_trace_totals_still_reads() {
+    let dir = TempDir::new().unwrap();
+    let mut capsule = Capsule::new(
+        "abc".to_string(),
+        "def".to_string(),
+        fingerprint(),
+        "claude:haiku".to_string(),
+        "api-key".to_string(),
+    );
+    capsule.trace_totals = Some(Default::default());
+    capsule.write(dir.path()).unwrap();
+
+    let path = dir.path().join("capsule.json");
+    let mut json: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert!(
+        json.as_object_mut()
+            .unwrap()
+            .remove("trace_totals")
+            .is_some()
+    );
+    let raw = serde_json::to_vec_pretty(&json).unwrap();
+    std::fs::write(&path, &raw).unwrap();
+    std::fs::write(dir.path().join("capsule.sha256"), Capsule::hash_bytes(&raw)).unwrap();
+
+    let read = Capsule::read(dir.path()).expect("an older capsule reads");
+    assert_eq!(read.trace_totals, None);
+    assert_eq!(read.base_commit, "abc");
+}
