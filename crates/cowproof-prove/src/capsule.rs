@@ -164,7 +164,7 @@ pub struct Capsule {
     #[serde(default = "default_runtime")]
     pub builder_runtime: String,
     /// The version the runtime's executable reported (`opencode --version` for `openrouter`
-    /// lanes), when the runner read one. Sealed in `capsule.json`; absent in older capsules
+    /// lanes, `codex --version` for `codex` lanes), when the runner read one. Sealed in `capsule.json`; absent in older capsules
     /// and in lanes whose runtime version is not recorded, which read as null.
     #[serde(default)]
     pub builder_runtime_version: Option<String>,
@@ -176,6 +176,12 @@ pub struct Capsule {
     /// Sealed in `capsule.json`; absent in older capsules, which read as null.
     #[serde(default)]
     pub openrouter_price: Option<serde_json::Value>,
+    /// What the director's `cowproof.toml` said the last segment's model costs (`codex` lanes
+    /// only; null for any other runtime): `inputPerMillion`, `cachedInputPerMillion` and
+    /// `outputPerMillion` in USD, and `source`, the director's note on where the figures came
+    /// from. Sealed in `capsule.json`; absent in older capsules, which read as null.
+    #[serde(default)]
+    pub codex_price: Option<serde_json::Value>,
     /// Where the lane's starting rung came from (D28): `flag`, `header`, `class` or
     /// `default`. Sealed in `capsule.json`; absent in older capsules, which read as null.
     #[serde(default)]
@@ -258,6 +264,7 @@ impl Capsule {
             builder_runtime: default_runtime(),
             builder_runtime_version: None,
             openrouter_price: None,
+            codex_price: None,
             rung_source: None,
             auth_mode,
             estimated_cost_usd: 0.0,

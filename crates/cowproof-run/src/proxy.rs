@@ -11,15 +11,15 @@
 //!
 //! What the proxy enforces (design.md, "Trust boundaries": Network and Credentials):
 //! - It forwards only the allowlisted `POST` paths of a configured provider: for Anthropic
-//!   `/v1/messages` and `/v1/messages/count_tokens`, for OpenRouter `/api/v1/chat/completions`
-//!   (a query string is allowed). Every other path, method, `CONNECT` and absolute-form request
+//!   `/v1/messages` and `/v1/messages/count_tokens`, for OpenRouter `/api/v1/chat/completions`,
+//!   for OpenAI (Codex, D28 step 3) `/v1/responses` (a query string is allowed). Every other path, method, `CONNECT` and absolute-form request
 //!   target, and every path of a provider that is not configured, gets 403 and the upstream is
 //!   never contacted.
 //! - Every credential on the request (`x-api-key`, `Authorization: Bearer`) must be the lane's
 //!   placeholder, and there must be at least one. Otherwise 403.
 //! - Incoming `x-api-key`, `authorization` and `proxy-authorization` are never forwarded; the proxy
 //!   sets the provider's own credential header to the real key (Anthropic: `x-api-key`;
-//!   OpenRouter: `Authorization: Bearer`). Headers are forwarded by allowlist (see
+//!   OpenRouter and OpenAI: `Authorization: Bearer`). Headers are forwarded by allowlist (see
 //!   [`forward_header`]), so a builder cannot add arbitrary headers to the upstream request.
 //! - The upstream host comes only from [`ProxyConfig`]; nothing in a request can change it.
 //! - Request and response bodies stream in both directions. The response body is never collected
@@ -32,7 +32,7 @@
 //! `https` upstream path (webpki roots) is built but has no test, because the tests have no
 //! internet and no trusted local CA.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::convert::Infallible;
 use std::fmt;
 use std::io::ErrorKind;
@@ -71,10 +71,18 @@ const ANTHROPIC_PATHS: [&str; 2] = ["/v1/messages", "/v1/messages/count_tokens"]
 /// The only path OpenCode uses on OpenRouter (observed against its 1.18.33 binary, D28 step 2),
 /// always with `POST`.
 const OPENROUTER_PATHS: [&str; 1] = ["/api/v1/chat/completions"];
+/// The only path Codex uses on OpenAI (observed against its 0.157.0 binary, D28 step 3), always
+/// with `POST`: the Responses API. Compaction of a long thread is one more request to this same
+/// path, not a separate endpoint.
+const OPENAI_PATHS: [&str; 1] = ["/v1/responses"];
 /// Largest request body the proxy streams to the upstream.
 const MAX_REQUEST_BYTES: u64 = 64 * 1024 * 1024;
 /// Most response bytes copied aside to read `usage` from a non-streaming JSON response.
 const MAX_USAGE_CAPTURE_BYTES: usize = 1024 * 1024;
+/// Longest server-sent-events line the proxy keeps while it looks for `response.completed`. The
+/// event carries the whole response object, so it can be large; a longer line is skipped (that
+/// call's usage is then unseen, and the runtime's own totals stand in).
+const MAX_SSE_LINE_BYTES: usize = 8 * 1024 * 1024;
 /// Most metric records kept; the oldest are dropped first.
 const MAX_METRICS: usize = 10_000;
 /// Longest path stored in a metric record.
@@ -93,6 +101,8 @@ pub enum Provider {
     /// OpenRouter's OpenAI-style chat completions (OpenCode). The real key goes in
     /// `Authorization: Bearer`.
     Openrouter,
+    /// OpenAI's Responses API (Codex). The real key goes in `Authorization: Bearer`.
+    Openai,
 }
 
 impl Provider {
@@ -100,6 +110,7 @@ impl Provider {
         match self {
             Self::Anthropic => "anthropic",
             Self::Openrouter => "openrouter",
+            Self::Openai => "openai",
         }
     }
 
@@ -108,6 +119,7 @@ impl Provider {
         match self {
             Self::Anthropic => &ANTHROPIC_PATHS,
             Self::Openrouter => &OPENROUTER_PATHS,
+            Self::Openai => &OPENAI_PATHS,
         }
     }
 }
@@ -123,6 +135,8 @@ struct Route {
     /// The upstream base URL as given (for display only).
     upstream_base: String,
     upstream: Upstream,
+    /// When set, a request is forwarded only if its JSON body names one of these models.
+    models: Option<BTreeSet<String>>,
 }
 
 /// Configuration for the proxy.
@@ -176,6 +190,31 @@ impl ProxyConfig {
         Ok(self)
     }
 
+    /// Forward a `provider` request only if its JSON body names one of `models` (`"model"`,
+    /// exactly once, as a string). Any other request gets 403 and the upstream is never
+    /// contacted. The body is read whole first (the proxy otherwise streams it), which the
+    /// runtimes' requests, a few hundred kilobytes at most, can bear. A runtime that can start
+    /// another agent on a model of its choosing (Codex's `spawn_agent` takes a `model`) would
+    /// otherwise spend at a price nobody configured.
+    pub fn with_models(
+        mut self,
+        provider: Provider,
+        models: impl IntoIterator<Item = String>,
+    ) -> Result<Self> {
+        let models: BTreeSet<String> = models.into_iter().collect();
+        if models.is_empty() {
+            bail!(
+                "the {} provider is limited to no model at all",
+                provider.name()
+            );
+        }
+        match self.routes.iter_mut().find(|r| r.provider == provider) {
+            Some(route) => route.models = Some(models),
+            None => bail!("the {} provider is not configured", provider.name()),
+        }
+        Ok(self)
+    }
+
     /// Set the idle timeout (longest gap between chunks while streaming).
     pub fn with_idle_timeout(mut self, timeout: Duration) -> Self {
         self.idle_timeout = timeout;
@@ -220,7 +259,9 @@ impl Route {
         }
         let (credential_header, text) = match provider {
             Provider::Anthropic => (HeaderName::from_static("x-api-key"), real_api_key),
-            Provider::Openrouter => (header::AUTHORIZATION, format!("Bearer {real_api_key}")),
+            Provider::Openrouter | Provider::Openai => {
+                (header::AUTHORIZATION, format!("Bearer {real_api_key}"))
+            }
         };
         let mut credential = HeaderValue::from_str(&text)
             .map_err(|_| anyhow::anyhow!("the real API key is not a valid header value"))?;
@@ -232,6 +273,7 @@ impl Route {
             credential_header,
             upstream_base,
             upstream,
+            models: None,
         })
     }
 }
@@ -316,27 +358,74 @@ pub struct RequestMetrics {
     pub input_tokens: Option<u64>,
     /// `output_tokens` from a non-streaming JSON response, when present.
     pub output_tokens: Option<u64>,
+    /// `input_tokens_details.cached_tokens` of an OpenAI Responses stream's `response.completed`
+    /// event (a part of `input_tokens`), when present.
+    pub cached_input_tokens: Option<u64>,
+}
+
+/// The tokens one model call used, as OpenAI's Responses API reports them in the
+/// `response.completed` event that ends the call's stream. `input` includes `cached_input`
+/// and `output` includes the reasoning tokens (OpenAI's own definitions).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CallUsage {
+    pub input: u64,
+    pub cached_input: u64,
+    pub output: u64,
 }
 
 /// Shared, bounded, in-memory metrics. Cloning shares the same log.
 #[derive(Clone, Default)]
-pub struct MetricsLog(Arc<Mutex<VecDeque<RequestMetrics>>>);
+pub struct MetricsLog(Arc<Mutex<LogInner>>);
+
+#[derive(Default)]
+struct LogInner {
+    records: VecDeque<RequestMetrics>,
+    /// Model calls whose usage a Responses stream reported, oldest first. Written the moment
+    /// the `response.completed` event passes, not when the stream ends, so a running lane can
+    /// be metered live.
+    usage: VecDeque<CallUsage>,
+    /// How many usage entries were ever pushed (the queue drops the oldest at its bound).
+    usage_total: u64,
+}
 
 impl MetricsLog {
     /// A copy of the records so far, oldest first.
     pub fn snapshot(&self) -> Vec<RequestMetrics> {
-        self.lock().iter().cloned().collect()
+        self.lock().records.iter().cloned().collect()
+    }
+
+    /// How many model calls with reported usage have passed so far. A launch reads this before
+    /// it starts and hands it to [`MetricsLog::usage_since`].
+    pub fn usage_recorded(&self) -> u64 {
+        self.lock().usage_total
+    }
+
+    /// The model calls with reported usage after the first `before` of them, oldest first.
+    pub fn usage_since(&self, before: u64) -> Vec<CallUsage> {
+        let log = self.lock();
+        let first_held = log.usage_total - log.usage.len() as u64;
+        let skip = before.saturating_sub(first_held) as usize;
+        log.usage.iter().skip(skip).copied().collect()
     }
 
     fn record(&self, metrics: RequestMetrics) {
         let mut log = self.lock();
-        if log.len() >= MAX_METRICS {
-            log.pop_front();
+        if log.records.len() >= MAX_METRICS {
+            log.records.pop_front();
         }
-        log.push_back(metrics);
+        log.records.push_back(metrics);
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, VecDeque<RequestMetrics>> {
+    pub(crate) fn push_usage(&self, usage: CallUsage) {
+        let mut log = self.lock();
+        if log.usage.len() >= MAX_METRICS {
+            log.usage.pop_front();
+        }
+        log.usage.push_back(usage);
+        log.usage_total += 1;
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, LogInner> {
         self.0.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
@@ -561,8 +650,10 @@ fn forward_header(provider: Provider, name: &HeaderName) -> bool {
             matches!(name, "anthropic-version" | "anthropic-beta" | "x-app")
                 || name.starts_with("x-stainless-")
         }
-        // OpenCode sends nothing else OpenRouter needs: the credential is the proxy's.
-        Provider::Openrouter => false,
+        // OpenCode sends nothing else OpenRouter needs, and Codex nothing else OpenAI needs
+        // (it adds installation, window and turn identifiers that the API does not use): the
+        // credential is the proxy's.
+        Provider::Openrouter | Provider::Openai => false,
     }
 }
 
@@ -656,14 +747,28 @@ async fn handle(req: Request<Incoming>, state: Arc<State>) -> Response<ProxyBody
     let request_id = format!("req-{}", uuid::Uuid::new_v4());
     let bytes_in = Arc::new(AtomicU64::new(0));
     let idle_timeout = state.config.idle_timeout();
-    let request_body = RequestTap {
+    let tap = RequestTap {
         inner: body,
         seen: Arc::clone(&bytes_in),
         idle_timeout,
         request_id: request_id.clone(),
         idle_sleep: Box::pin(tokio::time::sleep(idle_timeout)),
-    }
-    .boxed_unsync();
+    };
+    let request_body: ProxyBody = match &route.models {
+        None => tap.boxed_unsync(),
+        Some(models) => {
+            let Ok(collected) = tap.collect().await else {
+                return reject(&state, path, StatusCode::BAD_REQUEST, "bad request\n");
+            };
+            let bytes = collected.to_bytes();
+            if !requested_model(&bytes).is_some_and(|model| models.contains(&model)) {
+                return reject(&state, path, StatusCode::FORBIDDEN, "forbidden\n");
+            }
+            Full::new(bytes)
+                .map_err(|never| match never {})
+                .boxed_unsync()
+        }
+    };
     let mut upstream_request = Request::new(request_body);
     *upstream_request.method_mut() = Method::POST;
     *upstream_request.uri_mut() = target;
@@ -707,6 +812,10 @@ async fn handle(req: Request<Incoming>, state: Arc<State>) -> Response<ProxyBody
         }
     }
     let capture_usage = is_plain_json(&response_parts.headers);
+    // The Responses API reports a call's usage in the last event of its server-sent stream.
+    let scan_usage = route.provider == Provider::Openai
+        && is_event_stream(&response_parts.headers)
+        && response_parts.status.is_success();
     let idle_timeout = state.config.idle_timeout();
     let tap = ResponseTap {
         inner: response_body,
@@ -718,6 +827,7 @@ async fn handle(req: Request<Incoming>, state: Arc<State>) -> Response<ProxyBody
         }),
         bytes_out: 0,
         captured: capture_usage.then(Vec::new),
+        sse: scan_usage.then(|| SseScan::new(state.metrics.clone())),
         idle_timeout,
         request_id,
         idle_sleep: Box::pin(tokio::time::sleep(idle_timeout)),
@@ -742,6 +852,149 @@ fn is_plain_json(headers: &HeaderMap) -> bool {
         .get(header::CONTENT_ENCODING)
         .is_none_or(|v| v.as_bytes().eq_ignore_ascii_case(b"identity"));
     json && identity
+}
+
+/// The `"model"` a JSON request body names: the one string value of the body's top-level
+/// `model` key. `None` when the body is not a JSON object, has no such key, has it twice (two
+/// parsers may disagree about which one wins, so neither is trusted) or its value is not a
+/// string.
+fn requested_model(body: &[u8]) -> Option<String> {
+    use serde::de::{Deserializer, IgnoredAny, MapAccess, Visitor};
+
+    struct Top(Option<String>);
+
+    impl<'de> serde::Deserialize<'de> for Top {
+        fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+            struct V;
+            impl<'de> Visitor<'de> for V {
+                type Value = Top;
+                fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                    f.write_str("a JSON object")
+                }
+                fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Top, A::Error> {
+                    let mut model: Option<Option<String>> = None;
+                    while let Some(key) = map.next_key::<std::borrow::Cow<'de, str>>()? {
+                        if key == "model" {
+                            if model.is_some() {
+                                return Ok(Top(None));
+                            }
+                            // A value that is not a string is no model.
+                            model = Some(
+                                map.next_value::<serde_json::Value>()?
+                                    .as_str()
+                                    .map(str::to_string),
+                            );
+                        } else {
+                            map.next_value::<IgnoredAny>()?;
+                        }
+                    }
+                    Ok(Top(model.flatten()))
+                }
+            }
+            deserializer.deserialize_map(V)
+        }
+    }
+
+    serde_json::from_slice::<Top>(body).ok().and_then(|t| t.0)
+}
+
+/// A server-sent-events response that is not compressed, so its events can be read as they pass.
+fn is_event_stream(headers: &HeaderMap) -> bool {
+    let sse = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| {
+            v.trim_start()
+                .to_ascii_lowercase()
+                .starts_with("text/event-stream")
+        });
+    let identity = headers
+        .get(header::CONTENT_ENCODING)
+        .is_none_or(|v| v.as_bytes().eq_ignore_ascii_case(b"identity"));
+    sse && identity
+}
+
+/// Reads the `response.completed` (or `response.incomplete`) events of an OpenAI Responses
+/// stream as they pass and reports each one's usage to the log at once. It copies nothing but
+/// the line it is in the middle of, and that only up to [`MAX_SSE_LINE_BYTES`].
+struct SseScan {
+    log: MetricsLog,
+    line: Vec<u8>,
+    /// The current line outgrew the limit: skip it to its end.
+    skipping: bool,
+    /// The last usage seen, for the request's metric record.
+    last: Option<(u64, u64, u64)>,
+}
+
+impl SseScan {
+    fn new(log: MetricsLog) -> Self {
+        Self {
+            log,
+            line: Vec::new(),
+            skipping: false,
+            last: None,
+        }
+    }
+
+    fn feed(&mut self, data: &[u8]) {
+        for chunk in data.split_inclusive(|b| *b == b'\n') {
+            let ends_line = chunk.last() == Some(&b'\n');
+            if self.skipping {
+                self.skipping = !ends_line;
+                continue;
+            }
+            if self.line.len() + chunk.len() > MAX_SSE_LINE_BYTES {
+                self.line.clear();
+                self.skipping = !ends_line;
+                continue;
+            }
+            self.line.extend_from_slice(chunk);
+            if ends_line {
+                let line = std::mem::take(&mut self.line);
+                self.read_line(&line);
+            }
+        }
+    }
+
+    fn read_line(&mut self, line: &[u8]) {
+        let Some(rest) = line.strip_prefix(b"data:") else {
+            return;
+        };
+        // Cheap test first: only the two terminal events carry usage.
+        let text = String::from_utf8_lossy(rest);
+        if !(text.contains("response.completed") || text.contains("response.incomplete")) {
+            return;
+        }
+        let Ok(event) = serde_json::from_str::<serde_json::Value>(text.trim()) else {
+            return;
+        };
+        if !matches!(
+            event.get("type").and_then(serde_json::Value::as_str),
+            Some("response.completed" | "response.incomplete")
+        ) {
+            return;
+        }
+        let Some(usage) = event.get("response").and_then(|r| r.get("usage")) else {
+            return;
+        };
+        let count = |value: Option<&serde_json::Value>| {
+            value.and_then(serde_json::Value::as_u64).unwrap_or(0)
+        };
+        let input = count(usage.get("input_tokens"));
+        let output = count(usage.get("output_tokens"));
+        let cached = count(
+            usage
+                .get("input_tokens_details")
+                .and_then(|d| d.get("cached_tokens")),
+        )
+        .min(input);
+        self.log.push_usage(CallUsage {
+            input,
+            cached_input: cached,
+            output,
+        });
+        self.last = Some((input, cached, output));
+    }
 }
 
 /// Read `input_tokens` and `output_tokens` from a message or count_tokens response, or
@@ -839,6 +1092,8 @@ struct ResponseTap {
     bytes_out: u64,
     /// Copy of the body for `usage`, kept only for plain JSON and only up to a cap.
     captured: Option<Vec<u8>>,
+    /// The usage reader of an OpenAI Responses stream.
+    sse: Option<SseScan>,
     idle_timeout: Duration,
     request_id: String,
     idle_sleep: Pin<Box<Sleep>>,
@@ -849,10 +1104,16 @@ impl ResponseTap {
         let Some(report) = self.report.take() else {
             return;
         };
-        let (input_tokens, output_tokens) = match &self.captured {
+        let (mut input_tokens, mut output_tokens) = match &self.captured {
             Some(bytes) if (200..300).contains(&report.status) => parse_usage(bytes),
             _ => (None, None),
         };
+        let mut cached_input_tokens = None;
+        if let Some((input, cached, output)) = self.sse.as_ref().and_then(|scan| scan.last) {
+            input_tokens = Some(input);
+            output_tokens = Some(output);
+            cached_input_tokens = Some(cached);
+        }
         report.metrics.record(RequestMetrics {
             path: report.path,
             status: report.status,
@@ -860,6 +1121,7 @@ impl ResponseTap {
             bytes_out: self.bytes_out,
             input_tokens,
             output_tokens,
+            cached_input_tokens,
         });
     }
 }
@@ -884,6 +1146,9 @@ impl Body for ResponseTap {
             Poll::Ready(Some(Ok(frame))) => {
                 if let Some(data) = frame.data_ref() {
                     this.bytes_out += data.len() as u64;
+                    if let Some(scan) = &mut this.sse {
+                        scan.feed(data);
+                    }
                     if let Some(buffer) = &mut this.captured {
                         if buffer.len() + data.len() > MAX_USAGE_CAPTURE_BYTES {
                             this.captured = None;
@@ -1095,6 +1360,193 @@ mod tests {
             (Some(9), Some(3))
         );
         assert_eq!(parse_usage(b"data: not json"), (None, None));
+    }
+
+    #[test]
+    fn no_two_providers_allow_the_same_path() {
+        let providers = [Provider::Anthropic, Provider::Openrouter, Provider::Openai];
+        let mut seen = std::collections::BTreeSet::new();
+        for provider in providers {
+            for path in provider.allowed_paths() {
+                assert!(seen.insert(*path), "{path} is allowed by two providers");
+            }
+        }
+        assert_eq!(Provider::Openai.allowed_paths(), ["/v1/responses"]);
+        let config = ProxyConfig::new("a-key", "https://api.test.com")
+            .unwrap()
+            .with_provider(Provider::Openrouter, "or-key", "https://or.test.com")
+            .unwrap()
+            .with_provider(Provider::Openai, "oa-key", "https://oa.test.com")
+            .unwrap();
+        let route = |path| config.route_for(path).map(|r| r.provider);
+        assert_eq!(route("/v1/responses"), Some(Provider::Openai));
+        assert_eq!(route("/v1/messages"), Some(Provider::Anthropic));
+        assert_eq!(
+            route("/api/v1/chat/completions"),
+            Some(Provider::Openrouter)
+        );
+        // OpenAI's other endpoints are not forwarded: Codex needs none of them.
+        for other in [
+            "/v1/models",
+            "/v1/responses/compact",
+            "/v1/chat/completions",
+        ] {
+            assert_eq!(route(other), None, "{other}");
+        }
+    }
+
+    const COMPLETED: &str = r#"data: {"type":"response.completed","response":{"id":"resp_1","output":[],"usage":{"input_tokens":120,"input_tokens_details":{"cached_tokens":20},"output_tokens":30,"output_tokens_details":{"reasoning_tokens":5},"total_tokens":150}}}"#;
+
+    fn scan() -> (SseScan, MetricsLog) {
+        let log = MetricsLog::default();
+        (SseScan::new(log.clone()), log)
+    }
+
+    #[test]
+    fn the_sse_scan_reads_usage_from_the_completed_event_however_the_bytes_are_cut() {
+        let stream = format!(
+            "event: response.created\ndata: {{\"type\":\"response.created\"}}\n\nevent: response.completed\n{COMPLETED}\n\n"
+        );
+        // Whole, then one byte at a time (a line split anywhere), then CRLF line ends.
+        for pieces in [
+            vec![stream.as_bytes().to_vec()],
+            stream.bytes().map(|b| vec![b]).collect(),
+            vec![stream.replace('\n', "\r\n").into_bytes()],
+        ] {
+            let (mut scan, log) = scan();
+            for piece in pieces {
+                scan.feed(&piece);
+            }
+            assert_eq!(
+                log.usage_since(0),
+                [CallUsage {
+                    input: 120,
+                    cached_input: 20,
+                    output: 30
+                }]
+            );
+            assert_eq!(scan.last, Some((120, 20, 30)));
+        }
+    }
+
+    #[test]
+    fn the_sse_scan_counts_each_call_and_ignores_what_is_not_usage() {
+        let (mut scan, log) = scan();
+        scan.feed(
+            b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"response.completed\"}\n\n",
+        );
+        scan.feed(b"data: not json response.completed\n\n");
+        scan.feed(b": a comment line response.completed\n\n");
+        scan.feed(b"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"x\"}}\n\n");
+        assert_eq!(log.usage_recorded(), 0, "no usage in any of those");
+        scan.feed(format!("{COMPLETED}\n\n").as_bytes());
+        scan.feed(
+            b"data: {\"type\":\"response.incomplete\",\"response\":{\"usage\":{\"input_tokens\":7,\"output_tokens\":1}}}\n\n",
+        );
+        assert_eq!(log.usage_recorded(), 2);
+        // `since` skips what a launch had already seen.
+        assert_eq!(
+            log.usage_since(1),
+            [CallUsage {
+                input: 7,
+                cached_input: 0,
+                output: 1
+            }]
+        );
+        assert_eq!(log.usage_since(2), []);
+        // A cached count above the input is clamped to it.
+        scan.feed(
+            b"data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":3,\"input_tokens_details\":{\"cached_tokens\":9},\"output_tokens\":1}}}\n",
+        );
+        assert_eq!(log.usage_since(2)[0].cached_input, 3);
+    }
+
+    #[test]
+    fn the_sse_scan_skips_a_line_over_the_limit_and_reads_the_next() {
+        let (mut scan, log) = scan();
+        let mut long = b"data: ".to_vec();
+        long.resize(MAX_SSE_LINE_BYTES + 10, b'x');
+        // Fed in pieces, with the end of the line in the last one.
+        for piece in long.chunks(1024 * 1024) {
+            scan.feed(piece);
+        }
+        scan.feed(b"\n\n");
+        assert!(scan.line.is_empty() && !scan.skipping);
+        scan.feed(format!("{COMPLETED}\n\n").as_bytes());
+        assert_eq!(log.usage_recorded(), 1);
+    }
+
+    #[test]
+    fn usage_since_survives_the_bound() {
+        let log = MetricsLog::default();
+        for i in 0..(MAX_METRICS as u64 + 5) {
+            log.push_usage(CallUsage {
+                input: i,
+                cached_input: 0,
+                output: 0,
+            });
+        }
+        assert_eq!(log.usage_recorded(), MAX_METRICS as u64 + 5);
+        // The first five were dropped; asking from before them returns all that are held, and
+        // asking from after returns the rest.
+        assert_eq!(log.usage_since(0).len(), MAX_METRICS);
+        assert_eq!(log.usage_since(MAX_METRICS as u64).len(), 5);
+    }
+
+    #[test]
+    fn the_requested_model_is_the_one_string_value_of_the_top_level_key() {
+        let model = |body: &str| requested_model(body.as_bytes());
+        assert_eq!(
+            model(r#"{"model":"gpt-6-luna","input":[]}"#).as_deref(),
+            Some("gpt-6-luna")
+        );
+        // Wherever the key sits, and whatever surrounds it.
+        assert_eq!(
+            model(r#" {"input":[{"model":"nested"}],"x":{"model":"deep"},"model":"gpt-6-luna","stream":true} "#).as_deref(),
+            Some("gpt-6-luna")
+        );
+        // Escapes are decoded, as the upstream's parser will decode them.
+        assert_eq!(
+            model(r#"{"mod\u0065l":"a\u002fb"}"#).as_deref(),
+            Some("a/b")
+        );
+        // Not trusted: no key, two keys (parsers disagree about which wins), a value that is not
+        // a string, a body that is not an object, and bytes that are not JSON.
+        for bad in [
+            r#"{"input":[]}"#,
+            r#"{"model":"gpt-6-luna","model":"gpt-6-astra"}"#,
+            r#"{"model":"gpt-6-astra","input":[],"model":"gpt-6-luna"}"#,
+            r#"{"model":["gpt-6-luna"]}"#,
+            r#"{"model":null}"#,
+            r#"["model"]"#,
+            r#"{"model":"gpt-6-luna""#,
+            "not json",
+            "",
+        ] {
+            assert_eq!(model(bad), None, "{bad:?}");
+        }
+        assert_eq!(requested_model(&[0xff, 0xfe]), None);
+    }
+
+    #[test]
+    fn a_model_limit_needs_a_configured_provider_and_a_model() {
+        let config = ProxyConfig::new("a-key", "https://api.test.com").unwrap();
+        assert!(
+            ProxyConfig::new("a-key", "https://api.test.com")
+                .unwrap()
+                .with_models(Provider::Openai, ["m".to_string()])
+                .is_err()
+        );
+        assert!(
+            config
+                .with_models(Provider::Anthropic, Vec::<String>::new())
+                .is_err()
+        );
+        let limited = ProxyConfig::for_provider(Provider::Openai, "k", "https://oa.test.com")
+            .unwrap()
+            .with_models(Provider::Openai, ["gpt-6-luna".to_string()])
+            .unwrap();
+        assert!(limited.route_for("/v1/responses").unwrap().models.is_some());
     }
 
     #[test]

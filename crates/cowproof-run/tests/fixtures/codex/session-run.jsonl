@@ -1,0 +1,17 @@
+{"type":"thread.started","thread_id":"01a12d9c-b587-7d70-b3bc-ec3bd1cb4130"}
+{"type":"item.completed","item":{"id":"item_0","type":"error","message":"Model metadata for `gpt-test` not found. Defaulting to fallback metadata; this can degrade performance and cause issues."}}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"item_1","type":"reasoning","text":"Plan: edit, then check."}}
+{"type":"item.completed","item":{"id":"item_2","type":"agent_message","text":"Editing."}}
+{"type":"item.started","item":{"id":"item_3","type":"command_execution","command":"/bin/zsh -c 'exit 3'","aggregated_output":"","exit_code":null,"status":"in_progress"}}
+{"type":"item.started","item":{"id":"item_4","type":"command_execution","command":"/bin/zsh -c 'echo edited >> README.md'","aggregated_output":"","exit_code":null,"status":"in_progress"}}
+{"type":"item.completed","item":{"id":"item_3","type":"command_execution","command":"/bin/zsh -c 'exit 3'","aggregated_output":"","exit_code":3,"status":"failed"}}
+{"type":"item.completed","item":{"id":"item_4","type":"command_execution","command":"/bin/zsh -c 'echo edited >> README.md'","aggregated_output":"","exit_code":0,"status":"completed"}}
+{"type":"item.completed","item":{"id":"item_5","type":"agent_message","text":"Patching."}}
+{"type":"item.started","item":{"id":"item_6","type":"file_change","changes":[{"path":"/work/clone/made.txt","kind":"add"}],"status":"in_progress"}}
+{"type":"item.completed","item":{"id":"item_6","type":"file_change","changes":[{"path":"/work/clone/made.txt","kind":"add"}],"status":"completed"}}
+{"type":"item.completed","item":{"id":"item_7","type":"agent_message","text":"Checking."}}
+{"type":"item.started","item":{"id":"item_8","type":"mcp_tool_call","server":"cowproof-tools","tool":"run_check","arguments":{"id":"edit"},"result":null,"error":null,"status":"in_progress"}}
+{"type":"item.completed","item":{"id":"item_8","type":"mcp_tool_call","server":"cowproof-tools","tool":"run_check","arguments":{"id":"edit"},"result":{"content":[{"type":"text","text":"ok from stub"}],"structured_content":null},"error":null,"status":"completed"}}
+{"type":"item.completed","item":{"id":"item_9","type":"agent_message","text":"All done."}}
+{"type":"turn.completed","usage":{"input_tokens":400,"cached_input_tokens":40,"cache_write_input_tokens":0,"output_tokens":80,"reasoning_output_tokens":7}}

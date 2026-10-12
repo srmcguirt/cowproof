@@ -1,0 +1,9 @@
+{"type":"thread.started","thread_id":"01a12dda-b369-7902-aa5d-cbee86f92add"}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"Using code mode."}}
+{"type":"item.started","item":{"id":"item_1","type":"command_execution","command":"/bin/zsh -c 'echo edited >> README.md'","aggregated_output":"","exit_code":null,"status":"in_progress"}}
+{"type":"item.completed","item":{"id":"item_1","type":"command_execution","command":"/bin/zsh -c 'echo edited >> README.md'","aggregated_output":"","exit_code":0,"status":"completed"}}
+{"type":"item.started","item":{"id":"item_2","type":"mcp_tool_call","server":"cowproof-tools","tool":"run_check","arguments":{"id":"edit"},"result":null,"error":null,"status":"in_progress"}}
+{"type":"item.completed","item":{"id":"item_2","type":"mcp_tool_call","server":"cowproof-tools","tool":"run_check","arguments":{"id":"edit"},"result":{"content":[{"type":"text","text":"ok from stub"}],"structured_content":null},"error":null,"status":"completed"}}
+{"type":"item.completed","item":{"id":"item_3","type":"agent_message","text":"done"}}
+{"type":"turn.completed","usage":{"input_tokens":200,"cached_input_tokens":20,"cache_write_input_tokens":0,"output_tokens":40,"reasoning_output_tokens":0}}

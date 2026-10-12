@@ -62,10 +62,10 @@ impl Runtime {
         Self::ALL.into_iter().find(|r| r.name() == name)
     }
 
-    /// Whether the runner can launch this runtime: Claude Code (D28 step 1) and OpenCode for
-    /// OpenRouter models (step 2).
+    /// Whether the runner can launch this runtime: Claude Code (D28 step 1), OpenCode for
+    /// OpenRouter models (step 2) and Codex with an API key (step 3).
     pub fn has_adapter(self) -> bool {
-        matches!(self, Self::Claude | Self::Openrouter)
+        matches!(self, Self::Claude | Self::Openrouter | Self::Codex)
     }
 
     /// The refusal for a rung of this runtime, or `None` when it has an adapter.
@@ -590,20 +590,17 @@ mod tests {
     }
 
     #[test]
-    fn runtimes_are_a_closed_set_and_claude_and_openrouter_have_adapters() {
+    fn runtimes_are_a_closed_set_and_every_runtime_has_an_adapter() {
         for runtime in Runtime::ALL {
             assert_eq!(Runtime::from_name(runtime.name()), Some(runtime));
         }
         assert_eq!(Runtime::from_name("Claude"), None);
         assert!(Runtime::Claude.has_adapter());
         assert!(Runtime::Claude.adapter_refusal().is_none());
-        assert_eq!(
-            Runtime::Codex.adapter_refusal().as_deref(),
-            Some("runtime `codex` has no adapter yet (D28 step 1)")
-        );
         assert!(Runtime::Openrouter.has_adapter());
         assert!(Runtime::Openrouter.adapter_refusal().is_none());
-        assert!(!Runtime::Codex.has_adapter());
+        assert!(Runtime::Codex.has_adapter());
+        assert!(Runtime::Codex.adapter_refusal().is_none());
     }
 
     #[test]

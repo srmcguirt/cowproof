@@ -311,7 +311,10 @@ exit 0
             .arg(lanes_root)
             .arg("--claude-bin")
             .arg(&self.fake)
-            .env_remove("ANTHROPIC_API_KEY");
+            .env_remove("ANTHROPIC_API_KEY")
+            // An ambient OpenAI key must not make a Codex rung runnable in a test.
+            .env_remove("OPENAI_API_KEY")
+            .env_remove("COWPROOF_OPENAI_UPSTREAM");
         c
     }
 
@@ -3958,23 +3961,42 @@ fn reassign_at_the_top_of_a_custom_ladder_is_refused_as_today() {
     assert_reassign_refused(&h, &out, "no model above \"beta\" on the ladder", 2, 1);
 }
 
+/// `[runtimes.codex.prices]` for `gpt-6-luna`, so a ladder may list a Codex rung.
+const CODEX_PRICE: &str =
+    "[runtimes.codex.prices.\"gpt-6-luna\"]\ninput = 1.25\noutput = 10\nsource = \"test\"\n";
+
+/// [`start`] with `extra` arguments after the usual ones.
+fn start_with(h: &Harness, extra: &[&str]) -> Child {
+    let _g = fork_lock();
+    h.command(h.lanes.path())
+        .args(extra)
+        .env("ANTHROPIC_API_KEY", REAL_KEY)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap()
+}
+
 #[test]
-fn reassign_onto_a_rung_with_no_adapter_ends_the_lane_like_the_top_of_the_ladder() {
+fn reassign_onto_a_codex_rung_that_cannot_run_ends_the_lane_like_the_top_of_the_ladder() {
     if !sandbox_available() {
         return;
     }
     let h = owned_packet(&asks_until(9, &then_checks()));
-    h.commit_config(
-        "[ladder]\nrungs = [\"claude:alpha\", \"codex:gpt-6-luna\", \"claude:omega\"]\n",
-    );
-    let mut child = start(&h);
+    h.commit_config(&format!(
+        "[ladder]\nrungs = [\"claude:alpha\", \"codex:gpt-6-luna\", \"claude:omega\"]\n\n{CODEX_PRICE}"
+    ));
+    // No Codex where the director's PATH looks, and no OpenAI key: the rung is on the ladder and
+    // priced, but cannot run.
+    let mut child = start_with(&h, &["--codex-bin", "no-such-codex-binary"]);
     let first = wait_for_ask(&h, &mut child, 1);
     rule(&h, &first, &["--reassign"]);
     let out = finish(child);
     assert_reassign_refused(
         &h,
         &out,
-        "runtime `codex` has no adapter yet (D28 step 1)",
+        "`codex` was not found on this machine's PATH",
         1,
         0,
     );
@@ -3987,7 +4009,7 @@ fn reassign_onto_a_rung_with_no_adapter_ends_the_lane_like_the_top_of_the_ladder
 }
 
 #[test]
-fn a_named_reassign_onto_a_runtime_with_no_adapter_is_refused_too() {
+fn a_named_reassign_onto_a_codex_rung_that_cannot_run_is_refused_too() {
     if !sandbox_available() {
         return;
     }
@@ -3999,7 +4021,7 @@ fn a_named_reassign_onto_a_runtime_with_no_adapter_is_refused_too() {
     assert_reassign_refused(
         &h,
         &out,
-        "runtime `codex` has no adapter yet (D28 step 1)",
+        "`codex` was not found on this machine's PATH",
         1,
         0,
     );
@@ -4022,17 +4044,21 @@ fn assert_refused_before_start(h: &Harness, out: &Output, needle: &str) {
 }
 
 #[test]
-fn starting_on_a_runtime_with_no_adapter_is_exit_4_before_anything_starts() {
+fn starting_on_a_codex_rung_that_cannot_run_is_exit_4_before_anything_starts() {
     if !sandbox_available() {
         return;
     }
-    let no_adapter = "runtime `codex` has no adapter yet (D28 step 1)";
+    // No OpenAI key in the test's environment, and a price in the base commit, so the key is
+    // what is missing, whoever chose the rung.
+    let no_key = "OPENAI_API_KEY is not set";
 
     // The ladder's first rung is the default start.
     let by_default = Harness::new("");
-    by_default.commit_config("[ladder]\nrungs = [\"codex:gpt-6-luna\", \"claude:haiku\"]\n");
+    by_default.commit_config(&format!(
+        "[ladder]\nrungs = [\"codex:gpt-6-luna\", \"claude:haiku\"]\n\n{CODEX_PRICE}"
+    ));
     let out = by_default.run_with(&[]);
-    assert_refused_before_start(&by_default, &out, no_adapter);
+    assert_refused_before_start(&by_default, &out, no_key);
     assert!(
         String::from_utf8_lossy(&out.stderr)
             .contains("rung codex:gpt-6-luna refused (default chose it)"),
@@ -4042,20 +4068,33 @@ fn starting_on_a_runtime_with_no_adapter_is_exit_4_before_anything_starts() {
 
     // The flag.
     let by_flag = Harness::new("");
+    by_flag.commit_config(CODEX_PRICE);
     let out = by_flag.run_with(&["--model", "codex:gpt-6-luna"]);
-    assert_refused_before_start(&by_flag, &out, no_adapter);
+    assert_refused_before_start(&by_flag, &out, no_key);
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("(flag chose it)"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     // The header, on a ladder that lists the rung.
     let mut by_header = Harness::new("");
-    by_header.commit_config("[ladder]\nrungs = [\"claude:haiku\", \"codex:gpt-6-luna\"]\n");
+    by_header.commit_config(&format!(
+        "[ladder]\nrungs = [\"claude:haiku\", \"codex:gpt-6-luna\"]\n\n{CODEX_PRICE}"
+    ));
     by_header.set_header_field("rung", json!("codex:gpt-6-luna"));
     let out = by_header.run_with(&[]);
-    assert_refused_before_start(&by_header, &out, no_adapter);
+    assert_refused_before_start(&by_header, &out, no_key);
     assert!(
         String::from_utf8_lossy(&out.stderr).contains("(header chose it)"),
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
+
+    // Without a price it is the price that is named, with the key.
+    let unpriced = Harness::new("");
+    let out = unpriced.run_with(&["--model", "codex:gpt-6-luna"]);
+    assert_refused_before_start(&unpriced, &out, "model \"gpt-6-luna\" has no price");
 }
 
 #[test]

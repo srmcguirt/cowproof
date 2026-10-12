@@ -992,3 +992,450 @@ fn fake_serve(
         writer.flush()?;
     }
 }
+
+// ---------------------------------------------------------------------------------------------
+// A FAKE OpenAI (D28 step 3): the upstream the proxy forwards Codex's requests to.
+// ---------------------------------------------------------------------------------------------
+
+/// The lettered synthetic key the Codex tests give the director, and the one the fake requires.
+/// Not a real key: it is a repeated alphabet fragment, which the scrub check does not flag.
+#[allow(dead_code)] // only `tests/codex.rs` uses the fake OpenAI
+pub fn openai_test_key() -> String {
+    format!("sk-proj-{}", "abcdefghij".repeat(6))
+}
+
+/// One scripted reply of the fake OpenAI: some reasoning, some text, then function calls
+/// (`(namespace, tool name, arguments)`; a namespace is how Codex offers an MCP server's
+/// tools), and the usage the call reports.
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+pub struct ResponsesReply {
+    pub reasoning: Option<String>,
+    pub text: Option<String>,
+    pub calls: Vec<(Option<String>, String, Value)>,
+    /// Wait this long before answering (a slow model).
+    pub delay_ms: u64,
+    /// `(input, cached input, output)` tokens this call reports.
+    pub usage: (u64, u64, u64),
+}
+
+#[allow(dead_code)]
+impl ResponsesReply {
+    pub fn text(text: &str) -> Self {
+        ResponsesReply {
+            reasoning: None,
+            text: Some(text.to_string()),
+            calls: Vec::new(),
+            delay_ms: 0,
+            usage: (100, 10, 20),
+        }
+    }
+
+    /// Text, then calls to Codex's own tools (`exec_command`, ...).
+    pub fn tools(text: &str, calls: Vec<(&str, Value)>) -> Self {
+        let mut reply = Self::text(text);
+        reply.calls = calls
+            .into_iter()
+            .map(|(name, args)| (None, name.to_string(), args))
+            .collect();
+        reply
+    }
+
+    /// Text, then calls to the tools of the MCP server `server` (`cowproof-tools`).
+    pub fn mcp(text: &str, server: &str, calls: Vec<(&str, Value)>) -> Self {
+        let mut reply = Self::text(text);
+        reply.calls = calls
+            .into_iter()
+            .map(|(name, args)| {
+                (
+                    Some(format!("mcp__{}", server.replace('-', "_"))),
+                    name.to_string(),
+                    args,
+                )
+            })
+            .collect();
+        reply
+    }
+
+    /// The same reply, `ms` milliseconds late.
+    pub fn delayed(mut self, ms: u64) -> Self {
+        self.delay_ms = ms;
+        self
+    }
+
+    /// The same reply, reporting these tokens.
+    pub fn with_usage(mut self, input: u64, cached_input: u64, output: u64) -> Self {
+        self.usage = (input, cached_input, output);
+        self
+    }
+
+    /// The same reply with a reasoning summary before its text.
+    pub fn reasoning(mut self, text: &str) -> Self {
+        self.reasoning = Some(text.to_string());
+        self
+    }
+}
+
+struct OpenAiState {
+    script: Vec<ResponsesReply>,
+    next: usize,
+    seen: Vec<Seen>,
+    /// Answer every request with this status and a JSON error body.
+    fail_with: Option<u16>,
+    expected_key: String,
+}
+
+/// A small HTTP server on 127.0.0.1 that answers OpenAI Responses requests
+/// (`POST /v1/responses`, streamed) from a script and records every request it gets, whatever
+/// the path or method. It requires `Authorization: Bearer <openai_test_key()>`, as OpenAI
+/// requires a key, and answers 401 to anything else. A path it does not serve is a 404.
+#[allow(dead_code)]
+pub struct FakeOpenAi {
+    addr: std::net::SocketAddr,
+    state: std::sync::Arc<Mutex<OpenAiState>>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+#[allow(dead_code)]
+impl FakeOpenAi {
+    pub fn start(script: Vec<ResponsesReply>) -> Self {
+        Self::start_with(script, None)
+    }
+
+    /// A fake that refuses every request with `status` (an expired key, say).
+    pub fn failing(status: u16) -> Self {
+        Self::start_with(Vec::new(), Some(status))
+    }
+
+    fn start_with(script: Vec<ResponsesReply>, fail_with: Option<u16>) -> Self {
+        use std::sync::atomic::Ordering;
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let state = std::sync::Arc::new(Mutex::new(OpenAiState {
+            script,
+            next: 0,
+            seen: Vec::new(),
+            fail_with,
+            expected_key: openai_test_key(),
+        }));
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (st, sp) = (state.clone(), stop.clone());
+        let thread = std::thread::spawn(move || {
+            while !sp.load(Ordering::SeqCst) {
+                match listener.accept() {
+                    Ok((conn, _)) => {
+                        let st = st.clone();
+                        std::thread::spawn(move || {
+                            let _ = openai_serve(conn, st);
+                        });
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        FakeOpenAi {
+            addr,
+            state,
+            stop,
+            thread: Some(thread),
+        }
+    }
+
+    /// `http://127.0.0.1:<port>`, what `COWPROOF_OPENAI_UPSTREAM` is set to.
+    pub fn base(&self) -> String {
+        format!("http://{}", self.addr)
+    }
+
+    pub fn host(&self) -> String {
+        self.addr.to_string()
+    }
+
+    /// Every request so far, oldest first. `tool_names` lists Codex's own tools by name and an
+    /// MCP server's as `<namespace>::<tool>`.
+    pub fn seen(&self) -> Vec<Seen> {
+        self.state.lock().unwrap().seen.clone()
+    }
+
+    /// How many scripted replies were given.
+    pub fn replies_given(&self) -> usize {
+        self.state.lock().unwrap().next
+    }
+}
+
+impl Drop for FakeOpenAi {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+/// The text of a Responses `input` item or `instructions`, flattened.
+fn responses_text(item: &Value) -> String {
+    match item.get("content") {
+        Some(content) => flat_content(content),
+        None => String::new(),
+    }
+}
+
+/// One HTTP request: method, path, lower-cased headers and the body.
+struct HttpRequest {
+    method: String,
+    path: String,
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
+}
+
+fn read_http_request(
+    reader: &mut std::io::BufReader<std::net::TcpStream>,
+) -> std::io::Result<Option<HttpRequest>> {
+    use std::io::{BufRead, Read};
+    let mut line = String::new();
+    if reader.read_line(&mut line)? == 0 {
+        return Ok(None);
+    }
+    let mut parts = line.split_whitespace();
+    let (method, path) = (
+        parts.next().unwrap_or("").to_string(),
+        parts.next().unwrap_or("").to_string(),
+    );
+    let mut headers: Vec<(String, String)> = Vec::new();
+    loop {
+        let mut h = String::new();
+        if reader.read_line(&mut h)? == 0 {
+            return Ok(None);
+        }
+        let h = h.trim_end();
+        if h.is_empty() {
+            break;
+        }
+        if let Some((k, v)) = h.split_once(':') {
+            headers.push((k.trim().to_ascii_lowercase(), v.trim().to_string()));
+        }
+    }
+    let header = |name: &str| {
+        headers
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.clone())
+    };
+    let mut body = Vec::new();
+    if let Some(len) = header("content-length").and_then(|v| v.parse::<usize>().ok()) {
+        body.resize(len, 0);
+        reader.read_exact(&mut body)?;
+    } else if header("transfer-encoding").is_some_and(|v| v.contains("chunked")) {
+        loop {
+            let mut size_line = String::new();
+            reader.read_line(&mut size_line)?;
+            let size = usize::from_str_radix(size_line.trim(), 16).unwrap_or(0);
+            if size == 0 {
+                let mut end = String::new();
+                reader.read_line(&mut end)?;
+                break;
+            }
+            let mut chunk = vec![0u8; size];
+            reader.read_exact(&mut chunk)?;
+            body.extend_from_slice(&chunk);
+            let mut crlf = String::new();
+            reader.read_line(&mut crlf)?;
+        }
+    }
+    Ok(Some(HttpRequest {
+        method,
+        path,
+        headers,
+        body,
+    }))
+}
+
+fn openai_serve(
+    conn: std::net::TcpStream,
+    state: std::sync::Arc<Mutex<OpenAiState>>,
+) -> std::io::Result<()> {
+    use std::io::{BufReader, Write};
+    conn.set_nonblocking(false)?;
+    conn.set_read_timeout(Some(std::time::Duration::from_secs(120)))?;
+    let mut writer = conn.try_clone()?;
+    let mut reader = BufReader::new(conn);
+    while let Some(HttpRequest {
+        method,
+        path,
+        headers,
+        body,
+    }) = read_http_request(&mut reader)?
+    {
+        let header = |name: &str| {
+            headers
+                .iter()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| v.clone())
+        };
+        let request: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+        let input = request["input"].as_array().cloned().unwrap_or_default();
+        // Codex offers its tools in `tools`, or, for a model in its own catalog, as an
+        // `additional_tools` item of the input; either way an MCP server's or a code-mode
+        // namespace's tools are listed as `<namespace>::<tool>`.
+        let mut offered: Vec<Value> = request["tools"].as_array().cloned().unwrap_or_default();
+        for item in &input {
+            if item["type"] == "additional_tools" {
+                offered.extend(item["tools"].as_array().cloned().unwrap_or_default());
+            }
+        }
+        let mut tool_names: Vec<String> = Vec::new();
+        for tool in offered {
+            match tool["type"].as_str() {
+                Some("namespace") => {
+                    let namespace = tool["name"].as_str().unwrap_or("").to_string();
+                    for inner in tool["tools"].as_array().cloned().unwrap_or_default() {
+                        tool_names.push(format!(
+                            "{namespace}::{}",
+                            inner["name"].as_str().unwrap_or("")
+                        ));
+                    }
+                }
+                _ => tool_names.push(
+                    tool["name"]
+                        .as_str()
+                        .or_else(|| tool["type"].as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                ),
+            }
+        }
+        // Codex's own base prompt is `instructions`; the lane's preamble arrives as a
+        // developer message. Both are "the system prompt" to a reader.
+        let system = std::iter::once(request["instructions"].as_str().unwrap_or("").to_string())
+            .chain(
+                input
+                    .iter()
+                    .filter(|m| m["role"] == "developer")
+                    .map(responses_text),
+            )
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (reply, refusal) =
+            {
+                let mut st = state.lock().unwrap();
+                st.seen.push(Seen {
+                    method: method.clone(),
+                    path: path.clone(),
+                    authorization: header("authorization"),
+                    host: header("host"),
+                    model: request["model"].as_str().map(str::to_string),
+                    tool_names,
+                    messages: input.len(),
+                    last_message: input.last().map(responses_text).unwrap_or_default(),
+                    system,
+                    header_names: headers.iter().map(|(k, _)| k.clone()).collect(),
+                });
+                let authorized = header("authorization").as_deref()
+                    == Some(format!("Bearer {}", st.expected_key).as_str());
+                if method != "POST" || path != "/v1/responses" {
+                    (None, Some(404))
+                } else if let Some(status) = st.fail_with {
+                    (None, Some(status))
+                } else if !authorized {
+                    (None, Some(401))
+                } else {
+                    let i = st.next;
+                    st.next += 1;
+                    (
+                        Some(st.script.get(i).cloned().unwrap_or_else(|| {
+                            ResponsesReply::text("(the script is out of replies)")
+                        })),
+                        None,
+                    )
+                }
+            };
+        if let Some(status) = refusal {
+            let body = if status == 404 {
+                String::new()
+            } else {
+                json!({"error": {"message": "Incorrect API key provided.", "type": "invalid_request_error",
+                                 "code": "invalid_api_key"}})
+                .to_string()
+            };
+            write!(
+                writer,
+                "HTTP/1.1 {status} Error\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )?;
+            return Ok(());
+        }
+        let reply = reply.expect("a reply when there is no refusal");
+        if reply.delay_ms > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(reply.delay_ms));
+        }
+        writer.write_all(
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n",
+        )?;
+        let send =
+            |writer: &mut std::net::TcpStream, event: &str, data: Value| -> std::io::Result<()> {
+                let frame = format!("event: {event}\ndata: {data}\n\n");
+                write!(writer, "{:x}\r\n{frame}\r\n", frame.len())?;
+                writer.flush()
+            };
+        let response_id = format!("resp_{}", state.lock().unwrap().next);
+        send(
+            &mut writer,
+            "response.created",
+            json!({"type":"response.created","response":{"id":response_id}}),
+        )?;
+        let mut index = 0;
+        let mut output_item = |writer: &mut std::net::TcpStream, item: Value, empty: Value| {
+            send(
+                writer,
+                "response.output_item.added",
+                json!({"type":"response.output_item.added","output_index":index,"item":empty}),
+            )?;
+            send(
+                writer,
+                "response.output_item.done",
+                json!({"type":"response.output_item.done","output_index":index,"item":item}),
+            )?;
+            index += 1;
+            std::io::Result::Ok(())
+        };
+        if let Some(reasoning) = &reply.reasoning {
+            output_item(
+                &mut writer,
+                json!({"type":"reasoning","id":"rs_1","summary":[{"type":"summary_text","text":reasoning}]}),
+                json!({"type":"reasoning","id":"rs_1","summary":[]}),
+            )?;
+        }
+        if let Some(text) = &reply.text {
+            output_item(
+                &mut writer,
+                json!({"type":"message","role":"assistant","id":"msg_1","content":[{"type":"output_text","text":text}]}),
+                json!({"type":"message","role":"assistant","id":"msg_1","content":[]}),
+            )?;
+        }
+        for (k, (namespace, name, args)) in reply.calls.iter().enumerate() {
+            let mut item = json!({"type":"function_call","id":format!("fc_{k}"),
+                                  "call_id":format!("call_{}_{k}", response_id),
+                                  "name":name,"arguments":args.to_string()});
+            if let Some(namespace) = namespace {
+                item["namespace"] = json!(namespace);
+            }
+            output_item(&mut writer, item.clone(), item)?;
+        }
+        let (input_tokens, cached, output_tokens) = reply.usage;
+        send(
+            &mut writer,
+            "response.completed",
+            json!({"type":"response.completed","response":{"id":response_id,"usage":{
+                "input_tokens":input_tokens,"input_tokens_details":{"cached_tokens":cached},
+                "output_tokens":output_tokens,"output_tokens_details":{"reasoning_tokens":0},
+                "total_tokens":input_tokens + output_tokens}}}),
+        )?;
+        writer.write_all(b"0\r\n\r\n")?;
+        writer.flush()?;
+    }
+    Ok(())
+}

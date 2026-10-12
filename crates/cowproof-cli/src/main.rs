@@ -21,6 +21,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+mod codex;
 mod director_tools;
 mod doctor;
 mod host_agent;
@@ -295,6 +296,13 @@ struct RunOneArgs {
     /// director's `OPENROUTER_API_KEY` and goes only to the egress proxy
     #[arg(long, default_value = "opencode")]
     opencode_bin: String,
+    /// The Codex executable, resolved once on the director's PATH. Used for `codex` rungs
+    /// (D28 step 3); a lane that never runs one does not need it. An npm install's Node
+    /// wrapper is replaced by the native binary beside it. The real key comes from the
+    /// director's `OPENAI_API_KEY` and goes only to the egress proxy; the price of each model
+    /// comes from the base commit's `cowproof.toml`
+    #[arg(long, default_value = "codex")]
+    codex_bin: String,
     /// Hard cap on builder turns per session, passed to the builder (`--max-turns`)
     #[arg(long, default_value_t = 60)]
     max_turns: u32,

@@ -13,6 +13,7 @@
 
 pub mod bridge;
 pub mod claude;
+pub mod codex;
 pub mod deps;
 pub mod director;
 pub mod lane;

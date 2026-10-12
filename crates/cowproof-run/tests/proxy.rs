@@ -5,7 +5,9 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use cowproof_run::proxy::{MetricsLog, Provider, ProxyConfig, ProxyServer, RequestMetrics};
+use cowproof_run::proxy::{
+    CallUsage, MetricsLog, Provider, ProxyConfig, ProxyServer, RequestMetrics,
+};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UnixStream};
 
@@ -21,6 +23,9 @@ enum Reply {
     Json,
     /// 200 event-stream: head, then three chunks 300 ms apart.
     Sse,
+    /// 200 event-stream of an OpenAI Responses call: a delta, then `response.completed` with
+    /// usage, the completed event cut in two chunks in the middle of its JSON.
+    Responses,
 }
 
 #[derive(Clone, Debug)]
@@ -148,6 +153,30 @@ async fn fake_upstream(reply: Reply) -> Fake {
                                 return;
                             }
                             let _ = stream.flush().await;
+                        }
+                        let _ = stream.write_all(b"0\r\n\r\n").await;
+                    }
+                    Reply::Responses => {
+                        stream
+                            .write_all(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n")
+                            .await
+                            .unwrap();
+                        let completed = r#"event: response.completed
+data: {"type":"response.completed","response":{"id":"resp_1","usage":{"input_tokens":120,"input_tokens_details":{"cached_tokens":20},"output_tokens":30}}}
+
+"#;
+                        let (head, tail) = completed.split_at(completed.len() / 2);
+                        for data in [
+                            "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\"}\n\n",
+                            head,
+                            tail,
+                        ] {
+                            let chunk = format!("{:x}\r\n{data}\r\n", data.len());
+                            if stream.write_all(chunk.as_bytes()).await.is_err() {
+                                return;
+                            }
+                            let _ = stream.flush().await;
+                            tokio::time::sleep(Duration::from_millis(50)).await;
                         }
                         let _ = stream.write_all(b"0\r\n\r\n").await;
                     }
@@ -1116,4 +1145,276 @@ async fn an_openrouter_stream_is_relayed_as_it_arrives() {
         "the first event waited for the rest: {first:?}"
     );
     assert!(String::from_utf8_lossy(&raw).contains("data: three"));
+}
+
+// ---------------------------------------------------------------- OpenAI (D28 step 3)
+
+const OA_KEY: &str = "real-openai-key-SECRET-5555555555";
+const RESPONSES_PATH: &str = "/v1/responses";
+
+#[tokio::test]
+async fn openai_bearer_placeholder_is_swapped_for_the_real_bearer() {
+    let fake = fake_upstream(Reply::Json).await;
+    let proxy =
+        serve(ProxyConfig::for_provider(Provider::Openai, OA_KEY, fake.base()).unwrap()).await;
+    let bearer = format!("Bearer {}", proxy.placeholder);
+    // Codex's request: a Bearer, the identifiers it adds to every call, a user agent.
+    let response = send(
+        &proxy,
+        &request(
+            "POST",
+            RESPONSES_PATH,
+            &[
+                ("authorization", &bearer),
+                ("user-agent", "codex_exec/0.157.0"),
+                ("session-id", "01a12d9c-b587-7d70-b3bc-ec3bd1cb4130"),
+                ("x-codex-turn-metadata", "{\"installation_id\":\"i\"}"),
+                ("originator", "codex_exec"),
+                ("accept", "text/event-stream"),
+            ],
+            REQUEST_BODY,
+        ),
+    )
+    .await;
+    assert_eq!(response.status, 200, "{}", response.head);
+    assert_eq!(fake.count(), 1);
+    let seen = fake.first();
+    assert_eq!(seen.request_line, format!("POST {RESPONSES_PATH} HTTP/1.1"));
+    let want = format!("Bearer {OA_KEY}");
+    assert_eq!(seen.header("authorization"), Some(want.as_str()));
+    // The identifiers Codex adds are not the API's business: they stay in the lane.
+    for dropped in [
+        "session-id",
+        "x-codex-turn-metadata",
+        "originator",
+        "x-api-key",
+    ] {
+        assert_eq!(seen.header(dropped), None, "{dropped}");
+    }
+    assert_eq!(seen.header("user-agent"), Some("codex_exec/0.157.0"));
+    assert_eq!(seen.header("host"), Some(fake.addr.to_string().as_str()));
+    assert_eq!(seen.body, REQUEST_BODY.as_bytes());
+    for (name, value) in &seen.headers {
+        assert!(!value.contains(&proxy.placeholder), "placeholder in {name}");
+    }
+    assert!(!response.head.contains(OA_KEY) && !response.body.contains(OA_KEY));
+}
+
+#[tokio::test]
+async fn an_openai_proxy_forwards_only_the_responses_post() {
+    let fake = fake_upstream(Reply::Json).await;
+    let proxy =
+        serve(ProxyConfig::for_provider(Provider::Openai, OA_KEY, fake.base()).unwrap()).await;
+    let bearer = format!("Bearer {}", proxy.placeholder);
+    let auth: &[(&str, &str)] = &[("authorization", &bearer)];
+    let cases = [
+        (
+            "anthropic path",
+            request("POST", "/v1/messages", auth, REQUEST_BODY),
+        ),
+        (
+            "openrouter path",
+            request("POST", CHAT_PATH, auth, REQUEST_BODY),
+        ),
+        (
+            "chat completions",
+            request("POST", "/v1/chat/completions", auth, REQUEST_BODY),
+        ),
+        ("model list", request("GET", "/v1/models", auth, "")),
+        (
+            "compact",
+            request("POST", "/v1/responses/compact", auth, REQUEST_BODY),
+        ),
+        ("responses by GET", request("GET", RESPONSES_PATH, auth, "")),
+        (
+            "responses by PUT",
+            request("PUT", RESPONSES_PATH, auth, REQUEST_BODY),
+        ),
+        (
+            "chatgpt backend",
+            request("POST", "/backend-api/codex/responses", auth, REQUEST_BODY),
+        ),
+        (
+            "path prefix trick",
+            request("POST", "/v1/responses/../files", auth, REQUEST_BODY),
+        ),
+        (
+            "absolute-form target",
+            request(
+                "POST",
+                &format!("http://evil.example{RESPONSES_PATH}"),
+                auth,
+                REQUEST_BODY,
+            ),
+        ),
+        (
+            "foreign bearer",
+            request(
+                "POST",
+                RESPONSES_PATH,
+                &[("authorization", "Bearer attacker-openai-key")],
+                REQUEST_BODY,
+            ),
+        ),
+        (
+            "no credential",
+            request("POST", RESPONSES_PATH, &[], REQUEST_BODY),
+        ),
+    ];
+    for (name, bytes) in cases {
+        let response = send(&proxy, &bytes).await;
+        assert_eq!(response.status, 403, "{name}: {}", response.head);
+    }
+    assert_eq!(fake.count(), 0, "nothing reached the upstream");
+    // And the other providers' proxies do not serve the Responses path.
+    let anthropic = start_proxy(&fake.base()).await;
+    let bearer = format!("Bearer {}", anthropic.placeholder);
+    let response = send(
+        &anthropic,
+        &request(
+            "POST",
+            RESPONSES_PATH,
+            &[("authorization", &bearer)],
+            REQUEST_BODY,
+        ),
+    )
+    .await;
+    assert_eq!(response.status, 403, "{}", response.head);
+    assert_eq!(fake.count(), 0);
+}
+
+#[tokio::test]
+async fn a_responses_stream_reports_each_calls_usage_to_the_log_as_it_passes() {
+    let fake = fake_upstream(Reply::Responses).await;
+    let proxy =
+        serve(ProxyConfig::for_provider(Provider::Openai, OA_KEY, fake.base()).unwrap()).await;
+    let bearer = format!("Bearer {}", proxy.placeholder);
+    let call = || {
+        request(
+            "POST",
+            RESPONSES_PATH,
+            &[("authorization", &bearer)],
+            REQUEST_BODY,
+        )
+    };
+    assert_eq!(proxy.metrics.usage_recorded(), 0);
+    let response = send(&proxy, &call()).await;
+    assert_eq!(response.status, 200, "{}", response.head);
+    assert!(
+        response.body.contains("response.completed"),
+        "the stream is relayed whole"
+    );
+    let first = CallUsage {
+        input: 120,
+        cached_input: 20,
+        output: 30,
+    };
+    assert_eq!(proxy.metrics.usage_since(0), [first]);
+    // The request's own record carries the same figures.
+    let records = wait_for_metrics(&proxy.metrics, 1).await;
+    assert_eq!(records[0].path, RESPONSES_PATH);
+    assert_eq!(
+        (
+            records[0].input_tokens,
+            records[0].cached_input_tokens,
+            records[0].output_tokens
+        ),
+        (Some(120), Some(20), Some(30))
+    );
+    // A second call is a second entry, and a launch that began after the first sees only it.
+    let _ = send(&proxy, &call()).await;
+    assert_eq!(proxy.metrics.usage_recorded(), 2);
+    assert_eq!(proxy.metrics.usage_since(1), [first]);
+    assert_eq!(proxy.metrics.usage_since(2), []);
+}
+
+#[tokio::test]
+async fn only_the_openai_route_reads_usage_from_a_stream() {
+    // The same event-stream through an OpenRouter proxy is relayed and nothing is read from it.
+    let fake = fake_upstream(Reply::Responses).await;
+    let proxy = start_openrouter_proxy(&fake.base()).await;
+    let bearer = format!("Bearer {}", proxy.placeholder);
+    let response = send(
+        &proxy,
+        &request(
+            "POST",
+            CHAT_PATH,
+            &[("authorization", &bearer)],
+            REQUEST_BODY,
+        ),
+    )
+    .await;
+    assert_eq!(response.status, 200);
+    assert_eq!(proxy.metrics.usage_recorded(), 0);
+}
+
+#[tokio::test]
+async fn an_openai_proxy_with_a_model_limit_forwards_only_requests_for_those_models() {
+    let fake = fake_upstream(Reply::Json).await;
+    let config = ProxyConfig::for_provider(Provider::Openai, OA_KEY, fake.base())
+        .unwrap()
+        .with_models(Provider::Openai, ["gpt-6-luna".to_string()])
+        .unwrap();
+    let proxy = serve(config).await;
+    let bearer = format!("Bearer {}", proxy.placeholder);
+    let call = |body: &str| request("POST", RESPONSES_PATH, &[("authorization", &bearer)], body);
+
+    // The lane's model passes, and the body arrives whole and unchanged.
+    let body = r#"{"model":"gpt-6-luna","input":[{"role":"user","content":"hi"}],"stream":true}"#;
+    let response = send(&proxy, &call(body)).await;
+    assert_eq!(response.status, 200, "{}", response.head);
+    assert_eq!(fake.count(), 1);
+    let seen = fake.first();
+    assert_eq!(seen.body, body.as_bytes());
+    assert_eq!(
+        seen.header("content-length"),
+        Some(body.len().to_string().as_str())
+    );
+    let records = wait_for_metrics(&proxy.metrics, 1).await;
+    assert_eq!(records[0].bytes_in, body.len() as u64);
+
+    // Another model (a sub-agent Codex started on a dearer one), a body with two models, one
+    // with none, and bytes that are not JSON are all refused before the upstream is touched.
+    for (name, refused) in [
+        ("another model", r#"{"model":"gpt-6-astra","input":[]}"#),
+        (
+            "two models",
+            r#"{"model":"gpt-6-luna","input":[],"model":"gpt-6-astra"}"#,
+        ),
+        ("no model", r#"{"input":[]}"#),
+        ("a model that is not a string", r#"{"model":7}"#),
+        ("not JSON", "model=gpt-6-luna"),
+        ("an empty body", ""),
+    ] {
+        let response = send(&proxy, &call(refused)).await;
+        assert_eq!(response.status, 403, "{name}: {}", response.head);
+    }
+    assert_eq!(fake.count(), 1, "nothing else reached the upstream");
+    let records = wait_for_metrics(&proxy.metrics, 7).await;
+    assert_eq!(records.iter().filter(|r| r.status == 403).count(), 6);
+}
+
+#[tokio::test]
+async fn a_model_limit_does_not_touch_the_other_providers() {
+    let fake = fake_upstream(Reply::Json).await;
+    let config = ProxyConfig::new(REAL_KEY, fake.base())
+        .unwrap()
+        .with_provider(Provider::Openai, OA_KEY, fake.base())
+        .unwrap()
+        .with_models(Provider::Openai, ["gpt-6-luna".to_string()])
+        .unwrap();
+    let proxy = serve(config).await;
+    // Claude's request names a model the OpenAI limit would refuse; it is not subject to it.
+    let response = send(
+        &proxy,
+        &request(
+            "POST",
+            "/v1/messages",
+            &[("x-api-key", &proxy.placeholder)],
+            r#"{"model":"claude-haiku","messages":[]}"#,
+        ),
+    )
+    .await;
+    assert_eq!(response.status, 200, "{}", response.head);
+    assert_eq!(fake.count(), 1);
 }

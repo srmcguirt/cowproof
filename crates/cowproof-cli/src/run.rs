@@ -36,6 +36,7 @@
 //! (`env_clear`), so the director's `ANTHROPIC_API_KEY` is never inherited:
 //! the builder sees only the proxy's placeholder key.
 
+use crate::codex::{self, Codex, CodexConfig, CodexLaunch, codex_builder_command};
 use crate::openrouter::{self, Opencode, OpencodeLaunch, opencode_builder_command};
 use crate::preflight::{CheckStatus, PreflightOptions, preflight};
 use crate::remote::{self, BuilderSpecParts, LocalSide, RemoteHost, RemoteLane};
@@ -58,6 +59,7 @@ use cowproof_run::{
     LaneLayout, NetworkMode, SandboxPolicy,
     bridge::bridge_port,
     claude::{ClaudeSpec, claude_command},
+    codex::CodexPrice,
     deps::FetchOutcome,
     director::{self, VerdictEvent},
     escalate::{
@@ -69,9 +71,9 @@ use cowproof_run::{
     lane_tmp,
     models::{ModelPrice, PriceRecord},
     prefix::{assemble_prompt, prefix_version},
-    proxy::{Provider, ProxyConfig, ProxyServer},
+    proxy::{MetricsLog, Provider, ProxyConfig, ProxyServer},
     render_macos_profile, sandbox_command,
-    stream::{MeterSummary, StreamMeter},
+    stream::{MeterSummary, StreamMeter, UsageProbe},
     tools::{self, CheckOutcome, CheckTable, RunCheck, SessionEnd, SessionEndSignal},
 };
 use serde_json::{Value, json};
@@ -160,6 +162,10 @@ pub struct ProxyKeys {
     pub anthropic: Option<String>,
     /// The OpenRouter key and the upstream to send it to, for `openrouter` rungs.
     pub openrouter: Option<(String, String)>,
+    /// The OpenAI key, the upstream to send it to and the models a request may name, for `codex`
+    /// rungs: the proxy refuses a request for any other model (Codex can start a sub-agent on a
+    /// model of its own choosing, and the cost cap is priced for the lane's models only).
+    pub openai: Option<(String, String, Vec<String>)>,
 }
 
 impl From<String> for ProxyKeys {
@@ -168,6 +174,7 @@ impl From<String> for ProxyKeys {
         ProxyKeys {
             anthropic: Some(anthropic),
             openrouter: None,
+            openai: None,
         }
     }
 }
@@ -185,6 +192,8 @@ pub struct ProxyEndpoint {
     pub network: NetworkMode,
     /// The key the builder presents; the proxy swaps in the real one.
     pub placeholder_key: String,
+    /// What the proxy has seen: the model calls a Codex lane is metered from, live.
+    pub metrics: MetricsLog,
     /// The serving task. Abort it when the lane ends.
     pub task: JoinHandle<()>,
 }
@@ -219,9 +228,20 @@ pub async fn start_proxy(
             .context("configuring the egress proxy")?,
         );
     }
+    if let Some((key, upstream, models)) = keys.openai {
+        config = Some(
+            match config {
+                Some(config) => config.with_provider(Provider::Openai, key, upstream),
+                None => ProxyConfig::for_provider(Provider::Openai, key, upstream),
+            }
+            .and_then(|config| config.with_models(Provider::Openai, models))
+            .context("configuring the egress proxy")?,
+        );
+    }
     let config = config.context("the egress proxy has no provider to forward to")?;
     let placeholder_key = config.placeholder_key().to_string();
     let server = ProxyServer::new(config);
+    let metrics = server.metrics();
     let socket = lane_dir(layout)?.join("proxy.sock");
 
     let listener = tools::bind(&socket).context("binding the egress proxy socket")?;
@@ -243,6 +263,7 @@ pub async fn start_proxy(
         },
         socket,
         placeholder_key,
+        metrics,
         task,
     })
 }
@@ -318,10 +339,12 @@ fn fenced(text: &str) -> String {
 }
 
 /// Whether `session_id` has the shape the runtime's resume flag accepts: Claude's `--resume` takes
-/// hex and dashes, OpenCode's `-s` takes `ses_` and letters or digits.
+/// hex and dashes, OpenCode's `-s` takes `ses_` and letters or digits, Codex's `exec resume`
+/// takes a UUID.
 pub(crate) fn resumable_for(runtime: Runtime, session_id: &str) -> bool {
     match runtime {
         Runtime::Openrouter => cowproof_run::opencode::valid_session_id(session_id),
+        Runtime::Codex => cowproof_run::codex::valid_session_id(session_id),
         _ => resumable(session_id),
     }
 }
@@ -430,7 +453,7 @@ impl StartKind {
 
 /// One builder launch.
 struct Launch {
-    /// The runtime that drives this launch: `claude` or `openrouter` (OpenCode).
+    /// The runtime that drives this launch: `claude`, `openrouter` (OpenCode) or `codex`.
     runtime: Runtime,
     model: String,
     /// The packet this session works from (the system prompt is assembled
@@ -766,6 +789,82 @@ pub(crate) fn builder_command(l: &BuilderLaunch<'_>) -> Result<Command> {
     Ok(command)
 }
 
+/// What a runtime other than Claude hands the shared launcher: its argv after the executable,
+/// its complete environment, where it runs and the file it reads as stdin.
+pub(crate) struct RuntimeProcess {
+    pub args: Vec<String>,
+    pub env: Vec<(String, String)>,
+    pub cwd: PathBuf,
+    pub stdin_file: PathBuf,
+}
+
+/// What the shared launcher needs to know about the lane.
+pub(crate) struct RuntimeSandbox<'a> {
+    pub layout: &'a LaneLayout,
+    pub cowproof_exe: &'a Path,
+    pub bridge_port: u16,
+    pub proxy_socket: &'a Path,
+    pub network: NetworkMode,
+    /// The builder tools socket, canonical (`COWPROOF_RUNNER_SOCKET`).
+    pub runner_socket: &'a Path,
+    pub port_base: u16,
+    /// Launch without the OS sandbox (trusted local experiments only).
+    pub unsandboxed: bool,
+}
+
+/// The command for a runtime that is not Claude (OpenCode, Codex): the bridge wrapper, then the
+/// runtime's executable `bin`, under the builder sandbox policy with exactly the lane's
+/// environment. Not yet started. The prompt file the runtime reads is opened here, outside the
+/// sandbox, so the sandbox needs no grant for the path. The command makes the builder the
+/// leader of its own process group, so the caller can end the whole group.
+pub(crate) fn runtime_command(
+    s: &RuntimeSandbox<'_>,
+    bin: &Path,
+    mut process: RuntimeProcess,
+) -> Result<Command> {
+    if !bin.is_absolute() {
+        bail!("the runtime executable path is not absolute");
+    }
+    process.env.push((
+        "COWPROOF_RUNNER_SOCKET".to_string(),
+        s.runner_socket.to_string_lossy().into_owned(),
+    ));
+    process.env.extend(port_block_env(s.port_base));
+    let runtime: Vec<String> = std::iter::once(bin.to_string_lossy().into_owned())
+        .chain(process.args.iter().cloned())
+        .collect();
+    let argv = builder_argv(s.cowproof_exe, s.bridge_port, s.proxy_socket, &runtime);
+    let stdin = fs::File::open(&process.stdin_file)
+        .with_context(|| format!("opening {}", process.stdin_file.display()))?;
+
+    // The builder may execute the runtime and cowproof (the bridge wrapper and the MCP server).
+    let executables = vec![bin.to_path_buf(), s.cowproof_exe.to_path_buf()];
+    let policy =
+        SandboxPolicy::builder_with_executables(s.layout, s.network.clone(), &executables)?;
+    let mut command = if s.unsandboxed {
+        let mut env = process.env;
+        policy.apply_env(&mut env);
+        let mut cmd = Command::new(&argv[0]);
+        cmd.args(&argv[1..])
+            .env_clear()
+            .envs(env)
+            .current_dir(&process.cwd)
+            .kill_on_drop(true);
+        cmd
+    } else {
+        sandboxed_command(
+            &policy,
+            &s.layout.control.join("builder.sb"),
+            &argv,
+            process.env,
+            &process.cwd,
+        )?
+    };
+    command.stdin(Stdio::from(stdin));
+    command.process_group(0);
+    Ok(command)
+}
+
 /// Everything a launch needs that does not change between launches.
 struct Launcher {
     layout: LaneLayout,
@@ -774,10 +873,19 @@ struct Launcher {
     claude_bin: Option<PathBuf>,
     /// OpenCode and its version, when the lane may use an `openrouter` rung and it was found.
     opencode: Option<Opencode>,
-    /// The director holds an Anthropic key / an OpenRouter key. The proxy has the values;
-    /// these only say which rungs can run.
+    /// Codex and its version, when the lane may use a `codex` rung and it was found.
+    codex: Option<Codex>,
+    /// The director holds an Anthropic key / an OpenRouter key / an OpenAI key. The proxy has
+    /// the values; these only say which rungs can run.
     has_anthropic_key: bool,
     has_openrouter_key: bool,
+    has_openai_key: bool,
+    /// The director's price of every Codex model the lane may run, by exact model id, from the
+    /// base commit's `cowproof.toml`. A launch on a `codex` rung with no entry here is refused:
+    /// the cost cap cannot act without a price.
+    codex_prices: BTreeMap<String, CodexPrice>,
+    /// What the egress proxy sees; a Codex launch is metered from it.
+    metrics: MetricsLog,
     /// The price and limits of every OpenRouter model the lane may run, by exact model id,
     /// fetched from OpenRouter's model list at preflight. A launch on an `openrouter` rung with
     /// no entry here is refused: the cost cap cannot act without a price.
@@ -879,7 +987,26 @@ impl Launcher {
                     )
                 })
             }
-            Runtime::Codex => None,
+            Runtime::Codex => {
+                if self.remote.is_some() {
+                    return Some(
+                        "a remote lane (--host) runs Claude only; the `codex` runtime has no remote adapter"
+                            .to_string(),
+                    );
+                }
+                if self.codex.is_none() {
+                    return Some(
+                        "`codex` was not found on this machine's PATH, so the lane has no Codex builder"
+                            .to_string(),
+                    );
+                }
+                (!self.has_openai_key).then(|| {
+                    format!(
+                        "{} is not set, so the proxy holds no OpenAI key",
+                        codex::KEY_ENV
+                    )
+                })
+            }
         }
     }
 
@@ -890,11 +1017,27 @@ impl Launcher {
             .flatten()
     }
 
+    /// The director's price of `model` when `runtime` is `codex`; `None` for any other runtime.
+    fn codex_price(&self, runtime: Runtime, model: &str) -> Option<&CodexPrice> {
+        (runtime == Runtime::Codex)
+            .then(|| self.codex_prices.get(model))
+            .flatten()
+    }
+
+    /// The price record `run.json` and the capsule hold for a launch of `model` on `runtime`:
+    /// OpenRouter's, fetched at preflight, or the director's for Codex; null for Claude.
+    fn price_json(&self, runtime: Runtime, model: &str) -> Option<serde_json::Value> {
+        self.openrouter_price(runtime, model)
+            .map(PriceRecord::to_json)
+            .or_else(|| self.codex_price(runtime, model).map(CodexPrice::to_json))
+    }
+
     /// The version string the runner read from the runtime's executable, if it read one.
     fn runtime_version(&self, runtime: Runtime) -> Option<&str> {
         match runtime {
             Runtime::Openrouter => self.opencode.as_ref().map(|o| o.version.as_str()),
-            _ => None,
+            Runtime::Codex => self.codex.as_ref().map(|c| c.version.as_str()),
+            Runtime::Claude => None,
         }
     }
 
@@ -964,6 +1107,26 @@ impl Launcher {
         } else {
             None
         };
+        // A `codex` launch runs at the director's price for this exact model, and is metered from
+        // the egress proxy: the probe counts the model calls reported from this moment on, so it
+        // is made before the builder exists.
+        let codex_price: Option<CodexPrice> = if launch.runtime == Runtime::Codex {
+            Some(
+                self.codex_price(launch.runtime, &launch.model)
+                    .with_context(|| {
+                        format!(
+                            "no price is configured for codex model {:?}, so the cost cap cannot act on it",
+                            launch.model
+                        )
+                    })?
+                    .clone(),
+            )
+        } else {
+            None
+        };
+        let probe = codex_price
+            .is_some()
+            .then(|| UsageProbe::new(self.metrics.clone()));
         let (mut child_cmd, spec) = if let Some(price) = price {
             // OpenCode, in the same sandbox, behind the same bridge. The refusal above has
             // made sure it exists and that the lane is local.
@@ -983,6 +1146,30 @@ impl Launcher {
                 port_base: self.port_base,
                 model: &launch.model,
                 price,
+                packet: &launch.packet,
+                project_instructions: self.project_instructions.as_deref(),
+                prompt: &launch.prompt,
+                resume: launch.resume.as_deref(),
+                unsandboxed: self.unsandboxed,
+            })?;
+            (command, None)
+        } else if launch.runtime == Runtime::Codex {
+            // Codex, in the same sandbox, behind the same bridge. The refusal above has made
+            // sure it exists and that the lane is local.
+            let codex = self.codex.as_ref().context("codex was not located")?;
+            let command = codex_builder_command(&CodexLaunch {
+                layout,
+                codex_bin: &codex.bin,
+                cowproof_exe: &self.cowproof_exe,
+                path: &self.path,
+                base_url: &self.base_url,
+                bridge_port: self.bridge_port,
+                proxy_socket: &self.proxy_socket,
+                placeholder_key: &self.placeholder_key,
+                network: self.network.clone(),
+                runner_socket: &self.socket,
+                port_base: self.port_base,
+                model: &launch.model,
                 packet: &launch.packet,
                 project_instructions: self.project_instructions.as_deref(),
                 prompt: &launch.prompt,
@@ -1092,9 +1279,10 @@ impl Launcher {
         // Text read but not yet written (a line still waiting for its newline).
         let mut stderr_pending: Vec<u8> = Vec::new();
 
-        let mut meter = match price {
-            Some(price) => StreamMeter::opencode(launch.resume.is_some(), price),
-            None => StreamMeter::new(launch.resume.is_some()),
+        let mut meter = match (price, codex_price) {
+            (Some(price), _) => StreamMeter::opencode(launch.resume.is_some(), price),
+            (None, Some(price)) => StreamMeter::codex(launch.resume.is_some(), price, probe),
+            (None, None) => StreamMeter::new(launch.resume.is_some()),
         };
         let mut stream = tokio::fs::OpenOptions::new()
             .create(true)
@@ -1528,14 +1716,17 @@ impl Drive<'_> {
         launch: &Launch,
         seg: &SegmentRun,
         runtime_version: Option<&str>,
-        price: Option<&PriceRecord>,
+        price: Option<serde_json::Value>,
     ) -> serde_json::Value {
         json!({
             "index": index,
             "runtime": launch.runtime.name(),
-            // What OpenRouter's model list said the model costs, fetched at preflight and the
-            // figures the lane's cost was computed at (null for any other runtime).
-            "price": price.map(PriceRecord::to_json),
+            // The figures the lane's cost was computed at: what OpenRouter's model list said
+            // (fetched at preflight) or what the director's cowproof.toml said for Codex, with
+            // where they came from (null for Claude).
+            "price": price,
+            // Where a Codex lane's tokens came from (`proxy` or `events`), null otherwise.
+            "usageSource": seg.summary.usage_source,
             // The version the runtime's executable reported (`opencode --version`), when the
             // runner read one.
             "runtimeVersion": runtime_version,
@@ -1626,8 +1817,7 @@ impl Drive<'_> {
                 &launch,
                 &seg,
                 self.launcher.runtime_version(launch.runtime),
-                self.launcher
-                    .openrouter_price(launch.runtime, &launch.model),
+                self.launcher.price_json(launch.runtime, &launch.model),
             );
             // A hard limit ended the launch: no fallback, no relaunch, no proof.
             let hard_end = match seg.session_end {
@@ -1818,6 +2008,17 @@ impl Drive<'_> {
                             status,
                         );
                     }
+                    // Likewise a `codex` rung the director set no price for.
+                    if to.runtime == Runtime::Codex
+                        && self.launcher.codex_price(to.runtime, &to.model).is_none()
+                    {
+                        break (
+                            LaneEnd::Refused(format!(
+                                "reassign for {id} refused: {to} has no price in the base commit's cowproof.toml ([runtimes.codex.prices]), so the cost cap cannot act on it; add it there"
+                            )),
+                            status,
+                        );
+                    }
                     let summary = {
                         let mut queue = self.lock()?;
                         let summary = queue
@@ -1873,6 +2074,23 @@ fn reassign_summary(id: &EscalationId, ask: &Ask, from: &str, to: &str) -> Strin
         }
     }
     out
+}
+
+/// The requests the egress proxy refused or could not forward, as `path -> status -> count`.
+/// A Codex that kept a network habit would show up here (the bridge is the only place it can
+/// reach), so the run record is where a stray request is seen.
+fn proxy_refused(metrics: &MetricsLog) -> serde_json::Value {
+    let mut refused: BTreeMap<String, BTreeMap<String, u64>> = BTreeMap::new();
+    for record in metrics.snapshot() {
+        if !(200..300).contains(&record.status) {
+            *refused
+                .entry(record.path)
+                .or_default()
+                .entry(record.status.to_string())
+                .or_default() += 1;
+        }
+    }
+    json!(refused)
 }
 
 /// The lane directory: the parent of the clone.
@@ -2513,9 +2731,10 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
     .await;
     // A remote lane's `claude` runs on the host, whose own `doctor` checks it: a missing local
     // `claude` is no reason to stop. A lane that starts on an `openrouter` rung needs OpenCode
-    // and the OpenRouter key instead (checked below, once the rung is known), not `claude` or
-    // the Anthropic key; either may be missing.
-    let starts_on_openrouter = Routing::at_commit(&repo, "HEAD")
+    // and the OpenRouter key instead, one that starts on a `codex` rung needs Codex, the OpenAI
+    // key and a price (all checked below, once the rung is known), not `claude` or the
+    // Anthropic key; either may be missing.
+    let starts_on = Routing::at_commit(&repo, "HEAD")
         .ok()
         .and_then(|r| {
             r.start(
@@ -2525,18 +2744,19 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
             )
             .ok()
         })
-        .is_some_and(|(rung, _)| rung.runtime == Runtime::Openrouter);
+        .map(|(rung, _)| rung.runtime);
+    let starts_on_other_runtime = starts_on.is_some_and(|r| r != Runtime::Claude);
     let needed = |c: &crate::preflight::Check| {
         !(remote_host.is_some() && c.name == "claude")
-            && !(starts_on_openrouter && matches!(c.name, "claude" | "key"))
+            && !(starts_on_other_runtime && matches!(c.name, "claude" | "key"))
     };
     for check in &preflight_checks {
         match check.status {
             CheckStatus::Ok => {}
             CheckStatus::Warn => eprintln!("preflight warning: {}: {}", check.name, check.detail),
             CheckStatus::Fail if !needed(check) => {
-                let why = if starts_on_openrouter {
-                    "the lane starts on an openrouter rung"
+                let why = if starts_on_other_runtime {
+                    "the lane starts on a rung of another runtime"
                 } else {
                     "the builder runs on the host"
                 };
@@ -2668,6 +2888,73 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
             }
         }
     }
+    // 2d. Codex, the OpenAI key and the director's prices, the same way. The price of every
+    // `codex` model the lane could run (the start rung and each `codex` rung above it) is read
+    // from the base commit's `cowproof.toml`: a model with no price, a figure that is not
+    // above zero and a configuration that asks for a subscription login (D28 clause 6) all
+    // stop the run (exit 4), whatever runtime the lane starts on, because the cost cap acts
+    // on this price and a `reassign` may land there. A lane that starts on a `codex` rung also
+    // needs Codex itself and the OpenAI key; each is named. A lane that starts elsewhere finds
+    // Codex and the key only to let a later `reassign` land on a `codex` rung.
+    let openai_key = codex::real_key()?;
+    let (openai_upstream, openai_upstream_overridden) = codex::upstream()?;
+    let codex_models = codex::priced_models(&first_rung, &routing);
+    let starts_on_codex = first_rung.runtime == Runtime::Codex;
+    let codex_bin = if remote_host.is_some() || (!starts_on_codex && openai_key.is_none()) {
+        None
+    } else {
+        match codex::locate(&args.codex_bin, &director_path, &cwd).await {
+            Ok(found) => Some(found),
+            Err(_) if !starts_on_codex => None,
+            Err(why) => {
+                eprintln!("preflight failed: codex: {why}");
+                None
+            }
+        }
+    };
+    let mut codex_prices: BTreeMap<String, CodexPrice> = BTreeMap::new();
+    let mut codex_missing: Vec<&str> = Vec::new();
+    if starts_on_codex {
+        if remote_host.is_some() {
+            eprintln!(
+                "rung {first_rung} refused ({} chose it): a remote lane (--host) runs Claude only; the `codex` runtime has no remote adapter yet",
+                rung_source.name()
+            );
+            codex_missing.push("--host");
+        } else if codex_bin.is_none() {
+            codex_missing.push("codex");
+        }
+        if openai_key.is_none() {
+            eprintln!("preflight failed: key: {} is not set", codex::KEY_ENV);
+            codex_missing.push(codex::KEY_ENV);
+        }
+    }
+    if !codex_models.is_empty() && remote_host.is_none() {
+        // Read even when something above is missing, so one run names every problem at once.
+        let priced = CodexConfig::at_commit(&repo, "HEAD")
+            .map_err(|e| vec![format!("{e:#}")])
+            .and_then(|config| config.price_all(&codex_models));
+        match priced {
+            Ok(found) => codex_prices = found,
+            Err(errors) => {
+                for error in errors {
+                    eprintln!("preflight failed: codex price: {error}");
+                }
+                codex_missing.push("a price");
+            }
+        }
+    }
+    if !codex_missing.is_empty() {
+        if starts_on_codex && remote_host.is_none() {
+            eprintln!(
+                "rung {first_rung} refused ({} chose it): missing {}",
+                rung_source.name(),
+                codex_missing.join(", ")
+            );
+        }
+        eprintln!("nothing was started");
+        return Ok(INFRASTRUCTURE_EXIT_CODE);
+    }
     let claude_bin: Option<PathBuf> = match &remote_host {
         Some(host) => Some(PathBuf::from(&host.claude)),
         None => match resolve_executable(&args.claude_bin, &director_path, &cwd) {
@@ -2782,12 +3069,17 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
     // 4. Proxy and tools, both live before the builder starts.
     let has_anthropic_key = anthropic_key.is_some();
     let has_openrouter_key = openrouter_key.is_some();
+    let has_openai_key = openai_key.is_some();
     let endpoint = start_proxy(
         &layout,
         &header.id,
         ProxyKeys {
             anthropic: anthropic_key,
             openrouter: openrouter_key.map(|key| (key, openrouter_upstream.clone())),
+            // Only a ladder with a `codex` rung on or above the start can use the key at all.
+            openai: openai_key
+                .filter(|_| !codex_models.is_empty())
+                .map(|key| (key, openai_upstream.clone(), codex_models.clone())),
         },
     )
     .await?;
@@ -2977,8 +3269,12 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
         layout: layout.clone(),
         claude_bin: claude_bin.clone(),
         opencode: opencode.clone(),
+        codex: codex_bin.clone(),
         has_anthropic_key,
         has_openrouter_key,
+        has_openai_key,
+        codex_prices,
+        metrics: endpoint.metrics.clone(),
         prices,
         cowproof_exe: cowproof_exe.clone(),
         pk_exe: pk_exe.clone(),
@@ -3150,7 +3446,7 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
         )
     } else if ran_other_runtime {
         untraced(
-            "a segment ran on a runtime with no portkit hooks (openrouter)".to_string(),
+            "a segment ran on a runtime with no portkit hooks (openrouter or codex)".to_string(),
             json!([]),
         )
     } else {
@@ -3163,7 +3459,7 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
         .await
     };
 
-    let run = json!({
+    let mut run = json!({
         "id": header.id,
         "host": remote.as_ref().map(|r| r.alias()),
         "remoteLaneDir": remote_dir,
@@ -3229,6 +3525,12 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
         "projectInstructionsSha256": &launcher.project_instructions_sha256,
         "trace": trace,
     });
+    // The Codex the lane could use, and the director's override of the OpenAI upstream.
+    run["codexVersion"] = json!(launcher.codex.as_ref().map(|c| c.version.as_str()));
+    run["openaiUpstream"] = json!(openai_upstream_overridden.then_some(openai_upstream.as_str()));
+    // What the egress proxy refused or could not forward: nothing but the allowed requests
+    // should reach it, so an entry here is a runtime doing something it should not.
+    run["proxyRefused"] = proxy_refused(&launcher.metrics);
     fs::write(
         layout.control.join("run.json"),
         serde_json::to_vec_pretty(&run)?,
@@ -3282,6 +3584,9 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
             openrouter_price: launcher
                 .openrouter_price(lane_run.runtime, &lane_run.model)
                 .map(PriceRecord::to_json),
+            codex_price: launcher
+                .codex_price(lane_run.runtime, &lane_run.model)
+                .map(CodexPrice::to_json),
             model: &lane_run.model,
             rung_source: rung_source.name(),
             cost_usd: total_cost_usd,
@@ -3461,6 +3766,8 @@ struct ProofInput<'a> {
     runtime_version: Option<&'a str>,
     /// What OpenRouter's model list said the last segment's model costs (`openrouter` lanes).
     openrouter_price: Option<serde_json::Value>,
+    /// What the director's cowproof.toml said the last segment's model costs (`codex` lanes).
+    codex_price: Option<serde_json::Value>,
     model: &'a str,
     rung_source: &'a str,
     cost_usd: f64,
@@ -3687,6 +3994,7 @@ async fn replay_and_gate(
     capsule.builder_runtime = input.runtime.to_string();
     capsule.builder_runtime_version = input.runtime_version.map(str::to_string);
     capsule.openrouter_price = input.openrouter_price.clone();
+    capsule.codex_price = input.codex_price.clone();
     capsule.rung_source = Some(input.rung_source.to_string());
     capsule.estimated_cost_usd = input.cost_usd;
     capsule.estimated_tokens = input.tokens;
@@ -4489,6 +4797,7 @@ body"#;
             ProxyKeys {
                 anthropic: None,
                 openrouter: Some(("sk-or-unit-real".into(), "http://127.0.0.1:9".into())),
+                openai: None,
             },
         )
         .await
@@ -4503,6 +4812,7 @@ body"#;
             ProxyKeys {
                 anthropic: None,
                 openrouter: None,
+                openai: None,
             },
         )
         .await
@@ -4531,6 +4841,16 @@ body"#;
             "0a1b2c3d-1111-2222-3333-444455556666"
         ));
         assert!(!resumable_for(Runtime::Openrouter, "ses_;rm -rf /"));
+        // Codex takes a UUID, which is also the shape Claude takes, and not OpenCode's.
+        assert!(resumable_for(
+            Runtime::Codex,
+            "01a12d9c-b587-7d70-b3bc-ec3bd1cb4130"
+        ));
+        assert!(!resumable_for(
+            Runtime::Codex,
+            "ses_ed38dc388ffeb9FMHqRuDEw3t7"
+        ));
+        assert!(!resumable_for(Runtime::Codex, "0a1b2c3d-1111"));
     }
 
     #[test]

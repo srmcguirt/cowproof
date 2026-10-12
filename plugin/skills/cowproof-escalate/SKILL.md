@@ -73,7 +73,7 @@ cowproof rule <lane-id> <escalation-id> --reassign
 cowproof rule <lane-id> <escalation-id> --reassign --model <name>
 ```
 
-Hand the lane to a stronger model. Without `--model` it climbs the ladder in the base commit's `cowproof.toml` (`[ladder] rungs`; `haiku`, `sonnet`, `opus` when there is none). A fresh session on the new model takes over the same clone, told what the question and the attempts were. This resets the lane's cost and turn counters and its failed-check tallies, but not its escalation count. From the top rung, from a model off the ladder, or onto a rung whose runtime has no adapter yet (only `claude` has one), `--reassign` alone is refused and the lane ends `failed`, so name a model with `--model`.
+Hand the lane to a stronger model. Without `--model` it climbs the ladder in the base commit's `cowproof.toml` (`[ladder] rungs`; `haiku`, `sonnet`, `opus` when there is none). A fresh session on the new model takes over the same clone, told what the question and the attempts were. This resets the lane's cost and turn counters and its failed-check tallies, but not its escalation count. From the top rung, from a model off the ladder, or onto a rung that cannot run here (the runtime's executable or key is missing, a `codex` model has no price in `cowproof.toml`, or the lane is remote), `--reassign` alone is refused and the lane ends `failed`, so name a model with `--model`.
 
 **Stop.**
 

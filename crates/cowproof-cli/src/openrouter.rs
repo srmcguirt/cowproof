@@ -15,17 +15,16 @@
 //! run ([`cowproof_run::models`]). That request does not go through the lane's proxy.
 
 use crate::root::resolve_executable;
-use crate::run::{builder_argv, sandboxed_command};
+use crate::run::{RuntimeProcess, RuntimeSandbox, runtime_command};
 use anyhow::{Context, Result, anyhow, bail};
-use cowproof_core::{Routing, Rung, Runtime, port_block_env};
+use cowproof_core::{Routing, Rung, Runtime};
 use cowproof_run::{
-    LaneLayout, NetworkMode, SandboxPolicy,
+    LaneLayout, NetworkMode,
     models::{DEFAULT_TIMEOUT, ModelPrice},
     opencode::{OpencodeSpec, opencode_command, write_lane_files},
     prefix::assemble_prompt,
     proxy::{Provider, ProxyConfig},
 };
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
@@ -96,21 +95,27 @@ fn parse_timeout(text: &str) -> Result<Duration> {
     }
 }
 
-/// The OpenRouter model ids a lane that starts on `first` could run: `first` itself and every
-/// rung above it on the ladder, where a `reassign` can land. Each id once, in ladder order.
-/// A rung off the ladder is followed by nothing (`reassign` without a model has nowhere to go).
-pub(crate) fn priced_models(first: &Rung, routing: &Routing) -> Vec<String> {
+/// The model ids of `runtime` that a lane which starts on `first` could run: `first` itself
+/// and every rung above it on the ladder, where a `reassign` can land. Each id once, in ladder
+/// order. A rung off the ladder is followed by nothing (`reassign` without a model has nowhere
+/// to go). The runtimes that need a price (`openrouter`, `codex`) price exactly these.
+pub(crate) fn models_on_or_above(runtime: Runtime, first: &Rung, routing: &Routing) -> Vec<String> {
     let mut rungs = vec![first];
     if let Some(at) = routing.position(first) {
         rungs.extend(&routing.rungs[at + 1..]);
     }
     let mut models: Vec<String> = Vec::new();
     for rung in rungs {
-        if rung.runtime == Runtime::Openrouter && !models.contains(&rung.model) {
+        if rung.runtime == runtime && !models.contains(&rung.model) {
             models.push(rung.model.clone());
         }
     }
     models
+}
+
+/// The OpenRouter model ids a lane that starts on `first` could run (see [`models_on_or_above`]).
+pub(crate) fn priced_models(first: &Rung, routing: &Routing) -> Vec<String> {
+    models_on_or_above(Runtime::Openrouter, first, routing)
 }
 
 /// An OpenCode executable the runner can launch.
@@ -228,48 +233,26 @@ pub(crate) fn opencode_builder_command(l: &OpencodeLaunch<'_>) -> Result<Command
     let assembled = assemble_prompt(l.project_instructions, l.packet);
     write_lane_files(&spec, &assembled.system_append, l.prompt)?;
 
-    let mut invocation = opencode_command(&spec)?;
-    invocation.env.push((
-        "COWPROOF_RUNNER_SOCKET".to_string(),
-        l.runner_socket.to_string_lossy().into_owned(),
-    ));
-    invocation.env.extend(port_block_env(l.port_base));
-    invocation.program = l.opencode_bin.to_string_lossy().into_owned();
-    let opencode: Vec<String> = std::iter::once(invocation.program.clone())
-        .chain(invocation.args.iter().cloned())
-        .collect();
-    let argv = builder_argv(l.cowproof_exe, l.bridge_port, l.proxy_socket, &opencode);
-    let stdin = fs::File::open(&invocation.stdin_file)
-        .with_context(|| format!("opening {}", invocation.stdin_file.display()))?;
-
-    // The builder may execute opencode and cowproof (the bridge wrapper and the MCP server).
-    let executables = vec![l.opencode_bin.to_path_buf(), l.cowproof_exe.to_path_buf()];
-    let policy =
-        SandboxPolicy::builder_with_executables(l.layout, l.network.clone(), &executables)?;
-    let mut command = if l.unsandboxed {
-        let mut env = invocation.env;
-        policy.apply_env(&mut env);
-        let mut cmd = Command::new(&argv[0]);
-        cmd.args(&argv[1..])
-            .env_clear()
-            .envs(env)
-            .current_dir(&invocation.cwd)
-            .kill_on_drop(true);
-        cmd
-    } else {
-        sandboxed_command(
-            &policy,
-            &l.layout.control.join("builder.sb"),
-            &argv,
-            invocation.env,
-            &invocation.cwd,
-        )?
-    };
-    // The prompt, from a file the runner wrote: the descriptor is opened here, outside the
-    // sandbox, so the sandbox needs no grant for the path.
-    command.stdin(Stdio::from(stdin));
-    command.process_group(0);
-    Ok(command)
+    let invocation = opencode_command(&spec)?;
+    runtime_command(
+        &RuntimeSandbox {
+            layout: l.layout,
+            cowproof_exe: l.cowproof_exe,
+            bridge_port: l.bridge_port,
+            proxy_socket: l.proxy_socket,
+            network: l.network.clone(),
+            runner_socket: l.runner_socket,
+            port_base: l.port_base,
+            unsandboxed: l.unsandboxed,
+        },
+        l.opencode_bin,
+        RuntimeProcess {
+            args: invocation.args,
+            env: invocation.env,
+            cwd: invocation.cwd,
+            stdin_file: invocation.stdin_file,
+        },
+    )
 }
 
 #[cfg(test)]

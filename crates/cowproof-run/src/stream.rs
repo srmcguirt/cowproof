@@ -18,15 +18,24 @@
 //!   ([`StreamMeter::bash_commands`]), for escalate-early.
 //! * bandwidth: see [`MeterSummary::total_bandwidth_bytes`].
 //!
-//! The meter has two dialects. `claude` reads Claude Code's `stream-json` (above). `opencode`
+//! The meter has three dialects. `claude` reads Claude Code's `stream-json` (above). `opencode`
 //! reads OpenCode's `--format json` events (D28 step 2; see [`crate::opencode`]): a turn is one
 //! `step_finish`, a tool call is one `tool_use` event that carries its result, tokens come from
 //! `step_finish`, and a cost OpenCode reported is used and marked `reported`, else the cost is
-//! estimated from the per-model table and marked `estimate`.
+//! estimated from the per-model table and marked `estimate`. `codex` reads `codex exec --json`
+//! (D28 step 3; see [`crate::codex`]): a tool call is one completed item (`command_execution`,
+//! `file_change`, `mcp_tool_call`). Codex reports tokens only in `turn.completed`, once, at the
+//! end, and as the thread's running total, so a live meter cannot be built from the events: the
+//! tokens come from the egress proxy, which sees every model call's `response.completed` the
+//! moment it passes ([`UsageProbe`]), and the events stand in when the proxy saw none. Codex
+//! reports no cost, so the cost is always an estimate at the director's price.
 
 use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
+
+use crate::codex::{CodexPrice, ThreadUsage};
+use crate::proxy::{CallUsage, MetricsLog};
 
 /// A single stream-json event from the Claude API.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -176,6 +185,12 @@ pub struct MeterSummary {
     /// The error the session ended with, for runtimes that report one as an event.
     #[serde(default)]
     pub error: Option<String>,
+    /// Where a Codex lane's tokens came from: `proxy` (every model call, as it passed the
+    /// egress proxy), `events` (Codex's own `turn.completed` total, the thread's since it
+    /// began, so a resumed launch counts the earlier ones again) or `none`. Null for the other
+    /// runtimes.
+    #[serde(default)]
+    pub usage_source: Option<String>,
 }
 
 impl MeterSummary {
@@ -200,6 +215,83 @@ pub enum Dialect {
     Claude,
     /// OpenCode's `run --format json`.
     Opencode,
+    /// Codex's `exec --json`.
+    Codex,
+}
+
+/// The model calls the egress proxy has seen since a launch began: the live source of a Codex
+/// lane's tokens. It is made when the launch starts, so it counts that launch's calls only.
+#[derive(Clone)]
+pub struct UsageProbe {
+    log: MetricsLog,
+    before: u64,
+}
+
+impl UsageProbe {
+    /// A probe that counts the calls reported after this moment.
+    pub fn new(log: MetricsLog) -> Self {
+        let before = log.usage_recorded();
+        Self { log, before }
+    }
+
+    fn calls(&self) -> Vec<CallUsage> {
+        self.log.usage_since(self.before)
+    }
+}
+
+/// What the Codex dialect keeps.
+struct CodexState {
+    price: CodexPrice,
+    probe: Option<UsageProbe>,
+    /// The usage of the last `turn.completed`: the thread's total since it began.
+    events_usage: Option<ThreadUsage>,
+    completed: bool,
+}
+
+impl CodexState {
+    /// One entry per model call when the proxy saw them, else one for the whole thread from
+    /// `turn.completed`. `input_tokens` is the uncached part and `cache_read_input_tokens` the
+    /// cached part of the call's input, as for Claude.
+    fn turns(&self) -> (Vec<TurnUsage>, &'static str) {
+        let calls = self
+            .probe
+            .as_ref()
+            .map(UsageProbe::calls)
+            .unwrap_or_default();
+        if !calls.is_empty() {
+            let turns = calls
+                .iter()
+                .map(|c| TurnUsage {
+                    input_tokens: c.input.saturating_sub(c.cached_input),
+                    output_tokens: c.output,
+                    cache_read_input_tokens: c.cached_input,
+                    ..TurnUsage::default()
+                })
+                .collect();
+            return (turns, "proxy");
+        }
+        match self.events_usage {
+            Some(u) => (
+                vec![TurnUsage {
+                    input_tokens: u.input.saturating_sub(u.cached_input),
+                    output_tokens: u.output,
+                    cache_read_input_tokens: u.cached_input,
+                    ..TurnUsage::default()
+                }],
+                "events",
+            ),
+            None => (Vec::new(), "none"),
+        }
+    }
+
+    fn cost_usd(&self, turns: &[TurnUsage]) -> f64 {
+        turns.iter().fold(0.0, |total, t| {
+            total
+                + self
+                    .price
+                    .cost_usd(t.input_tokens, t.cache_read_input_tokens, t.output_tokens)
+        })
+    }
 }
 
 /// Meter for consuming stream-json lines and accumulating metrics.
@@ -212,8 +304,10 @@ pub struct StreamMeter {
     turn_reported_cost: Vec<Option<f64>>,
     /// For OpenCode: the `reason` of the last finished step.
     last_reason: Option<String>,
-    /// For OpenCode: the error event's text.
+    /// For OpenCode and Codex: the error event's text.
     error: Option<String>,
+    /// For Codex: what the dialect keeps.
+    codex: Option<CodexState>,
     resumed: bool,
     session_id: Option<String>,
     tool_calls: Vec<ToolCall>,
@@ -285,6 +379,7 @@ impl StreamMeter {
             turn_reported_cost: Vec::new(),
             last_reason: None,
             error: None,
+            codex: None,
             resumed,
             session_id: None,
             tool_calls: Vec::new(),
@@ -319,6 +414,22 @@ impl StreamMeter {
         }
     }
 
+    /// A meter for Codex's event stream, pricing at `price` (the director's figures for the
+    /// model). With a `probe` the tokens and the running cost are the proxy's, live; without one
+    /// they are Codex's own `turn.completed` totals, at the end.
+    pub fn codex(resumed: bool, price: CodexPrice, probe: Option<UsageProbe>) -> Self {
+        Self {
+            dialect: Dialect::Codex,
+            codex: Some(CodexState {
+                price,
+                probe,
+                events_usage: None,
+                completed: false,
+            }),
+            ..Self::new(resumed)
+        }
+    }
+
     /// Feed a single JSON line from the stream.
     ///
     /// Returns an error if the line is not valid JSON. Events of unknown type
@@ -329,6 +440,9 @@ impl StreamMeter {
             serde_json::from_str(line).map_err(|e| anyhow!("not valid JSON: {}", e))?;
         if self.dialect == Dialect::Opencode {
             return Ok(self.feed_opencode(&json));
+        }
+        if self.dialect == Dialect::Codex {
+            return Ok(self.feed_codex(&json));
         }
 
         let mut events = Vec::new();
@@ -484,6 +598,121 @@ impl StreamMeter {
         }]
     }
 
+    /// A tool call that arrives finished, with its result (Codex and OpenCode report them so).
+    fn note_finished_call(
+        &mut self,
+        id: String,
+        name: String,
+        command: Option<String>,
+        (input_bytes, output_bytes): (u64, u64),
+        is_error: bool,
+    ) {
+        let entry = self
+            .tool_calls_by_name
+            .entry(name.clone())
+            .or_insert((0, 0, 0));
+        entry.0 += 1;
+        entry.1 += input_bytes;
+        entry.2 += output_bytes;
+        self.tool_calls.push(ToolCall {
+            id,
+            name,
+            command,
+            input_bytes,
+            output_bytes,
+            is_error,
+        });
+    }
+
+    fn feed_codex(&mut self, json: &serde_json::Value) -> Vec<StreamEvent> {
+        use crate::codex::{Event, Item, Phase, mcp_tool_name, parse_event};
+        let event = parse_event(json);
+        let kind = match &event {
+            Event::Thread { .. } => "thread.started",
+            Event::TurnStarted => "turn.started",
+            Event::Item { phase, .. } => match phase {
+                Phase::Started => "item.started",
+                Phase::Updated => "item.updated",
+                Phase::Completed => "item.completed",
+            },
+            Event::TurnCompleted { .. } => "turn.completed",
+            Event::TurnFailed { .. } => "turn.failed",
+            Event::Error { .. } => "error",
+            Event::Other => "other",
+        };
+        match event {
+            Event::Thread { id } => self.session_id = Some(id),
+            Event::TurnStarted => {}
+            // Only a finished item is a call; its start and updates carry nothing new.
+            Event::Item {
+                phase: Phase::Started | Phase::Updated,
+                ..
+            } => {}
+            Event::Item { item, .. } => match item {
+                Item::AgentMessage { len } => self.result_text_length = len,
+                Item::Command {
+                    id,
+                    command,
+                    output_bytes,
+                    is_error,
+                } => {
+                    let input = command.len() as u64;
+                    self.note_finished_call(
+                        id,
+                        "Bash".to_string(),
+                        Some(command),
+                        (input, output_bytes),
+                        is_error,
+                    );
+                }
+                Item::FileChange {
+                    id,
+                    input_bytes,
+                    is_error,
+                } => self.note_finished_call(
+                    id,
+                    "Edit".to_string(),
+                    None,
+                    (input_bytes, 0),
+                    is_error,
+                ),
+                Item::Mcp {
+                    id,
+                    server,
+                    tool,
+                    input_bytes,
+                    output_bytes,
+                    is_error,
+                } => self.note_finished_call(
+                    id,
+                    mcp_tool_name(&server, &tool),
+                    None,
+                    (input_bytes, output_bytes),
+                    is_error,
+                ),
+                Item::WebSearch { id } => {
+                    self.note_finished_call(id, "WebSearch".to_string(), None, (0, 0), false)
+                }
+                // A notice, not a failure of the session; the reasoning text is not read.
+                Item::Warning { .. } | Item::Reasoning | Item::Other => {}
+            },
+            Event::TurnCompleted { usage } => {
+                if let Some(codex) = &mut self.codex {
+                    codex.events_usage = Some(usage);
+                    codex.completed = true;
+                }
+            }
+            Event::TurnFailed { message } => self.error = Some(message),
+            // A retry notice is Codex trying again; the error that is not one ends the turn.
+            Event::Error { retry: true, .. } => {}
+            Event::Error { message, .. } => self.error = Some(message),
+            Event::Other => self.unknown_event_count += 1,
+        }
+        vec![StreamEvent {
+            event_type: kind.to_string(),
+        }]
+    }
+
     /// OpenCode: the cost of each turn (the runtime's figure when it gave one, else the
     /// estimate at the fetched price), and whether every turn's came from the runtime.
     fn opencode_cost(&self) -> (f64, bool) {
@@ -613,7 +842,10 @@ impl StreamMeter {
 
     /// How many distinct assistant turns the meter has seen so far.
     pub fn turn_count(&self) -> usize {
-        self.turns.len()
+        match &self.codex {
+            Some(codex) => codex.turns().0.len(),
+            None => self.turns.len(),
+        }
     }
 
     /// The running cost ESTIMATE in USD of the turns seen so far on `model`
@@ -623,6 +855,9 @@ impl StreamMeter {
     pub fn estimated_cost_usd(&self, model: &str) -> f64 {
         if self.dialect == Dialect::Opencode {
             return self.opencode_cost().0;
+        }
+        if let Some(codex) = &self.codex {
+            return codex.cost_usd(&codex.turns().0);
         }
         // A fold, not `sum`: the sum of nothing is -0.0, which prints as "-0.0".
         self.turns.iter().fold(0.0, |total, turn| {
@@ -675,11 +910,45 @@ impl StreamMeter {
             unknown_event_count: self.unknown_event_count,
             cost_source: self.total_cost_usd.map(|_| "reported".to_string()),
             error: None,
+            usage_source: None,
         };
         if self.dialect == Dialect::Opencode {
             self.fill_opencode_summary(&mut summary);
         }
+        if self.codex.is_some() {
+            self.fill_codex_summary(&mut summary);
+        }
         summary
+    }
+
+    /// The totals Claude's `result` event would have given, from the calls the proxy saw (or,
+    /// failing that, Codex's own thread total), priced at the director's figures.
+    fn fill_codex_summary(&self, summary: &mut MeterSummary) {
+        let Some(codex) = &self.codex else {
+            return;
+        };
+        let (turns, source) = codex.turns();
+        summary.total_input_tokens = turns.iter().map(|t| t.input_tokens).sum();
+        summary.total_output_tokens = turns.iter().map(|t| t.output_tokens).sum();
+        summary.total_cache_read_tokens = turns.iter().map(|t| t.cache_read_input_tokens).sum();
+        summary.total_cache_creation_tokens = 0;
+        summary.num_turns = Some(turns.len() as u64);
+        summary.resume_warm = self
+            .resumed
+            .then(|| turns.first().map(|t| t.cache_read_input_tokens > 0))
+            .flatten();
+        summary.error = self.error.clone();
+        summary.result_subtype = if self.error.is_some() {
+            Some("error".to_string())
+        } else {
+            codex.completed.then(|| "success".to_string())
+        };
+        if !turns.is_empty() {
+            summary.total_cost_usd = Some(codex.cost_usd(&turns));
+            summary.cost_source = Some("estimate".to_string());
+        }
+        summary.usage_source = Some(source.to_string());
+        summary.turns = turns;
     }
 
     /// The totals Claude's `result` event would have given, from the turns OpenCode finished.
@@ -1213,5 +1482,203 @@ mod tests {
         let back: MeterSummary = serde_json::from_value(value).unwrap();
         assert_eq!(back.cost_source, None);
         assert_eq!(back.error, None);
+    }
+
+    // The fixtures are lines recorded from the real `codex exec --json` (0.157.0) against a
+    // fake OpenAI (`tests/fixtures/codex/`).
+    const CX_RUN: &str = include_str!("../tests/fixtures/codex/session-run.jsonl");
+    const CX_RESUME: &str = include_str!("../tests/fixtures/codex/session-resume.jsonl");
+    const CX_ERROR: &str = include_str!("../tests/fixtures/codex/error-401.jsonl");
+
+    fn cx_price() -> CodexPrice {
+        CodexPrice {
+            input: 2.0,
+            cached_input: 0.5,
+            output: 10.0,
+            source: "test".to_string(),
+        }
+    }
+
+    fn codex_meter(resumed: bool, probe: Option<UsageProbe>, text: &str) -> StreamMeter {
+        let mut meter = StreamMeter::codex(resumed, cx_price(), probe);
+        for line in text.lines().filter(|l| !l.is_empty()) {
+            meter.feed(line).expect("line should parse");
+        }
+        meter
+    }
+
+    fn call(input: u64, cached_input: u64, output: u64) -> CallUsage {
+        CallUsage {
+            input,
+            cached_input,
+            output,
+        }
+    }
+
+    #[test]
+    fn codex_tool_calls_are_the_finished_items_named_the_way_claude_names_them() {
+        let summary = codex_meter(false, None, CX_RUN).summary();
+        assert_eq!(
+            summary.session_id.as_deref(),
+            Some("01a12d9c-b587-7d70-b3bc-ec3bd1cb4130")
+        );
+        let calls: Vec<(&str, bool)> = summary
+            .tool_calls
+            .iter()
+            .map(|c| (c.name.as_str(), c.is_error))
+            .collect();
+        assert_eq!(
+            calls,
+            [
+                ("Bash", true),
+                ("Bash", false),
+                ("Edit", false),
+                ("mcp__cowproof-tools__run_check", false)
+            ]
+        );
+        assert_eq!(
+            summary.tool_calls[1].command.as_deref(),
+            Some("/bin/zsh -c 'echo edited >> README.md'")
+        );
+        // The failed command is the one the escalate-early observer will see as failed.
+        assert_eq!(
+            summary
+                .bash_commands()
+                .iter()
+                .map(|c| c.succeeded)
+                .collect::<Vec<_>>(),
+            [false, true]
+        );
+        assert_eq!(summary.tool_calls_by_name["Bash"].0, 2);
+        assert_eq!(summary.pending_tool_uses, 0);
+        assert_eq!(summary.orphan_results, 0);
+        assert_eq!(summary.permission_denials, Vec::<String>::new());
+        // The metadata notice and the reasoning item are neither unknown nor errors.
+        assert_eq!(summary.unknown_event_count, 0);
+        assert_eq!(summary.error, None);
+        assert_eq!(summary.result_subtype.as_deref(), Some("success"));
+        assert!(summary.result_text_length > 0);
+    }
+
+    #[test]
+    fn codex_without_a_probe_takes_the_threads_total_from_turn_completed() {
+        let meter = codex_meter(false, None, CX_RUN);
+        let summary = meter.summary();
+        assert_eq!(summary.usage_source.as_deref(), Some("events"));
+        // 400 input of which 40 cached; 80 output.
+        assert_eq!(summary.total_input_tokens, 360);
+        assert_eq!(summary.total_cache_read_tokens, 40);
+        assert_eq!(summary.total_output_tokens, 80);
+        assert_eq!(summary.total_cache_creation_tokens, 0);
+        assert_eq!(summary.num_turns, Some(1));
+        // 360 x $2 + 40 x $0.5 + 80 x $10 per million.
+        let want = (360.0 * 2.0 + 40.0 * 0.5 + 80.0 * 10.0) / 1e6;
+        assert!(
+            (summary.total_cost_usd.unwrap() - want).abs() < 1e-12,
+            "{summary:?}"
+        );
+        assert_eq!(summary.cost_source.as_deref(), Some("estimate"));
+        assert!((meter.estimated_cost_usd("ignored") - want).abs() < 1e-12);
+    }
+
+    #[test]
+    fn codex_with_a_probe_the_proxys_calls_are_the_turns_and_the_cost_is_live() {
+        let log = MetricsLog::default();
+        let probe = UsageProbe::new(log.clone());
+        let mut meter = StreamMeter::codex(false, cx_price(), Some(probe));
+        assert_eq!(
+            (meter.turn_count(), meter.estimated_cost_usd("m")),
+            (0, 0.0)
+        );
+        // A call passes the proxy before any event line shows it.
+        log.push_usage(call(100, 10, 20));
+        assert_eq!(meter.turn_count(), 1);
+        let one = (90.0 * 2.0 + 10.0 * 0.5 + 20.0 * 10.0) / 1e6;
+        assert!((meter.estimated_cost_usd("m") - one).abs() < 1e-12);
+        log.push_usage(call(100, 10, 20));
+        assert_eq!(meter.turn_count(), 2);
+        assert!((meter.estimated_cost_usd("m") - 2.0 * one).abs() < 1e-12);
+        // The events say 400 tokens; the summary still reports what the proxy saw.
+        for line in CX_RUN.lines() {
+            meter.feed(line).unwrap();
+        }
+        let summary = meter.summary();
+        assert_eq!(summary.usage_source.as_deref(), Some("proxy"));
+        assert_eq!(summary.turns.len(), 2);
+        assert_eq!(summary.turns[0].input_tokens, 90);
+        assert_eq!(summary.turns[0].cache_read_input_tokens, 10);
+        assert_eq!(summary.total_input_tokens, 180);
+        assert_eq!(summary.num_turns, Some(2));
+        assert!((summary.total_cost_usd.unwrap() - 2.0 * one).abs() < 1e-12);
+    }
+
+    #[test]
+    fn codex_a_probe_counts_only_the_calls_after_it_was_made() {
+        let log = MetricsLog::default();
+        log.push_usage(call(1000, 0, 1000));
+        let meter = StreamMeter::codex(true, cx_price(), Some(UsageProbe::new(log.clone())));
+        assert_eq!(
+            meter.turn_count(),
+            0,
+            "an earlier launch's call is not this one's"
+        );
+        log.push_usage(call(50, 40, 5));
+        assert_eq!(meter.turn_count(), 1);
+        assert_eq!(meter.summary().turns[0].input_tokens, 10);
+    }
+
+    #[test]
+    fn codex_a_resumed_launch_reports_its_id_and_a_warm_cache() {
+        let meter = codex_meter(true, None, CX_RESUME);
+        let summary = meter.summary();
+        assert_eq!(
+            summary.session_id.as_deref(),
+            Some("01a12d9c-b587-7d70-b3bc-ec3bd1cb4130")
+        );
+        assert_eq!(summary.resume_warm, Some(true));
+        // Without the proxy the thread's total since it began is all there is: 500 here.
+        assert_eq!(
+            summary.total_input_tokens + summary.total_cache_read_tokens,
+            500
+        );
+        assert!(summary.tool_calls.is_empty());
+    }
+
+    #[test]
+    fn codex_a_failed_turn_is_the_session_error_and_retries_are_not() {
+        let summary = codex_meter(false, None, CX_ERROR).summary();
+        assert_eq!(summary.result_subtype.as_deref(), Some("error"));
+        assert!(
+            summary
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("401 Unauthorized")
+        );
+        assert_eq!(summary.usage_source.as_deref(), Some("none"));
+        assert_eq!(summary.total_cost_usd, None);
+        assert_eq!(summary.cost_source, None);
+        assert_eq!(summary.num_turns, Some(0));
+        // A stream that ends with no turn event at all has neither a result nor an error.
+        let mut cut = StreamMeter::codex(false, cx_price(), None);
+        cut.feed(r#"{"type":"thread.started","thread_id":"01a12d9c-b587-7d70-b3bc-ec3bd1cb4130"}"#)
+            .unwrap();
+        cut.feed(r#"{"type":"error","message":"Reconnecting... 1/5 (x)"}"#)
+            .unwrap();
+        let summary = cut.summary();
+        assert_eq!((summary.result_subtype, summary.error), (None, None));
+    }
+
+    #[test]
+    fn codex_an_unknown_event_is_counted_and_a_non_json_line_is_refused() {
+        let mut meter = StreamMeter::codex(false, cx_price(), None);
+        meter.feed(r#"{"type":"something_new"}"#).unwrap();
+        assert_eq!(meter.summary().unknown_event_count, 1);
+        assert!(meter.feed("not json").is_err());
+        // Another dialect's events are unknown to it.
+        meter
+            .feed(r#"{"type":"step_finish","sessionID":"s","part":{}}"#)
+            .unwrap();
+        assert_eq!(meter.summary().unknown_event_count, 2);
     }
 }
