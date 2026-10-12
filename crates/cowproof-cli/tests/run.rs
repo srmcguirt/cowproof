@@ -2121,9 +2121,13 @@ fn a_non_blocking_ask_never_ends_the_session_and_the_builders_own_exit_is_record
 // resume loop acts on it with the handler blocking asks use. An answer does
 // not end the session: the builder reads it with `check_ruling`.
 
-/// The ruling must take effect within this long of the director giving it,
-/// against a builder that would otherwise sleep for two minutes.
-const RULED_WITHIN: Duration = Duration::from_secs(15);
+/// A hang guard: the ruling must take effect within this long of the director giving it,
+/// against a builder that would otherwise sleep for two minutes. It is not the property under
+/// test (that is [`a_stop_on_a_non_blocking_ask_ends_the_live_session_and_the_lane`], which
+/// measures from the runner's own "ending the builder now" line against `TERM_GRACE`): a ruling
+/// given to a loaded host also waits for the `cowproof rule` process to start and for the
+/// sandbox to wind down, and a fixed fifteen seconds failed twice in full workspace runs.
+const RULED_WITHIN: Duration = Duration::from_secs(90);
 
 /// A fake that, on its first launch, records its pid, asks NON-blocking and
 /// sleeps 120 s (in a background child, so the group has two members); later
@@ -2159,24 +2163,6 @@ fn reap_fake_group(h: &Harness) {
         && let Ok(pgid) = pid.trim().parse::<u32>()
     {
         signal_group("KILL", pgid);
-    }
-}
-
-/// Wait for the run to end, at most `RULED_WITHIN` after `ruled_at`. A run
-/// that is still going is killed (by its pid), and so is the first builder's
-/// process group (macOS only, see [`reap_fake_group`]), and the test fails.
-fn ends_within_of_the_ruling(h: &Harness, mut child: Child, ruled_at: Instant) -> Output {
-    loop {
-        if child.try_wait().unwrap().is_some() {
-            return child.wait_with_output().unwrap();
-        }
-        if ruled_at.elapsed() > RULED_WITHIN {
-            let _ = child.kill();
-            let _ = child.wait();
-            reap_fake_group(h);
-            panic!("the run was still going {RULED_WITHIN:?} after the ruling");
-        }
-        std::thread::sleep(Duration::from_millis(50));
     }
 }
 
@@ -2218,10 +2204,34 @@ fn a_stop_on_a_non_blocking_ask_ends_the_live_session_and_the_lane() {
     if !sandbox_available() {
         return;
     }
+    // The builder dies on SIGTERM, so a stop must not wait out `TERM_GRACE` for a SIGKILL.
+    // The clock starts at the runner's own line saying it is ending the builder, not at the
+    // `cowproof rule` call: how long a loaded host takes to start that process and deliver
+    // the ruling is not what is measured. From that line the runner sends SIGTERM and tears
+    // down; a run that waited the grace out ends about `TERM_GRACE` later, so the bound is
+    // three quarters of it. The waits around it only keep a hang from hanging the test.
+    let grace = term_grace();
+    let bound = grace * 3 / 4;
     let h = owned_packet(&nonblocking_sleeper("Quit?"));
-    let (child, id, ruled_at) = rule_the_moment_it_is_asked(&h, &["--stop"]);
-    let out = ends_within_of_the_ruling(&h, child, ruled_at);
-    assert_eq!(out.status.code(), Some(1), "{}", stdout_of(&out));
+    let mut run = start_watched(&h, &[]);
+    let id = wait_for_ask(&h, &mut run.child, 1);
+    rule(&h, &id, &["--stop"]);
+    run.wait_for_stderr("ending the builder now", RULED_WITHIN);
+    let ending = Instant::now();
+    let status = exit_within(&mut run, RULED_WITHIN);
+    let took = ending.elapsed();
+    assert!(
+        took < bound,
+        "the stop waited for the SIGTERM grace: exit {took:?} after the runner began ending \
+         the builder, bound {bound:?} of a {grace:?} grace:\n{}",
+        run.stderr()
+    );
+    let mut stdout = String::new();
+    if let Some(mut pipe) = run.child.stdout.take() {
+        use std::io::Read;
+        let _ = pipe.read_to_string(&mut stdout);
+    }
+    assert_eq!(status.code(), Some(1), "{stdout}\n{}", run.stderr());
     assert_eq!(h.launches(), 1, "no second launch");
     assert_eq!(h.run_json()["status"], "stopped");
     assert_eq!(segments(&h).len(), 1);
@@ -2747,21 +2757,64 @@ fn a_signal_while_the_lane_waits_for_a_ruling_ends_the_run_without_a_builder() {
     assert_eq!(h.launches(), 1);
 }
 
-/// The runner's `TERM_GRACE`, read from its source so the two cannot drift: how long the
-/// launcher lets a builder that ignores SIGTERM live before it sends SIGKILL.
-fn term_grace() -> Duration {
+/// A grace constant of the runner (`TERM_GRACE`, `CHECK_TERM_GRACE`), read from its source
+/// so the two cannot drift.
+fn grace_from_source(name: &str) -> Duration {
     const SRC: &str = include_str!("../src/run.rs");
+    let needle = format!("const {name}: Duration");
     let line = SRC
         .lines()
-        .find(|l| l.contains("const TERM_GRACE: Duration"))
-        .expect("src/run.rs no longer defines TERM_GRACE");
+        .find(|l| l.contains(&needle))
+        .unwrap_or_else(|| panic!("src/run.rs no longer defines {name}"));
     let secs = line
         .split("from_secs(")
         .nth(1)
         .and_then(|rest| rest.split(')').next())
         .and_then(|n| n.trim().parse::<u64>().ok())
-        .unwrap_or_else(|| panic!("cannot read TERM_GRACE from {line:?}"));
+        .unwrap_or_else(|| panic!("cannot read {name} from {line:?}"));
     Duration::from_secs(secs)
+}
+
+/// The runner's `TERM_GRACE`: how long the launcher lets a builder that ignores SIGTERM live
+/// before it sends SIGKILL.
+fn term_grace() -> Duration {
+    grace_from_source("TERM_GRACE")
+}
+
+/// The runner's `CHECK_TERM_GRACE`: the same for a `run_check` group.
+fn check_term_grace() -> Duration {
+    grace_from_source("CHECK_TERM_GRACE")
+}
+
+/// A heartbeat file is appended to every half second by a process that must not outlive the
+/// lane (or must be gone by some moment). Its length is how many beats it has made.
+fn beats(path: &Path) -> u64 {
+    fs::metadata(path).map(|m| m.len()).unwrap_or(0)
+}
+
+/// Assert that whatever writes `beat` has stopped: the file does not grow over two seconds
+/// (four beats). With `settle` above zero it may take that long to stop, which is for a
+/// process the runner ends without waiting for it; with zero the process must already be gone
+/// (the run has exited). A process that outlived its lane beats for as long as the test looks,
+/// however slowly a loaded host ends the others, so the check does not depend on a clock
+/// picked for an idle machine the way a marker written after a fixed delay does. A survivor
+/// that a loaded host starves for the whole two seconds would pass, which is the one way this
+/// can miss a leak.
+fn assert_heartbeat_stopped(beat: &Path, settle: Duration, what: &str) {
+    let begun = Instant::now();
+    loop {
+        let before = beats(beat);
+        std::thread::sleep(Duration::from_secs(2));
+        if beats(beat) == before {
+            return;
+        }
+        assert!(
+            begun.elapsed() < settle,
+            "{what} was still running {:?} after the lane ended: {} beats and counting",
+            begun.elapsed(),
+            beats(beat)
+        );
+    }
 }
 
 #[test]
@@ -3024,10 +3077,14 @@ fn the_timeout_ends_a_silent_builder_and_a_child_that_ignores_sigterm_and_nothin
     if !sandbox_available() {
         return;
     }
-    // The builder says nothing and sleeps. A background child ignores SIGTERM
-    // (only the group SIGKILL ends it) and would write a marker fourteen seconds in. The limit is eight seconds, wide enough for a
-    // cold sandbox start on a loaded machine (the clock runs from the builder's spawn).
-    let first = "( trap '' TERM; sleep 14; echo alive > \"$HOME/survived\" ) &\necho $! > \"$HOME/bgpid\"\nsleep 120\n";
+    // The builder says nothing and sleeps. A background child ignores SIGTERM (only the group
+    // SIGKILL ends it) and appends to a heartbeat file twice a second. The limit is eight
+    // seconds, wide enough for a cold sandbox start on a loaded machine (the clock runs from
+    // the builder's spawn). Once the leader is gone the runner SIGKILLs the group, so the
+    // child must have stopped beating when the run has exited, however late a loaded host got
+    // there; a marker written after a fixed delay (it was fourteen seconds) fails when that
+    // host takes longer than the delay.
+    let first = "( trap '' TERM; while :; do echo . >> \"$HOME/beat\"; sleep 0.5; done ) &\necho $! > \"$HOME/bgpid\"\nsleep 120\n";
     let h = owned_packet(first);
     let began = Instant::now();
     let child = {
@@ -3073,16 +3130,19 @@ fn the_timeout_ends_a_silent_builder_and_a_child_that_ignores_sigterm_and_nothin
     assert_eq!(segs[0]["signal"], 15, "SIGTERM ended the leader: {segs:?}");
     assert_not_proved(&h);
 
-    // The stubborn child is gone: by pid where the sandbox shares the host's
-    // pid space (macOS), and by effect everywhere (its marker would appear at
-    // fourteen seconds into the builder, after the run has already ended).
+    // The stubborn child is gone: by pid where the sandbox shares the host's pid space
+    // (macOS), and by effect everywhere (it has stopped beating).
     if cfg!(target_os = "macos") {
         assert_pid_gone(h.read("home/bgpid").trim());
     }
-    std::thread::sleep(Duration::from_secs(8));
     assert!(
-        !h.lane().join("home/survived").exists(),
-        "a background child outlived the timeout and wrote its marker"
+        beats(&h.lane().join("home/beat")) > 0,
+        "the stubborn child never ran"
+    );
+    assert_heartbeat_stopped(
+        &h.lane().join("home/beat"),
+        Duration::ZERO,
+        "a background child that ignores SIGTERM",
     );
 }
 
@@ -4840,11 +4900,9 @@ fn an_untraced_lane_records_no_trace_totals_and_is_still_proved() {
 // leaves a background subshell that writes a marker after 14 s and records its pid; a check
 // that was not ended as a group lets the marker appear.
 
-/// How long after the check started the marker would appear.
-const BG_MARKER_AFTER: Duration = Duration::from_secs(14);
-
-const BG_CHECK: &str =
-    "( sleep 14; echo alive > ../scratch/survived ) & echo $! > ../scratch/bgpid; sleep 300";
+/// The check leaves a background subshell that appends to `scratch/beat` twice a second and
+/// records its pid. A check that was not ended as a group lets it beat on after the lane's end.
+const BG_CHECK: &str = "( while :; do echo . >> ../scratch/beat; sleep 0.5; done ) & echo $! > ../scratch/bgpid; sleep 300";
 
 fn bg_check_harness(fake_body: &str) -> Harness {
     Harness::with_packet(
@@ -4855,17 +4913,18 @@ fn bg_check_harness(fake_body: &str) -> Harness {
 }
 
 /// Shell: start `run_check bg` in the background (it blocks for 300 s) and wait until the
-/// check has recorded its background pid.
+/// check has recorded its background pid and the subshell has beaten once.
 fn start_bg_check() -> String {
     format!(
-        "( {} ) &\nwhile [ ! -e \"$(dirname \"$HOME\")/scratch/bgpid\" ]; do sleep 0.1; done\n",
+        "( {} ) &\nwhile [ ! -e \"$(dirname \"$HOME\")/scratch/bgpid\" ] || [ ! -e \"$(dirname \"$HOME\")/scratch/beat\" ]; do sleep 0.25; done\n",
         mcp_session("bg.out", &[(3, "run_check", json!({"id": "bg"}))])
     )
 }
 
 /// The check's background subshell is gone: by pid where the sandbox shares the host's pid
-/// space (macOS), and by effect everywhere (its marker never appears).
-fn assert_bg_check_ended(h: &Harness, seen_at: Instant) {
+/// space (macOS), and by effect everywhere (it stops beating). `settle` is how long it may
+/// take, zero where the run has already ended.
+fn assert_bg_check_ended(h: &Harness, settle: Duration) {
     if cfg!(target_os = "macos") {
         assert_pid_gone(
             fs::read_to_string(h.lane().join("scratch/bgpid"))
@@ -4873,12 +4932,10 @@ fn assert_bg_check_ended(h: &Harness, seen_at: Instant) {
                 .trim(),
         );
     }
-    std::thread::sleep(
-        (BG_MARKER_AFTER + Duration::from_secs(3)).saturating_sub(seen_at.elapsed()),
-    );
-    assert!(
-        !h.lane().join("scratch/survived").exists(),
-        "the check's background process outlived the lane's end and wrote its marker"
+    assert_heartbeat_stopped(
+        &h.lane().join("scratch/beat"),
+        settle,
+        "the check's background process",
     );
 }
 
@@ -4886,11 +4943,10 @@ fn a_signal_ends_a_running_check_group(signal: &str) {
     let h = bg_check_harness(&format!("{}{}sleep 120\n", init_line(), start_bg_check()));
     let mut run = start_watched(&h, &[]);
     wait_for_file(&mut run, &h.lane().join("scratch/bgpid"));
-    let seen_at = Instant::now();
     send_signal(signal, &run.child);
     let status = exit_within(&mut run, INTERRUPT_EXIT_WITHIN);
     assert_interrupted_cleanly(&h, status, &run);
-    assert_bg_check_ended(&h, seen_at);
+    assert_bg_check_ended(&h, Duration::ZERO);
 }
 
 #[test]
@@ -4922,7 +4978,6 @@ fn a_stop_ruling_ends_the_check_the_parked_builder_left_running() {
     ));
     let mut child = start(&h);
     let id = wait_for_ask(&h, &mut child, 1);
-    let seen_at = Instant::now();
     rule(&h, &id, &["--stop"]);
     let out = finish(child);
     assert_eq!(
@@ -4932,7 +4987,7 @@ fn a_stop_ruling_ends_the_check_the_parked_builder_left_running() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert_eq!(h.run_json()["status"], "stopped");
-    assert_bg_check_ended(&h, seen_at);
+    assert_bg_check_ended(&h, Duration::ZERO);
 }
 
 #[test]
@@ -4948,13 +5003,14 @@ fn a_check_is_ended_when_the_builder_exits_and_the_lane_parks_before_any_ruling(
     ));
     let mut run = start_watched(&h, &[]);
     wait_for_file(&mut run, &h.lane().join("scratch/bgpid"));
-    let seen_at = Instant::now();
     // The ask parks the session: the runner ends the builder and waits for a ruling. Nothing
     // is ruled here, so only the builder's exit can end the check it left running.
     run.wait_for_stderr(WAITING, SESSION_END_WITHIN);
     assert_eq!(h.launches(), 1);
-    // The lane is still parked, no ruling given, when the check must be gone.
-    assert_bg_check_ended(&h, seen_at);
+    // The lane is still parked, no ruling given, when the check must be gone. The runner ends
+    // the group in the background (SIGTERM, then SIGKILL after `CHECK_TERM_GRACE`), so it
+    // may take that long, and a loaded host some more.
+    assert_bg_check_ended(&h, check_term_grace() + Duration::from_secs(10));
     assert!(
         run.child.try_wait().unwrap().is_none(),
         "the run ended by itself while parked:\n{}",
