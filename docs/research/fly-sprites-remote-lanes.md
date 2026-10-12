@@ -96,6 +96,30 @@ With a `socat` listener on `/tmp/local.sock` on the director, run `curl --unix-s
 
 **Founder approvals.** None of this can start without him: a new Fly organization for Sprites (not any existing one); his own sign-in and any payment method (I do not type either); a stated spend ceiling, since a cap is not documented; a restricted API token (prefix, sprite-count cap, expiry); and his decision to send private repository code and prompts to Fly, since the Sprites terms were not read.
 
+## 9. Prototype scorecard
+
+The experiments in section 8 cost cents, and they are worth running only if their results are comparable and decide something. Record the numbers below, decide the go or no-go rule before starting, and run each timing at least three times with the time of day noted, since the platform is shared.
+
+| Question | How to measure | Compare against |
+|---|---|---|
+| Create and wake time | `time sprite create`; a command after the sprite has gone idle, once warm and once cold | The docs: about 1 s to create, 100 to 500 ms warm wake, 1 to 2 s cold wake [4] |
+| Real CPU and memory | `nproc`, `free -m`, and `/sys/fs/cgroup/memory.peak` read after a build | The docs: 8 vCPU [4]; memory starts at 2 GB and grows to 16 GB on demand [9] |
+| Build speed | `time cargo build --release` of cowproof on a fresh sprite, again after it has gone cold, and again after a checkpoint restore | The same build, same commit, on the owner's Linux host |
+| Checkpoint and restore | `time sprite checkpoint create` and `time sprite restore v0` | The docs: about 1 to 3 s [5] |
+| Billed cost | CPU time from `/sys/fs/cgroup/cpu.stat` before and after, against the account page | The section 5 upper bound of about $0.056 per lane [28][29] |
+| Idle behavior | After the lane, whether the sprite goes cold and billed compute stops; whether any open ssh or proxy connection keeps it awake | The docs: idle after about 30 s, then cold; open connections and running commands keep it active [4][18] |
+| Reliability | How many of about 20 create, connect and exec cycles finish cleanly | The status incidents found in search results [30] |
+| Reverse socket | Whether `-R` Unix-socket forwards through `sprite proxy` carry traffic, with a deny-all network policy set, and after 10 minutes idle | Experiment 2 |
+| Lifeline | Whether killing the director's ssh ends the remote builder | Experiment 3, and the same test on the owner's host (one second, audit of 2026-10-11) |
+
+**Go or no-go, fixed before the first run:**
+- The sprite is not a remote work area at all if the reverse socket fails, or if the lifeline fails and cannot be fixed on the cowproof side. The design's key boundary depends on both.
+- It is not used for compiling if the release build is more than twice as slow as on the owner's host, or if it is OOM-killed before memory grows. Lanes that mostly edit code and run quick checks could still use it, with builds kept on the owner's host.
+- If billed cost per lane exceeds about three times the section 5 upper bound, or idle sprites keep billing compute, record why before deciding.
+- Otherwise, the next step is a design decision to add a Sprite entry kind next to the SSH host, which the founder approves.
+
+Who runs it: the founder, or the director once the founder has created a dedicated Fly organization, set a spend ceiling and put a restricted token in the Keychain. No worker lane runs it.
+
 ## Sources (all read 2026-10-11)
 
 1. https://docs.fly.io/sprites
