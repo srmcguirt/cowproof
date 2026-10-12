@@ -4382,6 +4382,209 @@ fn a_reassign_onto_a_profiled_rung_goes_ahead_when_the_packet_meets_it() {
     );
 }
 
+/// `haiku`, the rung a lane starts on and stays on through a redirect, needs tests and
+/// mutations; `sonnet` (never reached in these tests) needs the full set.
+const REDIRECT_PROFILE_CONFIG: &str = "[ladder]\nrungs = [\"claude:haiku\", \"claude:sonnet\"]\n\n\
+[profiles.strict]\nrequire = [\"tests\", \"mutations\"]\n\n\
+[routing.profiles]\n\"claude:haiku\" = \"strict\"\n";
+
+/// A harness whose packet meets the strict profile of the rung it starts on, with a redirect
+/// file written from it: `edit` changes the packet text, and the file is `redirect.md`.
+fn redirect_on_profiled_rung(config: &str, edit: impl Fn(&str) -> String) -> (Harness, PathBuf) {
+    redirect_after(
+        &asks_first("Right task?", true, &then_checks()),
+        config,
+        edit,
+    )
+}
+
+/// `redirect_on_profiled_rung` with the fake claude's script chosen by the caller.
+fn redirect_after(fake: &str, config: &str, edit: impl Fn(&str) -> String) -> (Harness, PathBuf) {
+    let mut h = owned_packet(fake);
+    h.append_body(&format!("{PROFILE_TESTS}{PROFILE_MUTATIONS}"));
+    h.commit_config(config);
+    let redirected = edit(&h.packet_text);
+    assert_ne!(redirected, h.packet_text);
+    let packet = h.work.path().join("redirect.md");
+    fs::write(&packet, &redirected).unwrap();
+    (h, packet)
+}
+
+#[test]
+fn a_redirect_lacking_a_requirement_of_the_rungs_profile_ends_the_lane_refused_naming_it() {
+    if !sandbox_available() {
+        return;
+    }
+    // The redirect drops the mutations section the strict profile of `haiku` requires.
+    let (h, packet) = redirect_on_profiled_rung(REDIRECT_PROFILE_CONFIG, |text| {
+        text.replace(PROFILE_MUTATIONS, "")
+            .replace("Change the README.", "Change the README, then stop.")
+    });
+    let mut child = start(&h);
+    let id = wait_for_ask(&h, &mut child, 1);
+    rule(&h, &id, &["--redirect", packet.to_str().unwrap()]);
+    let out = finish(child);
+    assert_eq!(out.status.code(), Some(1), "{}", stdout_of(&out));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("redirect for"), "{stderr}");
+    assert!(stderr.contains("profile \"strict\""), "{stderr}");
+    assert!(stderr.contains("claude:haiku"), "{stderr}");
+    assert!(stderr.contains("mutations: add"), "{stderr}");
+    assert!(
+        !stderr.contains("tests: add"),
+        "the redirect has its tests: {stderr}"
+    );
+    // The same end as a refused reassign: failed, work kept, no verdict, the ruling recorded
+    // and never delivered, and no second session.
+    assert_eq!(h.launches(), 1);
+    let run = h.run_json();
+    assert_eq!(run["status"], "failed", "{run}");
+    let error = run["error"].as_str().unwrap();
+    assert!(error.contains("profile \"strict\""), "{run}");
+    assert!(error.contains("mutations: add"), "{run}");
+    assert_eq!(queue_events(&h, "ruled").len(), 1);
+    assert!(queue_events(&h, "delivered").is_empty());
+    assert!(h.read("control/lane.patch").contains("+edited"));
+    assert!(!h.lane().join("control/verdict.json").exists());
+    assert_eq!(segments(&h).len(), 1);
+    assert_eq!(segments(&h)[0]["profile"]["met"], true);
+}
+
+#[test]
+fn a_redirect_that_meets_the_rungs_profile_is_delivered_and_recorded() {
+    if !sandbox_available() {
+        return;
+    }
+    let (h, packet) = redirect_on_profiled_rung(REDIRECT_PROFILE_CONFIG, |text| {
+        text.replace("Change the README.", "Change the README, then stop.")
+    });
+    let mut child = start(&h);
+    let id = wait_for_ask(&h, &mut child, 1);
+    rule(&h, &id, &["--redirect", packet.to_str().unwrap()]);
+    let out = finish(child);
+    assert_eq!(out.status.code(), Some(0), "{}", stdout_of(&out));
+    assert_eq!(h.launches(), 2);
+    assert_eq!(queue_events(&h, "delivered").len(), 1);
+    let met = json!({
+        "rung": "claude:haiku",
+        "name": "strict",
+        "requires": ["tests", "mutations"],
+        "met": true,
+        "missing": [],
+    });
+    let segs = segments(&h);
+    assert_eq!(segs[0]["profile"], met);
+    assert_eq!(
+        segs[1]["profile"], met,
+        "the redirected packet's check is recorded"
+    );
+}
+
+#[test]
+fn a_redirect_on_a_rung_with_no_profile_is_delivered_whatever_other_rungs_require() {
+    if !sandbox_available() {
+        return;
+    }
+    // `sonnet` is strict, the lane is on `haiku`: the redirect lacks everything and still goes.
+    let (h, packet) = redirect_on_profiled_rung(PROFILE_CONFIG, |text| {
+        text.replace(PROFILE_TESTS, "")
+            .replace(PROFILE_MUTATIONS, "")
+            .replace("Change the README.", "Change the README, then stop.")
+    });
+    let mut child = start(&h);
+    let id = wait_for_ask(&h, &mut child, 1);
+    rule(&h, &id, &["--redirect", packet.to_str().unwrap()]);
+    let out = finish(child);
+    assert_eq!(out.status.code(), Some(0), "{}", stdout_of(&out));
+    assert_eq!(h.launches(), 2);
+    assert_eq!(queue_events(&h, "delivered").len(), 1);
+    let segs = segments(&h);
+    assert_eq!(segs[0]["profile"], Value::Null);
+    assert_eq!(segs[1]["profile"], Value::Null);
+}
+
+/// Two rungs, the lane starts on `alpha`. `strict` needs tests and mutations.
+const ALPHA_NONE_BETA_STRICT: &str = REASSIGN_PROFILE_CONFIG;
+const ALPHA_STRICT_BETA_NONE: &str = "[ladder]\nrungs = [\"claude:alpha\", \"claude:beta\"]\n\n\
+[profiles.strict]\nrequire = [\"tests\", \"mutations\"]\n\n\
+[routing.profiles]\n\"claude:alpha\" = \"strict\"\n";
+
+#[test]
+fn a_redirect_after_a_reassign_is_checked_against_the_profile_of_the_rung_it_landed_on() {
+    if !sandbox_available() {
+        return;
+    }
+    // Starts on `alpha` (no profile), is reassigned onto `beta` (strict; the packet meets it,
+    // or the reassign itself would be refused), then is redirected to a packet without
+    // mutations: the profile that counts is `beta`'s, not the start rung's.
+    let (h, packet) = redirect_after(
+        &asks_until(2, &then_checks()),
+        ALPHA_NONE_BETA_STRICT,
+        |text| {
+            text.replace(PROFILE_MUTATIONS, "")
+                .replace("Change the README.", "Change the README, then stop.")
+        },
+    );
+    let mut child = start(&h);
+    let first = wait_for_ask(&h, &mut child, 1);
+    rule(&h, &first, &["--reassign"]);
+    let second = wait_for_ask(&h, &mut child, 2);
+    rule(&h, &second, &["--redirect", packet.to_str().unwrap()]);
+    let out = finish(child);
+    assert_eq!(out.status.code(), Some(1), "{}", stdout_of(&out));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("redirect for"), "{stderr}");
+    assert!(stderr.contains("claude:beta"), "{stderr}");
+    assert!(stderr.contains("profile \"strict\""), "{stderr}");
+    assert!(stderr.contains("mutations: add"), "{stderr}");
+    assert_eq!(h.launches(), 2, "no session starts on the redirect");
+    let run = h.run_json();
+    assert_eq!(run["status"], "failed", "{run}");
+    assert!(
+        run["error"]
+            .as_str()
+            .unwrap()
+            .contains("profile \"strict\""),
+        "{run}"
+    );
+    assert_eq!(queue_events(&h, "delivered").len(), 1, "the reassign only");
+    let segs = segments(&h);
+    assert_eq!(segs.len(), 2);
+    assert_eq!(segs[0]["profile"], Value::Null);
+    assert_eq!(segs[1]["profile"]["rung"], "claude:beta");
+}
+
+#[test]
+fn a_redirect_after_a_reassign_off_a_strict_rung_is_not_held_to_the_start_rungs_profile() {
+    if !sandbox_available() {
+        return;
+    }
+    // Starts on `alpha` (strict; the packet meets it), is reassigned onto `beta` (no profile),
+    // then is redirected to a packet without mutations: `beta` asks for nothing.
+    let (h, packet) = redirect_after(
+        &asks_until(2, &then_checks()),
+        ALPHA_STRICT_BETA_NONE,
+        |text| {
+            text.replace(PROFILE_MUTATIONS, "")
+                .replace("Change the README.", "Change the README, then stop.")
+        },
+    );
+    let mut child = start(&h);
+    let first = wait_for_ask(&h, &mut child, 1);
+    rule(&h, &first, &["--reassign"]);
+    let second = wait_for_ask(&h, &mut child, 2);
+    rule(&h, &second, &["--redirect", packet.to_str().unwrap()]);
+    let out = finish(child);
+    assert_eq!(out.status.code(), Some(0), "{}", stdout_of(&out));
+    assert_eq!(h.launches(), 3);
+    assert_eq!(h.seg(3, "model"), "beta");
+    assert_eq!(queue_events(&h, "delivered").len(), 2);
+    let segs = segments(&h);
+    assert_eq!(segs[0]["profile"]["met"], true);
+    assert_eq!(segs[1]["profile"], Value::Null);
+    assert_eq!(segs[2]["profile"], Value::Null);
+}
+
 // ----------------------------------------------------------------------------------------
 // Trace totals (D5, D23): the usage monitor's per-lane sums, in run.json and the capsule.
 // ----------------------------------------------------------------------------------------

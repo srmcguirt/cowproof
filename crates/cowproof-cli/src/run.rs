@@ -1760,8 +1760,11 @@ impl Drive<'_> {
         }
     }
 
-    /// Read and lint a redirect packet. Anything wrong refuses the redirect.
-    fn load_redirect(&self, packet_path: &str) -> Result<String, String> {
+    /// Read and lint a redirect packet, and check it against the profile of `rung`, the rung the
+    /// lane is on when the redirect is delivered (D28 clause 5; the redirect keeps that rung).
+    /// Anything wrong refuses the redirect, which ends the lane refused with its work kept and
+    /// the ruling left recorded and undelivered, as a refused reassign does.
+    fn load_redirect(&self, packet_path: &str, rung: &Rung) -> Result<String, String> {
         const MAX_PACKET: u64 = 1024 * 1024;
         let path = self.cwd.join(packet_path);
         let meta = fs::metadata(&path).map_err(|e| format!("{}: {e}", path.display()))?;
@@ -1784,11 +1787,15 @@ impl Drive<'_> {
             .filter(|f| f.severity == cowproof_lint::Severity::Error)
             .map(|f| one_line(&f.to_string()))
             .collect();
-        if errors.is_empty() {
-            Ok(text)
-        } else {
-            Err(format!("lint errors: {}", errors.join("; ")))
+        if !errors.is_empty() {
+            return Err(format!("lint errors: {}", errors.join("; ")));
         }
+        // `lint_for_run` drops the unmet-requirement `profile` findings, because lint resolves
+        // a rung of its own; the rung that counts here is the one the lane is on.
+        if let Some(refusal) = profile_refusal(self.profiles, rung, &text) {
+            return Err(format!("{rung} is the rung this lane is on, but {refusal}"));
+        }
+        Ok(text)
     }
 
     fn segment_record(
@@ -2011,7 +2018,7 @@ impl Drive<'_> {
                     }
                 }
                 EscalationVerdict::Redirect { packet_path } => {
-                    match self.load_redirect(&packet_path) {
+                    match self.load_redirect(&packet_path, &rung) {
                         Ok(text) => {
                             self.mark_delivered(&id)?;
                             packet = text;

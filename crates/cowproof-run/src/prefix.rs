@@ -82,6 +82,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn protocol_markers_all_occur_in_the_preamble() {
+        // The markers `cowproof lint` looks for in a packet (`packet-restates-protocol`) are
+        // phrases of this preamble. A marker that is not in it can never match a pasted
+        // protocol section. The check lives here, not in `cowproof-lint`: the preamble is this
+        // crate's file, `cowproof-core` (which owns the markers) is already a dependency, and
+        // `cowproof-lint`'s tests then read nothing outside their own crate.
+        for marker in cowproof_core::PROTOCOL_MARKERS {
+            assert!(
+                PREAMBLE.contains(marker),
+                "marker {marker:?} does not occur in the builder preamble"
+            );
+        }
+    }
+
+    #[test]
     fn test_prefix_version_stable() {
         // Same bytes, same hash
         let v1 = prefix_version();
