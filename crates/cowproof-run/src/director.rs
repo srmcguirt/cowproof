@@ -80,7 +80,7 @@ const SLOW_STEP: Duration = Duration::from_secs(1);
 /// busy. The director gives up on a lane after ten seconds (`SOCKET_TIMEOUT` in the CLI's
 /// `director_tools`), so this leaves it time to read an answer: a queue held that long is
 /// then said, and nothing is recorded, instead of the director getting silence.
-const LOCK_PATIENCE: Duration = Duration::from_secs(8);
+pub const LOCK_PATIENCE: Duration = Duration::from_secs(8);
 
 /// How often a request that found the queue held tries it again.
 const LOCK_POLL: Duration = Duration::from_millis(2);

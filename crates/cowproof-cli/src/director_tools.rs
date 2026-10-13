@@ -49,6 +49,13 @@ const MAX_RESPONSE: u64 = 1024 * 1024;
 /// that accepts and never answers must not hold a director tool call open.
 const SOCKET_TIMEOUT: Duration = Duration::from_secs(10);
 
+// A lane that waits for its queue answers "busy" after `LOCK_PATIENCE`; that answer must
+// reach the director before it gives up on the socket, or it would read as silence.
+const _: () = assert!(
+    cowproof_run::director::LOCK_PATIENCE.as_millis() + 1_000 < SOCKET_TIMEOUT.as_millis(),
+    "the lane's queue patience must leave the director time to read its answer"
+);
+
 /// How late this process's own timer must run, while it waits for a lane, to be named in the
 /// timeout message.
 const OWN_STALL: Duration = Duration::from_millis(500);
