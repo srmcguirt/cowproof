@@ -309,7 +309,7 @@ Signals, timers and process groups (step 13) do not fit any of the three; they a
 
 ### 6.4 Port packets in cowproof's processes
 
-**Status (2026-10-12): done for the first release (lane/port-packets).** The header, the seven lint rules, the replay gate, the held-out port cases and the capsule entry are built; the function adapters (6.1) followed in lane/port-adapters; whole-process capture followed in lane/port-exec (README "Process capture"). Where cowproof's implementation differs from the text below, the difference is named at the item:
+**Status (2026-10-12): done for the first release (lane/port-packets).** The header, the eight lint rules, the replay gate, the held-out port cases and the capsule entry are built; the function adapters (6.1) followed in lane/port-adapters; whole-process capture followed in lane/port-exec (README "Process capture"). Where cowproof's implementation differs from the text below, the difference is named at the item:
 
 - `kind` and `port` are parsed by `cowproof-core` (`Header`, `PortSpec`), strictly: an unknown key in `port`, `port.reference` or `port.parity` is an error; `kind: port` needs the object and a work packet may not have one. `cowproof-lint` runs the rules (`crates/cowproof-lint/src/port.rs`).
 - `port.parity.unordered_arrays` is a boolean (portkit's own option); `path_roots` is a list of path prefixes or `$ROOT`, `$HOME`, `$TMP`, `$SRC`: lint reads all of them, and the process adapter (`pk port exec`/`wrap`) substitutes the tokens (`path-roots` v1); another word starting with `$` is a header error. The `epsilon` default is `[port] epsilon` in the base `cowproof.toml` (0 when it has none); the lane's base commit is read, so a patch cannot raise it. The replay also passes `epsilon_rel = 0`.
@@ -332,6 +332,7 @@ Lint rules (added to `lanes-lint`'s rule table, `docs/packet-lint.md`). *Done: `
 | Rule | Catches |
 | --- | --- |
 | `port-cases-missing` | `port.cases` absent from the repository |
+| `port-adapter-missing` | the script file `port.reference.cmd` runs is absent from the repository, or its path is absolute or has `..` (a bare program or inline code names no file and is skipped) |
 | `port-fixtures-not-owned` | `port.fixtures` not covered by `owns` |
 | `port-reference-not-allowed` | a `wide: false` lane whose checks run the reference command without an `allow` entry (`lint_command_permission`, `lanes-lint` L339-361) |
 | `port-tool-unregistered` | a tool in `port.tools` with no registration target named in the packet body |

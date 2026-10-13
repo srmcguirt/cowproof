@@ -214,6 +214,11 @@ mod tests {
     }
 
     #[test]
+    fn test_preamble_tells_builders_to_give_mktemp_a_template() {
+        assert!(PREAMBLE.contains("mktemp \"$TMPDIR/name.XXXXXX\""));
+    }
+
+    #[test]
     fn test_preamble_tools_are_served() {
         // Every tool promised in the preamble must be in LANE_TOOLS
         for tool in LANE_TOOLS {

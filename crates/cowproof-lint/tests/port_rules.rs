@@ -1,4 +1,4 @@
-//! The seven lint rules of `kind: port` packets (portkit-integration.md, section 6.4): for
+//! The eight lint rules of `kind: port` packets (portkit-integration.md, section 6.4): for
 //! each, a packet that passes and one that fails, on a real directory of files.
 
 use cowproof_lint::{Finding, LintOptions, Severity, lint_packet, lint_packet_with};
@@ -26,6 +26,7 @@ fn repo() -> TempDir {
         r#"{"tool":"word_count","id":"001","input":{"text":"a b"},"expected":{"words":2}}"#,
     );
     put(root, ".portkit/plugins.toml", "");
+    put(root, "reference/wc.mjs", "");
     put(root, "crates/pk-wc/src/lib.rs", "");
     dir
 }
@@ -96,6 +97,127 @@ fn a_work_packet_is_never_checked_by_the_port_rules() {
     let work = json!({"id": "lane-a", "owns": ["crates/pk-wc/**"]});
     let findings = lint(dir.path(), &work, "");
     assert_eq!(rules(&findings), Vec::<&str>::new());
+}
+
+#[test]
+fn port_adapter_missing() {
+    let dir = repo();
+    // The adapter the clean packet runs exists, so there is nothing to report.
+    let present = header(|h| h["port"]["reference"]["cmd"] = json!("node reference/wc.mjs --flag"));
+    assert_eq!(rules(&lint(dir.path(), &present, BODY)), Vec::<&str>::new());
+    // A script the command names that is not a file is reported, with the rule and the path.
+    let missing = header(|h| h["port"]["reference"]["cmd"] = json!("node reference/nope.mjs"));
+    let findings = lint(dir.path(), &missing, BODY);
+    assert_eq!(rules(&findings), ["port-adapter-missing"], "{findings:?}");
+    let text = errors(&findings).join("\n");
+    assert!(text.contains("port-adapter-missing"), "{text}");
+    assert!(text.contains("reference/nope.mjs"), "{text}");
+    // A directory is not an adapter file.
+    let directory = header(|h| h["port"]["reference"]["cmd"] = json!("python3 reference"));
+    assert_eq!(
+        rules(&lint(dir.path(), &directory, BODY)),
+        ["port-adapter-missing"]
+    );
+    // Flags, assignments and a leading `env` are read past; a command that is itself a path
+    // is the file.
+    for (cmd, expected) in [
+        ("python3 -u reference/nope.py", "reference/nope.py"),
+        (
+            "node --import ./hook.mjs reference/nope.mjs",
+            "reference/nope.mjs",
+        ),
+        (
+            "TZ=UTC env node 'reference/nope.mjs' x",
+            "reference/nope.mjs",
+        ),
+        ("sh reference/nope.sh", "reference/nope.sh"),
+        ("./reference/nope.sh --x", "./reference/nope.sh"),
+    ] {
+        let h = header(|h| h["port"]["reference"]["cmd"] = json!(cmd));
+        let findings = lint(dir.path(), &h, BODY);
+        assert_eq!(
+            rules(&findings),
+            ["port-adapter-missing"],
+            "{cmd}: {findings:?}"
+        );
+        assert!(errors(&findings).join("\n").contains(expected), "{cmd}");
+    }
+    // The existing adapter, reached through the same shapes, passes.
+    for cmd in [
+        "node ./reference/wc.mjs",
+        "env TZ=UTC node reference/wc.mjs",
+        "node -r ./x.cjs reference/wc.mjs arg",
+        "./reference/wc.mjs",
+    ] {
+        let h = header(|h| h["port"]["reference"]["cmd"] = json!(cmd));
+        let findings = lint(dir.path(), &h, BODY);
+        assert_eq!(rules(&findings), Vec::<&str>::new(), "{cmd}: {findings:?}");
+    }
+}
+
+#[test]
+fn port_adapter_missing_skips_commands_with_no_file_to_name() {
+    let dir = repo();
+    for cmd in [
+        "sh -c 'node nope.mjs'",
+        "bash -c \"python3 nope.py\"",
+        "node -e 'process.exit(0)'",
+        "python3 -m adapter",
+        "cargo run --bin adapter",
+        "adapter-bin --serve",
+        "node $ADAPTER",
+        "node reference/*.mjs",
+        "node ~/adapter.mjs",
+        "node",
+    ] {
+        let h = header(|h| h["port"]["reference"]["cmd"] = json!(cmd));
+        let findings = lint(dir.path(), &h, BODY);
+        assert_eq!(rules(&findings), Vec::<&str>::new(), "{cmd}: {findings:?}");
+    }
+}
+
+#[test]
+fn port_adapter_missing_reports_a_path_outside_the_repository() {
+    let dir = repo();
+    // Even when the file exists (`reference/wc.mjs` does), an absolute or `..` path is not
+    // a path inside the repository.
+    let absolute = dir.path().join("reference/wc.mjs");
+    for cmd in [
+        "node ../escape.mjs".to_string(),
+        "node reference/../wc.mjs".to_string(),
+        "./../escape.mjs".to_string(),
+        format!("node {}", absolute.display()),
+        format!("{}", absolute.display()),
+    ] {
+        let h = header(|h| h["port"]["reference"]["cmd"] = json!(cmd));
+        let findings = lint(dir.path(), &h, BODY);
+        assert_eq!(
+            rules(&findings),
+            ["port-adapter-missing"],
+            "{cmd}: {findings:?}"
+        );
+        assert!(
+            errors(&findings)
+                .join("\n")
+                .contains("outside the repository"),
+            "{cmd}"
+        );
+    }
+}
+
+#[test]
+fn port_adapter_missing_reads_the_script_from_the_reference_cwd() {
+    let dir = repo();
+    put(dir.path(), "tools/ref/adapter.mjs", "");
+    let inside = header(|h| {
+        h["port"]["reference"] = json!({"cmd": "node adapter.mjs", "cwd": "tools/ref"});
+    });
+    assert_eq!(rules(&lint(dir.path(), &inside, BODY)), Vec::<&str>::new());
+    let missing = header(|h| {
+        h["port"]["reference"] = json!({"cmd": "node adapter.mjs", "cwd": "tools/other"});
+    });
+    let findings = lint(dir.path(), &missing, BODY);
+    assert_eq!(rules(&findings), ["port-adapter-missing"], "{findings:?}");
 }
 
 #[test]

@@ -325,11 +325,12 @@ The header parses strictly: `kind` is `work` (the default) or `port`, a `port` o
 | `port.tools` | the tool names the registry must answer; `not_ported` must be 0 for every one |
 | `port.parity` | `epsilon` (default: `[port] epsilon` in the base `cowproof.toml`, 0 when it has none), `ignore_paths` (JSON Pointers), `unordered_arrays`, `path_roots` (the tokens `$ROOT`, `$HOME`, `$TMP`, `$SRC` a process capture substitutes, or plain path prefixes; any other word starting with `$` is an error) |
 
-`cowproof lint` checks seven more rules for a port packet (`--escalations <lane>/control/escalations.jsonl` adds the lane's rulings to `port-accepted-unruled`):
+`cowproof lint` checks eight more rules for a port packet (`--escalations <lane>/control/escalations.jsonl` adds the lane's rulings to `port-accepted-unruled`):
 
 | Rule | Level | Fires when |
 | --- | --- | --- |
 | `port-cases-missing` | error | `port.cases` is not a file in the repository |
+| `port-adapter-missing` | error | the script file `port.reference.cmd` runs (`node adapter.mjs ...`, `python3 reference/adapter.py ...`, `./run.sh`) is not a file in the repository (under `port.reference.cwd` when set), or its path is absolute or has `..`; a bare program (`cargo run`) or inline code (`sh -c '...'`, `node -e`) names no file and is skipped |
 | `port-fixtures-not-owned` | error | `owns` does not reach `<fixtures>/<tool>/<id>.json` for some tool |
 | `port-reference-not-allowed` | error | a `wide: false` packet has a check that runs `port.reference.cmd` and no `allow` entry (or base allowlist entry) matches it |
 | `port-tool-unregistered` | error | the packet text does not name a tool in `port.tools`, or names no plugin manifest (`.portkit/plugins.toml`) that `owns` covers |

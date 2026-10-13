@@ -1,11 +1,12 @@
 //! The lint rules of `kind: port` packets (portkit-integration.md, section 6.4).
 //!
-//! Seven rules, none of which runs anything: they read the header, the packet text and the
+//! Eight rules, none of which runs anything: they read the header, the packet text and the
 //! files a port names. `port-nondeterministic-output` is a heuristic and only warns.
 //!
 //! | Rule | Level | Fires when |
 //! | --- | --- | --- |
 //! | `port-cases-missing` | error | `port.cases` is not a file in the repository |
+//! | `port-adapter-missing` | error | the script file `port.reference.cmd` runs (`node adapter.mjs ...`, `./run.sh`) is not a file in the repository, or its path is absolute or has `..` |
 //! | `port-fixtures-not-owned` | error | `owns` does not cover `<port.fixtures>/<tool>/<id>.json` for every tool |
 //! | `port-reference-not-allowed` | error | a `wide: false` packet has a check that runs `port.reference.cmd` and no `allow` entry matches the check |
 //! | `port-tool-unregistered` | error | a tool in `port.tools` is not named in the packet text, or the text names no owned plugin manifest to register it in |
@@ -25,7 +26,7 @@ use cowproof_core::{Header, PortSpec, glob_matches};
 use regex::Regex;
 use serde_json::Value;
 use std::fs;
-use std::path::Path;
+use std::path::{Component, Path};
 
 /// The tokens a process capture substitutes for a run's directories (`PATH_ROOT_TOKENS`).
 const ROOT_TOKENS: [&str; 4] = ["$ROOT", "$HOME", "$TMP", "$SRC"];
@@ -54,6 +55,7 @@ pub(crate) fn lint_port(
         return;
     };
     cases_missing(port, repo_root, findings);
+    adapter_missing(port, repo_root, findings);
     fixtures_not_owned(header, port, findings);
     reference_not_allowed(header, port, packet_text, findings);
     tool_unregistered(header, port, packet_text, findings);
@@ -70,6 +72,205 @@ fn cases_missing(port: &PortSpec, repo_root: &Path, findings: &mut Vec<Finding>)
             format!(
                 "port.cases {:?} is not a file in the repository; commit the cases file the fixtures are captured from",
                 port.cases
+            ),
+        ));
+    }
+}
+
+/// Programs that run a script file they are given as an argument. A bare program that is not
+/// one of these (`cargo`, `make`, `sh -c '...'` aside) has no file the lint can name.
+const INTERPRETERS: [&str; 17] = [
+    "node", "nodejs", "deno", "bun", "tsx", "ts-node", "python", "python3", "ruby", "perl", "php",
+    "bash", "sh", "dash", "zsh", "ksh", "fish",
+];
+
+/// Flags that take code, a module or a command in place of a script file: with one of
+/// these the command runs no file.
+const INLINE_FLAGS: [&str; 8] = [
+    "-c",
+    "-e",
+    "-p",
+    "-m",
+    "-E",
+    "--eval",
+    "--print",
+    "--command",
+];
+
+/// Flags that take a value in the next word, so the value is not the script.
+const VALUE_FLAGS: [&str; 10] = [
+    "-r",
+    "--require",
+    "--import",
+    "--loader",
+    "--experimental-loader",
+    "--env-file",
+    "-W",
+    "-X",
+    "--conditions",
+    "-C",
+];
+
+/// One word of a shell command line, and whether the shell would expand it (so its value is
+/// not the text).
+struct Word {
+    text: String,
+    dynamic: bool,
+}
+
+/// The words of the first simple command of `cmd`: quotes and backslashes are removed, and
+/// the reading stops at an unquoted operator (`|`, `&`, `;`, `<`, `>`, `(`, `)`, a newline).
+/// An unterminated quote gives no words.
+fn shell_words(cmd: &str) -> Vec<Word> {
+    let mut words = Vec::new();
+    let mut text = String::new();
+    let mut dynamic = false;
+    let mut open = false;
+    let mut chars = cmd.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\'' => {
+                open = true;
+                loop {
+                    match chars.next() {
+                        Some('\'') => break,
+                        Some(c) => text.push(c),
+                        None => return Vec::new(),
+                    }
+                }
+            }
+            '"' => {
+                open = true;
+                loop {
+                    match chars.next() {
+                        Some('"') => break,
+                        Some('\\') if matches!(chars.peek(), Some('"' | '\\' | '$' | '`')) => {
+                            text.push(chars.next().unwrap_or('\\'));
+                        }
+                        Some(c) => {
+                            dynamic |= c == '$' || c == '`';
+                            text.push(c);
+                        }
+                        None => return Vec::new(),
+                    }
+                }
+            }
+            '\\' => {
+                open = true;
+                match chars.next() {
+                    Some(c) => text.push(c),
+                    None => return Vec::new(),
+                }
+            }
+            c if c.is_whitespace() && c != '\n' => {
+                if open {
+                    words.push(Word {
+                        text: std::mem::take(&mut text),
+                        dynamic,
+                    });
+                    open = false;
+                    dynamic = false;
+                }
+            }
+            '|' | '&' | ';' | '<' | '>' | '(' | ')' | '\n' => break,
+            c => {
+                open = true;
+                dynamic |=
+                    matches!(c, '$' | '`' | '*' | '?' | '[' | '{') || (c == '~' && text.is_empty());
+                text.push(c);
+            }
+        }
+    }
+    if open {
+        words.push(Word { text, dynamic });
+    }
+    words
+}
+
+/// The file the reference command runs, as written in the command: the first argument after
+/// an interpreter (`node adapter.mjs`, `python3 -u reference/adapter.py`), or the command
+/// itself when it is a path (`./adapter.sh`). `None` when there is no file to name: a bare
+/// program on `PATH` (`cargo run`), inline code (`sh -c '...'`, `node -e ...`), or a word
+/// the shell would expand.
+fn adapter_script(cmd: &str) -> Option<String> {
+    let words = shell_words(cmd);
+    let mut words = words.iter().peekable();
+    // Leading `NAME=value` assignments and an `env` in front of the program.
+    while let Some(word) = words.peek() {
+        let is_assignment = word.text.split_once('=').is_some_and(|(name, _)| {
+            !name.is_empty()
+                && !name.starts_with(|c: char| c.is_ascii_digit())
+                && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        });
+        if is_assignment || word.text == "env" {
+            words.next();
+        } else {
+            break;
+        }
+    }
+    let program = words.next()?;
+    if program.dynamic {
+        return None;
+    }
+    let basename = program.text.rsplit('/').next().unwrap_or_default();
+    let versioned = basename
+        .strip_prefix("python")
+        .is_some_and(|v| !v.is_empty() && v.chars().all(|c| c.is_ascii_digit() || c == '.'));
+    if !(INTERPRETERS.contains(&basename) || versioned) {
+        // Not an interpreter: the command is the file when it is a path.
+        return program.text.contains('/').then(|| program.text.clone());
+    }
+    while let Some(word) = words.next() {
+        if word.dynamic {
+            return None;
+        }
+        let flag = word.text.as_str();
+        if INLINE_FLAGS.contains(&flag)
+            || flag.starts_with("--eval=")
+            || flag.starts_with("--print=")
+        {
+            return None;
+        }
+        if VALUE_FLAGS.contains(&flag) {
+            words.next();
+        } else if !flag.starts_with('-') {
+            return Some(word.text.clone());
+        }
+    }
+    None
+}
+
+fn adapter_missing(port: &PortSpec, repo_root: &Path, findings: &mut Vec<Finding>) {
+    let Some(reference) = &port.reference else {
+        return;
+    };
+    let Some(script) = adapter_script(&reference.cmd) else {
+        return;
+    };
+    // The reference runs with the repository, or its `cwd` folder, as the working directory.
+    let relative = match &reference.cwd {
+        Some(cwd) if !Path::new(&script).is_absolute() => Path::new(cwd).join(&script),
+        _ => Path::new(&script).to_path_buf(),
+    };
+    if relative.is_absolute()
+        || relative
+            .components()
+            .any(|c| matches!(c, Component::ParentDir | Component::RootDir))
+    {
+        findings.push(error(
+            "port-adapter-missing",
+            None,
+            format!(
+                "port.reference.cmd runs {script:?}, a path outside the repository (absolute or with ..); commit the adapter inside the repository and name it relative"
+            ),
+        ));
+    } else if !repo_root.join(&relative).is_file() {
+        findings.push(error(
+            "port-adapter-missing",
+            None,
+            format!(
+                "port.reference.cmd runs {script:?}, which is not a file in the repository ({}); commit the adapter the reference command runs",
+                relative.display()
             ),
         ));
     }

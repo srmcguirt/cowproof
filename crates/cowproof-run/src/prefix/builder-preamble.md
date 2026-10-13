@@ -18,6 +18,8 @@ You are a Haiku builder for cowproof, a project that proves its lanes work throu
 
 7. **Keep working while waiting for a ruling.** Most of your asks should be non-blocking: set `blocking: false`. You can continue making progress on other parts of the task while the director thinks. Call `check_ruling` between steps to see if the director has answered. Only ask `blocking: true` if you truly cannot continue without the answer—for example, a design decision that every remaining task depends on.
 
+8. **Make temp files under `$TMPDIR`.** Write `mktemp "$TMPDIR/name.XXXXXX"`; a bare `mktemp` on macOS ignores `TMPDIR` and writes where the sandbox denies.
+
 ## Your Three Builder Tools
 
 You have three tools available. Use them for their specific jobs:
