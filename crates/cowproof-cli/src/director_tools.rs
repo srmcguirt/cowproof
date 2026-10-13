@@ -29,12 +29,14 @@ use crate::watch::{
 };
 use anyhow::{Result, anyhow};
 use cowproof_run::escalate::{EscalationRecord, read_escalations};
+use cowproof_run::stall;
 use portkit_core::budget::Budget;
 use portkit_core::{Error, Registry, Tool, ToolSpec, async_trait};
 use portkit_mcp::{McpServer, ServerInfo};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
@@ -45,6 +47,10 @@ const MAX_RESPONSE: u64 = 1024 * 1024;
 /// How long one request to a lane's socket may take, connect to reply. A lane
 /// that accepts and never answers must not hold a director tool call open.
 const SOCKET_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How late this process's own timer must run, while it waits for a lane, to be named in the
+/// timeout message.
+const OWN_STALL: Duration = Duration::from_millis(500);
 
 /// A director's ruling on an escalation: the four verdict kinds.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -117,11 +123,25 @@ async fn send(lanes_root: &Path, lane: &str, request: &Value) -> Result<Value, S
     if !socket.exists() {
         return Err(SendError::NotRunning(lane.to_string()));
     }
+    // Measures this process's own timers while it waits, so a miss says whose clock stalled.
+    let own_late_ms = Arc::new(AtomicU64::new(0));
+    let _watch = {
+        let own_late_ms = own_late_ms.clone();
+        stall::watch_with(stall::TICK, OWN_STALL, move |s| {
+            own_late_ms.fetch_max(s.runtime_late.as_millis() as u64, Ordering::Relaxed);
+        })
+    };
     let reply = tokio::time::timeout(SOCKET_TIMEOUT, round_trip(&socket, request))
         .await
         .map_err(|_| {
+            let own = own_late_ms.load(Ordering::Relaxed);
+            let own = if own == 0 {
+                String::new()
+            } else {
+                format!(" (this process's own timers ran up to {own} ms late meanwhile)")
+            };
             SendError::Failed(format!(
-                "lane {lane} did not answer within {} s",
+                "lane {lane} did not answer within {} s{own}",
                 SOCKET_TIMEOUT.as_secs()
             ))
         })?

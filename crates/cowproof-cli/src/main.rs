@@ -410,8 +410,30 @@ enum HostAction {
     Setup(host_setup::SetupArgs),
 }
 
-#[tokio::main]
-async fn main() -> std::process::ExitCode {
+/// The fewest worker threads the runtime gets. Tokio's default is the host's CPU count (which a
+/// container's CPU quota lowers), and a runner on one or two workers shares them between the
+/// builder's stream, the proxy, the tools server and the checks, so one slow task would hold
+/// the rest up.
+const MIN_WORKER_THREADS: usize = 4;
+
+fn main() -> std::process::ExitCode {
+    let workers = std::thread::available_parallelism()
+        .map_or(MIN_WORKER_THREADS, std::num::NonZeroUsize::get)
+        .max(MIN_WORKER_THREADS);
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(workers)
+        .enable_all()
+        .build();
+    match runtime {
+        Ok(runtime) => runtime.block_on(async_main()),
+        Err(e) => {
+            eprintln!("Error: cannot start the async runtime: {e}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+async fn async_main() -> std::process::ExitCode {
     match Args::parse().command {
         // The portkit commands own their exit codes, so they bypass `dispatch`.
         Action::Pk { args } => cowproof_cli::pk::run_via_cowproof(args).await,

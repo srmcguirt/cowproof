@@ -23,6 +23,7 @@ pub mod models;
 pub mod opencode;
 pub mod prefix;
 pub mod proxy;
+pub mod stall;
 pub mod stream;
 pub mod tools;
 pub mod wire;

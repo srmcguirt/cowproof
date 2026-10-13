@@ -78,7 +78,7 @@ use cowproof_run::{
     models::{ModelPrice, PriceRecord},
     prefix::{assemble_prompt, prefix_version},
     proxy::{MetricsLog, Provider, ProxyConfig, ProxyServer},
-    render_macos_profile, sandbox_command,
+    render_macos_profile, sandbox_command, stall,
     stream::{MeterSummary, StreamMeter, UsageProbe},
     tools::{
         self, CheckEnd, CheckOutcome, CheckTable, LiveChecks, RunCheck, SessionEnd,
@@ -3632,7 +3632,7 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
         .context("resolving the tools socket")?;
     let director_sock_path = layout.control.join("director.sock");
     let director_listener =
-        director::bind(&director_sock_path).context("binding the director control socket")?;
+        director::bind_std(&director_sock_path).context("binding the director control socket")?;
     // Set mode to 0600 (read-write for owner only)
     let permissions = std::fs::Permissions::from_mode(0o600);
     std::fs::set_permissions(&director_sock_path, permissions)
@@ -3691,18 +3691,20 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
     // The director's rulings wake the resume loop below (D9, D25). The queue,
     // not the channel, is the truth: the loop re-reads it on every wake.
     let (verdict_tx, mut verdict_rx) = tokio::sync::mpsc::unbounded_channel();
-    let _director = AbortOnDrop(tokio::spawn({
+    // On a thread of its own (`director::serve_on_thread`): a ruling, a stop or a note reaches
+    // the lane whatever the main runtime's workers are doing.
+    let _director = director::serve_on_thread(
+        director_listener,
+        header.id.clone(),
+        queue.clone(),
+        Some(verdict_tx),
+    )
+    .context("serving the director control socket")?;
+    // Says so on stderr when the runtime (or the host) stops running this process for seconds.
+    let _stall_watch = stall::watch({
         let lane_id = header.id.clone();
-        let director_queue = queue.clone();
-        let verdict_tx = Some(verdict_tx);
-        async move {
-            if let Err(e) =
-                director::serve(director_listener, lane_id, director_queue, verdict_tx).await
-            {
-                eprintln!("director control socket stopped: {e}");
-            }
-        }
-    }));
+        move |stall| eprintln!("[{lane_id}] {}", stall.describe())
+    });
 
     // 4b. A remote lane (D27): the host's setup, in the order that matters. Master, doctor
     // (a failing one stops here, before any lane exists on the host), prepare, then the two
