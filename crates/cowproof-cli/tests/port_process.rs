@@ -552,9 +552,16 @@ fn a_process_id_stays_unpinned_and_the_capture_refuses_a_script_that_prints_one(
     project.write("ref/pid.sh", "#!/bin/sh\necho \"pid=$$\"\n");
     let cases = json!({"tool": "pid", "id": "one", "input": {}}).to_string();
     let out = project.exec(r#"sh "$PORTKIT_SRC/ref/pid.sh""#, &cases, &ROOTS);
-    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
-    assert!(text(&out).contains("not deterministic"), "{}", text(&out));
-    assert!(!project.path().join("fixtures/pid/one.json").exists());
+    if cfg!(target_os = "linux") {
+        // Each run has its own PID namespace under bubblewrap, so `$$` repeats and the
+        // capture is deterministic: nothing pins it, the namespace does.
+        assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+        assert!(project.path().join("fixtures/pid/one.json").exists());
+    } else {
+        assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+        assert!(text(&out).contains("not deterministic"), "{}", text(&out));
+        assert!(!project.path().join("fixtures/pid/one.json").exists());
+    }
 }
 
 #[test]
