@@ -774,9 +774,16 @@ fn retagging_a_base_fixture_for_another_platform_cannot_skip_it() {
     );
     let gates = gates(&lane);
     let evidence = gate(&gates, "port_replay")["evidence"].to_string();
+    // The director's held-out cases cover `shout` on this platform, so the platform rule does
+    // not also fire (coverage counts the base's fixtures and the held-out cases); the gate
+    // fails because nothing of the tool was replayed and because the base fixture changed.
     assert!(
-        evidence.contains(&format!(
-            "tool \\\"shout\\\" has no fixture for {host} (its fixtures cover {other}), so it was never proved on this platform"
+        evidence.contains("no fixture of tool \\\"shout\\\" was replayed"),
+        "{evidence}"
+    );
+    assert!(
+        !evidence.contains(&format!(
+            "has no fixture for {host} (its fixtures cover {other})"
         )),
         "{evidence}"
     );

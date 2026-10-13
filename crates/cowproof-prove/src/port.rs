@@ -620,6 +620,15 @@ fn judge(
             None => entry.0 = true,
         }
     }
+    // The platforms the tool's fixtures on disk are tagged for, to name in the failure (a lane
+    // that retagged and renamed a base fixture leaves nothing of the base under its old key).
+    for ((tool, _), platform) in cases {
+        if let (Some(entry), Some(p)) = (covered.get_mut(tool.as_str()), platform.as_deref())
+            && !runs_here(platform)
+        {
+            entry.1.insert(p);
+        }
+    }
     for (tool, (here, elsewhere)) in covered {
         let in_scope = tools.is_empty() || tools.iter().any(|t| t == tool);
         let held = held_out_tools.iter().any(|t| t == tool);
