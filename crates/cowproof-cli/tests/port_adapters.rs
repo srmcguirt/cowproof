@@ -626,7 +626,11 @@ fn the_clock_and_randomness_are_pinned_when_asked_and_left_alone_otherwise() {
             one_json_line(&PYTHON.tool(PYTHON_CLOCK, "dice", json!({}), &[("PORTKIT_SEED", "42")]));
         assert_eq!(
             a,
-            json!([0.6394267984578837, 0.025010755222666936, 0.27502931836911926])
+            json!([
+                0.6394267984578837,
+                0.025010755222666936,
+                0.27502931836911926
+            ])
         );
         let b = PYTHON.tool(PYTHON_CLOCK, "dice", json!({}), &[("PORTKIT_SEED", "42")]);
         assert_eq!(one_json_line(&b), a);
@@ -793,7 +797,12 @@ fn crypto_and_secrets_draw_one_seeded_stream_and_are_left_alone_unseeded() {
         assert_eq!(first("first_uuid"), json!(golden_uuid));
         // randomBytes and randomInt with callbacks draw from it too.
         let cb = |seed: &str| {
-            NODE.tool(NODE_ENTROPY, "callbacks", json!({}), &[("PORTKIT_SEED", seed)])
+            NODE.tool(
+                NODE_ENTROPY,
+                "callbacks",
+                json!({}),
+                &[("PORTKIT_SEED", seed)],
+            )
         };
         let (x, y, z) = (cb("42"), cb("42"), cb("43"));
         assert_eq!(x.stdout, y.stdout);
@@ -931,8 +940,20 @@ fn python_monotonic_clocks_start_at_zero_and_follow_the_pinned_sleep() {
         assert_eq!(snap[5].as_u64(), Some(wall_ns), "{snap}");
     };
     check(&v["a"], 0.0, 0, 1767315845.0, 1_767_315_845_000_000_000);
-    check(&v["b"], 1.5, 1_500_000_000, 1767315846.5, 1_767_315_846_500_000_000);
-    check(&v["c"], 3601.5, 3_601_500_000_000, 1767319446.5, 1_767_319_446_500_000_000);
+    check(
+        &v["b"],
+        1.5,
+        1_500_000_000,
+        1767315846.5,
+        1_767_315_846_500_000_000,
+    );
+    check(
+        &v["c"],
+        3601.5,
+        3_601_500_000_000,
+        1767319446.5,
+        1_767_319_446_500_000_000,
+    );
     assert_eq!(v["now"], "2026-01-02T02:04:06.500000");
     // Sleep keeps its refusals.
     let refused = one_json_line(&PYTHON.tool(
@@ -991,7 +1012,12 @@ fn node_monotonic_clocks_start_at_zero_and_follow_the_pinned_timers() {
     let out = NODE.tool(NODE_MONOTONIC, "clock", json!({}), &[("PORTKIT_NOW", NOW)]);
     let v = one_json_line(&out);
     let step = |elapsed_ms: u64| {
-        json!([elapsed_ms, [0, elapsed_ms * 1_000_000], elapsed_ms * 1_000_000, MS + elapsed_ms])
+        json!([
+            elapsed_ms,
+            [0, elapsed_ms * 1_000_000],
+            elapsed_ms * 1_000_000,
+            MS + elapsed_ms
+        ])
     };
     assert_eq!(v["a"], step(0));
     assert_eq!(v["b"], step(50));
@@ -1005,7 +1031,10 @@ fn node_monotonic_clocks_start_at_zero_and_follow_the_pinned_timers() {
     // Without the pin the real clocks stay: not zero, and the 50 ms timer really waits.
     let real = one_json_line(&NODE.tool(NODE_MONOTONIC, "real", json!({}), &[]));
     assert!(real["a"].as_f64().unwrap() > 0.0, "{real}");
-    assert!(real["b"].as_f64().unwrap() - real["a"].as_f64().unwrap() >= 45.0, "{real}");
+    assert!(
+        real["b"].as_f64().unwrap() - real["a"].as_f64().unwrap() >= 45.0,
+        "{real}"
+    );
     assert_ne!(real["h"].as_f64(), Some(0.0));
 }
 
@@ -1062,7 +1091,8 @@ fn numpy_is_seeded_when_it_can_be_imported_and_never_fails_the_capture_when_it_c
         eprintln!("SKIP: numpy is not importable here; the seeded-numpy assertions did not run");
         return;
     }
-    let run = |envs: &[(&str, &str)]| one_json_line(&PYTHON.tool(PYTHON_NUMPY, "draws", json!({}), envs));
+    let run =
+        |envs: &[(&str, &str)]| one_json_line(&PYTHON.tool(PYTHON_NUMPY, "draws", json!({}), envs));
     let a = run(&[("PORTKIT_SEED", "42")]);
     let b = run(&[("PORTKIT_SEED", "42")]);
     let c = run(&[("PORTKIT_SEED", "43")]);
