@@ -335,14 +335,23 @@ pub fn unfetched_notes(tree: &Path) -> Vec<String> {
 
 /// `.npmrc` with every credential removed, and how many lines had one. A line is dropped when
 /// its key ends in `_authToken`, `_auth` or `_password` (the forms `_authToken=`,
-/// `//host/:_authToken=` and `@scope:_password=`); a `registry=` URL with `user:pass@` in it
-/// keeps the URL without the credentials. The fetch gets this copy and nothing from the
-/// original, and the entry holds none of it.
+/// `//host/:_authToken=` and `@scope:_password=`) or in npm's client-certificate settings
+/// `key` (which can hold an inline PEM private key), `keyfile`, `cert` and `certfile`, plain
+/// or scoped, in any case. A PEM block that continues over the following lines goes with its
+/// first line. A `registry=` URL with `user:pass@` in it keeps the URL without the
+/// credentials. The fetch gets this copy and nothing from the original, and the entry holds
+/// none of it: a registry that needs a token or a client certificate is out of reach.
 pub fn strip_npmrc_auth(text: &str) -> (String, usize) {
     let mut out = String::new();
     let mut stripped = 0;
+    // Inside a PEM block that a dropped line opened and did not close.
+    let mut in_pem = false;
     for line in text.lines() {
         let trimmed = line.trim();
+        if in_pem {
+            in_pem = !trimmed.contains("-----END");
+            continue;
+        }
         let Some((key, value)) = trimmed.split_once('=') else {
             out.push_str(line);
             out.push('\n');
@@ -359,8 +368,12 @@ pub fn strip_npmrc_auth(text: &str) -> (String, usize) {
             .next()
             .unwrap_or("")
             .to_ascii_lowercase();
-        if matches!(last.as_str(), "_auth" | "_authtoken" | "_password") {
+        if matches!(
+            last.as_str(),
+            "_auth" | "_authtoken" | "_password" | "key" | "keyfile" | "cert" | "certfile"
+        ) {
             stripped += 1;
+            in_pem = value.contains("-----BEGIN") && !value.contains("-----END");
             continue;
         }
         match drop_url_credentials(value) {
@@ -1471,6 +1484,42 @@ mod tests {
         ] {
             assert!(clean.contains(kept), "{kept} was lost:\n{clean}");
         }
+    }
+
+    #[test]
+    fn the_npmrc_the_fetch_gets_has_no_client_certificate_setting_in_it() {
+        // The PEM header is built, not written, so the source holds no key-shaped literal.
+        let (begin, end) = (
+            concat!("-----BEGIN ", "PRIVATE KEY-----"),
+            "-----END PRIVATE KEY-----",
+        );
+        let rc = format!(
+            "registry=https://reg.example/npm/\n\
+             key=\"{begin}\\nPEMBODY1\\n{end}\"\n\
+             //reg.example/:KeyFile=/secret/KEYPATH\n\
+             //reg.example:8443/:key={begin}\n\
+             PEMBODY2\n\
+             {end}\n\
+             certfile=/CERTPATH\n\
+             @corp:cert=CERTPEM\n\
+             always-auth=true\n"
+        );
+        let (clean, stripped) = strip_npmrc_auth(&rc);
+        for gone in [
+            "PEMBODY1",
+            "PEMBODY2",
+            "KEYPATH",
+            "CERTPATH",
+            "CERTPEM",
+            "PRIVATE KEY",
+        ] {
+            assert!(!clean.contains(gone), "{gone} survived:\n{clean}");
+        }
+        assert_eq!(stripped, 5, "{clean}");
+        assert_eq!(
+            clean,
+            "registry=https://reg.example/npm/\nalways-auth=true\n"
+        );
     }
 
     #[test]

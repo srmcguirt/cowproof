@@ -662,3 +662,57 @@ fn a_registry_the_base_npmrc_names_is_reached_and_one_it_does_not_name_is_refuse
     );
     assert_eq!(refused.accepted.load(Ordering::SeqCst), 0);
 }
+
+#[test]
+fn npm_client_certificate_settings_reach_neither_the_fetch_nor_the_entry() {
+    if !sandbox_available() {
+        return;
+    }
+    let cache = var_tmp("cp-npm-cache-");
+    let (_npm_dir, npm) = fake_npm(FAKE_NPM_OK);
+    let mut files = npm_project();
+    // The PEM header is built, not written, so the source holds no key-shaped literal.
+    let begin = concat!("-----BEGIN ", "PRIVATE KEY-----");
+    let npmrc = format!(
+        "registry=https://registry.npmjs.org/\n\
+         key=\"{begin}\\nPEMBODY-0123\\n-----END PRIVATE KEY-----\"\n\
+         //reg.example/:keyfile=/x/KEYFILE-PATH\n\
+         certfile=/y/CERTFILE-PATH\n\
+         always-auth=true\n"
+    );
+    files.push((".npmrc", &npmrc));
+    let lane = new_lane(&files, cache.path(), &npm);
+    let held = var_tmp("cp-npm-held-");
+    run_with(&lane, &heldout(held.path(), NEEDS_MODULES), 0);
+
+    let c = capsule(&lane);
+    let e = entry(cache.path(), &c);
+    let seen = fs::read_to_string(e.join("npm/cache/npmrc.txt")).unwrap();
+    assert!(
+        seen.contains("registry=https://registry.npmjs.org/"),
+        "{seen}"
+    );
+    for gone in [
+        "PRIVATE KEY",
+        "PEMBODY-0123",
+        "keyfile",
+        "KEYFILE-PATH",
+        "certfile",
+        "CERTFILE-PATH",
+    ] {
+        assert!(!seen.contains(gone), "{gone} reached the fake:\n{seen}");
+    }
+    for file in files_under(&e) {
+        let text = String::from_utf8_lossy(&fs::read(&file).unwrap()).into_owned();
+        for gone in ["PEMBODY-0123", "KEYFILE-PATH", "CERTFILE-PATH"] {
+            assert!(!text.contains(gone), "{} holds {gone}", file.display());
+        }
+    }
+    assert!(
+        c.dependency_fetch_notes
+            .iter()
+            .any(|n| n.contains("3 credential line(s) of .npmrc were not used")),
+        "{:?}",
+        c.dependency_fetch_notes
+    );
+}
