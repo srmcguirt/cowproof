@@ -4797,6 +4797,7 @@ async fn replay_and_gate(
         Ok(Some(fetch)) => {
             capsule.dependency_cache_key = Some(fetch.key.clone());
             capsule.dependency_fetch_outcome = Some(fetch.outcome.name().to_string());
+            capsule.dependency_fetch_resolve = fetch.resolve_override.clone();
             match fetch.outcome {
                 FetchOutcome::Failed(why) => {
                     fetch_failed = true;

@@ -283,9 +283,29 @@ fn the_default_fetch_reaches_an_allowed_registry_host_through_the_proxy() {
     command.env_remove("COWPROOF_FETCH_NETWORK");
     let out = common::output(&mut command);
     assert_eq!(out.status.code(), Some(0), "cowproof run:\n{}", text(&out));
+    // The testing hook is loud and recorded: one warning line, and the capsule says so.
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    let warnings: Vec<&str> = stderr
+        .lines()
+        .filter(|l| l.contains("COWPROOF_FETCH_RESOLVE is set"))
+        .collect();
+    assert_eq!(warnings.len(), 1, "{}", text(&out));
+    assert!(
+        warnings[0].contains(&format!("index.crates.io={}", registry.addr))
+            && warnings[0].contains("(testing only)"),
+        "{}",
+        warnings[0]
+    );
     assert_eq!(lane.verdict()["verdict"], "proved", "{}", text(&out));
     let c = capsule(&lane);
     assert_eq!(c.dependency_fetch_outcome.as_deref(), Some("fetched"));
+    assert_eq!(
+        c.dependency_fetch_resolve.as_deref(),
+        Some(format!("index.crates.io={}", registry.addr).as_str()),
+        "the capsule records that the hook was set"
+    );
+    let json = fs::read_to_string(lane.capsule_dir().join("capsule.json")).unwrap();
+    assert!(json.contains("\"dependency_fetch_resolve\""), "{json}");
     let key = c.dependency_cache_key.unwrap();
     assert_eq!(
         fs::read_to_string(
@@ -401,4 +421,38 @@ fn a_fetch_hosts_the_patch_adds_is_ignored_by_the_allowlist() {
         "the patch's host was reached"
     );
     assert_eq!(lane.verdict()["verdict"], "infrastructure");
+}
+
+#[test]
+fn a_resolve_hook_target_that_is_not_loopback_fails_the_fetch_naming_the_variable() {
+    if !sandbox_available() {
+        return;
+    }
+    let cache = var_tmp("cp-fe-cache-");
+    let fake = var_tmp("cp-fe-cargo-");
+    let cargo = fake_cargo(fake.path(), &tunnel_to("index.crates.io"));
+    for bad in [
+        "index.crates.io=10.0.0.1:443",
+        "index.crates.io=93.184.216.34:443",
+        "index.crates.io=localhost:443",
+    ] {
+        let mut lane = lane(cache.path(), &cargo, "registry", &[], &run_checks(&["ok"]));
+        lane.set_env("COWPROOF_FETCH_RESOLVE", bad);
+        let out = run(&lane, 4);
+        let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+        assert!(
+            stdout.contains("infrastructure")
+                && stdout.contains("COWPROOF_FETCH_RESOLVE")
+                && stdout.contains("loopback"),
+            "{bad}: {}",
+            text(&out)
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+        assert!(
+            !stderr.contains("COWPROOF_FETCH_RESOLVE is set"),
+            "an invalid value must not read as accepted: {}",
+            text(&out)
+        );
+        assert!(entries(&cache.path().join("deps")).is_empty(), "{bad}");
+    }
 }

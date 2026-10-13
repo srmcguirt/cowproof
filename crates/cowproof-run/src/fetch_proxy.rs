@@ -252,27 +252,49 @@ impl Resolver {
         Self::default()
     }
 
-    /// Connect `host` to `addr` instead of looking it up.
+    /// Connect `host` to `addr` instead of looking it up. `addr` must be a loopback address
+    /// (`127.0.0.0/8` or `::1`): a fixed address can send an allowed name to a fake on this
+    /// machine and nowhere else, whoever sets it.
     pub fn with_fixed(mut self, host: &str, addr: SocketAddr) -> Result<Self> {
+        if !addr.ip().is_loopback() {
+            bail!("{addr} is not a loopback address (127.0.0.0/8 or ::1)");
+        }
         self.fixed.insert(normalize_host(host)?, addr);
         Ok(self)
     }
 
-    /// `host=ip:port[,host=ip:port...]`, the form of `COWPROOF_FETCH_RESOLVE`. Empty is the
-    /// system resolver.
+    /// `host=ip:port[,host=ip:port...]`, the form of `COWPROOF_FETCH_RESOLVE`, a testing
+    /// hook. Every address must be a loopback `ip:port`; a name, or any other address, is an
+    /// error. Empty is the system resolver.
     pub fn parse(spec: &str) -> Result<Self> {
         let mut resolver = Self::system();
         for entry in spec.split(',').map(str::trim).filter(|e| !e.is_empty()) {
             let (host, addr) = entry
                 .split_once('=')
                 .with_context(|| format!("{entry:?} is not host=ip:port"))?;
-            let addr: SocketAddr = addr
-                .trim()
-                .parse()
-                .with_context(|| format!("{addr:?} is not an ip:port"))?;
-            resolver = resolver.with_fixed(host, addr)?;
+            let addr: SocketAddr = addr.trim().parse().with_context(|| {
+                format!("{addr:?} is not a loopback ip:port (an address, not a name)")
+            })?;
+            resolver = resolver
+                .with_fixed(host, addr)
+                .with_context(|| format!("{entry:?}"))?;
         }
         Ok(resolver)
+    }
+
+    /// The fixed addresses as the `host=ip:port,...` text [`Resolver::parse`] reads, or `None`
+    /// when there are none (the system resolver for every name).
+    pub fn spec(&self) -> Option<String> {
+        if self.fixed.is_empty() {
+            return None;
+        }
+        Some(
+            self.fixed
+                .iter()
+                .map(|(host, addr)| format!("{host}={addr}"))
+                .collect::<Vec<_>>()
+                .join(","),
+        )
     }
 
     async fn resolve(&self, host: &str, port: u16) -> std::io::Result<Vec<SocketAddr>> {
@@ -667,6 +689,43 @@ mod tests {
         for bad in ["nohost", "h=notanaddress", "=127.0.0.1:1", "h=127.0.0.1"] {
             assert!(Resolver::parse(bad).is_err(), "{bad}");
         }
+        assert_eq!(
+            r.spec().unwrap(),
+            "index.crates.io=127.0.0.1:9000,other.example=[::1]:10"
+        );
+        assert_eq!(Resolver::system().spec(), None);
+    }
+
+    #[test]
+    fn a_fixed_address_must_be_loopback() {
+        for ok in [
+            "h.example=127.0.0.1:1",
+            "h.example=127.9.8.7:443",
+            "h.example=[::1]:1",
+        ] {
+            assert!(Resolver::parse(ok).is_ok(), "{ok}");
+        }
+        for bad in [
+            "h.example=10.0.0.1:443",
+            "h.example=192.168.1.5:443",
+            "h.example=93.184.216.34:443",
+            "h.example=0.0.0.0:443",
+            "h.example=[::]:443",
+            "h.example=[2001:db8::1]:443",
+            "h.example=localhost:443",
+            "h.example=other.example:443",
+        ] {
+            let e = format!("{:#}", Resolver::parse(bad).unwrap_err());
+            assert!(
+                e.contains("loopback"),
+                "{bad} gave {e:?}, which does not say why"
+            );
+        }
+        let e = Resolver::system()
+            .with_fixed("h.example", "10.0.0.1:443".parse().unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("loopback"), "{e}");
     }
 
     /// A fake upstream on `127.0.0.1` that greets each connection and counts them.

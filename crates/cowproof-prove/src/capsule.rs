@@ -333,6 +333,11 @@ pub struct Capsule {
     /// Dependency fetch outcome: "hit", "fetched", or an error message (D6, F-1).
     #[serde(default)]
     pub dependency_fetch_outcome: Option<String>,
+    /// Set only when the dependency fetch ran with the `COWPROOF_FETCH_RESOLVE` testing hook:
+    /// its `host=ip:port,...` text. A capsule that carries it was made against a fake, not a
+    /// real registry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dependency_fetch_resolve: Option<String>,
     /// The version of the builder preamble (sha256 hash of PREAMBLE bytes).
     /// Used to detect when the protocol has changed.
     #[serde(default)]
@@ -422,6 +427,7 @@ impl Capsule {
             flaky_checks: HashSet::new(),
             dependency_cache_key: None,
             dependency_fetch_outcome: None,
+            dependency_fetch_resolve: None,
             prefix_version: None,
             project_instructions_sha256: None,
             class: "light".to_string(),

@@ -263,6 +263,10 @@ fn a_lane_that_builds_offline_from_a_fetched_cache_is_proved_and_records_the_fet
     let json_path = lane.capsule_dir().join("capsule.json");
     let json = fs::read_to_string(&json_path).unwrap();
     assert!(json.contains("\"dependency_fetch_outcome\": \"fetched\""));
+    assert!(
+        !json.contains("dependency_fetch_resolve"),
+        "the testing hook was not set, so nothing is recorded"
+    );
     fs::write(&json_path, json.replace("\"fetched\"", "\"hit\"")).unwrap();
     assert!(Capsule::read(&lane.capsule_dir()).is_err());
     fs::write(&json_path, json).unwrap();

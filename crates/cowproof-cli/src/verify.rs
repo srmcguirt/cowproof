@@ -191,7 +191,16 @@ pub(crate) async fn fetch_dependencies(
     let network = FetchNetwork::from_env()?;
     let resolver = match std::env::var(FETCH_RESOLVE_ENV) {
         Ok(spec) => {
-            Resolver::parse(&spec).with_context(|| format!("reading {FETCH_RESOLVE_ENV}"))?
+            let resolver = Resolver::parse(&spec)
+                .with_context(|| format!("{FETCH_RESOLVE_ENV} is not usable"))?;
+            if let Some(fixed) = resolver.spec() {
+                eprintln!(
+                    "warning: {FETCH_RESOLVE_ENV} is set: {fixed} (testing only); the dependency \
+                     fetch connects those registry names to these loopback addresses and the \
+                     capsule records it"
+                );
+            }
+            resolver
         }
         Err(_) => Resolver::system(),
     };

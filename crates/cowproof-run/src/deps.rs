@@ -67,10 +67,11 @@ pub const CACHE_ROOT_ENV: &str = "COWPROOF_CACHE_ROOT";
 /// or `none`.
 pub const FETCH_NETWORK_ENV: &str = "COWPROOF_FETCH_NETWORK";
 
-/// The environment variable that fixes the address of allowed registry hosts, as
-/// `host=ip:port[,host=ip:port...]` ([`Resolver::parse`]). It only changes where an
-/// ALLOWED name connects (a registry behind a split-horizon resolver, a test's fake on
-/// `127.0.0.1`); it never admits a name the allowlist refuses.
+/// A TESTING HOOK: fixes the address of allowed registry hosts, as
+/// `host=ip:port[,host=ip:port...]` ([`Resolver::parse`]). Every address must be a loopback
+/// `ip:port` (`127.0.0.0/8`, `::1`), so it can send an allowed name to a fake on this
+/// machine and nowhere else; it never admits a name the allowlist refuses. When set, the
+/// runner warns on stderr and the capsule records it (`dependency_fetch_resolve`).
 pub const FETCH_RESOLVE_ENV: &str = "COWPROOF_FETCH_RESOLVE";
 
 /// How long one `cargo fetch` may take.
@@ -195,6 +196,10 @@ pub struct Prefetch {
     pub outcome: FetchOutcome,
     /// `<cache root>/deps/<key>`: valid when the outcome is not `Failed`.
     pub dir: PathBuf,
+    /// The `COWPROOF_FETCH_RESOLVE` testing hook's addresses (`host=ip:port,...`) when the
+    /// fetch ran with it set, else `None`. The capsule records it, so a proof made with it
+    /// is visibly not a real fetch.
+    pub resolve_override: Option<String>,
 }
 
 /// The `PATH` for the fetch and the `cargo` executable it runs.
@@ -331,6 +336,7 @@ fn prefetch_in(
             key: key.clone(),
             outcome,
             dir: dir.clone(),
+            resolve_override: config.egress.and_then(|e| e.resolver.spec()),
         }))
     };
 
