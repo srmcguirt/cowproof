@@ -958,7 +958,20 @@ mod tests {
         fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
         // The first run of a new executable can take seconds (macOS scans it); run it once,
         // harmlessly, so the timed probe below measures the probe and not the scan.
-        assert!(Command::new(&bin).arg("warm").status().unwrap().success());
+        // On Linux a fork on another test thread can still hold the script open for writing
+        // (until it execs), and exec then fails with ETXTBSY: retry the first run briefly. Once
+        // one run has started no writer is left, so the timed probe below cannot meet it.
+        let mut tries = 0;
+        let status = loop {
+            match Command::new(&bin).arg("warm").status() {
+                Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy && tries < 100 => {
+                    tries += 1;
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                other => break other.unwrap(),
+            }
+        };
+        assert!(status.success());
 
         let err = SystemRunner::output_within(
             bin.to_str().unwrap(),
