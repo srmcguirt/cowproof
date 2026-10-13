@@ -50,10 +50,19 @@ impl HangingTool {
         fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
         // The first run of a new executable can take seconds (macOS scans it); run it once,
         // harmlessly, so a timed probe measures the probe and not the scan.
-        let warmed = std::process::Command::new(&bin)
-            .arg("warm")
-            .status()
-            .unwrap();
+        // The lock covers this fixture's tests only: a fork elsewhere in the binary can still
+        // hold the script open for writing until it execs, and exec then fails with ETXTBSY.
+        // Retry the first run briefly; once one run has started no writer is left.
+        let mut tries = 0;
+        let warmed = loop {
+            match std::process::Command::new(&bin).arg("warm").status() {
+                Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy && tries < 100 => {
+                    tries += 1;
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                other => break other.unwrap(),
+            }
+        };
         assert!(warmed.success());
         HangingTool {
             _guard: guard,
