@@ -259,13 +259,19 @@ impl CopyMethod {
 /// are copied (a symlink as a symlink); permissions and modification times are kept, because
 /// cargo's freshness check compares them. Any other kind of file is an error.
 pub fn copy_tree(src: &Path, dst: &Path) -> io::Result<CopyMethod> {
+    copy_tree_with(src, dst, true)
+}
+
+/// [`copy_tree`], with copy-on-write switched off when `clone` is false (the byte-copy path,
+/// which a test must reach on a filesystem that could clone).
+fn copy_tree_with(src: &Path, dst: &Path, clone: bool) -> io::Result<CopyMethod> {
     if fs::symlink_metadata(dst).is_ok() {
         return Err(io::Error::new(
             io::ErrorKind::AlreadyExists,
             format!("{} already exists", dst.display()),
         ));
     }
-    if clone_whole(src, dst).is_ok() {
+    if clone && clone_whole(src, dst).is_ok() {
         return Ok(CopyMethod::Clone);
     }
     // A failed whole-tree clone leaves nothing, but be sure before copying by hand.
@@ -273,7 +279,7 @@ pub fn copy_tree(src: &Path, dst: &Path) -> io::Result<CopyMethod> {
         remove_all(dst)?;
     }
     let mut stats = Stats::default();
-    let result = copy_dir(src, dst, &mut stats);
+    let result = copy_dir(src, dst, clone, &mut stats);
     if result.is_err() {
         let _ = remove_all(dst);
     }
@@ -321,8 +327,10 @@ fn clone_whole(_src: &Path, _dst: &Path) -> io::Result<()> {
     Err(io::Error::from(io::ErrorKind::Unsupported))
 }
 
-fn copy_dir(src: &Path, dst: &Path, stats: &mut Stats) -> io::Result<()> {
+fn copy_dir(src: &Path, dst: &Path, clone: bool, stats: &mut Stats) -> io::Result<()> {
     let meta = fs::metadata(src)?;
+    // Created writable (the umask's default), so its children can be written whatever mode the
+    // source has; the source's mode is restored last.
     fs::create_dir(dst)?;
     for item in fs::read_dir(src)? {
         let item = item?;
@@ -330,12 +338,12 @@ fn copy_dir(src: &Path, dst: &Path, stats: &mut Stats) -> io::Result<()> {
         let to = dst.join(item.file_name());
         let kind = item.file_type()?;
         if kind.is_dir() {
-            copy_dir(&from, &to, stats)?;
+            copy_dir(&from, &to, clone, stats)?;
         } else if kind.is_symlink() {
             std::os::unix::fs::symlink(fs::read_link(&from)?, &to)?;
         } else if kind.is_file() {
             stats.files += 1;
-            if copy_file(&from, &to)? {
+            if copy_file(&from, &to, clone)? {
                 stats.cloned += 1;
             }
         } else {
@@ -345,24 +353,32 @@ fn copy_dir(src: &Path, dst: &Path, stats: &mut Stats) -> io::Result<()> {
             )));
         }
     }
-    fs::set_permissions(dst, meta.permissions())?;
+    // The modification time first, then the mode: a read-only directory cannot be changed
+    // once it is read-only, and its children are all written by now.
     fs::File::open(dst)?.set_modified(meta.modified()?)?;
-    Ok(())
+    fs::set_permissions(dst, meta.permissions())
 }
 
 /// Copy the regular file `src` to the new file `dst`, keeping its mode and modification time.
 /// `true` when the data was cloned, not copied.
-fn copy_file(src: &Path, dst: &Path) -> io::Result<bool> {
+fn copy_file(src: &Path, dst: &Path, clone: bool) -> io::Result<bool> {
+    use std::os::unix::fs::PermissionsExt;
     let meta = fs::metadata(src)?;
-    let cloned = clone_file(src, dst, &meta)?;
+    let cloned = clone && clone_file(src, dst, &meta)?;
     if !cloned {
         fs::copy(src, dst)?;
     }
-    fs::set_permissions(dst, meta.permissions())?;
+    // The modification time first, through a writable file, then the mode: opening a 0444 file
+    // for writing fails, so the file is writable (to its owner) only until the time is set.
+    fs::set_permissions(
+        dst,
+        fs::Permissions::from_mode(meta.permissions().mode() | 0o600),
+    )?;
     fs::File::options()
         .write(true)
         .open(dst)?
         .set_modified(meta.modified()?)?;
+    fs::set_permissions(dst, meta.permissions())?;
     Ok(cloned)
 }
 
@@ -737,5 +753,50 @@ mod tests {
             copy_tree(&src, &dst).unwrap_err().kind(),
             io::ErrorKind::AlreadyExists
         );
+    }
+    #[test]
+    fn a_read_only_file_and_directory_copy_on_the_byte_path_keeping_modes_and_times() {
+        let t = tmp();
+        let (src, dst) = (t.path().join("seed"), t.path().join("copy"));
+        fs::create_dir_all(src.join("ro-dir/inner")).unwrap();
+        fs::write(src.join("ro-dir/inner/data"), "in a read-only directory").unwrap();
+        fs::write(src.join("locked"), "read only").unwrap();
+        let old = SystemTime::now() - Duration::from_secs(86_400 * 5);
+        for path in [src.join("locked"), src.join("ro-dir/inner/data")] {
+            fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(old)
+                .unwrap();
+        }
+        fs::File::open(src.join("ro-dir"))
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        fs::set_permissions(src.join("locked"), fs::Permissions::from_mode(0o444)).unwrap();
+        fs::set_permissions(src.join("ro-dir"), fs::Permissions::from_mode(0o555)).unwrap();
+
+        let result = copy_tree_with(&src, &dst, false);
+        let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let dir_mode = fs::metadata(dst.join("ro-dir"))
+            .ok()
+            .map(|m| m.permissions().mode() & 0o777);
+        // Make both trees removable again before any assertion can unwind.
+        for dir in [src.join("ro-dir"), dst.join("ro-dir")] {
+            let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o755));
+        }
+        assert_eq!(result.unwrap(), CopyMethod::Copy);
+        let mtime = |p: &Path| fs::metadata(p).unwrap().modified().unwrap();
+        assert_eq!(
+            fs::read_to_string(dst.join("ro-dir/inner/data")).unwrap(),
+            "in a read-only directory"
+        );
+        assert_eq!(mode(&dst.join("locked")), 0o444);
+        assert_eq!(mtime(&dst.join("locked")), old);
+        assert_eq!(mtime(&dst.join("ro-dir/inner/data")), old);
+        assert_eq!(mtime(&dst.join("ro-dir")), old);
+        // The directory was made read-only again after its children were written.
+        assert_eq!(dir_mode, Some(0o555));
     }
 }

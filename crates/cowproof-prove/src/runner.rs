@@ -689,6 +689,9 @@ pub struct SandboxedRunner {
     /// The cargo target directory every command gets as `CARGO_TARGET_DIR`
     /// ([`SandboxedRunner::with_target_dir`]); `None` sets nothing.
     target_dir: Option<PathBuf>,
+    /// Also put `target_dir` at `<tree>/target` as a symlink before every command
+    /// ([`SandboxedRunner::with_target_link`]).
+    link_target: bool,
     /// The `bundle` that installs a Bundler entry's gems ([`SandboxedRunner::with_bundle_exe`]);
     /// `None` runs the `bundle` on the checks' `PATH`.
     bundle_exe: Option<PathBuf>,
@@ -732,6 +735,7 @@ impl SandboxedRunner {
             executables: Vec::new(),
             groups: None,
             target_dir: None,
+            link_target: false,
             bundle_exe: None,
             setup: Mutex::new(HashMap::new()),
         }
@@ -816,6 +820,15 @@ impl SandboxedRunner {
     /// the variable is not set and cargo builds in the tree's own `target/`.
     pub fn with_target_dir(mut self, dir: PathBuf) -> Self {
         self.target_dir = Some(dir);
+        self
+    }
+
+    /// Also put the directory given to [`SandboxedRunner::with_target_dir`] at `<tree>/target`
+    /// as a symlink before every command (`cowproof_run::link_target_dir`, replacing whatever
+    /// stood there), so a check that runs `./target/debug/<name>` finds cargo's output where it
+    /// always did. For the verifier's checks only, and only when a seed copy is in use.
+    pub fn with_target_link(mut self) -> Self {
+        self.link_target = true;
         self
     }
 
@@ -1002,6 +1015,12 @@ impl CheckRunner for SandboxedRunner {
             }
         }
         policy.executables.extend(self.executables.iter().cloned());
+        if self.link_target
+            && let Some(copy) = &self.target_dir
+        {
+            cowproof_run::link_target_dir(copy, tree)
+                .map_err(|e| InfraError::SpawnError(format!("target link failed: {e:#}")))?;
+        }
 
         // The gems are installed from the entry before the tree's first check; a step that
         // fails fails every check with its text, and the caller reads `setup_failures`.

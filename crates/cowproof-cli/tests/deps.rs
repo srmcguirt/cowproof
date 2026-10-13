@@ -1077,3 +1077,145 @@ fn a_base_without_a_lockfile_says_so_and_is_verified_without_a_seed() {
     assert!(record.note.unwrap().contains("Cargo.lock"));
     assert!(seeds(cache.path()).is_empty());
 }
+
+// ---------------------------------------------------------------------------------------
+// `./target` keeps working: the private copy is also linked at `<tree>/target`.
+// ---------------------------------------------------------------------------------------
+
+#[test]
+fn a_check_that_runs_a_binary_through_dot_target_passes_with_the_seed_in_use() {
+    if !sandbox_available() {
+        return;
+    }
+    let cache = var_tmp("cp-deps-cache-");
+    // The builder builds into the clone's own `target/`; the verifier builds into its private
+    // copy of the seed, which must also be what `./target` names, or the binary is not found.
+    let dir = std::env::var_os("CARGO")
+        .map(PathBuf::from)
+        .and_then(|c| c.parent().map(Path::to_path_buf))
+        .filter(|d| d.is_absolute())
+        .map(|d| format!("PATH=\"{}:$PATH\" ", d.display()))
+        .unwrap_or_default();
+    let lane = lane(
+        &vendored_project(None),
+        &run_checks(&["run"]),
+        json!([{
+            "id": "run",
+            "command": format!("{dir}cargo build --offline --locked && ./target/debug/app")
+        }]),
+        cache.path(),
+    );
+    // Only the verifier runs the held-out check: `target` is a link to the copy it was told of.
+    let held = var_tmp("cp-deps-held-");
+    let heldout = common::heldout(
+        held.path(),
+        "test -L target && test \"$(readlink target)\" = \"$CARGO_TARGET_DIR\" && test -x target/debug/app",
+    );
+    common::run_with(&lane, &heldout, 0);
+    assert_eq!(lane.verdict()["verdict"], "proved");
+    let record = cache_record(&lane);
+    assert!(
+        matches!(record.status.as_str(), "built" | "hit"),
+        "{record:?}"
+    );
+}
+
+#[test]
+fn a_cache_off_or_failed_verification_leaves_target_alone() {
+    if !sandbox_available() {
+        return;
+    }
+    // With the cache off, `target` is not a link and there is no variable.
+    let off = var_tmp("cp-deps-cache-");
+    let mut lane_off = seed_lane(off.path(), "true");
+    lane_off.set_env("COWPROOF_VERIFY_CACHE", "off");
+    let held = var_tmp("cp-deps-held-");
+    let heldout = common::heldout(
+        held.path(),
+        "test ! -L target && test -z \"${CARGO_TARGET_DIR:-}\"",
+    );
+    common::run_with(&lane_off, &heldout, 0);
+    assert_eq!(cache_record(&lane_off).status, "off");
+}
+
+/// `files` (relative path, content) written under a new directory, for `Lane::from_project`.
+fn project_dir(files: &[(String, String)]) -> TempDir {
+    let dir = var_tmp("cp-deps-proj-");
+    for (rel, content) in files {
+        let path = dir.path().join(rel);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, content).unwrap();
+    }
+    dir
+}
+
+#[test]
+fn a_lane_patch_that_commits_target_as_a_link_outside_the_tree_touches_nothing_there() {
+    if !sandbox_available() {
+        return;
+    }
+    let cache = var_tmp("cp-deps-cache-");
+    // A directory outside every tree the lane or the verifier owns, with something in it.
+    let outside = var_tmp("cp-deps-outside-");
+    let outside_path = outside.path().canonicalize().unwrap();
+    fs::create_dir_all(outside_path.join("sub")).unwrap();
+    fs::write(outside_path.join("keep.txt"), "precious").unwrap();
+    fs::write(outside_path.join("sub/deep.txt"), "also precious").unwrap();
+    let before = tree_hash(&outside_path);
+
+    // No `.gitignore`: the lane's `target` link is part of its patch.
+    let project: Vec<(String, String)> = vendored_project(None)
+        .into_iter()
+        .filter(|(p, _)| p != ".gitignore")
+        .collect();
+    let dir = project_dir(&project);
+    let packet = |id: &str| {
+        format!(
+            "# Task\n\n<!-- lane {} -->\n\nLink target.\n",
+            json!({
+                "id": id,
+                "owns": ["target", "README.md"],
+                "class": "light",
+                "checks": [{"id": "ok", "command": "true"}],
+            })
+        )
+    };
+    let body = format!(
+        "ln -s '{}' target\n{}",
+        outside_path.display(),
+        run_checks(&["ok"])
+    );
+    let mut lane = Lane::from_project(&body, dir.path(), &packet);
+    lane.set_env("COWPROOF_CACHE_ROOT", cache.path());
+    lane.set_env("COWPROOF_FETCH_NETWORK", "none");
+
+    // The verifier's checks write through `target`: they reach its private copy, not `outside`.
+    let held = var_tmp("cp-deps-held-");
+    let heldout = common::heldout(
+        held.path(),
+        "test -L target && test \"$(readlink target)\" = \"$CARGO_TARGET_DIR\" \
+         && echo planted > target/planted-file && test -f \"$CARGO_TARGET_DIR/planted-file\"",
+    );
+    let out = common::run_with(&lane, &heldout, 0);
+    assert_eq!(lane.verdict()["verdict"], "proved", "{}", text(&out));
+    let patch = fs::read_to_string(lane.capsule_dir().join("lane.patch")).unwrap();
+    assert!(
+        patch.contains("new file mode 120000") && patch.contains("target"),
+        "the lane's patch commits target as a link: {patch}"
+    );
+    assert!(matches!(
+        cache_record(&lane).status.as_str(),
+        "built" | "hit"
+    ));
+
+    assert_eq!(
+        tree_hash(&outside_path),
+        before,
+        "the directory outside the tree was changed"
+    );
+    assert!(!outside_path.join("planted-file").exists());
+    assert_eq!(
+        fs::read_to_string(outside_path.join("keep.txt")).unwrap(),
+        "precious"
+    );
+}

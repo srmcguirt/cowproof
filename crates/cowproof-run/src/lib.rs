@@ -618,18 +618,39 @@ pub fn link_npm_modules(deps_dir: &Path, tree: &Path) -> Result<()> {
     if !target.is_dir() {
         return Ok(());
     }
-    let link = tree.join("node_modules");
-    if std::fs::read_link(&link).is_ok_and(|current| current == target) {
+    replace_with_link(&tree.join("node_modules"), &target)
+        .with_context(|| format!("linking node_modules into {}", tree.display()))
+}
+
+/// Make `link` a symlink to `target`, replacing whatever stands there: a directory a patch
+/// committed, a file, or a symlink a check or a patch left (which is unlinked, never followed,
+/// so what it pointed at is untouched). Nothing is done when `link` already points at
+/// `target`. The one replace logic behind [`link_npm_modules`], [`link_vendor_cache`] and
+/// [`link_target_dir`].
+pub fn replace_with_link(link: &Path, target: &Path) -> Result<()> {
+    if std::fs::read_link(link).is_ok_and(|current| current == target) {
         return Ok(());
     }
-    match std::fs::symlink_metadata(&link) {
-        Ok(m) if m.is_dir() => std::fs::remove_dir_all(&link),
-        Ok(_) => std::fs::remove_file(&link),
+    // `symlink_metadata` does not follow: a symlink to a directory is not a directory here.
+    match std::fs::symlink_metadata(link) {
+        Ok(m) if m.is_dir() => std::fs::remove_dir_all(link),
+        Ok(_) => std::fs::remove_file(link),
         Err(_) => Ok(()),
     }
     .with_context(|| format!("clearing {}", link.display()))?;
-    std::os::unix::fs::symlink(&target, &link)
-        .with_context(|| format!("linking node_modules into {}", tree.display()))
+    std::os::unix::fs::symlink(target, link)
+        .with_context(|| format!("linking {} to {}", link.display(), target.display()))
+}
+
+/// Put the verifier's private copy of its compile-cache seed at `<tree>/target`, as a symlink
+/// to `copy`, the way [`link_npm_modules`] places `node_modules`, so a check that runs
+/// `./target/debug/<name>` finds cargo's output where it always did while `CARGO_TARGET_DIR`
+/// names the same directory. `copy` is in the verifier's scratch, which the sandbox may write.
+/// Whatever stood at `target` is replaced without following a symlink, and this is called before
+/// every check.
+pub fn link_target_dir(copy: &Path, tree: &Path) -> Result<()> {
+    replace_with_link(&tree.join("target"), copy)
+        .with_context(|| format!("linking target into {}", tree.display()))
 }
 
 /// Put the cache entry's `bundler/cache` at `<tree>/vendor/cache`, the verifier's rebuilt tree,
@@ -653,17 +674,7 @@ pub fn link_vendor_cache(deps_dir: &Path, tree: &Path) -> Result<()> {
         .with_context(|| format!("clearing {}", vendor.display()))?;
         std::fs::create_dir(&vendor).with_context(|| format!("creating {}", vendor.display()))?;
     }
-    let link = tree.join(BUNDLER_VENDOR_CACHE);
-    if std::fs::read_link(&link).is_ok_and(|current| current == target) {
-        return Ok(());
-    }
-    match std::fs::symlink_metadata(&link) {
-        Ok(m) if m.is_dir() => std::fs::remove_dir_all(&link),
-        Ok(_) => std::fs::remove_file(&link),
-        Err(_) => Ok(()),
-    }
-    .with_context(|| format!("clearing {}", link.display()))?;
-    std::os::unix::fs::symlink(&target, &link)
+    replace_with_link(&tree.join(BUNDLER_VENDOR_CACHE), &target)
         .with_context(|| format!("linking vendor/cache into {}", tree.display()))
 }
 

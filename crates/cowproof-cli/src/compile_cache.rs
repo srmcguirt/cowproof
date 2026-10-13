@@ -91,7 +91,7 @@ pub(crate) async fn attach(
     req: &Request<'_>,
 ) -> (SandboxedRunner, VerifyCache) {
     match prepare(req).await {
-        Ok((dir, record)) => (runner.with_target_dir(dir), record),
+        Ok((dir, record)) => (runner.with_target_dir(dir).with_target_link(), record),
         Err(record) => (runner, record),
     }
 }
