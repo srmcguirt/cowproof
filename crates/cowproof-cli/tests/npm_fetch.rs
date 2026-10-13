@@ -1,5 +1,6 @@
-//! The npm dependency fetch (D6, D11, D14, F-1), end to end: a real `cowproof run` against a
-//! FAKE `claude` and a FAKE `npm`, with no network at all and no real `npm` anywhere.
+//! The npm, yarn and pnpm dependency fetch (D6, D11, D14, F-1), end to end: a real `cowproof
+//! run` against a FAKE `claude` and a FAKE `npm`, `yarn` or `pnpm`, with no network at all and
+//! no real package tool anywhere.
 //!
 //! The fake `npm` (`common::fake_npm`) is injected the way `CARGO` names cargo: the lane's
 //! environment sets `COWPROOF_NPM` to it. It records its argv, its environment and the
@@ -14,8 +15,9 @@
 mod common;
 
 use common::{
-    FAKE_NPM_FAILS, FAKE_NPM_MUST_NOT_RUN, FAKE_NPM_OK, Lane, fake_npm, output, run_checks,
-    sandbox_available, text, var_tmp,
+    FAKE_JS_MUST_NOT_RUN, FAKE_NPM_FAILS, FAKE_NPM_MUST_NOT_RUN, FAKE_NPM_OK, FAKE_PNPM_FAILS,
+    FAKE_YARN_FAILS, Lane, fake_js_ok, fake_npm, fake_tool, output, run_checks, sandbox_available,
+    text, var_tmp,
 };
 use cowproof_prove::Capsule;
 use serde_json::json;
@@ -45,6 +47,11 @@ fn npm_project() -> Vec<(&'static str, &'static str)> {
 /// A lane over `files` whose builder runs the no-op check `ok`, with its own cache root, no
 /// fetch network, and the fake `npm` at `npm`.
 fn new_lane(files: &[(&str, &str)], cache: &Path, npm: &Path) -> Lane {
+    new_lane_for(files, cache, "COWPROOF_NPM", npm)
+}
+
+/// [`new_lane`] with the fake tool named by the hook variable `hook` (`COWPROOF_YARN`, ...).
+fn new_lane_for(files: &[(&str, &str)], cache: &Path, hook: &str, tool: &Path) -> Lane {
     let mut lane = Lane::new(
         &run_checks(&["ok"]),
         json!([{"id": "ok", "command": "true"}]),
@@ -52,7 +59,7 @@ fn new_lane(files: &[(&str, &str)], cache: &Path, npm: &Path) -> Lane {
     lane.commit_files(files);
     lane.set_env("COWPROOF_CACHE_ROOT", cache);
     lane.set_env("COWPROOF_FETCH_NETWORK", "none");
-    lane.set_env("COWPROOF_NPM", npm);
+    lane.set_env(hook, tool);
     lane
 }
 
@@ -543,6 +550,11 @@ fn upstream() -> Upstream {
 /// `host:443` and, if it gets one, records what the registry at the other end says into the
 /// cache, then installs `node_modules/fake-pkg`.
 fn tunnelling_npm(host: &str) -> String {
+    tunnelling_tool(host, "npm_config_cache")
+}
+
+/// [`tunnelling_npm`] for any tool that writes into the cache directory `cache_var` names.
+fn tunnelling_tool(host: &str, cache_var: &str) -> String {
     format!(
         r#"#!/bin/bash
 case "$npm_config_https_proxy" in http://127.0.0.1:*) ;; *) echo "npm ERR! npm_config_https_proxy=$npm_config_https_proxy" >&2; exit 6 ;; esac
@@ -557,7 +569,7 @@ case "$status" in
 esac
 IFS= read -r blank <&3
 IFS= read -r banner <&3
-printf '%s\n' "$banner" > "$npm_config_cache/banner"
+printf '%s\n' "$banner" > "${cache_var}/banner"
 mkdir -p node_modules/fake-pkg
 printf 'module.exports = 42;\n' > node_modules/fake-pkg/index.js
 "#
@@ -715,4 +727,540 @@ fn npm_client_certificate_settings_reach_neither_the_fetch_nor_the_entry() {
         "{:?}",
         c.dependency_fetch_notes
     );
+}
+
+// ---- yarn and pnpm -----------------------------------------------------------------------
+
+const YARN_V1_LOCK: &str = "# yarn lockfile v1\n";
+const YARN_BERRY_LOCK: &str = "__metadata:\n  version: 8\n";
+
+fn manifest() -> (&'static str, &'static str) {
+    npm_project().remove(0)
+}
+
+fn yarn_project() -> Vec<(&'static str, &'static str)> {
+    vec![manifest(), ("yarn.lock", YARN_V1_LOCK)]
+}
+
+fn pnpm_project() -> Vec<(&'static str, &'static str)> {
+    vec![manifest(), ("pnpm-lock.yaml", "lockfileVersion: '9.0'\n")]
+}
+
+/// The lines the fake recorded as its argv, in the entry the capsule names.
+fn recorded_argv(cache: &Path, c: &Capsule) -> Vec<String> {
+    fs::read_to_string(entry(cache, c).join("npm/cache/argv.txt"))
+        .unwrap()
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
+/// The environment the fake recorded, and the verifier's, for the tool's offline and
+/// no-scripts settings.
+const YARN_VERIFIER_SETTINGS: &str = "test \"$YARN_ENABLE_SCRIPTS\" = false \
+     && test \"$YARN_ENABLE_NETWORK\" = false \
+     && test \"$npm_config_ignore_scripts\" = true \
+     && case \"$YARN_CACHE_FOLDER\" in */deps/*/npm/cache) true;; *) false;; esac \
+     && test -L node_modules";
+
+#[test]
+fn a_classic_yarn_lane_gets_node_modules_and_is_proved_with_scripts_off() {
+    if !sandbox_available() {
+        return;
+    }
+    let cache = var_tmp("cp-yarn-cache-");
+    let (_dir, yarn) = fake_tool("yarn", &fake_js_ok("YARN_CACHE_FOLDER"));
+    let lane = new_lane_for(&yarn_project(), cache.path(), "COWPROOF_YARN", &yarn);
+    let held = var_tmp("cp-yarn-held-");
+    let check = format!("{NEEDS_MODULES} && {YARN_VERIFIER_SETTINGS}");
+    let out = run_with(&lane, &heldout(held.path(), &check), 0);
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains(&format!("{}: proved", lane.id)),
+        "{}",
+        text(&out)
+    );
+    assert_eq!(lane.verdict()["verdict"], "proved");
+
+    let c = capsule(&lane);
+    assert_eq!(c.dependency_fetch_outcome.as_deref(), Some("fetched"));
+    assert_eq!(c.dependency_ecosystems, vec!["yarn".to_string()]);
+    let e = entry(cache.path(), &c);
+    assert!(e.join("npm/node_modules/fake-pkg/index.js").is_file());
+    assert!(!e.join("cargo").exists());
+    assert_eq!(
+        recorded_argv(cache.path(), &c),
+        [
+            "install",
+            "--frozen-lockfile",
+            "--ignore-scripts",
+            "--non-interactive"
+        ]
+    );
+    let env = fs::read_to_string(e.join("npm/cache/env.txt")).unwrap();
+    assert!(env.contains("npm_config_ignore_scripts=true"), "{env}");
+    assert!(env.contains("YARN_ENABLE_SCRIPTS=false"), "{env}");
+    assert!(
+        env.lines()
+            .any(|l| l.starts_with("YARN_CACHE_FOLDER=") && l.ends_with("/new/npm/cache")),
+        "{env}"
+    );
+    assert!(
+        !env.contains("ANTHROPIC") && !env.contains("sk-test-real-xyz"),
+        "{env}"
+    );
+    let cwd = fs::read_to_string(e.join("npm/cache/cwd.txt")).unwrap();
+    assert!(cwd.trim_end().ends_with("/yarn-project"), "{cwd}");
+}
+
+#[test]
+fn a_berry_yarn_lane_with_the_node_modules_linker_installs_immutably_without_builds() {
+    if !sandbox_available() {
+        return;
+    }
+    let cache = var_tmp("cp-yarn-cache-");
+    let (_dir, yarn) = fake_tool("yarn", &fake_js_ok("YARN_CACHE_FOLDER"));
+    let files = vec![
+        manifest(),
+        ("yarn.lock", YARN_BERRY_LOCK),
+        (".yarnrc.yml", "nodeLinker: node-modules\n"),
+    ];
+    let lane = new_lane_for(&files, cache.path(), "COWPROOF_YARN", &yarn);
+    let held = var_tmp("cp-yarn-held-");
+    run_with(&lane, &heldout(held.path(), NEEDS_MODULES), 0);
+    let c = capsule(&lane);
+    assert_eq!(c.dependency_fetch_outcome.as_deref(), Some("fetched"));
+    assert_eq!(c.dependency_ecosystems, vec!["yarn".to_string()]);
+    assert_eq!(
+        recorded_argv(cache.path(), &c),
+        ["install", "--immutable", "--mode=skip-build"]
+    );
+    let env = fs::read_to_string(entry(cache.path(), &c).join("npm/cache/env.txt")).unwrap();
+    assert!(env.contains("YARN_ENABLE_SCRIPTS=false"), "{env}");
+    assert!(env.contains("YARN_ENABLE_GLOBAL_CACHE=false"), "{env}");
+}
+
+#[test]
+fn a_pnpm_lane_gets_node_modules_and_is_proved_with_scripts_off_and_a_hoisted_linker() {
+    if !sandbox_available() {
+        return;
+    }
+    let cache = var_tmp("cp-pnpm-cache-");
+    let (_dir, pnpm) = fake_tool("pnpm", &fake_js_ok("npm_config_store_dir"));
+    let lane = new_lane_for(&pnpm_project(), cache.path(), "COWPROOF_PNPM", &pnpm);
+    let held = var_tmp("cp-pnpm-held-");
+    let check = format!(
+        "{NEEDS_MODULES} && test \"$npm_config_ignore_scripts\" = true \
+         && test \"$npm_config_offline\" = true \
+         && case \"$npm_config_store_dir\" in */deps/*/npm/cache) true;; *) false;; esac \
+         && test -L node_modules"
+    );
+    let out = run_with(&lane, &heldout(held.path(), &check), 0);
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains(&format!("{}: proved", lane.id)),
+        "{}",
+        text(&out)
+    );
+
+    let c = capsule(&lane);
+    assert_eq!(c.dependency_fetch_outcome.as_deref(), Some("fetched"));
+    assert_eq!(c.dependency_ecosystems, vec!["pnpm".to_string()]);
+    assert!(
+        entry(cache.path(), &c)
+            .join("npm/node_modules/fake-pkg/index.js")
+            .is_file()
+    );
+    assert_eq!(
+        recorded_argv(cache.path(), &c),
+        [
+            "install",
+            "--frozen-lockfile",
+            "--ignore-scripts",
+            "--config.node-linker=hoisted"
+        ]
+    );
+    let env = fs::read_to_string(entry(cache.path(), &c).join("npm/cache/env.txt")).unwrap();
+    assert!(env.contains("npm_config_ignore_scripts=true"), "{env}");
+    assert!(
+        env.contains("npm_config_manage_package_manager_versions=false"),
+        "{env}"
+    );
+}
+
+#[test]
+fn a_berry_tree_on_plug_n_play_is_not_fetched_and_never_reported_as_fetched() {
+    if !sandbox_available() {
+        return;
+    }
+    // Spelled out, and by default (no `.yarnrc.yml` at all): neither leaves a node_modules.
+    for rc in [
+        Some("nodeLinker: pnp\n"),
+        Some("enableTelemetry: false\n"),
+        None,
+    ] {
+        let cache = var_tmp("cp-yarn-cache-");
+        // The fake must not run: nothing is installed for a tree with no node_modules.
+        let (_dir, yarn) = fake_tool("yarn", FAKE_JS_MUST_NOT_RUN);
+        let mut files = vec![manifest(), ("yarn.lock", YARN_BERRY_LOCK)];
+        files.extend(rc.map(|r| (".yarnrc.yml", r)));
+        let lane = new_lane_for(&files, cache.path(), "COWPROOF_YARN", &yarn);
+        let out = lane.run(&[]);
+        assert_eq!(out.status.code(), Some(0), "{rc:?}: {}", text(&out));
+        let c = capsule(&lane);
+        assert_eq!(
+            c.dependency_fetch_outcome.as_deref(),
+            Some("not_fetched"),
+            "{rc:?}"
+        );
+        assert_ne!(c.dependency_fetch_outcome.as_deref(), Some("fetched"));
+        assert!(c.dependency_cache_key.is_none());
+        assert!(c.dependency_ecosystems.is_empty());
+        assert!(
+            c.dependency_fetch_notes
+                .iter()
+                .any(|n| n.starts_with("yarn.lock: ") && n.contains("Plug'n'Play")),
+            "{rc:?}: {:?}",
+            c.dependency_fetch_notes
+        );
+        assert!(
+            fs::read_dir(cache.path().join("deps"))
+                .unwrap()
+                .next()
+                .is_none()
+        );
+    }
+}
+
+#[test]
+fn two_javascript_lockfiles_are_not_fetched_and_the_capsule_names_them() {
+    if !sandbox_available() {
+        return;
+    }
+    for extra in [
+        ("yarn.lock", YARN_V1_LOCK),
+        ("pnpm-lock.yaml", "lockfileVersion: '9.0'\n"),
+    ] {
+        let cache = var_tmp("cp-js-cache-");
+        // None of the fakes may run: no tool is guessed.
+        let (_n, npm) = fake_tool("npm", FAKE_NPM_MUST_NOT_RUN);
+        let (_y, yarn) = fake_tool("yarn", FAKE_JS_MUST_NOT_RUN);
+        let (_p, pnpm) = fake_tool("pnpm", FAKE_JS_MUST_NOT_RUN);
+        let mut files = npm_project();
+        files.push(extra);
+        let mut lane = new_lane(&files, cache.path(), &npm);
+        lane.set_env("COWPROOF_YARN", &yarn);
+        lane.set_env("COWPROOF_PNPM", &pnpm);
+        let out = lane.run(&[]);
+        assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+        let c = capsule(&lane);
+        assert_eq!(c.dependency_fetch_outcome.as_deref(), Some("not_fetched"));
+        assert!(c.dependency_ecosystems.is_empty());
+        assert!(c.dependency_cache_key.is_none());
+        let want = format!(
+            "package-lock.json, {}: more than one JavaScript lockfile",
+            extra.0
+        );
+        assert!(
+            c.dependency_fetch_notes
+                .iter()
+                .any(|n| n.starts_with(&want)),
+            "{want}: {:?}",
+            c.dependency_fetch_notes
+        );
+        assert!(
+            fs::read_dir(cache.path().join("deps"))
+                .unwrap()
+                .next()
+                .is_none()
+        );
+    }
+}
+
+#[test]
+fn a_yarnrc_yml_token_top_level_or_under_a_scope_reaches_neither_the_fetch_nor_the_entry() {
+    if !sandbox_available() {
+        return;
+    }
+    let cache = var_tmp("cp-yarn-cache-");
+    let (_dir, yarn) = fake_tool("yarn", &fake_js_ok("YARN_CACHE_FOLDER"));
+    let rc = format!(
+        "nodeLinker: node-modules\n\
+         npmRegistryServer: \"https://registry.yarnpkg.com\"\n\
+         npmAuthToken: {SECRET}\n\
+         npmScopes:\n  corp:\n    npmRegistryServer: \"https://registry.yarnpkg.com\"\n    npmAuthToken: {SECRET}\n    npmAlwaysAuth: true\n\
+         npmRegistries:\n  \"//registry.yarnpkg.com\":\n    npmAuthIdent: \"user:{SECRET}\"\n"
+    );
+    let files = vec![
+        manifest(),
+        ("yarn.lock", YARN_BERRY_LOCK),
+        (".yarnrc.yml", rc.as_str()),
+    ];
+    let lane = new_lane_for(&files, cache.path(), "COWPROOF_YARN", &yarn);
+    let held = var_tmp("cp-yarn-held-");
+    run_with(&lane, &heldout(held.path(), NEEDS_MODULES), 0);
+
+    let c = capsule(&lane);
+    let e = entry(cache.path(), &c);
+    let seen = fs::read_to_string(e.join("npm/cache/yarnrc_yml.txt")).unwrap();
+    assert!(seen.contains("nodeLinker: node-modules"), "{seen}");
+    assert!(seen.contains("npmScopes:"), "{seen}");
+    assert!(
+        !seen.contains(SECRET)
+            && !seen.contains("npmAuthToken")
+            && !seen.contains("npmAuthIdent")
+            && !seen.contains("npmAlwaysAuth"),
+        "{seen}"
+    );
+    for file in files_under(&e) {
+        let bytes = fs::read(&file).unwrap();
+        assert!(
+            !String::from_utf8_lossy(&bytes).contains(SECRET),
+            "{} holds the token",
+            file.display()
+        );
+    }
+    // Two tokens, one ident and one alwaysAuth line were left out.
+    assert!(
+        c.dependency_fetch_notes
+            .iter()
+            .any(|n| n.contains("yarn: 4 credential line(s) of .yarnrc.yml were not used")),
+        "{:?}",
+        c.dependency_fetch_notes
+    );
+    let json = fs::read_to_string(lane.capsule_dir().join("capsule.json")).unwrap();
+    assert!(!json.contains(SECRET));
+}
+
+#[test]
+fn a_classic_yarnrc_and_an_npmrc_token_reach_neither_the_yarn_fetch_nor_the_entry() {
+    if !sandbox_available() {
+        return;
+    }
+    let cache = var_tmp("cp-yarn-cache-");
+    let (_dir, yarn) = fake_tool("yarn", &fake_js_ok("YARN_CACHE_FOLDER"));
+    let yarnrc = format!(
+        "registry \"https://registry.yarnpkg.com\"\n\
+         \"//registry.yarnpkg.com/:_authToken\" \"{SECRET}\"\n\
+         \"//registry.yarnpkg.com/:_auth\" \"{SECRET}\"\n"
+    );
+    let npmrc = format!("//registry.npmjs.org/:_authToken={SECRET}\n");
+    let mut files = yarn_project();
+    files.push((".yarnrc", &yarnrc));
+    files.push((".npmrc", &npmrc));
+    let lane = new_lane_for(&files, cache.path(), "COWPROOF_YARN", &yarn);
+    let held = var_tmp("cp-yarn-held-");
+    run_with(&lane, &heldout(held.path(), NEEDS_MODULES), 0);
+
+    let c = capsule(&lane);
+    let e = entry(cache.path(), &c);
+    let seen = fs::read_to_string(e.join("npm/cache/yarnrc.txt")).unwrap();
+    assert!(
+        seen.contains("registry \"https://registry.yarnpkg.com\""),
+        "{seen}"
+    );
+    assert!(!seen.contains(SECRET) && !seen.contains("_auth"), "{seen}");
+    let npmrc_seen = fs::read_to_string(e.join("npm/cache/npmrc.txt")).unwrap();
+    assert!(!npmrc_seen.contains(SECRET), "{npmrc_seen}");
+    for file in files_under(&e) {
+        let bytes = fs::read(&file).unwrap();
+        assert!(
+            !String::from_utf8_lossy(&bytes).contains(SECRET),
+            "{} holds the token",
+            file.display()
+        );
+    }
+    for want in [
+        "yarn: 2 credential line(s) of .yarnrc were not used",
+        "yarn: 1 credential line(s) of .npmrc were not used",
+    ] {
+        assert!(
+            c.dependency_fetch_notes.iter().any(|n| n.contains(want)),
+            "{want}: {:?}",
+            c.dependency_fetch_notes
+        );
+    }
+}
+
+#[test]
+fn a_pnpm_npmrc_token_reaches_neither_the_fetch_nor_the_entry() {
+    if !sandbox_available() {
+        return;
+    }
+    let cache = var_tmp("cp-pnpm-cache-");
+    let (_dir, pnpm) = fake_tool("pnpm", &fake_js_ok("npm_config_store_dir"));
+    let npmrc = format!(
+        "registry=https://registry.npmjs.org/\n//registry.npmjs.org/:_authToken={SECRET}\n"
+    );
+    let mut files = pnpm_project();
+    files.push((".npmrc", &npmrc));
+    let lane = new_lane_for(&files, cache.path(), "COWPROOF_PNPM", &pnpm);
+    let held = var_tmp("cp-pnpm-held-");
+    run_with(&lane, &heldout(held.path(), NEEDS_MODULES), 0);
+    let c = capsule(&lane);
+    let e = entry(cache.path(), &c);
+    let seen = fs::read_to_string(e.join("npm/cache/npmrc.txt")).unwrap();
+    assert!(
+        seen.contains("registry=https://registry.npmjs.org/"),
+        "{seen}"
+    );
+    for file in files_under(&e) {
+        let bytes = fs::read(&file).unwrap();
+        assert!(!String::from_utf8_lossy(&bytes).contains(SECRET));
+    }
+    assert!(
+        c.dependency_fetch_notes
+            .iter()
+            .any(|n| n.contains("pnpm: 1 credential line(s) of .npmrc were not used")),
+        "{:?}",
+        c.dependency_fetch_notes
+    );
+}
+
+#[test]
+fn a_failing_yarn_or_pnpm_is_infrastructure_exit_4_naming_the_tool_and_its_first_error() {
+    if !sandbox_available() {
+        return;
+    }
+    for (files, hook, name, body, label, first, skipped) in [
+        (
+            yarn_project(),
+            "COWPROOF_YARN",
+            "yarn",
+            FAKE_YARN_FAILS,
+            "yarn install --frozen-lockfile --ignore-scripts failed",
+            "error Couldn't find package \"fake-pkg\"",
+            "warning fake-pkg",
+        ),
+        (
+            pnpm_project(),
+            "COWPROOF_PNPM",
+            "pnpm",
+            FAKE_PNPM_FAILS,
+            "pnpm install --frozen-lockfile --ignore-scripts failed",
+            "ERR_PNPM_FETCH_404",
+            "Progress: resolved",
+        ),
+    ] {
+        let cache = var_tmp("cp-js-cache-");
+        let (_dir, tool) = fake_tool(name, body);
+        let lane = new_lane_for(&files, cache.path(), hook, &tool);
+        let out = lane.run(&[]);
+        assert_eq!(out.status.code(), Some(4), "{name}: {}", text(&out));
+        let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+        assert!(
+            stdout.contains(&format!("{}: infrastructure: ", lane.id))
+                && stdout.contains("dependency fetch failed: ")
+                && stdout.contains(label)
+                && stdout.contains(first),
+            "{name}: {}",
+            text(&out)
+        );
+        assert!(
+            !stdout.contains(skipped),
+            "the first ERROR line is named, not the first line: {stdout}"
+        );
+        let verdict = lane.verdict();
+        assert_eq!(verdict["verdict"], "infrastructure", "{verdict}");
+        assert_eq!(verdict["exitCode"], 4);
+        let c = capsule(&lane);
+        assert_eq!(c.dependency_fetch_outcome.as_deref(), Some("failed"));
+        assert!(c.dependency_ecosystems.is_empty());
+        assert!(
+            fs::read_dir(cache.path().join("deps"))
+                .unwrap()
+                .next()
+                .is_none()
+        );
+    }
+}
+
+#[test]
+fn a_second_yarn_or_pnpm_lane_with_the_same_lockfile_hits_the_cache_and_does_not_call_the_tool() {
+    if !sandbox_available() {
+        return;
+    }
+    for (files, hook, name, cache_var) in [
+        (yarn_project(), "COWPROOF_YARN", "yarn", "YARN_CACHE_FOLDER"),
+        (
+            pnpm_project(),
+            "COWPROOF_PNPM",
+            "pnpm",
+            "npm_config_store_dir",
+        ),
+    ] {
+        let cache = var_tmp("cp-js-cache-");
+        let (_first_dir, first_tool) = fake_tool(name, &fake_js_ok(cache_var));
+        let first = new_lane_for(&files, cache.path(), hook, &first_tool);
+        let held = var_tmp("cp-js-held-");
+        let heldout = heldout(held.path(), NEEDS_MODULES);
+        run_with(&first, &heldout, 0);
+        let a = capsule(&first);
+        let recorded = entry(cache.path(), &a).join("npm/cache/argv.txt");
+        let before = fs::read_to_string(&recorded).unwrap();
+
+        let (_second_dir, second_tool) = fake_tool(name, FAKE_JS_MUST_NOT_RUN);
+        let second = new_lane_for(&files, cache.path(), hook, &second_tool);
+        run_with(&second, &heldout, 0);
+        let b = capsule(&second);
+        assert_eq!(
+            a.dependency_fetch_outcome.as_deref(),
+            Some("fetched"),
+            "{name}"
+        );
+        assert_eq!(b.dependency_fetch_outcome.as_deref(), Some("hit"), "{name}");
+        assert_eq!(b.dependency_ecosystems, vec![name.to_string()]);
+        assert_eq!(a.dependency_cache_key, b.dependency_cache_key);
+        assert_eq!(fs::read_to_string(&recorded).unwrap(), before);
+        assert_eq!(fs::read_dir(cache.path().join("deps")).unwrap().count(), 1);
+    }
+}
+
+#[test]
+fn yarn_may_reach_yarns_registry_and_pnpm_may_not() {
+    if !sandbox_available() {
+        return;
+    }
+    // Allowed for yarn: registry.yarnpkg.com, mapped to a live fake on 127.0.0.1.
+    let registry = upstream();
+    let cache = var_tmp("cp-yarn-cache-");
+    let (_dir, yarn) = fake_tool(
+        "yarn",
+        &tunnelling_tool("registry.yarnpkg.com", "YARN_CACHE_FOLDER"),
+    );
+    let mut lane = new_lane_for(&yarn_project(), cache.path(), "COWPROOF_YARN", &yarn);
+    lane.set_env("COWPROOF_FETCH_NETWORK", "registry");
+    lane.set_env(
+        "COWPROOF_FETCH_RESOLVE",
+        format!("registry.yarnpkg.com={}", registry.addr),
+    );
+    let held = var_tmp("cp-yarn-held-");
+    run_with(&lane, &heldout(held.path(), NEEDS_MODULES), 0);
+    let c = capsule(&lane);
+    assert_eq!(
+        fs::read_to_string(entry(cache.path(), &c).join("npm/cache/banner")).unwrap(),
+        format!("{BANNER}\n")
+    );
+    assert_eq!(registry.accepted.load(Ordering::SeqCst), 1);
+
+    // Refused for pnpm: yarn's host is not on its list, though the name resolves.
+    let other = upstream();
+    let cache = var_tmp("cp-pnpm-cache-");
+    let (_dir, pnpm) = fake_tool(
+        "pnpm",
+        &tunnelling_tool("registry.yarnpkg.com", "npm_config_store_dir"),
+    );
+    let mut lane = new_lane_for(&pnpm_project(), cache.path(), "COWPROOF_PNPM", &pnpm);
+    lane.set_env("COWPROOF_FETCH_NETWORK", "registry");
+    lane.set_env(
+        "COWPROOF_FETCH_RESOLVE",
+        format!("registry.yarnpkg.com={}", other.addr),
+    );
+    let out = lane.run(&[]);
+    assert_eq!(out.status.code(), Some(4), "{}", text(&out));
+    assert!(
+        String::from_utf8_lossy(&out.stdout)
+            .contains("refused a connection to registry.yarnpkg.com:443"),
+        "{}",
+        text(&out)
+    );
+    assert_eq!(other.accepted.load(Ordering::SeqCst), 0);
 }

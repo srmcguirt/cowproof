@@ -48,6 +48,10 @@ pub const DEFAULT_HOSTS: [&str; 3] = ["index.crates.io", "static.crates.io", "cr
 /// The host an npm fetch may reach with no configuration: the public npm registry.
 pub const DEFAULT_NPM_HOSTS: [&str; 1] = ["registry.npmjs.org"];
 
+/// The hosts a yarn fetch may reach with no configuration: yarn's own registry address and
+/// the public npm registry (a lockfile written by npm tooling resolves there).
+pub const DEFAULT_YARN_HOSTS: [&str; 2] = ["registry.yarnpkg.com", "registry.npmjs.org"];
+
 /// The one port a tunnel may be opened to.
 pub const TUNNEL_PORT: u16 = 443;
 
@@ -90,15 +94,51 @@ impl FetchAllowlist {
         }
     }
 
+    /// The defaults of a yarn fetch alone: yarn's registry address and the public npm
+    /// registry.
+    pub fn yarn_defaults() -> Self {
+        Self {
+            hosts: DEFAULT_YARN_HOSTS
+                .iter()
+                .map(|h| (*h).to_string())
+                .collect(),
+        }
+    }
+
     /// The allowlist of an npm fetch of the tree `tree`, which must be the BASE: the
     /// `.npmrc` and the `cowproof.toml` as they were before `lane.patch`. The npm defaults,
     /// then the https hosts of every `registry=` and `@scope:registry=` entry of the base's
     /// `.npmrc`, then `[proof] fetch_hosts`. A hostname named only by a `//host/:_authToken`
     /// line is not allowed by it: that line says who to authenticate to, not where to go.
     pub fn npm_from_tree(tree: &Path) -> Result<Self> {
-        let mut list = Self::npm_defaults();
+        Self::js_from_tree(tree, Self::npm_defaults(), false)
+    }
+
+    /// The allowlist of a pnpm fetch: the same as npm's (pnpm reads the `.npmrc`).
+    pub fn pnpm_from_tree(tree: &Path) -> Result<Self> {
+        Self::js_from_tree(tree, Self::npm_defaults(), false)
+    }
+
+    /// The allowlist of a yarn fetch of the BASE tree `tree`: the yarn defaults, the
+    /// registries of the base's `.npmrc`, `.yarnrc` (`registry` and `@scope:registry`) and
+    /// `.yarnrc.yml` (`npmRegistryServer`, top level or under `npmScopes`), then
+    /// `[proof] fetch_hosts`. `npmRegistries` keys name who to authenticate to, not where to
+    /// go, and allow nothing.
+    pub fn yarn_from_tree(tree: &Path) -> Result<Self> {
+        Self::js_from_tree(tree, Self::yarn_defaults(), true)
+    }
+
+    fn js_from_tree(tree: &Path, mut list: Self, yarn: bool) -> Result<Self> {
         if let Some(text) = read_regular(&tree.join(".npmrc"))? {
             list = list.with_hosts(npmrc_hosts(&text))?;
+        }
+        if yarn {
+            if let Some(text) = read_regular(&tree.join(".yarnrc"))? {
+                list = list.with_hosts(yarnrc_hosts(&text))?;
+            }
+            if let Some(text) = read_regular(&tree.join(".yarnrc.yml"))? {
+                list = list.with_hosts(yarnrc_yml_hosts(&text))?;
+            }
         }
         if let Some(text) = read_regular(&tree.join(POLICY_FILE))? {
             list = list.with_hosts(
@@ -259,6 +299,46 @@ fn npmrc_hosts(text: &str) -> Vec<String> {
         if key == "registry" || (key.starts_with('@') && key.ends_with(":registry")) {
             let value = value.trim().trim_matches(['"', '\'']);
             hosts.extend(https_host(value));
+        }
+    }
+    hosts
+}
+
+/// The https hosts a classic `.yarnrc` names as registries: the value of `registry` and of
+/// any `"@scope:registry"` key (`key "value"` lines).
+fn yarnrc_hosts(text: &str) -> Vec<String> {
+    let mut hosts = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.starts_with('#') {
+            continue;
+        }
+        let (key, value) = line
+            .split_once(|c: char| c.is_whitespace() || c == '=')
+            .unwrap_or((line, ""));
+        let key = key.trim().trim_matches('"');
+        if key == "registry" || (key.starts_with('@') && key.ends_with(":registry")) {
+            hosts.extend(https_host(value.trim().trim_matches(['"', '\'', '='])));
+        }
+    }
+    hosts
+}
+
+/// The https hosts a `.yarnrc.yml` names as registries: the value of every
+/// `npmRegistryServer` key, at the top level or under `npmScopes`. Read line by line, so a
+/// flow-style mapping names nothing.
+fn yarnrc_yml_hosts(text: &str) -> Vec<String> {
+    let mut hosts = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.starts_with('#') {
+            continue;
+        }
+        if let Some((key, value)) = line.split_once(':')
+            && key.trim().trim_matches(['"', '\'']) == "npmRegistryServer"
+        {
+            let value = value.split(" #").next().unwrap_or("");
+            hosts.extend(https_host(value.trim().trim_matches(['"', '\''])));
         }
     }
     hosts
@@ -727,6 +807,57 @@ mod tests {
         ] {
             assert!(!list.allows(host, 443), "{host}: {:?}", sorted(&list));
         }
+    }
+
+    #[test]
+    fn a_yarn_fetch_allows_yarns_registries_and_the_bases_yarn_and_npm_registries_only() {
+        let tmp = TempDir::new().unwrap();
+        let bare = FetchAllowlist::yarn_from_tree(tmp.path()).unwrap();
+        assert_eq!(
+            sorted(&bare),
+            ["registry.npmjs.org", "registry.yarnpkg.com"]
+        );
+
+        std::fs::write(
+            tmp.path().join(".npmrc"),
+            "registry=https://npmrc.example/\n",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join(".yarnrc"),
+            "# registry \"https://commented.example/\"\n\
+             registry \"https://classic.example/\"\n\
+             \"@corp:registry\" \"https://classic-scope.example/\"\n\
+             lastUpdateCheck 1\n",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join(".yarnrc.yml"),
+            "nodeLinker: node-modules\n\
+             npmRegistryServer: \"https://berry.example\"\n\
+             npmScopes:\n  corp:\n    npmRegistryServer: 'https://berry-scope.example/' # note\n\
+             npmRegistries:\n  \"//auth-only.example\":\n    npmAuthToken: x\n\
+             \x20 \"http://plain.example\":\n    npmRegistryServer: http://plain.example\n",
+        )
+        .unwrap();
+        let list = FetchAllowlist::yarn_from_tree(tmp.path()).unwrap();
+        for host in [
+            "registry.yarnpkg.com",
+            "registry.npmjs.org",
+            "npmrc.example",
+            "classic.example",
+            "classic-scope.example",
+            "berry.example",
+            "berry-scope.example",
+        ] {
+            assert!(list.allows(host, 443), "{host}: {:?}", sorted(&list));
+        }
+        for host in ["commented.example", "auth-only.example", "plain.example"] {
+            assert!(!list.allows(host, 443), "{host}: {:?}", sorted(&list));
+        }
+        // pnpm reads the `.npmrc` and nothing of yarn's.
+        let pnpm = FetchAllowlist::pnpm_from_tree(tmp.path()).unwrap();
+        assert_eq!(sorted(&pnpm), ["npmrc.example", "registry.npmjs.org"]);
     }
 
     #[test]

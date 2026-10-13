@@ -385,7 +385,8 @@ impl SandboxPolicy {
     /// The npm part, when the entry has one, is mounted the same way: `npm/node_modules` and
     /// `npm/cache` become READ-ONLY grants (the caller links the modules into the tree,
     /// [`link_npm_modules`]), and npm is told to stay offline, to run no lifecycle scripts and
-    /// to use that cache (`npm_config_cache`).
+    /// to use that cache (`npm_config_cache`; `YARN_CACHE_FOLDER` and `npm_config_store_dir`
+    /// for yarn and pnpm, whose offline settings come with it).
     pub fn with_dependency_cache(mut self, deps_dir: &Path) -> Self {
         for name in DEPENDENCY_CACHE_DIRS {
             let dir = deps_dir.join("cargo").join(name);
@@ -399,10 +400,10 @@ impl SandboxPolicy {
             let cache = npm.join(NPM_CACHE);
             if cache.is_dir() {
                 self.ro_paths.push(cache.clone());
-                self.env_set.push((
-                    "npm_config_cache".to_string(),
-                    cache.to_string_lossy().into_owned(),
-                ));
+                for name in NPM_CACHE_ENV {
+                    self.env_set
+                        .push((name.to_string(), cache.to_string_lossy().into_owned()));
+                }
             }
             for (k, v) in NPM_VERIFIER_ENV {
                 self.env_set.push((k.to_string(), v.to_string()));
@@ -491,26 +492,49 @@ pub const DEPENDENCY_CACHE_DIRS: [&str; 2] = ["registry", "git"];
 /// wins over a package lock).
 pub const NPM_LOCKFILES: [&str; 2] = ["npm-shrinkwrap.json", "package-lock.json"];
 
-/// The manifest `npm ci` checks the lockfile against.
+/// The yarn lockfile at the tree root (classic v1 or Berry).
+pub const YARN_LOCKFILE: &str = "yarn.lock";
+
+/// The pnpm lockfile at the tree root.
+pub const PNPM_LOCKFILE: &str = "pnpm-lock.yaml";
+
+/// The manifest `npm ci`, `yarn install --frozen-lockfile` and `pnpm install
+/// --frozen-lockfile` check the lockfile against.
 pub const NPM_MANIFEST: &str = "package.json";
 
-/// The directory of a cache entry that holds the npm part: `<entry>/npm/node_modules` (the
-/// install) and `<entry>/npm/cache` (npm's own cache, so an offline `npm ci` can run).
+/// The directory of a cache entry that holds the Node part: `<entry>/npm/node_modules` (the
+/// install) and `<entry>/npm/cache` (the tool's own cache or store, so an offline install
+/// can run). The directory keeps the name it had when npm was the only tool; the same layout
+/// holds an install made by yarn or pnpm, whichever the tree's lockfile names.
 pub const NPM_ENTRY_DIR: &str = "npm";
 
 /// What the verifier mounts of the npm part, relative to `<entry>/npm`.
 pub const NPM_MODULES: &str = "node_modules";
 pub const NPM_CACHE: &str = "cache";
 
-/// The environment npm gets in the verifier. `ignore-scripts` keeps npm from running a
-/// lifecycle script of an installed package (an explicit `npm test` or `npm run` still
-/// runs the script it names), `offline` keeps it off the network it does not have, and
-/// `logs-max=0` stops it from writing a debug log into the read-only cache.
-const NPM_VERIFIER_ENV: [(&str, &str); 4] = [
+/// The environment the Node tools get in the verifier (npm, yarn and pnpm read the settings
+/// of their own; the entry does not say which tool filled it, so all of them are set).
+/// `ignore-scripts` (`YARN_ENABLE_SCRIPTS` for Yarn Berry) keeps the tool from running a
+/// lifecycle script of an installed package (an explicit `npm test` or `yarn run` still runs
+/// the script it names), `offline` (`YARN_ENABLE_NETWORK=false` for Berry) keeps it off the
+/// network it does not have, and `logs-max=0` stops npm from writing a debug log into the
+/// read-only cache.
+const NPM_VERIFIER_ENV: [(&str, &str); 7] = [
     ("npm_config_offline", "true"),
     ("npm_config_ignore_scripts", "true"),
     ("npm_config_logs_max", "0"),
     ("npm_config_update_notifier", "false"),
+    ("YARN_ENABLE_SCRIPTS", "false"),
+    ("YARN_ENABLE_NETWORK", "false"),
+    ("YARN_ENABLE_TELEMETRY", "false"),
+];
+
+/// The settings that point each tool at the entry's `cache` directory: npm's cache, yarn's
+/// cache folder (classic and Berry) and pnpm's store.
+const NPM_CACHE_ENV: [&str; 3] = [
+    "npm_config_cache",
+    "YARN_CACHE_FOLDER",
+    "npm_config_store_dir",
 ];
 
 /// Link the cache's `registry` (and `git`, when present) into `cargo_home`, the
@@ -665,11 +689,13 @@ pub fn dependency_cache_key(repo_tree: &Path, target_triple: &str) -> Result<Str
     hasher.update(target_triple.as_bytes());
 
     let mut names: Vec<&str> = LOCKFILES.iter().chain(REGISTRY_CONFIGS).copied().collect();
-    // `npm ci` refuses a lockfile that does not match `package.json`, so with an npm
+    // `npm ci`, `yarn install --frozen-lockfile` and `pnpm install --frozen-lockfile` refuse a
+    // lockfile that does not match `package.json`, so with a JavaScript
     // lockfile the manifest is an input too: the same lockfile beside another manifest is
     // another key, never a hit on an install made for the first.
     if NPM_LOCKFILES
         .iter()
+        .chain(&[YARN_LOCKFILE, PNPM_LOCKFILE])
         .any(|name| repo_tree.join(name).is_file())
     {
         names.push(NPM_MANIFEST);
@@ -3145,6 +3171,10 @@ mod tests {
             ("npm_config_offline", "true".to_string()),
             ("npm_config_ignore_scripts", "true".to_string()),
             ("npm_config_cache", cache.to_string_lossy().into_owned()),
+            ("YARN_CACHE_FOLDER", cache.to_string_lossy().into_owned()),
+            ("npm_config_store_dir", cache.to_string_lossy().into_owned()),
+            ("YARN_ENABLE_SCRIPTS", "false".to_string()),
+            ("YARN_ENABLE_NETWORK", "false".to_string()),
         ] {
             assert!(
                 policy

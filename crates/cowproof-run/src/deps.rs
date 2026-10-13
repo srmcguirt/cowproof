@@ -42,7 +42,7 @@
 //! * **Upkeep**: every hit and install takes a lease and touches a use marker in the entry,
 //!   and `cowproof cache prune` removes the unused (see [`crate::cache`]); a fetch also
 //!   clears the stale work directories of interrupted runs.
-//! * **What is covered**: Cargo and npm.
+//! * **What is covered**: Cargo, npm, yarn and pnpm.
 //!   * A tree with a `Cargo.lock` gets `<entry>/cargo/{registry,git}`.
 //!   * A tree with a `package-lock.json` or `npm-shrinkwrap.json` at its root gets
 //!     `<entry>/npm/node_modules` and `<entry>/npm/cache`. The fetch runs
@@ -53,23 +53,33 @@
 //!     the proxy variables and `npm_config_*` settings, nothing inherited. The allowlist is
 //!     `registry.npmjs.org`, the https hosts of the base `.npmrc`'s `registry` and
 //!     `@scope:registry`, and the base `cowproof.toml`'s `[proof] fetch_hosts`. No lifecycle
-//!     script of any package runs, at fetch or in the verifier. A tree with both lockfiles
-//!     fetches both into the one entry.
-//!   * Nothing else is fetched. A tree whose only dependency file is a `package.json`, a
-//!     `yarn.lock`, a `pnpm-lock.yaml` or a `Gemfile.lock` has no entry; the outcome is
-//!     [`FetchOutcome::NotFetched`] and says why in [`Prefetch::notes`], and is never
-//!     "fetched". yarn, pnpm and Bundler are in the backlog.
-//!   * `npm` is found by `COWPROOF_NPM` (an absolute path, the test hook the way `CARGO` is
-//!     for cargo) or the first `npm` on the director's `PATH`; its directory is put on the
-//!     fetch's `PATH` so its `node` is found. An `npm` that needs files under the hidden home
-//!     (nvm) is not reachable from the sandbox.
+//!     script of any package runs, at fetch or in the verifier. A tree with a `Cargo.lock`
+//!     too fetches both into the one entry.
+//!   * A `yarn.lock` or `pnpm-lock.yaml` is installed the same way into the same layout
+//!     ([`JsTool`]): classic yarn with `yarn install --frozen-lockfile --ignore-scripts
+//!     --non-interactive`, Yarn Berry with `yarn install --immutable --mode=skip-build` (only
+//!     with `nodeLinker: node-modules`; Plug'n'Play is [`FetchOutcome::NotFetched`]), pnpm with
+//!     `pnpm install --frozen-lockfile --ignore-scripts --config.node-linker=hoisted`. The
+//!     base's `.yarnrc.yml` and `.yarnrc` are stripped of credentials, certificate keys and
+//!     code-in-the-tree settings ([`strip_yarnrc_yml`], [`strip_yarnrc`]) like the `.npmrc`.
+//!     Exactly one tool's lockfile is expected: two are `NotFetched`, naming both.
+//!   * Nothing else is fetched. A tree whose only dependency file is a `package.json` with no
+//!     lockfile, a `Gemfile.lock`, two tools' lockfiles or a Berry Plug'n'Play `yarn.lock` has
+//!     no entry; the outcome is [`FetchOutcome::NotFetched`] and says why in
+//!     [`Prefetch::notes`], and is never "fetched". Bundler is in the backlog.
+//!   * `npm`, `yarn` and `pnpm` are found by `COWPROOF_NPM`, `COWPROOF_YARN` and
+//!     `COWPROOF_PNPM` (an absolute path, the test hook the way `CARGO` is for cargo) or the
+//!     first one on the director's `PATH`; its directory is put on the fetch's `PATH` so its
+//!     `node` is found. A tool that needs files under the hidden home (nvm) is not reachable
+//!     from the sandbox.
 
 use crate::bridge::bridge_port;
 use crate::cache::{self, Alive};
 use crate::fetch_proxy::{self, FetchAllowlist, FetchProxy, Resolver};
 use crate::{
     LaneLayout, NPM_CACHE, NPM_ENTRY_DIR, NPM_LOCKFILES, NPM_MANIFEST, NPM_MODULES, NetworkMode,
-    REGISTRY_CONFIGS, SandboxPolicy, dependency_cache_key, render_macos_profile, sandbox_command,
+    PNPM_LOCKFILE, REGISTRY_CONFIGS, SandboxPolicy, YARN_LOCKFILE, dependency_cache_key,
+    render_macos_profile, sandbox_command,
 };
 use anyhow::{Context, Result, bail};
 use std::ffi::OsString;
@@ -96,7 +106,13 @@ pub const FETCH_RESOLVE_ENV: &str = "COWPROOF_FETCH_RESOLVE";
 /// Without it the first `npm` on the director's `PATH` is used. Tests point it at a fake.
 pub const NPM_ENV: &str = "COWPROOF_NPM";
 
-/// How long one `cargo fetch` or `npm ci` may take.
+/// The environment variable that names the `yarn` to fetch with, as [`NPM_ENV`] does for npm.
+pub const YARN_ENV: &str = "COWPROOF_YARN";
+
+/// The environment variable that names the `pnpm` to fetch with, as [`NPM_ENV`] does for npm.
+pub const PNPM_ENV: &str = "COWPROOF_PNPM";
+
+/// How long one `cargo fetch`, `npm ci`, `yarn install` or `pnpm install` may take.
 pub const FETCH_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
 /// The cache root: `$COWPROOF_CACHE_ROOT` when set and non-empty, else `~/.cache/cowproof`.
@@ -196,7 +212,8 @@ pub enum FetchOutcome {
     /// This call fetched it.
     Fetched,
     /// The tree has dependency files this runner does not fetch (a `package.json` with no
-    /// npm lockfile, a yarn, pnpm or Bundler lockfile) and nothing it does: no entry, and
+    /// JavaScript lockfile, lockfiles of two tools, a Yarn Plug'n'Play tree, a Bundler
+    /// lockfile) and nothing it does: no entry, and
     /// [`Prefetch::notes`] says what was left out. Never reported as fetched.
     NotFetched,
     /// The fetch could not run or failed; the reason is for the director.
@@ -223,7 +240,7 @@ pub struct Prefetch {
     pub outcome: FetchOutcome,
     /// `<cache root>/deps/<key>`: valid when the outcome is not `Failed`.
     pub dir: PathBuf,
-    /// The ecosystems the entry holds (`cargo`, `npm`) when the outcome is a hit or a fetch,
+    /// The ecosystems the entry holds (`cargo`, `npm`, `yarn` or `pnpm`) when the outcome is a hit or a fetch,
     /// else empty: what the capsule records as fetched.
     pub ecosystems: Vec<&'static str>,
     /// What was left out or changed, one line each: dependency files that are not fetched,
@@ -235,56 +252,264 @@ pub struct Prefetch {
     pub resolve_override: Option<String>,
 }
 
-/// The `PATH` for the fetch and the `cargo` and `npm` executables it runs.
+/// The `PATH` for the fetch and the `cargo`, `npm`, `yarn` and `pnpm` executables it runs.
 #[derive(Debug, Clone)]
 pub struct FetchTools {
     /// The fetch's `PATH`, as the verifier's is.
     pub path: String,
     /// The `cargo` to run, granted read-only when it lives under the hidden home.
     pub cargo: Option<PathBuf>,
-    /// The `npm` to run ([`resolve_npm`]), granted read-only like `cargo`; its directory is
+    /// The `npm` to run ([`resolve_tool`]), granted read-only like `cargo`; its directory is
     /// added to the fetch's `PATH` so the `node` beside it is found.
     pub npm: Option<PathBuf>,
+    /// The `yarn` to run, found and granted the same way.
+    pub yarn: Option<PathBuf>,
+    /// The `pnpm` to run, found and granted the same way.
+    pub pnpm: Option<PathBuf>,
 }
 
-/// The `npm` a fetch runs: `$COWPROOF_NPM` when it names an existing absolute file, else
-/// the first absolute `PATH` entry that holds an `npm`. Empty and relative `PATH` entries
-/// are skipped, as for cargo: they would search the tree.
-pub fn resolve_npm(
-    npm_env: Option<&std::ffi::OsStr>,
+impl FetchTools {
+    /// The executable for `tool`, when one was found.
+    fn js(&self, tool: JsTool) -> Option<&Path> {
+        match tool {
+            JsTool::Npm => self.npm.as_deref(),
+            JsTool::YarnClassic | JsTool::YarnBerry => self.yarn.as_deref(),
+            JsTool::Pnpm => self.pnpm.as_deref(),
+        }
+    }
+}
+
+/// The `name` executable (`npm`, `yarn` or `pnpm`) a fetch runs: the file `tool_env` names
+/// (`$COWPROOF_NPM`, `$COWPROOF_YARN`, `$COWPROOF_PNPM`) when it is an existing absolute
+/// file, else the first absolute `PATH` entry that holds a `name`. Empty and relative `PATH`
+/// entries are skipped, as for cargo: they would search the tree.
+pub fn resolve_tool(
+    name: &str,
+    tool_env: Option<&std::ffi::OsStr>,
     path_env: Option<&std::ffi::OsStr>,
 ) -> Option<PathBuf> {
-    if let Some(npm) = npm_env.map(Path::new)
-        && npm.is_absolute()
-        && npm.is_file()
+    if let Some(tool) = tool_env.map(Path::new)
+        && tool.is_absolute()
+        && tool.is_file()
     {
-        return Some(npm.to_path_buf());
+        return Some(tool.to_path_buf());
     }
     std::env::split_paths(path_env?)
         .filter(|dir| dir.is_absolute())
-        .map(|dir| dir.join("npm"))
-        .find(|npm| npm.is_file())
+        .map(|dir| dir.join(name))
+        .find(|tool| tool.is_file())
+}
+
+/// The Node package tool a tree's lockfile names, and the way it installs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JsTool {
+    /// `npm ci --ignore-scripts --no-audit --no-fund` for a `package-lock.json` or
+    /// `npm-shrinkwrap.json`.
+    Npm,
+    /// `yarn install --frozen-lockfile --ignore-scripts --non-interactive` for a classic
+    /// (v1) `yarn.lock`.
+    YarnClassic,
+    /// `yarn install --immutable --mode=skip-build` for a Yarn Berry (v2+) `yarn.lock` whose
+    /// `.yarnrc.yml` sets `nodeLinker: node-modules`.
+    YarnBerry,
+    /// `pnpm install --frozen-lockfile --ignore-scripts --config.node-linker=hoisted` for a
+    /// `pnpm-lock.yaml`.
+    Pnpm,
+}
+
+impl JsTool {
+    /// The tool's name: the ecosystem the capsule records and the executable looked for.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Npm => "npm",
+            Self::YarnClassic | Self::YarnBerry => "yarn",
+            Self::Pnpm => "pnpm",
+        }
+    }
+
+    /// Names the command in messages.
+    fn label(self) -> &'static str {
+        match self {
+            Self::Npm => "npm ci --ignore-scripts",
+            Self::YarnClassic => "yarn install --frozen-lockfile --ignore-scripts",
+            Self::YarnBerry => "yarn install --immutable --mode=skip-build",
+            Self::Pnpm => "pnpm install --frozen-lockfile --ignore-scripts",
+        }
+    }
+
+    /// The arguments: a frozen install from the lockfile that runs no lifecycle script of any
+    /// package and leaves a plain `node_modules`.
+    fn args(self) -> &'static [&'static str] {
+        match self {
+            Self::Npm => &["ci", "--ignore-scripts", "--no-audit", "--no-fund"],
+            Self::YarnClassic => &[
+                "install",
+                "--frozen-lockfile",
+                "--ignore-scripts",
+                "--non-interactive",
+            ],
+            Self::YarnBerry => &["install", "--immutable", "--mode=skip-build"],
+            Self::Pnpm => &[
+                "install",
+                "--frozen-lockfile",
+                "--ignore-scripts",
+                "--config.node-linker=hoisted",
+            ],
+        }
+    }
+
+    /// The lockfiles the tool's install reads.
+    fn lockfiles(self) -> &'static [&'static str] {
+        match self {
+            Self::Npm => &NPM_LOCKFILES,
+            Self::YarnClassic | Self::YarnBerry => &[YARN_LOCKFILE],
+            Self::Pnpm => &[PNPM_LOCKFILE],
+        }
+    }
+
+    /// The executable's file name.
+    fn program(self) -> &'static str {
+        self.name()
+    }
+
+    /// The variables that point the tool at the bridge.
+    fn proxy_env(self) -> &'static [&'static str] {
+        match self {
+            Self::Npm | Self::Pnpm => &[
+                "npm_config_https_proxy",
+                "npm_config_proxy",
+                "HTTPS_PROXY",
+                "https_proxy",
+            ],
+            Self::YarnClassic | Self::YarnBerry => &[
+                "npm_config_https_proxy",
+                "npm_config_proxy",
+                "YARN_HTTPS_PROXY",
+                "YARN_HTTP_PROXY",
+                "HTTPS_PROXY",
+                "https_proxy",
+            ],
+        }
+    }
+
+    /// Builds the allowlist from the base tree.
+    fn allowlist(self) -> fn(&Path) -> Result<FetchAllowlist> {
+        match self {
+            Self::Npm => FetchAllowlist::npm_from_tree,
+            Self::YarnClassic | Self::YarnBerry => FetchAllowlist::yarn_from_tree,
+            Self::Pnpm => FetchAllowlist::pnpm_from_tree,
+        }
+    }
+
+    /// What to say of a failed command's output.
+    fn describe(self) -> fn(&[u8]) -> String {
+        match self {
+            Self::Npm => npm_failure,
+            Self::YarnClassic | Self::YarnBerry => yarn_failure,
+            Self::Pnpm => pnpm_failure,
+        }
+    }
+}
+
+/// What a tree's JavaScript lockfiles ask for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JsPlan {
+    /// No JavaScript lockfile.
+    Nothing,
+    /// Exactly one tool's lockfile, and the tool can install it.
+    Fetch(JsTool),
+    /// A lockfile this runner does not install: the line for [`Prefetch::notes`].
+    NotFetched(String),
+}
+
+/// What the JavaScript lockfiles of `tree` (the rebuilt tree) ask for. Exactly one tool's
+/// lockfile is expected: `package-lock.json` and `npm-shrinkwrap.json` are npm's (a shrinkwrap
+/// wins), `yarn.lock` is yarn's and `pnpm-lock.yaml` is pnpm's, and lockfiles of two tools
+/// are never resolved by picking one. A Yarn Berry tree (a `.yarnrc.yml`, or a `__metadata`
+/// header in `yarn.lock`) installs only with `nodeLinker: node-modules`; Plug'n'Play leaves no
+/// `node_modules` to mount. Every file is read as a regular file: a symlink could point
+/// anywhere.
+pub fn js_plan(tree: &Path) -> JsPlan {
+    let has = |name: &str| is_regular(&tree.join(name));
+    let npm = NPM_LOCKFILES.iter().any(|n| has(n));
+    let yarn = has(YARN_LOCKFILE);
+    let pnpm = has(PNPM_LOCKFILE);
+    if usize::from(npm) + usize::from(yarn) + usize::from(pnpm) > 1 {
+        let present: Vec<&str> = NPM_LOCKFILES
+            .iter()
+            .copied()
+            .filter(|n| has(n))
+            .chain([YARN_LOCKFILE].into_iter().filter(|_| yarn))
+            .chain([PNPM_LOCKFILE].into_iter().filter(|_| pnpm))
+            .collect();
+        return JsPlan::NotFetched(format!(
+            "{}: more than one JavaScript lockfile, so no tool is guessed and node_modules is not available to the verifier",
+            present.join(", ")
+        ));
+    }
+    if npm {
+        return JsPlan::Fetch(JsTool::Npm);
+    }
+    if pnpm {
+        return JsPlan::Fetch(JsTool::Pnpm);
+    }
+    if !yarn {
+        return JsPlan::Nothing;
+    }
+    let lock = fs::read_to_string(tree.join(YARN_LOCKFILE)).unwrap_or_default();
+    let rc = read_config(tree, ".yarnrc.yml").ok().flatten();
+    if rc.is_none() && !lock.lines().any(|l| l.starts_with("__metadata:")) {
+        return JsPlan::Fetch(JsTool::YarnClassic);
+    }
+    if rc.as_deref().is_some_and(yarnrc_yml_uses_node_modules) {
+        JsPlan::Fetch(JsTool::YarnBerry)
+    } else {
+        JsPlan::NotFetched(
+            "yarn.lock: Yarn Berry without `nodeLinker: node-modules` in .yarnrc.yml (Plug'n'Play) is not supported, so node_modules is not available to the verifier"
+                .to_string(),
+        )
+    }
+}
+
+/// Whether a `.yarnrc.yml` sets the top-level `nodeLinker` to `node-modules`.
+fn yarnrc_yml_uses_node_modules(text: &str) -> bool {
+    text.lines().any(|line| {
+        line.strip_prefix("nodeLinker:").is_some_and(|value| {
+            value
+                .split(" #")
+                .next()
+                .unwrap_or("")
+                .trim()
+                .trim_matches(['"', '\''])
+                == "node-modules"
+        })
+    })
 }
 
 /// Which ecosystems a rebuilt tree has something to fetch for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Needs {
     pub cargo: bool,
-    pub npm: bool,
+    /// The Node tool that installs the tree's one JavaScript lockfile ([`js_plan`]).
+    pub js: Option<JsTool>,
 }
 
 impl Needs {
-    /// What `tree` (the rebuilt tree) asks for: a `Cargo.lock`, and an npm lockfile that is a
-    /// regular file (a symlink in the tree could point anywhere).
+    /// What `tree` (the rebuilt tree) asks for: a `Cargo.lock`, and one JavaScript lockfile
+    /// that is a regular file (a symlink in the tree could point anywhere) and that a tool
+    /// installs.
     pub fn of(tree: &Path) -> Self {
         Self {
             cargo: tree.join("Cargo.lock").is_file(),
-            npm: NPM_LOCKFILES.iter().any(|n| is_regular(&tree.join(n))),
+            js: match js_plan(tree) {
+                JsPlan::Fetch(tool) => Some(tool),
+                _ => None,
+            },
         }
     }
 
     fn any(self) -> bool {
-        self.cargo || self.npm
+        self.cargo || self.js.is_some()
     }
 
     fn ecosystems(self) -> Vec<&'static str> {
@@ -292,8 +517,8 @@ impl Needs {
         if self.cargo {
             names.push("cargo");
         }
-        if self.npm {
-            names.push("npm");
+        if let Some(tool) = self.js {
+            names.push(tool.name());
         }
         names
     }
@@ -304,28 +529,18 @@ fn is_regular(path: &Path) -> bool {
 }
 
 /// The dependency files of `tree` this runner does not fetch, one line each, so the capsule
-/// says what a check may be missing. A `package.json` with an npm lockfile is fetched; one
-/// with a yarn or pnpm lockfile gets that lockfile's line; one with neither gets its own.
+/// says what a check may be missing. A `package.json` with a lockfile an installed tool
+/// reads is fetched; a lockfile no tool installs (two tools' lockfiles, a Yarn Plug'n'Play
+/// tree) gets its own line; a `package.json` with no lockfile gets that one.
 pub fn unfetched_notes(tree: &Path) -> Vec<String> {
     let has = |name: &str| is_regular(&tree.join(name));
     let mut notes = Vec::new();
-    let npm_lock = NPM_LOCKFILES.iter().any(|n| has(n));
-    if has("yarn.lock") {
-        notes.push(
-            "yarn.lock: yarn is not fetched, so node_modules is not available to the verifier"
-                .to_string(),
-        );
-    }
-    if has("pnpm-lock.yaml") {
-        notes.push(
-            "pnpm-lock.yaml: pnpm is not fetched, so node_modules is not available to the verifier"
-                .to_string(),
-        );
-    }
-    if has(NPM_MANIFEST) && !npm_lock && !has("yarn.lock") && !has("pnpm-lock.yaml") {
-        notes.push(format!(
-            "{NPM_MANIFEST} without a package-lock.json or npm-shrinkwrap.json: nothing is fetched, so node_modules is not available to the verifier"
-        ));
+    match js_plan(tree) {
+        JsPlan::NotFetched(note) => notes.push(note),
+        JsPlan::Nothing if has(NPM_MANIFEST) => notes.push(format!(
+            "{NPM_MANIFEST} without a package-lock.json, npm-shrinkwrap.json, yarn.lock or pnpm-lock.yaml: nothing is fetched, so node_modules is not available to the verifier"
+        )),
+        _ => {}
     }
     if has("Gemfile.lock") {
         notes.push("Gemfile.lock: Bundler is not fetched".to_string());
@@ -396,6 +611,170 @@ fn drop_url_credentials(value: &str) -> Option<String> {
     let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
     let (_userinfo, host) = rest[..authority_end].rsplit_once('@')?;
     Some(format!("{scheme}://{host}{}", &rest[authority_end..]))
+}
+
+/// A yarn configuration file with what the fetch must not get removed, and the counts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct YarnrcStripped {
+    pub text: String,
+    /// Lines that held a credential or a client-certificate setting.
+    pub credentials: usize,
+    /// Lines that named code in the tree to run (`yarnPath`, `yarn-path`, `plugins`).
+    pub code: usize,
+}
+
+/// The settings of a yarn configuration file that hold a credential: the npm auth keys, and
+/// the client-certificate keys of npm and Berry. Lower case, compared in any case.
+const YARN_CREDENTIAL_KEYS: [&str; 12] = [
+    "npmauthtoken",
+    "npmauthident",
+    "npmalwaysauth",
+    "_authtoken",
+    "_auth",
+    "_password",
+    "key",
+    "keyfile",
+    "cert",
+    "certfile",
+    "httpskeyfilepath",
+    "httpscertfilepath",
+];
+
+/// Credential setting names that give a flow-style line away whatever its shape.
+const YARN_CREDENTIAL_WORDS: [&str; 4] = [
+    "npmauthtoken",
+    "npmauthident",
+    "httpskeyfilepath",
+    "httpscertfilepath",
+];
+
+/// The settings that make yarn run code from the tree. The fetch does not copy the tree's
+/// `.yarn` directory, so a release or plugin named there is not available and the host's yarn
+/// is used instead.
+const YARN_CODE_KEYS: [&str; 3] = ["yarnpath", "yarn-path", "plugins"];
+
+/// What a yarn configuration line sets: its key as written, the setting's name (the last
+/// `:` part of the key, lower case, without a leading `-`/`--`) and the value text.
+fn yarn_setting(line: &str, yml: bool) -> Option<(String, String, String)> {
+    let t = line.trim().trim_start_matches("- ");
+    let (raw, key, value) = if let Some(rest) = t.strip_prefix('"') {
+        let (key, rest) = rest.split_once('"')?;
+        (&t[..key.len() + 2], key, rest.trim_start_matches(':'))
+    } else if yml {
+        let (key, value) = t.split_once(':')?;
+        (key, key, value)
+    } else {
+        let (key, value) = t
+            .split_once(|c: char| c.is_whitespace() || c == '=')
+            .unwrap_or((t, ""));
+        (key, key, value)
+    };
+    // `//host/:_authToken` and `@scope:registry` carry a scope: the setting is the last part.
+    let name = key.trim().rsplit(':').next().unwrap_or("");
+    Some((
+        raw.to_string(),
+        name.trim_start_matches('-').to_ascii_lowercase(),
+        value.trim().to_string(),
+    ))
+}
+
+/// A yarn setting's value text without its quotes or a trailing ` # comment`, and the same
+/// with a URL's `user:pass@` removed (`None` when it has none).
+fn yarn_value_without_url_credentials(value: &str) -> Option<String> {
+    let value = value.split(" #").next().unwrap_or("").trim();
+    drop_url_credentials(value.trim_matches(['"', '\'']))
+}
+
+fn strip_yarn_config(text: &str, yml: bool) -> YarnrcStripped {
+    let mut out = String::new();
+    let (mut credentials, mut code) = (0, 0);
+    // Inside a PEM block, or the lines under a dropped key: skipped until they end.
+    let mut in_pem = false;
+    let mut below: Option<usize> = None;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        let indent = line.len() - line.trim_start().len();
+        if in_pem {
+            in_pem = !trimmed.contains("-----END");
+            continue;
+        }
+        if let Some(parent) = below {
+            let item = trimmed.starts_with('-') && indent == parent;
+            if trimmed.is_empty() || indent > parent || item {
+                continue;
+            }
+            below = None;
+        }
+        let keep = |out: &mut String| {
+            out.push_str(line);
+            out.push('\n');
+        };
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            keep(&mut out);
+            continue;
+        }
+        let Some((raw, name, value)) = yarn_setting(line, yml) else {
+            keep(&mut out);
+            continue;
+        };
+        let is_credential = YARN_CREDENTIAL_KEYS.contains(&name.as_str());
+        let is_code = YARN_CODE_KEYS.contains(&name.as_str());
+        if is_credential || is_code {
+            if is_credential {
+                credentials += 1;
+                in_pem = value.contains("-----BEGIN") && !value.contains("-----END");
+            } else {
+                code += 1;
+            }
+            // A key with no value, or a block scalar, owns the lines indented below it.
+            let bare = value.is_empty() || value.starts_with(['|', '>']);
+            if yml && bare {
+                below = Some(indent);
+            }
+            continue;
+        }
+        let lower = line.to_ascii_lowercase();
+        if YARN_CREDENTIAL_WORDS.iter().any(|w| lower.contains(w)) {
+            // A flow-style mapping that holds a credential setting: dropped whole.
+            credentials += 1;
+            continue;
+        }
+        match yarn_value_without_url_credentials(&value) {
+            Some(clean) => {
+                credentials += 1;
+                let pad = &line[..indent];
+                let dash = if trimmed.starts_with("- ") { "- " } else { "" };
+                if yml {
+                    out.push_str(&format!("{pad}{dash}{raw}: {clean}\n"));
+                } else {
+                    out.push_str(&format!("{pad}{dash}{raw} \"{clean}\"\n"));
+                }
+            }
+            None => keep(&mut out),
+        }
+    }
+    YarnrcStripped {
+        text: out,
+        credentials,
+        code,
+    }
+}
+
+/// `.yarnrc.yml` (Yarn Berry) with every credential removed: `npmAuthToken`, `npmAuthIdent`
+/// and `npmAlwaysAuth`, at the top level and under `npmRegistries` and `npmScopes` entries;
+/// the client-certificate keys `key`, `keyfile`, `cert`, `certfile`, `httpsKeyFilePath` and
+/// `httpsCertFilePath`; and the `user:pass@` of a URL value. A line with such a key anywhere
+/// in a flow-style mapping goes whole. `yarnPath` and `plugins` (code in the tree) go too. A
+/// key with no value takes the lines indented below it with it.
+pub fn strip_yarnrc_yml(text: &str) -> YarnrcStripped {
+    strip_yarn_config(text, true)
+}
+
+/// Classic `.yarnrc` with every credential removed: `_authToken`, `_auth`, `_password` (also
+/// as `"//host/:_authToken"`), the client-certificate keys, and the `user:pass@` of a URL
+/// value; `yarn-path` goes too.
+pub fn strip_yarnrc(text: &str) -> YarnrcStripped {
+    strip_yarn_config(text, false)
 }
 
 /// The registry configuration files of a tree, and its `cowproof.toml` (whose
@@ -530,14 +909,24 @@ fn prefetch_in(
             resolve_override: None,
         }));
     }
-    if needs.npm
-        && let Some(text) = read_npmrc(&tree)?
-    {
-        let (_, stripped) = strip_npmrc_auth(&text);
-        if stripped > 0 {
-            notes.push(format!(
-                "npm: {stripped} credential line(s) of .npmrc were not used (the fetch never receives a token)"
-            ));
+    if let Some(tool) = needs.js {
+        for file in stripped_configs(tool, &tree)? {
+            if file.credentials > 0 {
+                notes.push(format!(
+                    "{}: {} credential line(s) of {} were not used (the fetch never receives a token)",
+                    tool.name(),
+                    file.credentials,
+                    file.name
+                ));
+            }
+            if file.code > 0 {
+                notes.push(format!(
+                    "{}: {} setting(s) of {} naming code in the tree (yarnPath, plugins) were not used",
+                    tool.name(),
+                    file.code,
+                    file.name
+                ));
+            }
         }
     }
     let done = |outcome: FetchOutcome| {
@@ -583,8 +972,8 @@ fn prefetch_in(
         if needs.cargo {
             fetch_cargo(work, &tree, &fresh, lane, config)?;
         }
-        if needs.npm {
-            fetch_npm(work, &tree, &fresh, lane, config)?;
+        if let Some(tool) = needs.js {
+            fetch_js(tool, work, &tree, &fresh, lane, config)?;
         }
         Ok(())
     })();
@@ -624,7 +1013,7 @@ fn entry_state(dir: &Path, needs: Needs) -> EntryState {
         Err(_) => EntryState::Absent,
         Ok(_)
             if (!needs.cargo || dir.join("cargo/registry").is_dir())
-                && (!needs.npm || dir.join(NPM_ENTRY_DIR).join(NPM_MODULES).is_dir()) =>
+                && (needs.js.is_none() || dir.join(NPM_ENTRY_DIR).join(NPM_MODULES).is_dir()) =>
         {
             EntryState::Complete
         }
@@ -649,15 +1038,56 @@ fn install(fresh: &Path, dir: &Path, needs: Needs) -> Result<FetchOutcome> {
     }
 }
 
-/// The base's `.npmrc` as text (`None` when it is absent, a directory or a symlink).
-fn read_npmrc(tree: &Path) -> Result<Option<String>> {
-    let path = tree.join(".npmrc");
+/// A configuration file of the base (`.npmrc`, `.yarnrc`, `.yarnrc.yml`) as text (`None` when
+/// it is absent, a directory or a symlink).
+fn read_config(tree: &Path, name: &str) -> Result<Option<String>> {
+    let path = tree.join(name);
     if !is_regular(&path) {
         return Ok(None);
     }
     fs::read_to_string(&path)
         .map(Some)
         .with_context(|| format!("reading {}", path.display()))
+}
+
+/// One configuration file the fetch gets, stripped of what it must not receive.
+struct StrippedConfig {
+    name: &'static str,
+    text: String,
+    credentials: usize,
+    code: usize,
+}
+
+/// The configuration files `tool` reads, from the base tree, each with its credentials removed:
+/// the `.npmrc` (npm, pnpm and yarn), and for yarn the `.yarnrc` and `.yarnrc.yml` too.
+fn stripped_configs(tool: JsTool, tree: &Path) -> Result<Vec<StrippedConfig>> {
+    let mut files = Vec::new();
+    if let Some(text) = read_config(tree, ".npmrc")? {
+        let (text, credentials) = strip_npmrc_auth(&text);
+        files.push(StrippedConfig {
+            name: ".npmrc",
+            text,
+            credentials,
+            code: 0,
+        });
+    }
+    if matches!(tool, JsTool::YarnClassic | JsTool::YarnBerry) {
+        for (name, strip) in [
+            (".yarnrc", strip_yarnrc as fn(&str) -> YarnrcStripped),
+            (".yarnrc.yml", strip_yarnrc_yml),
+        ] {
+            if let Some(text) = read_config(tree, name)? {
+                let s = strip(&text);
+                files.push(StrippedConfig {
+                    name,
+                    text: s.text,
+                    credentials: s.credentials,
+                    code: s.code,
+                });
+            }
+        }
+    }
+    Ok(files)
 }
 
 /// What one sandboxed fetch command is: the same sandbox, proxy and process group for cargo
@@ -742,11 +1172,13 @@ fn fetch_cargo(
     )
 }
 
-/// `npm ci --ignore-scripts --no-audit --no-fund` in a scratch copy of the tree's
-/// `package.json`, lockfile and credential-free `.npmrc`, filling `<fresh>/npm`: npm's cache
-/// in `cache` (it writes there while it runs) and the install in `node_modules`, moved out of
-/// the scratch directory when the command succeeds.
-fn fetch_npm(
+/// The tool's frozen install (`npm ci`, `yarn install --frozen-lockfile` or `--immutable`,
+/// `pnpm install --frozen-lockfile`; see [`JsTool`]) in a scratch copy of the tree's
+/// `package.json`, lockfile and credential-free configuration, filling `<fresh>/npm`: the
+/// tool's cache or store in `cache` (it writes there while it runs) and the install in
+/// `node_modules`, moved out of the scratch directory when the command succeeds.
+fn fetch_js(
+    tool: JsTool,
     work: &Path,
     tree: &Path,
     fresh: &Path,
@@ -754,49 +1186,48 @@ fn fetch_npm(
     config: &FetchConfig,
 ) -> Result<()> {
     let tools = config.tools;
-    let project = work.join("npm-project");
+    let label = tool.label();
+    let project = work.join(format!("{}-project", tool.name()));
     let home = work.join("home");
     let entry = fresh.join(NPM_ENTRY_DIR);
     let cache = entry.join(NPM_CACHE);
-    fs::create_dir_all(&project).context("creating the npm fetch directory")?;
+    fs::create_dir_all(&project).context("creating the install directory")?;
     fs::create_dir_all(&home)?;
-    fs::create_dir_all(&cache).context("creating the npm cache directory")?;
+    fs::create_dir_all(&cache).context("creating the cache directory")?;
 
-    // Only the manifest, the lockfile(s) and the credential-free `.npmrc` go in. Each is read
-    // from the rebuilt tree as a regular file: a symlink there could point anywhere.
+    // Only the manifest, the lockfile(s) and the credential-free configuration go in. Each is
+    // read from the rebuilt tree as a regular file: a symlink there could point anywhere.
     let manifest = tree.join(NPM_MANIFEST);
     if !is_regular(&manifest) {
         bail!(
-            "npm ci --ignore-scripts cannot run: the tree has an npm lockfile but no {NPM_MANIFEST} at its root"
+            "{label} cannot run: the tree has a {} lockfile but no {NPM_MANIFEST} at its root",
+            tool.name()
         );
     }
     fs::copy(&manifest, project.join(NPM_MANIFEST))
         .with_context(|| format!("copying {NPM_MANIFEST}"))?;
-    for name in NPM_LOCKFILES {
+    for name in tool.lockfiles() {
         let from = tree.join(name);
         if is_regular(&from) {
             fs::copy(&from, project.join(name)).with_context(|| format!("copying {name}"))?;
         }
     }
-    if let Some(text) = read_npmrc(tree)? {
-        fs::write(project.join(".npmrc"), strip_npmrc_auth(&text).0)
-            .context("writing the credential-free .npmrc")?;
+    for file in stripped_configs(tool, tree)? {
+        fs::write(project.join(file.name), file.text)
+            .with_context(|| format!("writing the credential-free {}", file.name))?;
     }
     // A global npm configuration of the host is not read: an empty one stands in for it.
     let global = home.join("npmrc-global");
     fs::write(&global, "").context("writing the empty global npm configuration")?;
 
-    let program = match &tools.npm {
-        Some(n) if n.is_absolute() => n.to_string_lossy().into_owned(),
-        _ => "npm".to_string(),
+    let found = tools.js(tool);
+    let program = match found {
+        Some(t) if t.is_absolute() => t.to_string_lossy().into_owned(),
+        _ => tool.program().to_string(),
     };
-    // npm is a script that finds `node` on `PATH`: its own directory comes along.
+    // The tool is a script that finds `node` on `PATH`: its own directory comes along.
     let mut path = tools.path.clone();
-    if let Some(dir) = tools
-        .npm
-        .as_deref()
-        .and_then(Path::parent)
-        .and_then(Path::to_str)
+    if let Some(dir) = found.and_then(Path::parent).and_then(Path::to_str)
         && Path::new(dir).is_absolute()
         && !dir.contains(':')
         && !path.split(':').any(|e| e == dir)
@@ -807,47 +1238,70 @@ fn fetch_npm(
             format!("{path}:{dir}")
         };
     }
+    let cache_text = cache.to_string_lossy().into_owned();
+    let mut env: Vec<(&str, String)> = vec![
+        (
+            "npm_config_globalconfig",
+            global.to_string_lossy().into_owned(),
+        ),
+        ("npm_config_ignore_scripts", "true".to_string()),
+        ("npm_config_update_notifier", "false".to_string()),
+    ];
+    match tool {
+        JsTool::Npm => {
+            env.push(("npm_config_cache", cache_text));
+            env.push(("npm_config_logs_max", "0".to_string()));
+        }
+        JsTool::YarnClassic | JsTool::YarnBerry => {
+            env.push(("YARN_CACHE_FOLDER", cache_text));
+            env.push(("YARN_ENABLE_SCRIPTS", "false".to_string()));
+            env.push(("YARN_ENABLE_TELEMETRY", "false".to_string()));
+            env.push((
+                "YARN_GLOBAL_FOLDER",
+                home.join("yarn-global").to_string_lossy().into_owned(),
+            ));
+            if tool == JsTool::YarnBerry {
+                // The cache is the entry's, not a global one under the home.
+                env.push(("YARN_ENABLE_GLOBAL_CACHE", "false".to_string()));
+            }
+        }
+        JsTool::Pnpm => {
+            env.push(("npm_config_store_dir", cache_text));
+            env.push((
+                "npm_config_cache_dir",
+                home.join("pnpm-cache").to_string_lossy().into_owned(),
+            ));
+            env.push((
+                "PNPM_HOME",
+                home.join("pnpm").to_string_lossy().into_owned(),
+            ));
+            // pnpm may otherwise fetch the release a `packageManager` field names.
+            env.push((
+                "npm_config_manage_package_manager_versions",
+                "false".to_string(),
+            ));
+        }
+    }
     run_fetch(
         work,
         lane,
         fresh,
         config,
         Job {
-            label: "npm ci --ignore-scripts",
+            label,
             program,
-            args: ["ci", "--ignore-scripts", "--no-audit", "--no-fund"]
-                .map(str::to_string)
-                .to_vec(),
-            exe: tools
-                .npm
-                .as_deref()
-                .filter(|n| n.is_absolute() && n.is_file()),
+            args: tool.args().iter().map(|a| (*a).to_string()).collect(),
+            exe: found.filter(|t| t.is_absolute() && t.is_file()),
             cwd: &project,
             path,
             home: &home,
             rw: vec![project.clone()],
             ro: Vec::new(),
-            env: [
-                ("npm_config_cache", cache.to_string_lossy().into_owned()),
-                (
-                    "npm_config_globalconfig",
-                    global.to_string_lossy().into_owned(),
-                ),
-                ("npm_config_ignore_scripts", "true".to_string()),
-                ("npm_config_logs_max", "0".to_string()),
-                ("npm_config_update_notifier", "false".to_string()),
-            ]
-            .map(|(k, v)| (k.to_string(), v))
-            .to_vec(),
-            proxy_env: &[
-                "npm_config_https_proxy",
-                "npm_config_proxy",
-                "HTTPS_PROXY",
-                "https_proxy",
-            ],
-            allowlist: FetchAllowlist::npm_from_tree,
+            env: env.into_iter().map(|(k, v)| (k.to_string(), v)).collect(),
+            proxy_env: tool.proxy_env(),
+            allowlist: tool.allowlist(),
             tree,
-            describe: npm_failure,
+            describe: tool.describe(),
         },
     )?;
 
@@ -863,19 +1317,38 @@ fn fetch_npm(
     }
 }
 
-/// The first line npm reported as an error (`npm ERR!` or `npm error`), else its first line
-/// of output, cut to a sensible length.
-fn npm_failure(output: &[u8]) -> String {
+/// The first line of `output` that starts (after any leading symbols, such as Berry's `➤`)
+/// with one of `prefixes`, in any case, else its first line, cut to a sensible length.
+fn first_error_line(output: &[u8], prefixes: &[&str]) -> String {
     let text = String::from_utf8_lossy(output);
     let lines = || text.lines().map(str::trim).filter(|l| !l.is_empty());
     let line = lines()
         .find(|l| {
-            let l = l.to_ascii_lowercase();
-            l.starts_with("npm err") || l.starts_with("npm error")
+            let l = l
+                .trim_start_matches(|c: char| !c.is_alphanumeric())
+                .to_ascii_lowercase();
+            prefixes.iter().any(|p| l.starts_with(p))
         })
         .or_else(|| lines().next())
         .unwrap_or("no output");
     line.chars().take(300).collect()
+}
+
+/// The first line npm reported as an error (`npm ERR!` or `npm error`), else its first line
+/// of output, cut to a sensible length.
+fn npm_failure(output: &[u8]) -> String {
+    first_error_line(output, &["npm err", "npm error"])
+}
+
+/// The first error line of yarn: classic's `error ...`, or one of Berry's `YN0001`, `YN0028`
+/// and `YN0035` lines.
+fn yarn_failure(output: &[u8]) -> String {
+    first_error_line(output, &["error", "yn0001", "yn0028", "yn0035"])
+}
+
+/// The first error line of pnpm: its `ERR_PNPM_*` code line, or an `ERROR` line.
+fn pnpm_failure(output: &[u8]) -> String {
+    first_error_line(output, &["err_pnpm", "error", "err "])
 }
 
 /// Run one fetch command under the fetch sandbox with the registry-only proxy (or the other
@@ -1047,7 +1520,7 @@ mod tests {
 
     const CARGO: Needs = Needs {
         cargo: true,
-        npm: false,
+        js: None,
     };
 
     /// A fetch configuration for a test that never reaches the command: running one is a
@@ -1323,6 +1796,8 @@ mod tests {
             path: "/usr/bin:/bin".into(),
             cargo: None,
             npm: None,
+            yarn: None,
+            pnpm: None,
         }
     }
 
@@ -1363,12 +1838,12 @@ mod tests {
                 "package.json without a package-lock.json",
             ),
             (
-                &["package.json", "yarn.lock"][..],
-                "yarn.lock: yarn is not fetched",
+                &["package.json", "package-lock.json", "yarn.lock"][..],
+                "package-lock.json, yarn.lock: more than one JavaScript lockfile",
             ),
             (
-                &["package.json", "pnpm-lock.yaml"][..],
-                "pnpm-lock.yaml: pnpm is not fetched",
+                &["package.json", "yarn.lock", "pnpm-lock.yaml"][..],
+                "yarn.lock, pnpm-lock.yaml: more than one JavaScript lockfile",
             ),
             (
                 &["Gemfile.lock"][..],
@@ -1416,7 +1891,7 @@ mod tests {
             for f in files {
                 fs::write(t.join(f), "{}").unwrap();
             }
-            assert!(Needs::of(&t).npm, "{files:?}");
+            assert_eq!(Needs::of(&t).js, Some(JsTool::Npm), "{files:?}");
             assert!(
                 unfetched_notes(&t).is_empty(),
                 "{files:?}: {:?}",
@@ -1428,7 +1903,7 @@ mod tests {
         fs::create_dir_all(&linked).unwrap();
         fs::write(linked.join("real"), "{}").unwrap();
         std::os::unix::fs::symlink(linked.join("real"), linked.join("package-lock.json")).unwrap();
-        assert!(!Needs::of(&linked).npm);
+        assert_eq!(Needs::of(&linked).js, None);
     }
 
     #[test]
@@ -1436,11 +1911,11 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let both = Needs {
             cargo: true,
-            npm: true,
+            js: Some(JsTool::Npm),
         };
         let npm = Needs {
             cargo: false,
-            npm: true,
+            js: Some(JsTool::Pnpm),
         };
         let old = tmp.path().join("old");
         complete_entry(&old);
@@ -1523,26 +1998,35 @@ mod tests {
     }
 
     #[test]
-    fn npm_is_found_by_the_hook_variable_or_the_path_and_never_by_a_relative_entry() {
+    fn a_tool_is_found_by_the_hook_variable_or_the_path_and_never_by_a_relative_entry() {
         let tmp = TempDir::new().unwrap();
         let bin = tmp.path().join("bin");
         fs::create_dir_all(&bin).unwrap();
-        fs::write(bin.join("npm"), "#!/bin/sh\n").unwrap();
+        for name in ["npm", "yarn", "pnpm"] {
+            fs::write(bin.join(name), "#!/bin/sh\n").unwrap();
+        }
         let path = std::env::join_paths([Path::new(""), Path::new("rel"), bin.as_path()]).unwrap();
-        assert_eq!(resolve_npm(None, Some(&path)), Some(bin.join("npm")));
-        let hook = tmp.path().join("hook-npm");
+        for name in ["npm", "yarn", "pnpm"] {
+            assert_eq!(
+                resolve_tool(name, None, Some(&path)),
+                Some(bin.join(name)),
+                "{name}"
+            );
+        }
+        assert_eq!(resolve_tool("bundler", None, Some(&path)), None);
+        let hook = tmp.path().join("hook-yarn");
         fs::write(&hook, "x").unwrap();
         assert_eq!(
-            resolve_npm(Some(hook.as_os_str()), Some(&path)),
+            resolve_tool("yarn", Some(hook.as_os_str()), Some(&path)),
             Some(hook.clone())
         );
         // A hook that is not an existing absolute file falls back to the PATH.
         assert_eq!(
-            resolve_npm(Some("relative-npm".as_ref()), Some(&path)),
-            Some(bin.join("npm"))
+            resolve_tool("pnpm", Some("relative-pnpm".as_ref()), Some(&path)),
+            Some(bin.join("pnpm"))
         );
-        assert_eq!(resolve_npm(None, Some("".as_ref())), None);
-        assert_eq!(resolve_npm(None, None), None);
+        assert_eq!(resolve_tool("npm", None, Some("".as_ref())), None);
+        assert_eq!(resolve_tool("npm", None, None), None);
     }
 
     #[test]
@@ -1555,6 +2039,176 @@ mod tests {
         );
         assert_eq!(npm_failure(b"\n  boom\n"), "boom");
         assert_eq!(npm_failure(b""), "no output");
+    }
+
+    #[test]
+    fn yarn_and_pnpm_failures_are_named_by_their_first_error_line() {
+        assert_eq!(
+            yarn_failure(b"warning x\ninfo y\nerror Couldn't find package \"z\"\nerror two\n"),
+            "error Couldn't find package \"z\""
+        );
+        assert_eq!(
+            yarn_failure(
+                "\u{27a4} YN0000: info\n\u{27a4} YN0001: \u{2502} Error: boom\n".as_bytes()
+            ),
+            "\u{27a4} YN0001: \u{2502} Error: boom"
+        );
+        assert_eq!(
+            pnpm_failure(
+                b"Progress: resolved 1\n ERR_PNPM_FETCH_404  GET https://r/x: Not Found\n"
+            ),
+            "ERR_PNPM_FETCH_404  GET https://r/x: Not Found"
+        );
+        assert_eq!(pnpm_failure(b""), "no output");
+    }
+
+    #[test]
+    fn the_tool_a_javascript_lockfile_names_is_one_and_never_a_guess() {
+        let plan = |files: &[(&str, &str)]| {
+            let tmp = TempDir::new().unwrap();
+            for (name, text) in files {
+                fs::write(tmp.path().join(name), text).unwrap();
+            }
+            js_plan(tmp.path())
+        };
+        assert_eq!(plan(&[("package.json", "{}")]), JsPlan::Nothing);
+        assert_eq!(
+            plan(&[("package-lock.json", "{}")]),
+            JsPlan::Fetch(JsTool::Npm)
+        );
+        assert_eq!(plan(&[("pnpm-lock.yaml", "")]), JsPlan::Fetch(JsTool::Pnpm));
+        assert_eq!(
+            plan(&[("yarn.lock", "# yarn lockfile v1\n")]),
+            JsPlan::Fetch(JsTool::YarnClassic)
+        );
+        let berry_lock = "__metadata:\n  version: 8\n";
+        let node_modules = "nodeLinker: node-modules\n";
+        assert_eq!(
+            plan(&[("yarn.lock", berry_lock), (".yarnrc.yml", node_modules)]),
+            JsPlan::Fetch(JsTool::YarnBerry)
+        );
+        // A `.yarnrc.yml` makes it Berry whatever the lockfile says.
+        assert_eq!(
+            plan(&[
+                ("yarn.lock", "# v1\n"),
+                (".yarnrc.yml", "nodeLinker: \"node-modules\" # x\n")
+            ]),
+            JsPlan::Fetch(JsTool::YarnBerry)
+        );
+        // Plug'n'Play, spelled out, by default, or another linker: nothing to mount.
+        for (lock, rc) in [
+            (berry_lock, Some("nodeLinker: pnp\n")),
+            (berry_lock, Some("enableTelemetry: false\n")),
+            (berry_lock, Some("nodeLinker: pnpm\n")),
+            (berry_lock, Some("  nodeLinker: node-modules\n")),
+            (berry_lock, None),
+        ] {
+            let mut files = vec![("yarn.lock", lock)];
+            files.extend(rc.map(|r| (".yarnrc.yml", r)));
+            match plan(&files) {
+                JsPlan::NotFetched(note) => {
+                    assert!(
+                        note.contains("Plug'n'Play is not") || note.contains("Plug'n'Play)"),
+                        "{note}"
+                    );
+                    assert!(note.starts_with("yarn.lock: "), "{note}");
+                }
+                other => panic!("{files:?}: {other:?}"),
+            }
+        }
+        // Two tools' lockfiles are named, and none is picked.
+        match plan(&[
+            ("package-lock.json", "{}"),
+            ("yarn.lock", ""),
+            ("pnpm-lock.yaml", ""),
+        ]) {
+            JsPlan::NotFetched(note) => assert!(
+                note.starts_with("package-lock.json, yarn.lock, pnpm-lock.yaml: more than one"),
+                "{note}"
+            ),
+            other => panic!("{other:?}"),
+        }
+        // npm's two lockfiles are one tool's.
+        assert_eq!(
+            plan(&[("package-lock.json", "{}"), ("npm-shrinkwrap.json", "{}")]),
+            JsPlan::Fetch(JsTool::Npm)
+        );
+    }
+
+    #[test]
+    fn the_yarnrc_yml_the_fetch_gets_has_no_credential_and_no_code_in_it() {
+        let begin = concat!("-----BEGIN ", "PRIVATE KEY-----");
+        let rc = format!(
+            "# kept comment\n\
+             nodeLinker: node-modules\n\
+             npmRegistryServer: \"https://user:pw@reg.example/\"\n\
+             npmAuthToken: TOP-TOKEN\n\
+             npmAlwaysAuth: true\n\
+             yarnPath: .yarn/releases/yarn-4.js\n\
+             plugins:\n  - path: .yarn/plugins/x.cjs\n    spec: \"x\"\n\
+             npmScopes:\n  corp:\n    npmRegistryServer: \"https://corp.example\"\n    npmAuthIdent: \"user:IDENT\"\n\
+             npmRegistries:\n  \"//reg.example\":\n    npmAuthToken: REG-TOKEN\n    httpsKeyFilePath: /k/KEYPATH\n\
+             \x20 \"//other.example\": {{ npmAuthToken: FLOW-TOKEN }}\n\
+             cert: |\n    {begin}\n    PEMBODY\n\
+             enableTelemetry: false\n"
+        );
+        let got = strip_yarnrc_yml(&rc);
+        for gone in [
+            "TOP-TOKEN",
+            "user:pw",
+            "yarnPath",
+            "yarn-4.js",
+            "plugins",
+            "x.cjs",
+            "IDENT",
+            "REG-TOKEN",
+            "KEYPATH",
+            "FLOW-TOKEN",
+            "PEMBODY",
+            "PRIVATE KEY",
+            "npmAlwaysAuth",
+        ] {
+            assert!(!got.text.contains(gone), "{gone} survived:\n{}", got.text);
+        }
+        for kept in [
+            "# kept comment",
+            "nodeLinker: node-modules",
+            "npmRegistryServer: https://reg.example/",
+            "npmScopes:",
+            "npmRegistryServer: \"https://corp.example\"",
+            "enableTelemetry: false",
+        ] {
+            assert!(got.text.contains(kept), "{kept} lost:\n{}", got.text);
+        }
+        // token, alwaysAuth, ident, token, key path, flow line, cert, url = 8; yarnPath, plugins = 2
+        assert_eq!((got.credentials, got.code), (8, 2), "{}", got.text);
+    }
+
+    #[test]
+    fn the_classic_yarnrc_the_fetch_gets_has_no_credential_in_it() {
+        let rc = "# kept\n\
+                  registry \"https://user:pw@reg.example/\"\n\
+                  \"//reg.example/:_authToken\" \"CLASSIC-TOKEN\"\n\
+                  //bare.example/:_auth BARE-AUTH\n\
+                  \"@corp:registry\" \"https://corp.example/\"\n\
+                  keyfile /k/KEYFILE\n\
+                  yarn-path \".yarn/releases/yarn-1.js\"\n\
+                  lastUpdateCheck 1\n";
+        let got = strip_yarnrc(rc);
+        for gone in [
+            "user:pw",
+            "CLASSIC-TOKEN",
+            "BARE-AUTH",
+            "KEYFILE",
+            "yarn-1.js",
+        ] {
+            assert!(!got.text.contains(gone), "{gone} survived:\n{}", got.text);
+        }
+        assert_eq!(
+            got.text,
+            "# kept\nregistry \"https://reg.example/\"\n\"@corp:registry\" \"https://corp.example/\"\nlastUpdateCheck 1\n"
+        );
+        assert_eq!((got.credentials, got.code), (4, 1));
     }
 
     #[test]
@@ -1575,6 +2229,8 @@ mod tests {
             path: String::new(),
             cargo: None,
             npm: None,
+            yarn: None,
+            pnpm: None,
         };
         let build = |tree: &Path| -> Result<()> {
             fs::write(tree.join("Cargo.lock"), "# lock\n")?;
@@ -1628,6 +2284,8 @@ mod tests {
             path: String::new(),
             cargo: None,
             npm: None,
+            yarn: None,
+            pnpm: None,
         };
         let got = prefetch(|_| Ok(()), &root, &lane, &config(&tools, &|_| false)).unwrap();
         assert!(got.is_none(), "the fetch itself ran");
@@ -1655,6 +2313,8 @@ mod tests {
             path: String::new(),
             cargo: None,
             npm: None,
+            yarn: None,
+            pnpm: None,
         };
         prefetch(|_| Ok(()), &root, &lane, &config(&tools, &|_| true)).unwrap();
         assert_eq!(
@@ -1685,6 +2345,8 @@ mod tests {
             path: String::new(),
             cargo: None,
             npm: None,
+            yarn: None,
+            pnpm: None,
         };
         let got = prefetch(
             |_| Ok(()),

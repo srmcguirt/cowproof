@@ -43,11 +43,13 @@ is named); 4 infrastructure (the capsule was refused as tampered, unsandboxed or
 or the replay could not run, or the dependency fetch the checks need failed; never a \
 refutation).
 
-Dependencies: a capsule whose tree has a Cargo.lock, a package-lock.json or an \
-npm-shrinkwrap.json names a dependency cache key. The cache is <cache root>/deps/<key>, the \
+Dependencies: a capsule whose tree has a Cargo.lock, and one of package-lock.json, \
+npm-shrinkwrap.json, yarn.lock or pnpm-lock.yaml, names a dependency cache key. The cache is <cache root>/deps/<key>, the \
 cache root being ~/.cache/cowproof or $COWPROOF_CACHE_ROOT; verify fetches it (cargo fetch \
---locked and npm ci --ignore-scripts, in a sandbox; npm is $COWPROOF_NPM or the first npm on \
-PATH; the network is $COWPROOF_FETCH_NETWORK: `registry` by default, a proxy that tunnels only \
+--locked, npm ci --ignore-scripts, yarn install --frozen-lockfile --ignore-scripts (classic) or \
+--immutable --mode=skip-build (Berry, node-modules linker only), or pnpm install --frozen-lockfile \
+--ignore-scripts, in a sandbox; the tool is $COWPROOF_NPM, $COWPROOF_YARN or $COWPROOF_PNPM, or the \
+first on PATH; the network is $COWPROOF_FETCH_NETWORK: `registry` by default, a proxy that tunnels only \
 to the base's registry hosts and the base cowproof.toml's [proof] fetch_hosts; `open` for full \
 outbound network; or `none`) when it is absent, and mounts it read-only for the checks \
 (node_modules appears in the tree, read-only).")]
@@ -236,17 +238,27 @@ pub(crate) async fn fetch_dependencies(
     let bridge_exe = std::env::current_exe()
         .and_then(|p| p.canonicalize())
         .context("locating the cowproof executable for the fetch's bridge")?;
-    // `$COWPROOF_NPM` (a test hook, as `$CARGO` is for cargo) or the first `npm` on `PATH`.
-    let npm = deps::resolve_npm(
-        std::env::var_os(deps::NPM_ENV).as_deref(),
-        std::env::var_os("PATH").as_deref(),
-    );
+    // `$COWPROOF_NPM`, `$COWPROOF_YARN` and `$COWPROOF_PNPM` (test hooks, as `$CARGO` is for
+    // cargo) or the first `npm`, `yarn` and `pnpm` on `PATH`.
+    let path_env = std::env::var_os("PATH");
+    let find = |name: &str, hook: &str| {
+        deps::resolve_tool(name, std::env::var_os(hook).as_deref(), path_env.as_deref())
+    };
+    let npm = find("npm", deps::NPM_ENV);
+    let yarn = find("yarn", deps::YARN_ENV);
+    let pnpm = find("pnpm", deps::PNPM_ENV);
     let root = deps::cache_root(&layout.real_home);
     let layout = layout.clone();
     let cancelled = Arc::new(AtomicBool::new(false));
     let _cancel = CancelOnDrop(cancelled.clone());
     tokio::task::spawn_blocking(move || {
-        let tools = FetchTools { path, cargo, npm };
+        let tools = FetchTools {
+            path,
+            cargo,
+            npm,
+            yarn,
+            pnpm,
+        };
         let egress = FetchEgress {
             bridge_exe,
             resolver,

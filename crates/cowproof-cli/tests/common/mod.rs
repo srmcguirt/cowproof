@@ -374,21 +374,76 @@ echo "npm ERR! the fake npm was called although the cache entry was complete" >&
 exit 1
 "#;
 
-/// Write an executable `npm` with `body` into a new directory under `/var/tmp` and return the
-/// directory (keep it alive) and the path of the script. Pass the path to a lane as
-/// `COWPROOF_NPM`, the way `CARGO` names the cargo the verifier uses.
+/// A FAKE `yarn` or `pnpm` that succeeds, as [`FAKE_NPM_OK`] is for npm. It records into
+/// the tool's own cache directory, named by `cache_var` (`YARN_CACHE_FOLDER` for yarn,
+/// `npm_config_store_dir` for pnpm): `argv.txt`, `env.txt`, `cwd.txt`, and the configuration
+/// files it was given (`npmrc.txt`, `yarnrc.txt`, `yarnrc_yml.txt`). It installs
+/// `node_modules/fake-pkg/index.js` into its working directory.
+#[allow(dead_code)] // `tests/npm_fetch.rs` uses it; the other test crates do not
+pub fn fake_js_ok(cache_var: &str) -> String {
+    format!(
+        r#"#!/bin/sh
+dir="${cache_var}"
+printf '%s\n' "$@" > "$dir/argv.txt"
+env | sort > "$dir/env.txt"
+pwd > "$dir/cwd.txt"
+if [ -f .npmrc ]; then cat .npmrc > "$dir/npmrc.txt"; fi
+if [ -f .yarnrc ]; then cat .yarnrc > "$dir/yarnrc.txt"; fi
+if [ -f .yarnrc.yml ]; then cat .yarnrc.yml > "$dir/yarnrc_yml.txt"; fi
+mkdir -p node_modules/fake-pkg
+printf 'module.exports = 42;\n' > node_modules/fake-pkg/index.js
+exit 0
+"#
+    )
+}
+
+/// A FAKE `yarn` whose install fails the way a missing package does.
+#[allow(dead_code)] // `tests/npm_fetch.rs` uses it; the other test crates do not
+pub const FAKE_YARN_FAILS: &str = r#"#!/bin/sh
+echo "warning fake-pkg@1.0.0: deprecated, for the test" >&2
+echo "error Couldn't find package \"fake-pkg\" on the \"npm\" registry." >&2
+echo "info Visit https://yarnpkg.com/en/docs/cli/install" >&2
+exit 1
+"#;
+
+/// A FAKE `pnpm` whose install fails the way a missing package does.
+#[allow(dead_code)] // `tests/npm_fetch.rs` uses it; the other test crates do not
+pub const FAKE_PNPM_FAILS: &str = r#"#!/bin/sh
+echo "Progress: resolved 1, reused 0, downloaded 0, added 0" >&2
+echo " ERR_PNPM_FETCH_404  GET https://registry.npmjs.org/fake-pkg: Not Found - 404" >&2
+exit 1
+"#;
+
+/// A FAKE `yarn` or `pnpm` that must not be called: a run that reaches it is a cache miss, or
+/// a tree that should not have been installed at all.
+#[allow(dead_code)] // `tests/npm_fetch.rs` uses it; the other test crates do not
+pub const FAKE_JS_MUST_NOT_RUN: &str = r#"#!/bin/sh
+echo "error the fake tool was called although nothing should have been installed" >&2
+exit 1
+"#;
+
+/// Write an executable named `name` (`npm`, `yarn` or `pnpm`) with `body` into a new directory
+/// under `/var/tmp` and return the directory (keep it alive) and the path of the script. Pass
+/// the path to a lane as `COWPROOF_NPM`, `COWPROOF_YARN` or `COWPROOF_PNPM`, the way `CARGO`
+/// names the cargo the verifier uses.
 #[allow(dead_code)] // `tests/npm_fetch.rs` and `tests/deps.rs` use it; the other test crates do not
-pub fn fake_npm(body: &str) -> (TempDir, PathBuf) {
-    let dir = var_tmp("cp-fake-npm-");
-    let npm = dir.path().canonicalize().unwrap().join("npm");
+pub fn fake_tool(name: &str, body: &str) -> (TempDir, PathBuf) {
+    let dir = var_tmp(&format!("cp-fake-{name}-"));
+    let tool = dir.path().canonicalize().unwrap().join(name);
     {
         // Linux refuses to exec a file some process holds open for writing (ETXTBSY), and a
         // fork on another test thread can inherit that handle: write under the fork lock.
         let _g = fork_lock();
-        fs::write(&npm, body).unwrap();
-        fs::set_permissions(&npm, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::write(&tool, body).unwrap();
+        fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).unwrap();
     }
-    (dir, npm)
+    (dir, tool)
+}
+
+/// [`fake_tool`] for `npm`.
+#[allow(dead_code)] // `tests/npm_fetch.rs` and `tests/deps.rs` use it; the other test crates do not
+pub fn fake_npm(body: &str) -> (TempDir, PathBuf) {
+    fake_tool("npm", body)
 }
 
 pub fn git(repo: &Path, args: &[&str]) {
