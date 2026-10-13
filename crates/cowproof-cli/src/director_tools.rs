@@ -295,7 +295,11 @@ impl Tool for LanesTool {
             "lanes",
             "List every lane with its state, its parked blocking escalation (id and age, not \
              the question), its pending notes and its last event time. Reads the lane files \
-             and returns at once.",
+             and returns at once. `ctx_saved_bytes_builder_reported` comes from the lane's \
+             own portkit trace, which its builder can write: it is the builder's account, \
+             not a measurement, and no verdict reads it. `run_json: \"unreadable\"` means \
+             the lane's run.json is there and cannot be used, so its credential mode and \
+             figures are unknown, not absent.",
             json!({
                 "type": "object",
                 "properties": {
@@ -318,7 +322,12 @@ impl Tool for LanesTool {
             .map_err(|e| Error::invalid_input("lanes", e.to_string()))?;
         let lanes = lane_snapshots(&root, now_ms(), ttl.as_millis() as u64)
             .map_err(|e| Error::tool_failed("lanes", e.to_string()))?;
-        Ok(json!({ "lanes_root": root, "lanes": lanes }))
+        Ok(json!({
+            "lanes_root": root,
+            "notice": "ctx_saved_bytes_builder_reported was written by a builder (it can \
+                       write its own trace): the builder's account, not a measurement.",
+            "lanes": lanes,
+        }))
     }
 }
 

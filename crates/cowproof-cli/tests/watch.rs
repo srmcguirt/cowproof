@@ -626,7 +626,7 @@ fn watch_shows_ctx_saved_for_traced_lanes_and_a_dash_for_the_rest() {
             "AGE",
             "NOTES",
             "LAST EVENT",
-            "CTX-SAVED"
+            "CTX-SAVED*"
         ]
     );
     let saved = |id: &str| -> &str {
@@ -645,7 +645,12 @@ fn watch_shows_ctx_saved_for_traced_lanes_and_a_dash_for_the_rest() {
     ] {
         assert_eq!(saved(untraced), "-", "{untraced}");
     }
-    assert_eq!(table.len(), 8);
+    // Seven lanes and the header, then the footnote that says whose figure the column is.
+    assert_eq!(table.len(), 9);
+    assert_eq!(
+        table[8],
+        ["* builder-written trace figure: informational, no verdict reads it."]
+    );
 }
 
 #[test]

@@ -5,18 +5,37 @@
 //! `portkit_core::trace::CallRecord` per line. [`read_lane_traces`] is the safe walk: no
 //! symlink is followed at any step (the lane's `portkit` directory, its `traces` directory
 //! and each trace file are all builder-writable), a file larger than 32 MiB is unreadable,
+//! the walk as a whole stops at 64 MiB and 256 files (what is left is counted, not read),
 //! and a line that is not a record is counted, not fatal. `cowproof report port-candidates`
 //! and the runner's lane-end totals both read through it, so there is one trace parser.
 
 use cowproof_prove::{ToolTotals, TraceTotals};
 use portkit_core::trace::{CallRecord, Summary};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::io::Read;
 use std::path::Path;
 
 /// A trace file larger than this is unreadable (a day of one lane is KBs).
 pub const MAX_FILE_BYTES: u64 = 32 * 1024 * 1024;
+
+/// The walk of one lane reads at most this many bytes of trace in all (audit S-5): the bound
+/// on a file is per file, and the records of every file are held in memory at once. Twice the
+/// largest single file, and ten thousand times a day of one lane.
+pub const MAX_LANE_BYTES: u64 = 64 * 1024 * 1024;
+
+/// The walk of one lane reads at most this many trace files (audit S-5). A lane writes one
+/// file a day.
+pub const MAX_LANE_FILES: usize = 256;
+
+/// `by_tool` keeps this many tool names; the rest are folded into [`OTHER_TOOLS`] (audit S-5).
+pub const MAX_TOOL_NAMES: usize = 64;
+
+/// A tool name is cut to this many bytes (on a character boundary) before it is a key.
+pub const MAX_TOOL_NAME_BYTES: usize = 64;
+
+/// The `by_tool` entry that holds the calls and bytes of every folded tool name.
+pub const OTHER_TOOLS: &str = "other";
 
 /// What the walk of one lane concluded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,6 +59,9 @@ pub struct LaneTraces {
     pub symlinked: usize,
     /// Directories and files that could not be read, or were too large.
     pub unreadable: usize,
+    /// Trace files not read because the lane had passed [`MAX_LANE_BYTES`] or
+    /// [`MAX_LANE_FILES`]. The lane is still `Traced`; the totals cover the files before.
+    pub unread_files: usize,
     /// Lines that did not parse as records.
     pub malformed_lines: usize,
     pub records: Vec<CallRecord>,
@@ -52,6 +74,7 @@ pub fn read_lane_traces(lane_dir: &Path) -> LaneTraces {
         files: 0,
         symlinked: 0,
         unreadable: 0,
+        unread_files: 0,
         malformed_lines: 0,
         records: Vec::new(),
     };
@@ -80,6 +103,7 @@ pub fn read_lane_traces(lane_dir: &Path) -> LaneTraces {
     };
     let mut files: Vec<_> = read.filter_map(Result::ok).collect();
     files.sort_by_key(|e| e.file_name());
+    let mut budget = MAX_LANE_BYTES;
     for file in files {
         let path = file.path();
         if path.extension().is_none_or(|ext| ext != "jsonl") {
@@ -96,12 +120,18 @@ pub fn read_lane_traces(lane_dir: &Path) -> LaneTraces {
         if !kind.is_file() {
             continue;
         }
-        match read_bounded(&path) {
-            Some(bytes) => {
+        if out.files >= MAX_LANE_FILES {
+            out.unread_files += 1;
+            continue;
+        }
+        match read_bounded(&path, budget) {
+            Ok(bytes) => {
+                budget -= bytes.len() as u64;
                 out.files += 1;
                 parse_records(&bytes, &mut out);
             }
-            None => out.unreadable += 1,
+            Err(Unread::Unreadable) => out.unreadable += 1,
+            Err(Unread::OverBudget) => out.unread_files += 1,
         }
     }
     if out.files > 0 {
@@ -110,19 +140,38 @@ pub fn read_lane_traces(lane_dir: &Path) -> LaneTraces {
     out
 }
 
-/// The file, or none when it is too large or cannot be read. The read is bounded as well
-/// as the size checked: a file can grow between the two.
-fn read_bounded(path: &Path) -> Option<Vec<u8>> {
-    if fs::metadata(path).ok()?.len() > MAX_FILE_BYTES {
-        return None;
+/// Why a trace file was not read.
+enum Unread {
+    /// Larger than [`MAX_FILE_BYTES`], or it could not be read.
+    Unreadable,
+    /// Within the file bound, but more than the lane has left of [`MAX_LANE_BYTES`].
+    OverBudget,
+}
+
+/// The file, or why not. The read is bounded as well as the size checked: a file can grow
+/// between the two. `budget` is what the lane has left of its aggregate bound.
+fn read_bounded(path: &Path, budget: u64) -> Result<Vec<u8>, Unread> {
+    let len = fs::metadata(path).map_err(|_| Unread::Unreadable)?.len();
+    if len > MAX_FILE_BYTES {
+        return Err(Unread::Unreadable);
+    }
+    if len > budget {
+        return Err(Unread::OverBudget);
     }
     let mut bytes = Vec::new();
     fs::File::open(path)
-        .ok()?
+        .map_err(|_| Unread::Unreadable)?
         .take(MAX_FILE_BYTES + 1)
         .read_to_end(&mut bytes)
-        .ok()?;
-    (bytes.len() as u64 <= MAX_FILE_BYTES).then_some(bytes)
+        .map_err(|_| Unread::Unreadable)?;
+    let read = bytes.len() as u64;
+    if read > MAX_FILE_BYTES {
+        Err(Unread::Unreadable)
+    } else if read > budget {
+        Err(Unread::OverBudget)
+    } else {
+        Ok(bytes)
+    }
 }
 
 fn parse_records(bytes: &[u8], out: &mut LaneTraces) {
@@ -138,17 +187,54 @@ fn parse_records(bytes: &[u8], out: &mut LaneTraces) {
 }
 
 /// The lane's totals: `None` when no trace file was read (an untraced lane has none, and a
-/// walk that was skipped has none either).
+/// walk that was skipped has none either). A lane past the aggregate bound is still traced:
+/// its totals cover the files read and `unread_files` says how many were left.
 pub fn lane_trace_totals(lane_dir: &Path) -> Option<TraceTotals> {
     let traces = read_lane_traces(lane_dir);
-    (traces.state == LaneState::Traced)
-        .then(|| trace_totals(&traces.records, traces.malformed_lines as u64))
+    (traces.state == LaneState::Traced).then(|| {
+        let mut totals = trace_totals(&traces.records, traces.malformed_lines as u64);
+        totals.unread_files = traces.unread_files as u64;
+        totals
+    })
+}
+
+/// `name` cut to [`MAX_TOOL_NAME_BYTES`] bytes at a character boundary.
+fn cut_tool_name(name: &str) -> &str {
+    if name.len() <= MAX_TOOL_NAME_BYTES {
+        return name;
+    }
+    let mut end = MAX_TOOL_NAME_BYTES;
+    while !name.is_char_boundary(end) {
+        end -= 1;
+    }
+    &name[..end]
+}
+
+/// Keep the [`MAX_TOOL_NAMES`] busiest tools (most calls; the name breaks a tie) and fold the
+/// rest into [`OTHER_TOOLS`], adding to a real tool of that name if it is among the kept.
+/// Returns how many names were folded. A pure function of the map.
+fn fold_tools(by_tool: &mut BTreeMap<String, ToolTotals>) -> u64 {
+    if by_tool.len() <= MAX_TOOL_NAMES {
+        return 0;
+    }
+    let mut ranked: Vec<(String, ToolTotals)> = std::mem::take(by_tool).into_iter().collect();
+    ranked.sort_by(|a, b| b.1.calls.cmp(&a.1.calls).then_with(|| a.0.cmp(&b.0)));
+    let folded = ranked.split_off(MAX_TOOL_NAMES);
+    by_tool.extend(ranked);
+    let other: &mut ToolTotals = by_tool.entry(OTHER_TOOLS.to_string()).or_default();
+    for (_, tool) in &folded {
+        other.calls = other.calls.saturating_add(tool.calls);
+        other.delivered_bytes = other.delivered_bytes.saturating_add(tool.delivered_bytes);
+    }
+    folded.len() as u64
 }
 
 /// Add up records: calls, rejected calls, produced, delivered and saved bytes (portkit's own
 /// [`Summary`], so the sums are the ones `pk trace` prints), the re-read rate, calls and
-/// delivered bytes by tool, and what `pk-read` delivered. This is the one place the lane totals
-/// are computed.
+/// delivered bytes by tool (at most [`MAX_TOOL_NAMES`] names, each cut to
+/// [`MAX_TOOL_NAME_BYTES`]; the rest folded into [`OTHER_TOOLS`] and counted), and what
+/// `pk-read` delivered. This is the one place the lane totals are computed, and a pure
+/// function of the records.
 pub fn trace_totals(records: &[CallRecord], malformed_lines: u64) -> TraceTotals {
     let mut summary = Summary::default();
     let mut seen: HashSet<(&str, &str)> = HashSet::new();
@@ -167,7 +253,10 @@ pub fn trace_totals(records: &[CallRecord], malformed_lines: u64) -> TraceTotals
                 reread += 1;
             }
         }
-        let tool: &mut ToolTotals = totals.by_tool.entry(record.tool.clone()).or_default();
+        let tool: &mut ToolTotals = totals
+            .by_tool
+            .entry(cut_tool_name(&record.tool).to_string())
+            .or_default();
         tool.calls += 1;
         tool.delivered_bytes = tool.delivered_bytes.saturating_add(delivered);
         if record.tool == "Bash" && record.target.as_deref().is_some_and(runs_pk_read) {
@@ -176,6 +265,7 @@ pub fn trace_totals(records: &[CallRecord], malformed_lines: u64) -> TraceTotals
                 totals.pk_read.delivered_bytes.saturating_add(delivered);
         }
     }
+    totals.folded_tool_names = fold_tools(&mut totals.by_tool);
     totals.calls = summary.calls as u64;
     totals.rejected = summary.rejected as u64;
     totals.produced_bytes = summary.produced_bytes as u64;
@@ -383,5 +473,179 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(lane_trace_totals(dir.path()), None);
         assert_eq!(read_lane_traces(dir.path()).state, LaneState::Untraced);
+    }
+
+    #[test]
+    fn more_than_64_tool_names_fold_into_other_with_their_calls_and_bytes_summed() {
+        // Tool `t00` has 1 call, `t01` 2, ... `t64` 65: 65 names, the quietest one folds.
+        let mut records = Vec::new();
+        for n in 0..=64u64 {
+            for _ in 0..=n {
+                records.push(record(&format!("t{n:02}"), None, 3));
+            }
+        }
+        let t = trace_totals(&records, 0);
+        assert_eq!(t.folded_tool_names, 1);
+        assert_eq!(t.by_tool.len(), MAX_TOOL_NAMES + 1);
+        assert!(!t.by_tool.contains_key("t00"));
+        assert_eq!(
+            t.by_tool[OTHER_TOOLS],
+            ToolTotals {
+                calls: 1,
+                delivered_bytes: 3
+            }
+        );
+        // Nothing is lost: the by-tool calls and bytes still add up to the totals.
+        assert_eq!(t.by_tool.values().map(|v| v.calls).sum::<u64>(), t.calls);
+        assert_eq!(
+            t.by_tool.values().map(|v| v.delivered_bytes).sum::<u64>(),
+            t.delivered_bytes
+        );
+
+        // A hundred names fold thirty-six; the same records in another order total the same.
+        let many: Vec<_> = (0..100)
+            .map(|n| record(&format!("n{n:03}"), None, 1))
+            .collect();
+        let t = trace_totals(&many, 0);
+        assert_eq!(t.folded_tool_names, 36);
+        assert_eq!(t.by_tool[OTHER_TOOLS].calls, 36);
+        let mut reversed = many.clone();
+        reversed.reverse();
+        assert_eq!(trace_totals(&reversed, 0), t);
+    }
+
+    #[test]
+    fn exactly_64_tool_names_are_kept_whole() {
+        let records: Vec<_> = (0..MAX_TOOL_NAMES)
+            .map(|n| record(&format!("t{n}"), None, 1))
+            .collect();
+        let t = trace_totals(&records, 0);
+        assert_eq!(t.folded_tool_names, 0);
+        assert_eq!(t.by_tool.len(), MAX_TOOL_NAMES);
+        assert!(!t.by_tool.contains_key(OTHER_TOOLS));
+    }
+
+    #[test]
+    fn a_tool_name_is_cut_to_64_bytes_on_a_character_boundary() {
+        let long = "T".repeat(1024);
+        // Three bytes a character: 21 of them are 63 bytes, the 22nd would pass 64.
+        let wide = "\u{20ac}".repeat(400);
+        let t = trace_totals(&[record(&long, None, 1), record(&wide, None, 1)], 0);
+        let names: Vec<&String> = t.by_tool.keys().collect();
+        assert_eq!(names.len(), 2);
+        assert!(
+            names.iter().all(|n| n.len() <= MAX_TOOL_NAME_BYTES),
+            "{names:?}"
+        );
+        assert!(t.by_tool.contains_key(&"T".repeat(64)));
+        assert!(t.by_tool.contains_key(&"\u{20ac}".repeat(21)));
+        // Two long names that share a 64-byte head are one tool; their calls add up.
+        let a = format!("{}a", "S".repeat(64));
+        let b = format!("{}b", "S".repeat(64));
+        let t = trace_totals(&[record(&a, None, 1), record(&b, None, 2)], 0);
+        assert_eq!(
+            t.by_tool[&"S".repeat(64)],
+            ToolTotals {
+                calls: 2,
+                delivered_bytes: 3
+            }
+        );
+    }
+
+    #[test]
+    fn a_5_mib_tool_name_leaves_the_totals_small() {
+        let t = trace_totals(&[record(&"T".repeat(5 * 1024 * 1024), None, 1)], 0);
+        assert!(serde_json::to_vec(&t).unwrap().len() < 1024);
+    }
+
+    #[test]
+    fn the_totals_are_marked_builder_written_and_older_totals_read_as_such() {
+        let t = trace_totals(&[], 0);
+        assert!(t.builder_written);
+        let json = serde_json::to_value(&t).unwrap();
+        assert_eq!(json["builderWritten"], true, "{json}");
+        assert_eq!(json["foldedToolNames"], 0);
+        assert_eq!(json["unreadFiles"], 0);
+
+        // A capsule written before the marker, the fold count and the walk bound.
+        let old: TraceTotals = serde_json::from_value(serde_json::json!({
+            "calls": 2,
+            "deliveredBytes": 5,
+            "producedBytes": 6,
+            "byTool": {"Read": {"calls": 2, "deliveredBytes": 5}},
+            "pkRead": {"calls": 0, "deliveredBytes": 0},
+            "malformedLines": 0,
+        }))
+        .unwrap();
+        assert!(old.builder_written, "its figures were builder-written too");
+        assert_eq!((old.folded_tool_names, old.unread_files), (0, 0));
+        assert_eq!(old.calls, 2);
+    }
+
+    fn trace_file(traces: &Path, name: &str, extra_bytes: u64) {
+        let path = traces.join(name);
+        fs::write(&path, line() + "\n").unwrap();
+        if extra_bytes > 0 {
+            let len = fs::metadata(&path).unwrap().len();
+            // Sparse zeros after the record: one malformed line, no disk used.
+            fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_len(len + extra_bytes)
+                .unwrap();
+        }
+    }
+
+    fn line() -> String {
+        r#"{"tool":"Read","target":"a","surface":"agent","outcome":"ok","at":"x","duration_ms":0.0,"input_bytes":1,"produced_bytes":90,"delivered_bytes":40}"#.to_string()
+    }
+
+    #[test]
+    fn the_walk_stops_at_the_aggregate_byte_bound_and_counts_what_it_left() {
+        let lane = tempfile::tempdir_in("/var/tmp").unwrap();
+        let traces = lane.path().join("portkit/traces");
+        fs::create_dir_all(&traces).unwrap();
+        // Three files of 30 MiB (each under the file bound): two fit in 64 MiB, not three.
+        for name in ["a.jsonl", "b.jsonl", "c.jsonl"] {
+            trace_file(&traces, name, 30 * 1024 * 1024);
+        }
+        let walk = read_lane_traces(lane.path());
+        assert_eq!(walk.state, LaneState::Traced);
+        assert_eq!((walk.files, walk.unread_files, walk.unreadable), (2, 1, 0));
+        assert_eq!(walk.records.len(), 2);
+        let t = lane_trace_totals(lane.path()).expect("still traced");
+        assert_eq!((t.calls, t.unread_files), (2, 1));
+    }
+
+    #[test]
+    fn the_walk_stops_at_the_file_count_bound_and_counts_what_it_left() {
+        let lane = tempfile::tempdir_in("/var/tmp").unwrap();
+        let traces = lane.path().join("portkit/traces");
+        fs::create_dir_all(&traces).unwrap();
+        for n in 0..MAX_LANE_FILES + 5 {
+            trace_file(&traces, &format!("{n:04}.jsonl"), 0);
+        }
+        let walk = read_lane_traces(lane.path());
+        assert_eq!(walk.state, LaneState::Traced);
+        assert_eq!((walk.files, walk.unread_files), (MAX_LANE_FILES, 5));
+        assert_eq!(walk.records.len(), MAX_LANE_FILES);
+        // The files read are the first by name; the same lane walked twice totals the same.
+        assert_eq!(
+            lane_trace_totals(lane.path()),
+            lane_trace_totals(lane.path())
+        );
+        assert_eq!(lane_trace_totals(lane.path()).unwrap().unread_files, 5);
+    }
+
+    #[test]
+    fn a_lane_within_the_bounds_has_nothing_unread() {
+        let lane = tempfile::tempdir_in("/var/tmp").unwrap();
+        let traces = lane.path().join("portkit/traces");
+        fs::create_dir_all(&traces).unwrap();
+        trace_file(&traces, "a.jsonl", 0);
+        let walk = read_lane_traces(lane.path());
+        assert_eq!((walk.files, walk.unread_files), (1, 0));
+        assert_eq!(lane_trace_totals(lane.path()).unwrap().unread_files, 0);
     }
 }

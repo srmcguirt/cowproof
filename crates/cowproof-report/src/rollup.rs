@@ -126,6 +126,9 @@ pub struct Climbed {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Delivered {
+    /// Always true: the figures below come from traces the builders wrote (audit S-6), so the
+    /// `--json` carries the label the text output prints.
+    pub builder_written: bool,
     pub start_rung: String,
     /// Proved lanes of the rung, traced or not.
     pub proved_lanes: usize,
@@ -159,6 +162,9 @@ pub struct LaneRow {
     pub cost_usd: Option<f64>,
     pub cost_is_estimate: bool,
     pub turns: Option<u64>,
+    /// Always true: the trace figures below (`deliveredBytes` to `rereadRate`) are the
+    /// builder's own account, as `run.json` marks them (audit S-6).
+    pub builder_written: bool,
     /// `traceTotals.deliveredBytes` of `run.json`, for a traced lane.
     pub delivered_bytes: Option<u64>,
     /// `traceTotals.savedBytes`, when the lane's `run.json` has it.
@@ -281,6 +287,7 @@ pub fn rollup(roots: &[PathBuf], options: &Options) -> Result<Rollup> {
     let delivered: Vec<Delivered> = accs
         .into_iter()
         .map(|(rung, acc)| Delivered {
+            builder_written: true,
             start_rung: rung.to_string(),
             proved_lanes: acc.proved,
             traced_proved_lanes: acc.traced,
@@ -494,6 +501,7 @@ fn read_lane(dir: &Path, id: &str, root: &Path, options: &Options) -> Found {
         cost_usd,
         cost_is_estimate,
         turns: turns_of(&run),
+        builder_written: true,
         delivered_bytes: trace_figure(&run, "deliveredBytes").and_then(Value::as_u64),
         saved_bytes: trace_figure(&run, "savedBytes").and_then(Value::as_u64),
         rejected: trace_figure(&run, "rejected").and_then(Value::as_u64),

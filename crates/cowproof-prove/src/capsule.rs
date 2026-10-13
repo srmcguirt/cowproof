@@ -293,9 +293,15 @@ pub struct ToolTotals {
 /// read from `<lane>/portkit/traces/*.jsonl` at lane end and describe how the lane was
 /// watched; they never enter the verdict. The builder can write its own trace directory, so
 /// the figures are the builder's own account, not a measurement the runner made.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TraceTotals {
+    /// Always true when the runner writes it: every figure below comes from a trace the
+    /// builder can write, so none is a measurement the runner made (audit S-6). It travels
+    /// with the figures into `run.json`, the capsule, the `lanes` tool and the rollup. A
+    /// capsule written before it reads as true: its figures were builder-written too.
+    #[serde(default = "builder_written_default")]
+    pub builder_written: bool,
     /// Records read.
     pub calls: u64,
     /// Bytes that reached the builder's context (`delivered_bytes`), summed.
@@ -325,6 +331,38 @@ pub struct TraceTotals {
     pub pk_read: ToolTotals,
     /// Lines of a trace file that were not records.
     pub malformed_lines: u64,
+    /// Tool names folded into the `other` entry of `by_tool` because the lane named more than
+    /// 64 (audit S-5). Absent in older capsules, which read as 0.
+    #[serde(default)]
+    pub folded_tool_names: u64,
+    /// Trace files the walk left unread because the lane's trace passed the aggregate bound
+    /// on bytes or files (audit S-5): the totals cover the files before them. Absent in older
+    /// capsules, which read as 0.
+    #[serde(default)]
+    pub unread_files: u64,
+}
+
+fn builder_written_default() -> bool {
+    true
+}
+
+impl Default for TraceTotals {
+    fn default() -> Self {
+        Self {
+            builder_written: true,
+            calls: 0,
+            delivered_bytes: 0,
+            produced_bytes: 0,
+            saved_bytes: 0,
+            rejected: 0,
+            reread_rate: None,
+            by_tool: BTreeMap::new(),
+            pk_read: ToolTotals::default(),
+            malformed_lines: 0,
+            folded_tool_names: 0,
+            unread_files: 0,
+        }
+    }
 }
 
 /// The main capsule structure.

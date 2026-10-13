@@ -408,6 +408,31 @@ async fn lanes_reports_the_state_cowproof_watch_prints() {
     assert_eq!(lanes[1]["pending_notes"], 0);
 }
 
+/// Audit S-5 and S-6: the saved figure is named for whose it is, the reply carries a notice,
+/// and a `run.json` that cannot be read says so instead of leaving the lane's row bare.
+#[tokio::test]
+async fn lanes_labels_the_builder_reported_figure_and_says_when_run_json_is_unreadable() {
+    let root = Root::new();
+    fs::write(
+        root.control("lane-a").join("run.json"),
+        json!({"status": "proved", "traceTotals": {"savedBytes": 4242}}).to_string(),
+    )
+    .unwrap();
+    // 5 MiB: past the 4 MiB the reader takes.
+    fs::write(
+        root.control("lane-b").join("run.json"),
+        format!(r#"{{"status":"proved","pad":"{}"}}"#, "x".repeat(5 << 20)),
+    )
+    .unwrap();
+    let out = tool("lanes", json!({"lanes_root": root.arg()})).await;
+    let lanes = out["lanes"].as_array().unwrap();
+    assert_eq!(lanes[0]["ctx_saved_bytes_builder_reported"], 4242, "{out}");
+    assert!(lanes[0].get("ctx_saved_bytes").is_none(), "{out}");
+    assert!(lanes[0].get("run_json").is_none(), "{out}");
+    assert_eq!(lanes[1]["run_json"], "unreadable", "{out}");
+    assert!(out["notice"].as_str().unwrap().contains("builder"), "{out}");
+}
+
 #[tokio::test]
 async fn events_returns_only_what_came_after_the_cursor() {
     let root = Root::new();

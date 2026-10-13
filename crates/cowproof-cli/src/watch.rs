@@ -244,37 +244,30 @@ fn lane_verdict(lane_dir: &Path) -> Option<String> {
 
 /// Get the state of a lane: its verdict when it has one (`control/verdict.json`), otherwise
 /// the status in `control/run.json`, otherwise `running`. `run.json` alone says `finished` for
-/// a builder that exited, however the proof went.
-fn get_lane_state(lane_dir: &Path) -> String {
+/// a builder that exited, however the proof went. A `run.json` that cannot be read (too large
+/// or not JSON) says `finished`; the `run_json` field and the `?` cells say it is unreadable.
+fn get_lane_state(lane_dir: &Path, run: &RunJson) -> String {
     if let Some(verdict) = lane_verdict(lane_dir) {
         return verdict;
     }
-    let run_json = lane_dir.join("control/run.json");
-    if !run_json.exists() {
-        return "running".to_string();
+    let obj = match run {
+        RunJson::Absent => return "running".to_string(),
+        RunJson::Unreadable => return "finished".to_string(),
+        RunJson::Doc(obj) => obj,
+    };
+    // Check for status field (stopped, failed, timeout, finished, ...)
+    if let Some(status) = obj.get("status").and_then(|v| v.as_str()) {
+        return status.to_string();
     }
-
-    match fs::read_to_string(&run_json) {
-        Ok(content) => match serde_json::from_str::<serde_json::Value>(&content) {
-            Ok(obj) => {
-                // Check for status field (stopped, failed, timeout, finished, ...)
-                if let Some(status) = obj.get("status").and_then(|v| v.as_str()) {
-                    return status.to_string();
-                }
-                // Fall back to exitCode (exit 0, exit 1, etc.)
-                if let Some(exit_code) = obj.get("exitCode").and_then(|v| v.as_i64()) {
-                    return format!("exit {}", exit_code);
-                }
-                // Legacy: exit_code field
-                if let Some(exit_code) = obj.get("exit_code").and_then(|v| v.as_i64()) {
-                    return format!("exit {}", exit_code);
-                }
-                "finished".to_string()
-            }
-            Err(_) => "finished".to_string(),
-        },
-        Err(_) => "finished".to_string(),
+    // Fall back to exitCode (exit 0, exit 1, etc.)
+    if let Some(exit_code) = obj.get("exitCode").and_then(|v| v.as_i64()) {
+        return format!("exit {}", exit_code);
     }
+    // Legacy: exit_code field
+    if let Some(exit_code) = obj.get("exit_code").and_then(|v| v.as_i64()) {
+        return format!("exit {}", exit_code);
+    }
+    "finished".to_string()
 }
 
 /// Get the last event time for a lane, if any.
@@ -361,29 +354,49 @@ impl LaneCredential {
     }
 }
 
-/// `control/run.json` of a lane, read without following a link and only up to a bound; none
-/// when it is absent, not a file, too large or not JSON. The runner writes it at lane end, so
-/// a lane that is still running has none.
-fn read_run_json(lane_dir: &Path) -> Option<serde_json::Value> {
+/// The longest `control/run.json` that `watch` and the `lanes` tool read.
+const MAX_RUN_JSON_BYTES: u64 = 4 * 1024 * 1024;
+
+/// What `control/run.json` of a lane held when it was read.
+#[derive(Debug, Clone, PartialEq)]
+enum RunJson {
+    /// There is no such file: the runner writes it at lane end, so the lane is still running.
+    Absent,
+    /// The file is there and cannot be used: not a regular file (a link is not followed),
+    /// larger than [`MAX_RUN_JSON_BYTES`], or not JSON. It is never shown as nothing: the
+    /// cells that come from it say `?` (audit S-5), because a builder that could blank them
+    /// would hide a credential in its lane.
+    Unreadable,
+    Doc(serde_json::Value),
+}
+
+/// `control/run.json` of a lane, read once, without following a link and only up to a bound.
+fn read_run_json(lane_dir: &Path) -> RunJson {
     let path = lane_dir.join("control/run.json");
-    let meta = fs::symlink_metadata(&path).ok()?;
-    if !meta.is_file() || meta.len() > 4 * 1024 * 1024 {
-        return None;
+    let meta = match fs::symlink_metadata(&path) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return RunJson::Absent,
+        Err(_) => return RunJson::Unreadable,
+    };
+    if !meta.is_file() || meta.len() > MAX_RUN_JSON_BYTES {
+        return RunJson::Unreadable;
     }
     let mut text = String::new();
-    fs::File::open(&path)
-        .ok()?
-        .take(4 * 1024 * 1024)
-        .read_to_string(&mut text)
-        .ok()?;
-    serde_json::from_str(&text).ok()
+    let read = fs::File::open(&path)
+        .and_then(|f| f.take(MAX_RUN_JSON_BYTES + 1).read_to_string(&mut text));
+    if read.is_err() || text.len() as u64 > MAX_RUN_JSON_BYTES {
+        return RunJson::Unreadable;
+    }
+    serde_json::from_str(&text).map_or(RunJson::Unreadable, RunJson::Doc)
 }
 
 /// The credential mode recorded in the lane's `control/run.json`, when it is not `api-key`. The
 /// file is read without following a link and only up to a bound; the label is a file the builder
 /// cannot write, printed in a table, so it is held to a short lower-case alphabet anyway.
-fn lane_credential(lane_dir: &Path) -> Option<LaneCredential> {
-    let doc = read_run_json(lane_dir)?;
+fn lane_credential(run: &RunJson) -> Option<LaneCredential> {
+    let RunJson::Doc(doc) = run else {
+        return None;
+    };
     let label = |v: &serde_json::Value| {
         v.as_str()
             .filter(|n| {
@@ -408,14 +421,15 @@ fn lane_credential(lane_dir: &Path) -> Option<LaneCredential> {
 /// The bytes the budget kept out of a traced lane's context: `traceTotals.savedBytes` of
 /// `control/run.json` (D5). The runner reads the lane's trace once, at lane end, and writes the
 /// totals into `run.json` then, so a lane that is still running, an untraced lane, an older
-/// `run.json` without the figure and a `run.json` that cannot be read all have none. This never
-/// opens the trace files, so a missing or malformed trace cannot fail `watch`. The figure is
-/// the builder's own account (it can write its trace): informational.
-fn lane_ctx_saved(lane_dir: &Path) -> Option<u64> {
-    read_run_json(lane_dir)?
-        .get("traceTotals")?
-        .get("savedBytes")?
-        .as_u64()
+/// `run.json` without the figure all have none; a `run.json` that cannot be read has none here
+/// and the snapshot says so in `run_json`. This never opens the trace files, so a missing or
+/// malformed trace cannot fail `watch`. The figure is the builder's own account (it can write
+/// its trace): informational, and labelled so wherever it is shown.
+fn lane_ctx_saved(run: &RunJson) -> Option<u64> {
+    let RunJson::Doc(doc) = run else {
+        return None;
+    };
+    doc.get("traceTotals")?.get("savedBytes")?.as_u64()
 }
 
 /// Bytes as a short human figure: `950`, `12.3k`, `4.5M`, `1.2G` (decimal units).
@@ -452,9 +466,24 @@ pub struct LaneSnapshot {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub credential: Option<LaneCredential>,
     /// Bytes the budget kept out of the lane's context, once the lane has ended with trace
-    /// totals (`traceTotals.savedBytes`); none while it runs, and for an untraced lane.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// totals (`traceTotals.savedBytes`); none while it runs, and for an untraced lane. The
+    /// builder wrote the trace it comes from, so the name says whose figure it is (audit S-6).
+    #[serde(
+        rename = "ctx_saved_bytes_builder_reported",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub ctx_saved_bytes: Option<u64>,
+    /// `"unreadable"` when the lane's `run.json` is there and cannot be used (too large, a
+    /// link, or not JSON): `credential` and the saved figure are then unknown, not absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_json: Option<&'static str>,
+}
+
+impl LaneSnapshot {
+    /// Whether the lane's `run.json` could not be read, so the cells from it are `?`.
+    fn run_json_unreadable(&self) -> bool {
+        self.run_json.is_some()
+    }
 }
 
 /// Every lane under `lanes_root`, sorted by name, as data.
@@ -469,15 +498,18 @@ pub fn lane_snapshots(
         let control_dir = lane_dir.join("control");
         let parked = parked(&control_dir, id, now_ms, cache_ttl_ms);
         let notes = count_pending_notes(&control_dir, id);
+        // Read once: the state, the credential and the saved figure all come from it.
+        let run = read_run_json(&lane_dir);
         rows.push(LaneSnapshot {
             id: id.to_string(),
-            state: get_lane_state(&lane_dir),
+            state: get_lane_state(&lane_dir, &run),
             queue_unreadable: parked.is_err() || notes.is_err(),
             parked: parked.ok().flatten(),
             pending_notes: notes.ok(),
             last_event_ms: get_last_event_time(&lane_dir),
-            credential: lane_credential(&lane_dir),
-            ctx_saved_bytes: lane_ctx_saved(&lane_dir),
+            credential: lane_credential(&run),
+            ctx_saved_bytes: lane_ctx_saved(&run),
+            run_json: (run == RunJson::Unreadable).then_some("unreadable"),
         });
     }
     Ok(rows)
@@ -487,6 +519,9 @@ fn watch_table(lanes_root: &Path, cache_ttl_ms: u64) -> Result<()> {
     let now_ms = now_ms();
     let rows = lane_snapshots(lanes_root, now_ms, cache_ttl_ms)?;
     print!("{}", render_table(&rows, now_ms));
+    if let Some(note) = saved_footnote(&rows) {
+        println!("{note}");
+    }
     Ok(())
 }
 
@@ -495,13 +530,16 @@ fn watch_table(lanes_root: &Path, cache_ttl_ms: u64) -> Result<()> {
 /// Two columns are optional so that the table of plain lanes is unchanged: `CTX-SAVED` appears
 /// when some lane has trace totals, and `CREDENTIAL` when some lane is not on the default API
 /// key. `CTX-SAVED` is `-` for a lane without a figure (untraced, still running, or an older
-/// `run.json`).
+/// `run.json`), and `?` for a lane whose `run.json` could not be read. A column also appears for
+/// such a lane, so a builder cannot blank it by making its `run.json` unreadable (audit S-5).
+/// The saved figure is the builder's own account, so its header carries a `*` (audit S-6) and
+/// [`saved_footnote`] explains it under the table.
 fn render_table(rows: &[LaneSnapshot], now_ms: u64) -> String {
-    let show_saved = rows.iter().any(|r| r.ctx_saved_bytes.is_some());
-    let show_credential = rows.iter().any(|r| r.credential.is_some());
+    let show_saved = show_saved_column(rows);
+    let show_credential = show_credential_column(rows);
     let mut header = "LANE\tSTATE\tPARKED\tAGE\tNOTES\tLAST EVENT".to_string();
     if show_saved {
-        header.push_str("\tCTX-SAVED");
+        header.push_str("\tCTX-SAVED*");
     }
     if show_credential {
         header.push_str("\tCREDENTIAL");
@@ -534,20 +572,42 @@ fn render_table(rows: &[LaneSnapshot], now_ms: u64) -> String {
         );
         if show_saved {
             line.push('\t');
-            line.push_str(&row.ctx_saved_bytes.map_or("-".to_string(), human_bytes));
+            line.push_str(&if row.run_json_unreadable() {
+                "?".to_string()
+            } else {
+                row.ctx_saved_bytes.map_or("-".to_string(), human_bytes)
+            });
         }
         if show_credential {
             line.push('\t');
-            line.push_str(
-                &row.credential
+            line.push_str(&if row.run_json_unreadable() {
+                "?".to_string()
+            } else {
+                row.credential
                     .as_ref()
-                    .map_or_else(|| "api-key".to_string(), LaneCredential::cell),
-            );
+                    .map_or_else(|| "api-key".to_string(), LaneCredential::cell)
+            });
         }
         out.push_str(&line);
         out.push('\n');
     }
     out
+}
+
+fn show_saved_column(rows: &[LaneSnapshot]) -> bool {
+    rows.iter()
+        .any(|r| r.ctx_saved_bytes.is_some() || r.run_json_unreadable())
+}
+
+fn show_credential_column(rows: &[LaneSnapshot]) -> bool {
+    rows.iter()
+        .any(|r| r.credential.is_some() || r.run_json_unreadable())
+}
+
+/// The line under the table when `CTX-SAVED*` shows.
+fn saved_footnote(rows: &[LaneSnapshot]) -> Option<&'static str> {
+    show_saved_column(rows)
+        .then_some("* builder-written trace figure: informational, no verdict reads it.")
 }
 
 /// One queue event as `watch --events` prints it and the `events` tool returns it.
@@ -893,12 +953,17 @@ mod tests {
         dir
     }
 
+    /// What `run.json` of a lane that holds `json` reads as.
+    fn run_of(json: &str) -> RunJson {
+        read_run_json(lane_with_run_json(json).path())
+    }
+
     #[test]
     fn the_credential_column_names_a_subscription_lane_and_says_when_a_credential_is_in_the_lane() {
         let sub = lane_with_run_json(
             r#"{"authMode":"subscription","credentialKind":"claude-oauth-token","credentialInLane":false}"#,
         );
-        let credential = lane_credential(sub.path()).unwrap();
+        let credential = lane_credential(&read_run_json(sub.path())).unwrap();
         assert_eq!(credential.cell(), "subscription (claude-oauth-token)");
         assert!(!credential.in_lane);
 
@@ -907,7 +972,7 @@ mod tests {
             r#"{"authMode":"subscription","credentialKind":"claude-oauth-token","credentialInLane":true}"#,
         );
         assert_eq!(
-            lane_credential(held.path()).unwrap().cell(),
+            lane_credential(&read_run_json(held.path())).unwrap().cell(),
             "subscription (claude-oauth-token, in lane)"
         );
 
@@ -916,18 +981,15 @@ mod tests {
             r#"{"authMode":"api-key","credentialKind":null,"credentialInLane":false}"#,
             r#"{"status":"finished"}"#,
             r#"{"authMode":"Sub\tscription"}"#,
-            "not json",
         ] {
-            assert_eq!(
-                lane_credential(lane_with_run_json(json).path()),
-                None,
-                "{json}"
-            );
+            assert_eq!(lane_credential(&run_of(json)), None, "{json}");
         }
+        // A run.json that cannot be read has no credential to name; the snapshot says so.
+        assert_eq!(lane_credential(&run_of("not json")), None);
         // An API-key lane that somehow held a credential is shown.
         let odd = lane_with_run_json(r#"{"authMode":"api-key","credentialInLane":true}"#);
         assert_eq!(
-            lane_credential(odd.path()).unwrap().cell(),
+            lane_credential(&read_run_json(odd.path())).unwrap().cell(),
             "api-key (in lane)"
         );
     }
@@ -952,9 +1014,9 @@ mod tests {
     #[test]
     fn ctx_saved_is_the_saved_bytes_of_a_traced_lanes_totals_and_none_otherwise() {
         let saved = lane_with_run_json(r#"{"traceTotals":{"calls":3,"savedBytes":12345}}"#);
-        assert_eq!(lane_ctx_saved(saved.path()), Some(12_345));
+        assert_eq!(lane_ctx_saved(&read_run_json(saved.path())), Some(12_345));
         let zero = lane_with_run_json(r#"{"traceTotals":{"savedBytes":0}}"#);
-        assert_eq!(lane_ctx_saved(zero.path()), Some(0));
+        assert_eq!(lane_ctx_saved(&read_run_json(zero.path())), Some(0));
 
         // Untraced (null totals), an older run.json (totals without the figure), a figure that
         // is not a count, and a run.json that is not JSON all show nothing, and none fails.
@@ -967,16 +1029,12 @@ mod tests {
             "not json",
             "",
         ] {
-            assert_eq!(
-                lane_ctx_saved(lane_with_run_json(json).path()),
-                None,
-                "{json}"
-            );
+            assert_eq!(lane_ctx_saved(&run_of(json)), None, "{json}");
         }
         // A lane that is still running has no run.json yet.
         let running = tempfile::tempdir().unwrap();
         fs::create_dir_all(running.path().join("control")).unwrap();
-        assert_eq!(lane_ctx_saved(running.path()), None);
+        assert_eq!(lane_ctx_saved(&read_run_json(running.path())), None);
     }
 
     #[test]
@@ -987,7 +1045,7 @@ mod tests {
         let traces = lane.path().join("portkit/traces");
         fs::create_dir_all(&traces).unwrap();
         fs::write(traces.join("2026-10-12.jsonl"), "{ truncated\n\u{0}\u{0}").unwrap();
-        assert_eq!(lane_ctx_saved(lane.path()), None);
+        assert_eq!(lane_ctx_saved(&read_run_json(lane.path())), None);
     }
 
     fn snapshot(id: &str, saved: Option<u64>) -> LaneSnapshot {
@@ -1000,6 +1058,7 @@ mod tests {
             last_event_ms: None,
             credential: None,
             ctx_saved_bytes: saved,
+            run_json: None,
         }
     }
 
@@ -1021,7 +1080,7 @@ mod tests {
                 "AGE",
                 "NOTES",
                 "LAST EVENT",
-                "CTX-SAVED"
+                "CTX-SAVED*"
             ]
         );
         let saved = |id: &str| lines.iter().find(|l| l[0] == id).unwrap()[6];
@@ -1041,6 +1100,7 @@ mod tests {
             "{table}"
         );
         assert!(!table.contains("CTX-SAVED"), "{table}");
+        assert_eq!(saved_footnote(&[snapshot("lane-a", None)]), None);
         assert!(table.lines().all(|l| l.split('\t').count() == 6), "{table}");
     }
 
@@ -1054,7 +1114,7 @@ mod tests {
         });
         let table = render_table(&[sub, snapshot("lane-b", None)], 0);
         let header = table.lines().next().unwrap();
-        assert!(header.ends_with("\tCTX-SAVED\tCREDENTIAL"), "{header}");
+        assert!(header.ends_with("\tCTX-SAVED*\tCREDENTIAL"), "{header}");
         let a = table.lines().nth(1).unwrap();
         assert!(
             a.ends_with("\t2.0k\tsubscription (claude-oauth-token)"),
@@ -1062,5 +1122,65 @@ mod tests {
         );
         let b = table.lines().nth(2).unwrap();
         assert!(b.ends_with("\t-\tapi-key"), "{b}");
+    }
+
+    #[test]
+    fn run_json_reads_as_absent_unreadable_or_a_document() {
+        let none = tempfile::tempdir().unwrap();
+        fs::create_dir_all(none.path().join("control")).unwrap();
+        assert_eq!(read_run_json(none.path()), RunJson::Absent);
+        assert!(matches!(
+            run_of(r#"{"status":"finished"}"#),
+            RunJson::Doc(_)
+        ));
+        // Malformed, empty and too large are not nothing.
+        assert_eq!(run_of("not json"), RunJson::Unreadable);
+        assert_eq!(run_of(""), RunJson::Unreadable);
+        let big = format!(r#"{{"pad":"{}"}}"#, "x".repeat(MAX_RUN_JSON_BYTES as usize));
+        assert_eq!(run_of(&big), RunJson::Unreadable);
+        // A link is not followed.
+        let lane = tempfile::tempdir().unwrap();
+        let elsewhere = lane.path().join("elsewhere.json");
+        fs::write(&elsewhere, r#"{"status":"finished"}"#).unwrap();
+        fs::create_dir_all(lane.path().join("control")).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, lane.path().join("control/run.json")).unwrap();
+        assert_eq!(read_run_json(lane.path()), RunJson::Unreadable);
+    }
+
+    #[test]
+    fn an_oversized_run_json_shows_question_marks_not_blanks() {
+        let mut row = snapshot("lane-a", None);
+        row.run_json = Some("unreadable");
+        let table = render_table(&[row, snapshot("lane-b", Some(5))], 0);
+        let header = table.lines().next().unwrap();
+        assert!(header.ends_with("\tCTX-SAVED*\tCREDENTIAL"), "{header}");
+        let a = table.lines().nth(1).unwrap();
+        assert!(a.ends_with("\t?\t?"), "{a}");
+        let b = table.lines().nth(2).unwrap();
+        assert!(b.ends_with("\t5\tapi-key"), "{b}");
+        // The columns also appear when only the unreadable lane would have filled them.
+        let mut only = snapshot("lane-a", None);
+        only.run_json = Some("unreadable");
+        assert!(render_table(&[only.clone()], 0).contains("CTX-SAVED*\tCREDENTIAL"));
+        assert!(saved_footnote(&[only]).is_some());
+    }
+
+    #[test]
+    fn the_lanes_json_names_the_builder_reported_figure_and_flags_an_unreadable_run_json() {
+        let mut row = snapshot("lane-a", Some(7));
+        row.run_json = Some("unreadable");
+        let json = serde_json::to_value(&row).unwrap();
+        assert_eq!(json["ctx_saved_bytes_builder_reported"], 7);
+        assert!(json.get("ctx_saved_bytes").is_none(), "{json}");
+        assert_eq!(json["run_json"], "unreadable");
+        let plain = serde_json::to_value(snapshot("lane-b", None)).unwrap();
+        assert!(plain.get("run_json").is_none(), "{plain}");
+    }
+
+    #[test]
+    fn the_footnote_shows_under_the_table_only_when_the_saved_column_does() {
+        let note = saved_footnote(&[snapshot("lane-a", Some(1))]).expect("a footnote");
+        assert!(note.starts_with("* builder-written"), "{note}");
+        assert!(saved_footnote(&[snapshot("lane-a", None)]).is_none());
     }
 }

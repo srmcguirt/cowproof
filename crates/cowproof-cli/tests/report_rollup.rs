@@ -315,10 +315,12 @@ fn the_rollup_shows_the_trace_means_per_proved_traced_lane_by_start_rung() {
     assert_eq!(
         doc["delivered"],
         json!([
-            {"startRung": "claude:haiku", "provedLanes": 4, "tracedProvedLanes": 3,
+            {"builderWritten": true, "startRung": "claude:haiku", "provedLanes": 4,
+             "tracedProvedLanes": 3,
              "meanDeliveredBytes": 3000.0, "meanSavedBytes": 700.0, "meanRejected": 1.0,
              "meanRereadRate": 0.5},
-            {"startRung": "claude:sonnet", "provedLanes": 1, "tracedProvedLanes": 0,
+            {"builderWritten": true, "startRung": "claude:sonnet", "provedLanes": 1,
+             "tracedProvedLanes": 0,
              "meanDeliveredBytes": null, "meanSavedBytes": null, "meanRejected": null,
              "meanRereadRate": null},
         ])
@@ -332,6 +334,9 @@ fn the_rollup_shows_the_trace_means_per_proved_traced_lane_by_start_rung() {
             .unwrap()
             .clone()
     };
+    // The label travels with the figures in each lane row too (audit S-6).
+    assert_eq!(lane("a")["builderWritten"], true);
+    assert_eq!(lane("f")["builderWritten"], true);
     assert_eq!(lane("a")["savedBytes"], 400);
     assert_eq!(lane("a")["rejected"], 2);
     assert_eq!(lane("a")["rereadRate"], 0.5);

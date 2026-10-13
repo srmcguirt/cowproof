@@ -5699,6 +5699,7 @@ fn a_traced_lane_records_exact_trace_totals_in_run_json_and_the_capsule() {
     // rejected) and the five hooks. Both `pk-read src/lib.rs` calls name one target, so one of
     // the six calls (every one names a target) is a re-read.
     let expected = json!({
+        "builderWritten": true,
         "calls": 6,
         "deliveredBytes": 1145,
         "producedBytes": 1645,
@@ -5711,6 +5712,8 @@ fn a_traced_lane_records_exact_trace_totals_in_run_json_and_the_capsule() {
         },
         "pkRead": {"calls": 2, "deliveredBytes": 10},
         "malformedLines": 1,
+        "foldedToolNames": 0,
+        "unreadFiles": 0,
     });
     assert_eq!(h.run_json()["traceTotals"], expected);
     let raw: Value = serde_json::from_str(&h.read("control/capsule/capsule.json")).unwrap();

@@ -1,6 +1,7 @@
-//! Proof tests for `docs/audit-2026-10-13.md`. Every test is `#[ignore]`d and FAILS today, so
-//! the suite stays green; `cargo test -p cowproof --test audit_2026_10_13 -- --ignored` shows
-//! them failing. Each names the finding it proves. None needs a sandbox, a network or a tool.
+//! Proof tests for `docs/audit-2026-10-13.md`. A test for an open finding is `#[ignore]`d and
+//! FAILS today, so the suite stays green; `cargo test -p cowproof --test audit_2026_10_13 --
+//! --ignored` shows them failing. A test for a resolved finding (S-5, S-6) is not ignored.
+//! Each names the finding it proves. None needs a sandbox, a network or a tool.
 
 use cowproof_run::bundler::{Host, Plan, parse, plan};
 use std::fs;
@@ -85,7 +86,6 @@ fn trace_line(tool: &str) -> String {
 /// the `lanes` tool read `run.json` only up to 4 MiB, so a builder that makes it larger loses the
 /// lane its CREDENTIAL (including `in lane`) and CTX-SAVED columns, silently.
 #[test]
-#[ignore = "S-5: open finding"]
 fn audit_s5_a_builder_can_blind_watch_to_the_credential_column_by_growing_run_json() {
     let tmp = tempfile::tempdir_in("/var/tmp").unwrap();
     let make = |name: &str, tool: &str| {
@@ -121,7 +121,6 @@ fn audit_s5_a_builder_can_blind_watch_to_the_credential_column_by_growing_run_js
 /// `run.json`; the `lanes` tool's JSON (and the `watch` column) carry it with no marker, so an
 /// agent director reads `ctx_saved_bytes` as a measurement.
 #[test]
-#[ignore = "S-6: open finding"]
 fn audit_s6_the_lanes_tool_does_not_label_a_builder_reported_figure() {
     let tmp = tempfile::tempdir_in("/var/tmp").unwrap();
     let run = serde_json::json!({
