@@ -36,13 +36,18 @@ pub struct Stall {
 impl Stall {
     /// The line the runner prints.
     pub fn describe(&self) -> String {
+        self.describe_for("runner")
+    }
+
+    /// The same line for another watcher (`who` is "runner", "director thread", ...).
+    pub fn describe_for(&self, who: &str) -> String {
         let cause = if self.os_late * 2 >= self.runtime_late {
             "the host did not run this process"
         } else {
             "the runner's runtime was blocked while the host was not"
         };
         format!(
-            "runner stall: a task on the async runtime woke {} ms late; an OS thread woke {} ms late over the same time ({cause})",
+            "{who} stall: a task on the async runtime woke {} ms late; an OS thread woke {} ms late over the same time ({cause})",
             self.runtime_late.as_millis(),
             self.os_late.as_millis()
         )

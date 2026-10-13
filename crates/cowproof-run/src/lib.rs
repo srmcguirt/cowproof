@@ -18,6 +18,7 @@ pub mod codex;
 pub mod deps;
 pub mod director;
 pub mod fetch_proxy;
+pub mod hostload;
 pub mod lane;
 pub mod models;
 pub mod opencode;

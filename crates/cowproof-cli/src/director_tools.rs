@@ -29,6 +29,7 @@ use crate::watch::{
 };
 use anyhow::{Result, anyhow};
 use cowproof_run::escalate::{EscalationRecord, read_escalations};
+use cowproof_run::hostload::Snapshot;
 use cowproof_run::stall;
 use portkit_core::budget::Budget;
 use portkit_core::{Error, Registry, Tool, ToolSpec, async_trait};
@@ -36,8 +37,8 @@ use portkit_mcp::{McpServer, ServerInfo};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
@@ -131,18 +132,18 @@ async fn send(lanes_root: &Path, lane: &str, request: &Value) -> Result<Value, S
             own_late_ms.fetch_max(s.runtime_late.as_millis() as u64, Ordering::Relaxed);
         })
     };
-    let reply = tokio::time::timeout(SOCKET_TIMEOUT, round_trip(&socket, request))
+    let stage = AtomicU8::new(Stage::Connecting as u8);
+    let host_before = Snapshot::take();
+    let started = Instant::now();
+    let reply = tokio::time::timeout(SOCKET_TIMEOUT, round_trip(&socket, request, &stage))
         .await
         .map_err(|_| {
-            let own = own_late_ms.load(Ordering::Relaxed);
-            let own = if own == 0 {
-                String::new()
-            } else {
-                format!(" (this process's own timers ran up to {own} ms late meanwhile)")
-            };
-            SendError::Failed(format!(
-                "lane {lane} did not answer within {} s{own}",
-                SOCKET_TIMEOUT.as_secs()
+            SendError::Failed(timeout_message(
+                lane,
+                Stage::from(stage.load(Ordering::Relaxed)),
+                started.elapsed(),
+                own_late_ms.load(Ordering::Relaxed),
+                &host_before,
             ))
         })?
         .map_err(|e| SendError::Failed(e.to_string()))?;
@@ -154,10 +155,75 @@ async fn send(lanes_root: &Path, lane: &str, request: &Value) -> Result<Value, S
     }
 }
 
-async fn round_trip(socket: &Path, request: &Value) -> Result<Value> {
+/// How far a request to a lane had got, for the message when the lane did not answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Stage {
+    Connecting = 0,
+    Writing = 1,
+    AwaitingReply = 2,
+}
+
+impl From<u8> for Stage {
+    fn from(n: u8) -> Stage {
+        match n {
+            0 => Stage::Connecting,
+            1 => Stage::Writing,
+            _ => Stage::AwaitingReply,
+        }
+    }
+}
+
+impl Stage {
+    fn describe(self) -> &'static str {
+        match self {
+            Stage::Connecting => "the connection to its socket was not accepted",
+            Stage::Writing => "the request was not yet written to the connected socket",
+            Stage::AwaitingReply => "the request was sent and the lane did not reply",
+        }
+    }
+}
+
+/// The message for a lane that did not answer in [`SOCKET_TIMEOUT`]: how far the request
+/// got, whether this process's own clock ran late, and what the host did meanwhile, so a
+/// miss tells a stuck runner from a machine that did not run this process or the runner.
+fn timeout_message(
+    lane: &str,
+    stage: Stage,
+    elapsed: Duration,
+    own_late_ms: u64,
+    host_before: &Snapshot,
+) -> String {
+    let mut message = format!(
+        "lane {lane} did not answer within {} s ({})",
+        SOCKET_TIMEOUT.as_secs(),
+        stage.describe()
+    );
+    // The timeout and the watchdog both wake on the same late tick when the whole machine
+    // stood still, and the timeout can be read first: so the timeout's own lateness counts.
+    let timeout_late = elapsed.saturating_sub(SOCKET_TIMEOUT);
+    let timeout_late = if timeout_late >= OWN_STALL {
+        timeout_late.as_millis() as u64
+    } else {
+        0
+    };
+    let own = own_late_ms.max(timeout_late);
+    if own > 0 {
+        message.push_str(&format!(
+            " (this process's own timers ran up to {own} ms late meanwhile)"
+        ));
+    }
+    let host = Snapshot::take().since_waiting(host_before, elapsed);
+    if !host.is_empty() {
+        message.push_str(&format!("; {host}"));
+    }
+    message
+}
+
+async fn round_trip(socket: &Path, request: &Value, stage: &AtomicU8) -> Result<Value> {
     let mut stream = UnixStream::connect(socket)
         .await
         .map_err(|e| anyhow!("cannot connect to director socket: {e}"))?;
+    stage.store(Stage::Writing as u8, Ordering::Relaxed);
     let mut line = serde_json::to_vec(request)?;
     line.push(b'\n');
     stream
@@ -165,6 +231,7 @@ async fn round_trip(socket: &Path, request: &Value) -> Result<Value> {
         .await
         .map_err(|e| anyhow!("failed to write request: {e}"))?;
     stream.flush().await?;
+    stage.store(Stage::AwaitingReply as u8, Ordering::Relaxed);
     let mut reader = BufReader::new(stream.take(MAX_RESPONSE));
     let mut reply = Vec::new();
     reader
@@ -661,5 +728,72 @@ mod tests {
         }
         let err = send_note(root, "ok", "t").await.unwrap_err();
         assert!(matches!(err, SendError::NotRunning(_)), "{err}");
+    }
+
+    #[test]
+    fn a_missed_answer_says_how_far_the_request_got_and_whose_clock_was_late() {
+        let nothing = Snapshot::default();
+        let on_time = timeout_message(
+            "l1",
+            Stage::AwaitingReply,
+            SOCKET_TIMEOUT + Duration::from_millis(20),
+            0,
+            &nothing,
+        );
+        assert!(
+            on_time.starts_with("lane l1 did not answer within 10 s (the request was sent"),
+            "{on_time}"
+        );
+        assert!(!on_time.contains("own timers"), "{on_time}");
+
+        // The whole machine stood still: the timeout itself fired four seconds late, even
+        // though the watchdog had not yet noted its own late tick.
+        let stood_still = timeout_message(
+            "l1",
+            Stage::Connecting,
+            SOCKET_TIMEOUT + Duration::from_secs(4),
+            0,
+            &nothing,
+        );
+        assert!(stood_still.contains("connection to its socket was not accepted"));
+        assert!(
+            stood_still.contains("own timers ran up to 4000 ms late"),
+            "{stood_still}"
+        );
+
+        // The watchdog's own figure counts when it is the larger.
+        let watched = timeout_message("l1", Stage::Writing, SOCKET_TIMEOUT, 7000, &nothing);
+        assert!(watched.contains("not yet written"), "{watched}");
+        assert!(watched.contains("up to 7000 ms late"), "{watched}");
+    }
+
+    /// A lane that accepts the connection, reads the request and never answers: the stage
+    /// the message names is the one after the write.
+    #[tokio::test]
+    async fn a_lane_that_accepts_and_stays_silent_is_in_the_awaiting_stage() {
+        let dir = tempfile::Builder::new().tempdir_in("/var/tmp").unwrap();
+        let sock = dir.path().join("director.sock");
+        let listener = tokio::net::UnixListener::bind(&sock).unwrap();
+        let silent = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut line = String::new();
+            // The connection stays open (the reader owns it) and is never answered.
+            let mut reader = BufReader::new(stream);
+            reader.read_line(&mut line).await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let stage = AtomicU8::new(Stage::Connecting as u8);
+        let request = json!({"op": "note", "text": "t"});
+        let waited = tokio::time::timeout(
+            Duration::from_millis(500),
+            round_trip(&sock, &request, &stage),
+        )
+        .await;
+        assert!(waited.is_err(), "the lane never answers");
+        assert_eq!(
+            Stage::from(stage.load(Ordering::Relaxed)),
+            Stage::AwaitingReply
+        );
+        silent.abort();
     }
 }

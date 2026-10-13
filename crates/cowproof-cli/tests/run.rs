@@ -176,6 +176,9 @@ struct Harness {
     packet_text: String,
     fake: PathBuf,
     cowproof: PathBuf,
+    /// The stderr of the `cowproof run` that `start_watched` began for this harness, so a
+    /// failing `cowproof rule` can print what the runner said meanwhile.
+    runner_stderr: Mutex<Option<std::sync::Arc<Mutex<String>>>>,
 }
 
 impl Harness {
@@ -309,6 +312,7 @@ exit 0
             packet_text,
             fake,
             cowproof,
+            runner_stderr: Mutex::new(None),
         }
     }
 
@@ -1578,8 +1582,11 @@ fn wait_for_ask(h: &Harness, child: &mut Child, nth: usize) -> String {
     }
 }
 
-/// `cowproof rule <lane> <id> <verdict args>`, which must succeed.
+/// `cowproof rule <lane> <id> <verdict args>`, which must succeed. When it does not, the
+/// failure prints the runner's side too: its stderr so far (a watched run only) and its queue
+/// file, since a lane that "did not answer" has to be explained by what the lane was doing.
 fn rule(h: &Harness, id: &str, verdict: &[&str]) {
+    let started = Instant::now();
     let out = output(
         Command::new(&h.cowproof)
             .args(["rule", &h.id, id])
@@ -1587,11 +1594,27 @@ fn rule(h: &Harness, id: &str, verdict: &[&str]) {
             .arg("--lanes-root")
             .arg(h.lanes.path()),
     );
-    assert!(
-        out.status.success(),
-        "cowproof rule {verdict:?}:\nstdout: {}\nstderr: {}",
+    if out.status.success() {
+        return;
+    }
+    let runner = match h
+        .runner_stderr
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+    {
+        Some(stderr) => stderr.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+        None => "(this run's stderr is not collected; use start_watched to see it)".to_string(),
+    };
+    panic!(
+        "cowproof rule {verdict:?} failed after {:?}:\nstdout: {}\nstderr: {}\n\
+         the runner's stderr:\n{runner}\n\
+         the lane's queue file:\n{}",
+        started.elapsed(),
         String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
+        String::from_utf8_lossy(&out.stderr),
+        fs::read_to_string(h.lane().join("control/escalations.jsonl"))
+            .unwrap_or_else(|e| format!("(unreadable: {e})")),
     );
 }
 
@@ -2385,6 +2408,7 @@ fn start_watched(h: &Harness, extra: &[&str]) -> Watched {
     let pipe = child.stderr.take().unwrap();
     let stderr = std::sync::Arc::new(Mutex::new(String::new()));
     let sink = stderr.clone();
+    *h.runner_stderr.lock().unwrap_or_else(|e| e.into_inner()) = Some(stderr.clone());
     let arrivals = std::sync::Arc::new(Mutex::new(Vec::new()));
     let arrived = arrivals.clone();
     std::thread::spawn(move || {
@@ -2554,6 +2578,41 @@ fn the_runner_ends_the_whole_process_group_so_no_background_child_survives() {
         !h.lane().join("home/survived").exists(),
         "a background child outlived the session end and wrote its marker"
     );
+}
+
+/// When `cowproof rule` fails, the helper's failure carries what the runner printed and its
+/// queue file, so a lane that "did not answer" is explained by what the lane was doing.
+#[test]
+fn a_failed_rule_prints_the_runners_stderr_and_queue_file() {
+    if !sandbox_available() {
+        return;
+    }
+    let ask = mcp_session("ask.out", &[(3, "ask", blocking_ask("Which?"))]);
+    let first = format!("{}{ask}sleep 120\n", init_line());
+    let h = owned_packet(&first_then(&first, &then_checks()));
+    let mut run = start_watched(&h, &[]);
+    let id = wait_for_ask(&h, &mut run.child, 1);
+    run.wait_for_stderr(WAITING, SESSION_END_WITHIN);
+
+    // A ruling the lane refuses (no such escalation) fails the helper.
+    let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        rule(&h, &format!("{}:E99", h.id), &["--stop"]);
+    }))
+    .expect_err("a ruling on an escalation that does not exist must fail");
+    let message = refused
+        .downcast_ref::<String>()
+        .cloned()
+        .expect("the failure is a formatted message");
+    assert!(message.contains("failed after"), "{message}");
+    assert!(message.contains("unknown"), "{message}");
+    assert!(message.contains("the runner's stderr:"), "{message}");
+    assert!(message.contains(WAITING), "{message}");
+    assert!(message.contains("\"event\":\"asked\""), "{message}");
+
+    // The real escalation is still parked: end the lane properly.
+    rule(&h, &id, &["--stop"]);
+    let out = finish(run.child);
+    assert_eq!(out.status.code(), Some(7), "{}", stdout_of(&out));
 }
 
 #[test]

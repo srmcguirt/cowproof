@@ -21,13 +21,16 @@
 //! - Rule reply special field: `"delivery":"pending"` or `"delivery":"sent"` when sent through channel (D25)
 
 use crate::escalate::{EscalationId, Queue, Verdict};
+use crate::hostload::Snapshot;
+use crate::stall;
 use crate::wire::{self, Read};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::io;
 use std::os::unix::fs::FileTypeExt;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, TryLockError};
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::mpsc;
@@ -69,10 +72,152 @@ pub struct VerdictEvent {
     pub verdict: Verdict,
 }
 
+/// A step slower than this puts a line on the lane's stderr, and a step still running puts
+/// another each time it passes a further multiple of it.
+const SLOW_STEP: Duration = Duration::from_secs(1);
+
+/// The longest a request waits for the queue's mutex before it answers that the queue is
+/// busy. The director gives up on a lane after ten seconds (`SOCKET_TIMEOUT` in the CLI's
+/// `director_tools`), so this leaves it time to read an answer: a queue held that long is
+/// then said, and nothing is recorded, instead of the director getting silence.
+const LOCK_PATIENCE: Duration = Duration::from_secs(8);
+
+/// How often a request that found the queue held tries it again.
+const LOCK_POLL: Duration = Duration::from_millis(2);
+
+/// Where the handler's diagnostics go: the lane's stderr (the tests collect them instead).
+type Say = Arc<dyn Fn(&str) + Send + Sync>;
+
 struct Context {
     lane: String,
     queue: Arc<Mutex<Queue>>,
     verdict_tx: Option<mpsc::UnboundedSender<VerdictEvent>>,
+    /// See [`SLOW_STEP`].
+    slow: Duration,
+    /// See [`LOCK_PATIENCE`].
+    lock_patience: Duration,
+    say: Say,
+}
+
+impl Context {
+    fn new(
+        lane: String,
+        queue: Arc<Mutex<Queue>>,
+        verdict_tx: Option<mpsc::UnboundedSender<VerdictEvent>>,
+    ) -> Context {
+        Context {
+            lane,
+            queue,
+            verdict_tx,
+            slow: SLOW_STEP,
+            lock_patience: LOCK_PATIENCE,
+            say: Arc::new(|line| eprintln!("{line}")),
+        }
+    }
+
+    /// One diagnostic line, with the lane's name in front.
+    fn say(&self, text: &str) {
+        (self.say)(&format!("[{}] director: {text}", self.lane));
+    }
+
+    /// The summary line for a request in which some step was slow; nothing when none was.
+    fn report(&self, what: &str, trace: &Trace, host_before: &Snapshot) {
+        if !trace.has_step_of(self.slow) {
+            return;
+        }
+        let total = trace.total();
+        let host = Snapshot::take().since_waiting(host_before, total);
+        let host = if host.is_empty() {
+            String::new()
+        } else {
+            format!("; {host}")
+        };
+        self.say(&format!(
+            "{what} took {} ms in all: {}{host}",
+            total.as_millis(),
+            trace.describe()
+        ));
+    }
+}
+
+/// The steps one request went through, with how long each took.
+#[derive(Default)]
+struct Trace {
+    steps: Vec<(&'static str, Duration)>,
+}
+
+impl Trace {
+    fn step(&mut self, name: &'static str, took: Duration) {
+        self.steps.push((name, took));
+    }
+
+    fn has_step_of(&self, limit: Duration) -> bool {
+        self.steps.iter().any(|(_, took)| *took >= limit)
+    }
+
+    fn total(&self) -> Duration {
+        self.steps.iter().map(|(_, took)| *took).sum()
+    }
+
+    fn describe(&self) -> String {
+        self.steps
+            .iter()
+            .map(|(name, took)| format!("{name} {} ms", took.as_millis()))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+/// Where a request's work is. The work runs on a blocking thread; the director thread reads
+/// this while it waits, so a request that is taking long can say what it is taking long *in*.
+struct Progress {
+    state: Mutex<ProgressState>,
+}
+
+struct ProgressState {
+    step: &'static str,
+    since: Instant,
+    done: Vec<(&'static str, Duration)>,
+}
+
+impl Progress {
+    fn new() -> Progress {
+        Progress {
+            state: Mutex::new(ProgressState {
+                step: "worker start",
+                since: Instant::now(),
+                done: Vec::new(),
+            }),
+        }
+    }
+
+    fn state(&self) -> std::sync::MutexGuard<'_, ProgressState> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The work has moved on to `step`.
+    fn at(&self, step: &'static str) {
+        let mut state = self.state();
+        let took = state.since.elapsed();
+        let previous = state.step;
+        state.done.push((previous, took));
+        state.step = step;
+        state.since = Instant::now();
+    }
+
+    /// The step it is in, and for how long.
+    fn current(&self) -> (&'static str, Duration) {
+        let state = self.state();
+        (state.step, state.since.elapsed())
+    }
+
+    /// Every step so far, the one in progress last.
+    fn steps(&self) -> Vec<(&'static str, Duration)> {
+        let state = self.state();
+        let mut steps = state.done.clone();
+        steps.push((state.step, state.since.elapsed()));
+        steps
+    }
 }
 
 /// The director socket served on its own OS thread, stopped when this is dropped.
@@ -82,7 +227,9 @@ struct Context {
 /// the proxy, the tools server, the checks) shares the main runtime's workers, and one task
 /// that holds a worker for seconds would hold the director's `accept` with it. So the socket
 /// gets a thread and a current-thread runtime of its own. The handlers only take the queue's
-/// mutex, append one line and send on a channel, none of which needs the main runtime.
+/// mutex, append one line and send on a channel, none of which needs the main runtime. They
+/// do that on this runtime's own blocking pool, so a queue held (or a disk that is slow)
+/// keeps this thread free to accept, to answer, and to say on stderr what it is waiting in.
 pub struct DirectorThread {
     stop: Option<tokio::sync::oneshot::Sender<()>>,
 }
@@ -103,6 +250,13 @@ pub fn serve_on_thread(
     lane: String,
     queue: Arc<Mutex<Queue>>,
     verdict_tx: Option<mpsc::UnboundedSender<VerdictEvent>>,
+) -> io::Result<DirectorThread> {
+    serve_context_on_thread(listener, Context::new(lane, queue, verdict_tx))
+}
+
+fn serve_context_on_thread(
+    listener: std::os::unix::net::UnixListener,
+    ctx: Context,
 ) -> io::Result<DirectorThread> {
     listener.set_nonblocking(true)?;
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
@@ -130,8 +284,20 @@ pub fn serve_on_thread(
                     }
                 };
                 let _ = ready_tx.send(Ok(()));
+                // This thread's own clock, next to the runner's: a request that was slow
+                // because this thread was not run (or was blocked) says so.
+                let _watch = {
+                    let ctx_say = ctx.say.clone();
+                    let lane = ctx.lane.clone();
+                    stall::watch_with(stall::TICK, ctx.slow, move |stall| {
+                        ctx_say(&format!(
+                            "[{lane}] {}",
+                            stall.describe_for("director thread")
+                        ));
+                    })
+                };
                 tokio::select! {
-                    served = serve(listener, lane, queue, verdict_tx) => {
+                    served = serve_context(listener, ctx) => {
                         if let Err(e) = served {
                             eprintln!("director control socket stopped: {e}");
                         }
@@ -153,11 +319,11 @@ pub async fn serve(
     queue: Arc<Mutex<Queue>>,
     verdict_tx: Option<mpsc::UnboundedSender<VerdictEvent>>,
 ) -> io::Result<()> {
-    let ctx = Arc::new(Context {
-        lane,
-        queue,
-        verdict_tx,
-    });
+    serve_context(listener, Context::new(lane, queue, verdict_tx)).await
+}
+
+async fn serve_context(listener: UnixListener, ctx: Context) -> io::Result<()> {
+    let ctx = Arc::new(ctx);
     loop {
         let stream = match listener.accept().await {
             Ok((stream, _)) => stream,
@@ -174,17 +340,37 @@ pub async fn serve(
         let ctx = ctx.clone();
         tokio::spawn(async move {
             // A broken connection is the client's loss; nothing to report.
-            let _ = handle_connection(stream, &ctx).await;
+            let _ = handle_connection(stream, ctx).await;
         });
     }
 }
 
-async fn handle_connection(stream: UnixStream, ctx: &Context) -> io::Result<()> {
+/// One connection: its requests in turn, each with the time every step of it took. When any
+/// step took `ctx.slow` or more, one line on the lane's stderr gives all of them.
+async fn handle_connection(stream: UnixStream, ctx: Arc<Context>) -> io::Result<()> {
+    let accepted = Instant::now();
+    let host_before = Snapshot::take();
     let (read, mut write) = stream.into_split();
     let mut read = BufReader::new(read);
+    let mut first = true;
     loop {
-        let response = match wire::read_line_capped(&mut read, wire::MAX_LINE).await? {
-            Read::Eof => return Ok(()),
+        let line = wire::read_line_capped(&mut read, wire::MAX_LINE).await?;
+        let mut trace = Trace::default();
+        if first {
+            // Connect to request: the client's own time, and the wait for this thread to run.
+            trace.step("request line", accepted.elapsed());
+            first = false;
+        }
+        match line {
+            Read::Eof => {
+                // A client that connected, waited and left without asking.
+                ctx.report(
+                    "a connection that closed without a request",
+                    &trace,
+                    &host_before,
+                );
+                return Ok(());
+            }
             Read::TooLong => {
                 let max_line = wire::MAX_LINE;
                 wire::send(
@@ -208,9 +394,15 @@ async fn handle_connection(stream: UnixStream, ctx: &Context) -> io::Result<()> 
                 .await;
                 return Ok(());
             }
-            Read::Line(bytes) => dispatch(&bytes, ctx).await,
-        };
-        wire::send(&mut write, &response).await?;
+            Read::Line(bytes) => {
+                let (what, response) = dispatch(&bytes, &ctx, &mut trace).await;
+                let sending = Instant::now();
+                let sent = wire::send(&mut write, &response).await;
+                trace.step("reply", sending.elapsed());
+                ctx.report(&what, &trace, &host_before);
+                sent?;
+            }
+        }
     }
 }
 
@@ -230,26 +422,99 @@ struct Request {
     verdict: Option<Value>,
 }
 
-async fn dispatch(line: &[u8], ctx: &Context) -> Value {
-    let request: Request = match serde_json::from_slice(line) {
-        Ok(r) => r,
-        Err(e) => return wire::failure(&format!("malformed request: {e}")),
-    };
-    let result = match request.op.as_str() {
-        "rule" => rule(ctx, request.id, request.verdict),
-        "note" => note(ctx, request.text),
-        _ => Err("unknown op".to_string()),
-    };
-    match result {
-        Ok(v) => v,
-        Err(e) => wire::failure(&e),
+/// What a request is called in a diagnostic line: the op and, for a ruling, the escalation.
+fn describe_request(request: &Request) -> String {
+    match (&request.op[..], &request.id) {
+        ("rule", Some(id)) => format!("rule {}", id.chars().take(80).collect::<String>()),
+        (op, _) => op.chars().take(40).collect(),
     }
 }
 
-fn lock(queue: &Mutex<Queue>) -> Result<std::sync::MutexGuard<'_, Queue>, String> {
-    queue
-        .lock()
-        .map_err(|_| "the escalation queue is unavailable".to_string())
+async fn dispatch(line: &[u8], ctx: &Arc<Context>, trace: &mut Trace) -> (String, Value) {
+    let request: Request = match serde_json::from_slice(line) {
+        Ok(r) => r,
+        Err(e) => {
+            return (
+                "a malformed request".to_string(),
+                wire::failure(&format!("malformed request: {e}")),
+            );
+        }
+    };
+    let what = describe_request(&request);
+    let result = match request.op.as_str() {
+        "rule" => rule(ctx, &what, request.id, request.verdict, trace).await,
+        "note" => note(ctx, &what, request.text, trace).await,
+        _ => Err("unknown op".to_string()),
+    };
+    let response = match result {
+        Ok(v) => v,
+        Err(e) => wire::failure(&e),
+    };
+    (what, response)
+}
+
+/// Run `work` on a blocking thread and wait for it here, saying on the lane's stderr what it
+/// is in each time it passes a further `ctx.slow`. The director thread stays free to accept,
+/// answer other requests and run its stall watchdog while the work waits, and a work that
+/// never finishes still leaves its lines.
+async fn run_step<T: Send + 'static>(
+    ctx: &Arc<Context>,
+    what: &str,
+    trace: &mut Trace,
+    work: impl FnOnce(&Progress) -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
+    let progress = Arc::new(Progress::new());
+    let worker = progress.clone();
+    let started = Instant::now();
+    let mut handle = tokio::task::spawn_blocking(move || work(&worker));
+    let mut next = tokio::time::Instant::now() + ctx.slow;
+    let joined = loop {
+        tokio::select! {
+            joined = &mut handle => break joined,
+            _ = tokio::time::sleep_until(next) => {
+                let (step, in_step) = progress.current();
+                ctx.say(&format!(
+                    "{what} has been running {} ms, {} ms of it in `{step}`",
+                    started.elapsed().as_millis(),
+                    in_step.as_millis()
+                ));
+                next += ctx.slow;
+            }
+        }
+    };
+    for (name, took) in progress.steps() {
+        trace.step(name, took);
+    }
+    joined.unwrap_or_else(|e| Err(format!("the director's {what} step failed: {e}")))
+}
+
+/// Take the queue's mutex and run `work` with it. A mutex held for longer than
+/// `ctx.lock_patience` is not waited for: the request is refused with nothing recorded.
+fn with_queue<T>(
+    ctx: &Context,
+    progress: &Progress,
+    work: impl FnOnce(&mut Queue, &Progress) -> Result<T, String>,
+) -> Result<T, String> {
+    progress.at("queue lock");
+    let waiting = Instant::now();
+    let mut queue = loop {
+        match ctx.queue.try_lock() {
+            Ok(queue) => break queue,
+            Err(TryLockError::Poisoned(_)) => {
+                return Err("the escalation queue is unavailable".to_string());
+            }
+            Err(TryLockError::WouldBlock) => {
+                if waiting.elapsed() >= ctx.lock_patience {
+                    return Err(format!(
+                        "the lane's escalation queue was in use by the runner for {:?}; nothing was recorded, send this again",
+                        ctx.lock_patience
+                    ));
+                }
+                std::thread::sleep(LOCK_POLL);
+            }
+        }
+    };
+    work(&mut queue, progress)
 }
 
 /// Parse a verdict from the request JSON.
@@ -284,63 +549,83 @@ fn parse_verdict(v: Value) -> Result<Verdict, String> {
     }
 }
 
-fn rule(ctx: &Context, id: Option<String>, verdict: Option<Value>) -> Result<Value, String> {
+async fn rule(
+    ctx: &Arc<Context>,
+    what: &str,
+    id: Option<String>,
+    verdict: Option<Value>,
+    trace: &mut Trace,
+) -> Result<Value, String> {
     let id = id.ok_or("missing id")?;
     let verdict_value = verdict.ok_or("missing verdict")?;
-
-    // Parse the escalation ID and validate it belongs to this lane.
     let escalation_id = EscalationId::from_string(id);
-    let mut queue = lock(&ctx.queue)?;
+    let owner = ctx.clone();
+    run_step(ctx, what, trace, move |progress| {
+        with_queue(&owner, progress, |queue, progress| {
+            // Check that the ID belongs to this lane before ruling.
+            if let Some((_, _, _)) = queue.get(&escalation_id) {
+                // Verify it belongs to this lane by checking the ID format.
+                if !escalation_id.0.starts_with(&format!("{}:E", owner.lane)) {
+                    return Err(format!(
+                        "escalation {} does not belong to this lane {}",
+                        escalation_id, owner.lane
+                    ));
+                }
+            } else {
+                return Err(format!("escalation {} unknown", escalation_id));
+            }
 
-    // Check that the ID belongs to this lane before ruling.
-    if let Some((_, _, _)) = queue.get(&escalation_id) {
-        // Verify it belongs to this lane by checking the ID format.
-        if !escalation_id.0.starts_with(&format!("{}:E", ctx.lane)) {
-            return Err(format!(
-                "escalation {} does not belong to this lane {}",
-                escalation_id, ctx.lane
-            ));
-        }
-    } else {
-        return Err(format!("escalation {} unknown", escalation_id));
-    }
+            // Parse the verdict.
+            let parsed_verdict = parse_verdict(verdict_value)?;
 
-    // Parse the verdict.
-    let parsed_verdict = parse_verdict(verdict_value)?;
+            // Apply the ruling: this is the reply's whole job. Nothing below waits for the
+            // builder, the session or the delivery.
+            progress.at("recording the ruling");
+            queue.rule(&owner.lane, &escalation_id, &parsed_verdict)?;
+            progress.at("waking the runner");
 
-    // Apply the ruling.
-    queue.rule(&ctx.lane, &escalation_id, &parsed_verdict)?;
+            // Send the verdict through the channel if one exists (D25).
+            let delivery_status = if let Some(ref tx) = owner.verdict_tx {
+                let event = VerdictEvent {
+                    id: escalation_id.clone(),
+                    verdict: parsed_verdict.clone(),
+                };
+                if tx.send(event).is_ok() {
+                    "sent"
+                } else {
+                    "failed-channel-closed"
+                }
+            } else {
+                "pending"
+            };
 
-    // Send the verdict through the channel if one exists (D25).
-    let delivery_status = if let Some(ref tx) = ctx.verdict_tx {
-        let event = VerdictEvent {
-            id: escalation_id.clone(),
-            verdict: parsed_verdict.clone(),
-        };
-        if tx.send(event).is_ok() {
-            "sent"
-        } else {
-            "failed-channel-closed"
-        }
-    } else {
-        "pending"
-    };
-
-    Ok(success(json!({
-        "id": escalation_id.0,
-        "delivery": delivery_status
-    })))
+            Ok(success(json!({
+                "id": escalation_id.0,
+                "delivery": delivery_status
+            })))
+        })
+    })
+    .await
 }
 
-fn note(ctx: &Context, text: Option<String>) -> Result<Value, String> {
+async fn note(
+    ctx: &Arc<Context>,
+    what: &str,
+    text: Option<String>,
+    trace: &mut Trace,
+) -> Result<Value, String> {
     let text = text.ok_or("missing text")?;
-    let mut queue = lock(&ctx.queue)?;
-
-    let note_id = queue.note(&ctx.lane, &text)?;
-
-    Ok(success(json!({
-        "id": note_id.0
-    })))
+    let owner = ctx.clone();
+    run_step(ctx, what, trace, move |progress| {
+        with_queue(&owner, progress, |queue, progress| {
+            progress.at("recording the note");
+            let note_id = queue.note(&owner.lane, &text)?;
+            Ok(success(json!({
+                "id": note_id.0
+            })))
+        })
+    })
+    .await
 }
 
 #[cfg(test)]
@@ -569,6 +854,233 @@ mod tests {
             );
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
+    }
+
+    /// One request over a plain blocking socket; the reply, or a panic after `patience`.
+    fn ask_over(socket: &Path, request: &Value, patience: std::time::Duration) -> Value {
+        use std::io::{BufRead, Write};
+        let mut stream = std::os::unix::net::UnixStream::connect(socket).unwrap();
+        stream.set_read_timeout(Some(patience)).unwrap();
+        stream.write_all(format!("{request}\n").as_bytes()).unwrap();
+        let mut reply = String::new();
+        std::io::BufReader::new(stream)
+            .read_line(&mut reply)
+            .unwrap_or_else(|e| panic!("no reply within {patience:?}: {e}"));
+        serde_json::from_str(&reply).unwrap()
+    }
+
+    fn a_blocking_ask() -> crate::escalate::Ask {
+        crate::escalate::Ask {
+            kind: crate::escalate::AskKind::Blocker,
+            question: "Which one?".to_string(),
+            tried: vec!["read the packet".to_string()],
+            options: vec![crate::escalate::Opt {
+                id: "a".to_string(),
+                summary: "do A".to_string(),
+                cost: "low".to_string(),
+            }],
+            recommend: "a".to_string(),
+            blocking: true,
+        }
+    }
+
+    /// A director thread whose diagnostics are collected, with short limits.
+    struct Served {
+        _thread: DirectorThread,
+        socket: std::path::PathBuf,
+        queue: Arc<Mutex<Queue>>,
+        said: Arc<Mutex<Vec<String>>>,
+        id: String,
+        _dir: TempDir,
+    }
+
+    fn served(slow_ms: u64, patience_ms: u64) -> Served {
+        let dir = tempfile::Builder::new().tempdir_in("/var/tmp").unwrap();
+        let socket = dir.path().join("director.sock");
+        let queue = Arc::new(Mutex::new(
+            Queue::new(dir.path(), Box::new(SystemClock)).unwrap(),
+        ));
+        let id = queue
+            .lock()
+            .unwrap()
+            .ask("lane", &a_blocking_ask(), crate::escalate::Origin::Builder)
+            .unwrap()
+            .0;
+        let said: Arc<Mutex<Vec<String>>> = Arc::default();
+        let sink = said.clone();
+        let mut ctx = Context::new("lane".to_string(), queue.clone(), None);
+        ctx.slow = std::time::Duration::from_millis(slow_ms);
+        ctx.lock_patience = std::time::Duration::from_millis(patience_ms);
+        ctx.say = Arc::new(move |line| sink.lock().unwrap().push(line.to_string()));
+        let thread = serve_context_on_thread(bind_std(&socket).unwrap(), ctx).unwrap();
+        Served {
+            _thread: thread,
+            socket,
+            queue,
+            said,
+            id,
+            _dir: dir,
+        }
+    }
+
+    fn rule_request(id: &str) -> Value {
+        json!({"op": "rule", "id": id, "verdict": "stop"})
+    }
+
+    fn ruled_events(dir: &Path) -> usize {
+        std::fs::read_to_string(dir.join("escalations.jsonl"))
+            .unwrap()
+            .lines()
+            .filter(|l| l.contains("\"ruled\""))
+            .count()
+    }
+
+    /// The queue's mutex held by the runner for longer than the director's patience (the
+    /// director gives a lane ten seconds; here the patience is 300 ms and the hold 3 s): the
+    /// ruling is answered, as refused with nothing recorded, while the mutex is STILL held,
+    /// and the same ruling sent again afterwards is recorded once. With a handler that
+    /// waits on the mutex as long as it takes, the reply comes only after the release, which
+    /// the test makes wait for the reply: it fails at its read timeout.
+    #[test]
+    fn a_ruling_is_answered_while_the_runner_holds_the_queue_and_recorded_when_sent_again() {
+        let lane = served(100, 300);
+        let (held_tx, held_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let queue = lane.queue.clone();
+        let holder = std::thread::spawn(move || {
+            let guard = queue.lock().unwrap();
+            held_tx.send(()).unwrap();
+            // Held until the test has its answer; never longer than the hold below.
+            let _ = release_rx.recv_timeout(std::time::Duration::from_secs(3));
+            drop(guard);
+        });
+        held_rx.recv().unwrap();
+
+        let started = std::time::Instant::now();
+        let busy = ask_over(
+            &lane.socket,
+            &rule_request(&lane.id),
+            std::time::Duration::from_secs(2),
+        );
+        let took = started.elapsed();
+        assert_eq!(busy["ok"], json!(false), "{busy}");
+        let error = busy["error"].as_str().unwrap();
+        assert!(error.contains("in use by the runner"), "{error}");
+        assert!(error.contains("nothing was recorded"), "{error}");
+        assert!(
+            took < std::time::Duration::from_millis(1500),
+            "the busy answer took {took:?}"
+        );
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+
+        let dir = lane._dir.path();
+        assert_eq!(ruled_events(dir), 0, "a refused ruling is not recorded");
+        let again = ask_over(
+            &lane.socket,
+            &rule_request(&lane.id),
+            std::time::Duration::from_secs(5),
+        );
+        assert_eq!(again["ok"], json!(true), "{again}");
+        assert_eq!(ruled_events(dir), 1);
+
+        // What the lane's stderr got: the wait named, with the step it was in, and the
+        // director's own thread was never the thing that stood still.
+        let said = lane.said.lock().unwrap().join("\n");
+        assert!(said.contains("[lane] director: rule "), "{said}");
+        assert!(said.contains("in `queue lock`"), "{said}");
+        assert!(said.contains("queue lock "), "{said}");
+        assert!(!said.contains("director thread stall"), "{said}");
+    }
+
+    /// While one request waits for the held queue, another connection is still accepted and
+    /// answered by the same thread (a malformed line needs no queue).
+    #[test]
+    fn a_request_waiting_for_the_queue_does_not_hold_the_director_thread() {
+        let lane = served(100, 2000);
+        let (held_tx, held_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let queue = lane.queue.clone();
+        let holder = std::thread::spawn(move || {
+            let guard = queue.lock().unwrap();
+            held_tx.send(()).unwrap();
+            let _ = release_rx.recv_timeout(std::time::Duration::from_secs(10));
+            drop(guard);
+        });
+        held_rx.recv().unwrap();
+        let waiting = {
+            let socket = lane.socket.clone();
+            let id = lane.id.clone();
+            std::thread::spawn(move || {
+                ask_over(
+                    &socket,
+                    &rule_request(&id),
+                    std::time::Duration::from_secs(20),
+                )
+            })
+        };
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let started = std::time::Instant::now();
+        let other = ask_over(
+            &lane.socket,
+            &json!({"op": "nonsense"}),
+            std::time::Duration::from_secs(2),
+        );
+        assert_eq!(other["error"], json!("unknown op"), "{other}");
+        assert!(started.elapsed() < std::time::Duration::from_millis(500));
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+        let ruled = waiting.join().unwrap();
+        assert_eq!(ruled["ok"], json!(true), "{ruled}");
+    }
+
+    /// A client that connects and then takes its time to send is named in the summary, so a
+    /// slow reply can be told from a slow request.
+    #[test]
+    fn a_slow_client_is_named_in_the_summary_line() {
+        use std::io::{BufRead, Write};
+        let lane = served(100, 2000);
+        let mut stream = std::os::unix::net::UnixStream::connect(&lane.socket).unwrap();
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        stream
+            .write_all(b"{\"op\":\"note\",\"text\":\"late\"}\n")
+            .unwrap();
+        let mut reply = String::new();
+        std::io::BufReader::new(stream)
+            .read_line(&mut reply)
+            .unwrap();
+        assert!(reply.contains("\"ok\":true"), "{reply}");
+        // The line is written after the reply; give the thread a moment.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let line = loop {
+            let said = lane.said.lock().unwrap().clone();
+            if let Some(line) = said.iter().find(|l| l.contains("note took")) {
+                break line.clone();
+            }
+            assert!(std::time::Instant::now() < deadline, "no summary: {said:?}");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        assert!(line.contains("request line 4"), "{line}");
+        assert!(line.contains("queue lock "), "{line}");
+        assert!(line.contains("recording the note "), "{line}");
+        assert!(line.contains("reply "), "{line}");
+    }
+
+    /// A request that is quick says nothing at all.
+    #[test]
+    fn a_quick_request_leaves_no_line() {
+        let lane = served(1000, 2000);
+        let reply = ask_over(
+            &lane.socket,
+            &json!({"op": "note", "text": "quick"}),
+            std::time::Duration::from_secs(5),
+        );
+        assert_eq!(reply["ok"], json!(true), "{reply}");
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(lane.said.lock().unwrap().is_empty());
     }
 
     struct SystemClock;
