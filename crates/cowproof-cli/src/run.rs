@@ -6180,17 +6180,22 @@ body"#;
             infrastructure: vec![],
             no_checks_declared: false,
             heldout_failed: vec!["hidden-edge".into()],
+            setup_failed: vec!["`bundle install --local` failed (exit 5): boom".into()],
             notes: vec![],
         };
         let (outcome, reasons) = reasons_of(&e);
         assert_eq!(outcome, Outcome::Refuted);
         assert_eq!(outcome.exit_code(), 2);
-        assert_eq!(reasons.len(), 5, "{reasons:?}");
+        assert_eq!(reasons.len(), 6, "{reasons:?}");
         assert!(reasons[0].contains("\"unit\" failed"));
         assert!(reasons[1].contains("\"marker\" diverged") && reasons[1].contains("exit 1"));
         assert!(reasons[2].contains("held-out check \"hidden-edge\" failed"));
-        assert!(reasons[3].contains("gate ownership failed") && reasons[3].contains("x.txt"));
-        assert!(reasons[4].contains("\"late\" was never run"));
+        assert!(
+            reasons[3].contains("dependency setup failed")
+                && reasons[3].contains("`bundle install --local` failed (exit 5)")
+        );
+        assert!(reasons[4].contains("gate ownership failed") && reasons[4].contains("x.txt"));
+        assert!(reasons[5].contains("\"late\" was never run"));
     }
 
     #[test]
