@@ -363,6 +363,13 @@ pub struct Capsule {
     /// real registry.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dependency_fetch_resolve: Option<String>,
+    /// The reference-runtime directories the director granted the verifier (`--runtime-dir`
+    /// or `COWPROOF_RUNTIME_DIRS`), canonical, read-only: what this proof saw beyond the
+    /// system directories. Absent when none was granted, so existing capsules and their seals
+    /// are unchanged. `cowproof verify` of the capsule needs the same directories again, else
+    /// the held-out cases that need them are skipped and the skip names this list.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub runtime_dirs: Vec<String>,
     /// The version of the builder preamble (sha256 hash of PREAMBLE bytes).
     /// Used to detect when the protocol has changed.
     #[serde(default)]
@@ -453,6 +460,7 @@ impl Capsule {
             dependency_cache_key: None,
             dependency_fetch_outcome: None,
             dependency_fetch_resolve: None,
+            runtime_dirs: Vec::new(),
             prefix_version: None,
             project_instructions_sha256: None,
             class: "light".to_string(),

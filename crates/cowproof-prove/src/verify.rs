@@ -34,6 +34,9 @@ pub struct VerifyOptions {
     /// capsule. `None` is the running executable (`std::env::current_exe`). It must be
     /// reachable inside the verifier's sandbox (`SandboxedRunner::with_executable`).
     pub pk_exe: Option<PathBuf>,
+    /// The runtime directories the caller granted the runner (`--runtime-dir`), as text. The
+    /// capsule records the ones its proof had; a held-out skip names those the caller lacks.
+    pub runtime_dirs: Vec<String>,
 }
 
 impl Default for VerifyOptions {
@@ -48,6 +51,7 @@ impl Default for VerifyOptions {
             held_slot_path: None,
             allow_unsandboxed: false,
             pk_exe: None,
+            runtime_dirs: Vec::new(),
         }
     }
 }
@@ -318,6 +322,7 @@ pub async fn verify(
                     pk_exe: &pk_exe,
                     runner,
                     timeout: opts.default_timeout,
+                    runtime_dirs: &opts.runtime_dirs,
                 })
                 .await?,
             )

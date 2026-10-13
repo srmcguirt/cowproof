@@ -25,6 +25,7 @@ use cowproof_run::{
     },
     fetch_proxy::Resolver,
     lane_tmp, link_dependency_cache,
+    runtime_dirs::{self, Protected, RUNTIME_DIRS_ENV, RuntimeDir},
 };
 use std::fs;
 use std::io::Write;
@@ -64,6 +65,13 @@ pub struct VerifyArgs {
     /// are the capsule's base commit's `cowproof.toml` `[classes]`
     #[arg(long)]
     slot_dir: Option<PathBuf>,
+    /// A reference-runtime directory to grant the verifier, by absolute path; repeatable, and
+    /// `COWPROOF_RUNTIME_DIRS` (colon-separated) adds more. Read-only, with its `bin` on the
+    /// verifier's `PATH`, exactly as for `cowproof run --runtime-dir`. A capsule made with
+    /// runtime directories names them (`runtime_dirs`); pass the same ones here, or the
+    /// held-out cases that need them are skipped and the skip names the capsule's list
+    #[arg(long = "runtime-dir", value_name = "DIR")]
+    runtime_dir: Vec<PathBuf>,
 }
 
 /// The sandboxed check runner the verifier uses, for both `cowproof run` and
@@ -72,11 +80,13 @@ pub struct VerifyArgs {
 /// visible to a check. Clears any earlier `verify_dir` (the builder owned the lane's
 /// scratch), then creates it with the verifier's own `CARGO_HOME` inside. `deps` is the
 /// fetched dependency cache (D6): its `registry` (and `git`) are linked into that
-/// `CARGO_HOME` and mounted read-only, and nothing else of it is visible.
+/// `CARGO_HOME` and mounted read-only, and nothing else of it is visible. `runtime` is the
+/// director's granted runtime directories (`--runtime-dir`): read-only, on the checks' `PATH`.
 pub(crate) fn verifier_runner(
     layout: &LaneLayout,
     verify_dir: &Path,
     deps: Option<&Path>,
+    runtime: &[RuntimeDir],
 ) -> Result<SandboxedRunner> {
     remove_path(verify_dir).context("clearing the verify directory")?;
     let cache = verify_dir.join("cache");
@@ -86,12 +96,26 @@ pub(crate) fn verifier_runner(
     let mut verify_layout = layout.clone();
     verify_layout.scratch = verify_dir.to_path_buf();
     let mut runner =
-        SandboxedRunner::new(verify_layout, cache.clone(), host_platform().to_string());
+        SandboxedRunner::new(verify_layout, cache.clone(), host_platform().to_string())
+            .with_runtime_dirs(runtime.to_vec());
     if let Some(deps) = deps {
         link_dependency_cache(deps, &cache.join(".cargo"))?;
         runner = runner.with_dependency_cache(deps.to_path_buf());
     }
     Ok(runner)
+}
+
+/// The runtime directories the director grants (`--runtime-dir` flags, then
+/// `COWPROOF_RUNTIME_DIRS`), read once at startup and checked: an error names the first
+/// refused directory and the rule. `protected` is what no grant may touch.
+pub(crate) fn director_runtime_dirs(
+    flags: &[PathBuf],
+    real_home: &Path,
+    protected: &[Protected<'_>],
+) -> Result<Vec<RuntimeDir>> {
+    let env = std::env::var_os(RUNTIME_DIRS_ENV);
+    let asked = runtime_dirs::requested(flags, env.as_deref())?;
+    runtime_dirs::resolve(&asked, real_home, protected)
 }
 
 /// What rebuilds the tree a lane's dependencies are fetched for: the same four steps
@@ -328,6 +352,43 @@ pub async fn verify_capsule(args: VerifyArgs) -> Result<i32> {
     let real_home =
         PathBuf::from(std::env::var_os("HOME").ok_or_else(|| anyhow!("HOME is not set"))?);
 
+    // The runtime directories the director grants (`--runtime-dir`, `COWPROOF_RUNTIME_DIRS`),
+    // checked before anything is created: a refusal ends here, with no workdir, slot or sandbox.
+    let cache_root = deps::cache_root(&real_home);
+    let verify_area = real_home.join(".cache/cowproof/verify");
+    let mut protected = vec![
+        Protected {
+            what: "the repository",
+            path: &repo,
+        },
+        Protected {
+            what: "the capsule",
+            path: &capsule_dir,
+        },
+        Protected {
+            what: "the cowproof cache",
+            path: &cache_root,
+        },
+        Protected {
+            what: "the verify directory",
+            path: &verify_area,
+        },
+    ];
+    if let Some(dir) = &args.workdir {
+        protected.push(Protected {
+            what: "the workdir",
+            path: dir,
+        });
+    }
+    let runtime = match director_runtime_dirs(&args.runtime_dir, &real_home, &protected) {
+        Ok(dirs) => dirs,
+        Err(e) => {
+            eprintln!("refused: {e:#}");
+            eprintln!("nothing was started");
+            return Ok(4);
+        }
+    };
+
     // The workdir is laid out like a lane (`<root>/lane/{clone,home,scratch,control}`,
     // lanes root `<root>`), so the sandbox policy sees the shape it sees in `run`.
     let (root, ours) = match args.workdir {
@@ -383,8 +444,11 @@ pub async fn verify_capsule(args: VerifyArgs) -> Result<i32> {
     // with. A capsule that cannot be read is refused by `verify` below, as it always was,
     // without a slot.
     let capsule = Capsule::read(&capsule_dir).ok();
-    let mut options = VerifyOptions::default();
-    let mut runner = verifier_runner(&layout, &verify_dir, deps_dir.as_deref())?;
+    let mut options = VerifyOptions {
+        runtime_dirs: runtime_dirs::names(&runtime),
+        ..VerifyOptions::default()
+    };
+    let mut runner = verifier_runner(&layout, &verify_dir, deps_dir.as_deref(), &runtime)?;
     // A port capsule's replay runs `cowproof pk port replay` in the sandbox: this executable
     // must be reachable there.
     if capsule.as_ref().is_some_and(|c| c.port.is_some()) {

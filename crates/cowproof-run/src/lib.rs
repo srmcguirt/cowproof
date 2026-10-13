@@ -23,6 +23,7 @@ pub mod models;
 pub mod opencode;
 pub mod prefix;
 pub mod proxy;
+pub mod runtime_dirs;
 pub mod stall;
 pub mod stream;
 pub mod tools;
@@ -274,6 +275,14 @@ impl SandboxPolicy {
     /// run Rust tools take them from the director's environment).
     pub fn with_rustup(mut self, rustup: RustupEnv) -> Self {
         self.rustup = rustup;
+        self
+    }
+
+    /// Grant the director's runtime directories (`--runtime-dir`, [`runtime_dirs`]) READ-ONLY
+    /// to this policy: a reference runtime installed under the hidden home reads and runs
+    /// and cannot be changed. Only the verifier and the builder's `run_check` take them.
+    pub fn with_runtime_dirs(mut self, dirs: &[runtime_dirs::RuntimeDir]) -> Self {
+        self.ro_paths.extend(dirs.iter().map(|d| d.dir.clone()));
         self
     }
 
@@ -1915,6 +1924,60 @@ mod tests {
         // capture runs only git: no grant.
         let capture = SandboxPolicy::capture(&f.lane);
         assert_eq!(capture.rustup, RustupEnv::default());
+    }
+
+    /// A runtime directory is a read-only grant in both renderings, for the policies that
+    /// take it, and nothing else of the home comes with it.
+    #[test]
+    fn a_runtime_dir_is_a_read_only_grant_in_both_renderings() {
+        let f = rustup_fixture();
+        let rt = f.lane.real_home.join("nvm/node22");
+        std::fs::create_dir_all(rt.join("bin")).unwrap();
+        let granted =
+            runtime_dirs::resolve(std::slice::from_ref(&rt), &f.lane.real_home, &[]).unwrap();
+        let dir = granted[0].dir.to_str().unwrap().to_string();
+        let home = f.lane.real_home.to_str().unwrap().to_string();
+        let cache = f.lane.real_home.join("cache");
+        for (name, policy) in [
+            ("verifier", SandboxPolicy::verifier(&f.lane, &cache)),
+            ("run_check", SandboxPolicy::run_check(&f.lane)),
+        ] {
+            let plain = render_macos_profile(&policy).unwrap();
+            assert!(!plain.contains(&dir), "{name}: granted without being asked");
+            let policy = policy.with_runtime_dirs(&granted);
+            assert!(policy.ro_paths.contains(&granted[0].dir), "{name}");
+            assert!(!policy.rw_paths.contains(&granted[0].dir), "{name}");
+            let profile = render_macos_profile(&policy).unwrap();
+            assert!(
+                profile.contains(&format!("(allow file-read* (subpath \"{dir}\"))")),
+                "{name}: {profile}"
+            );
+            assert!(
+                profile.contains(&format!("(deny file-write* (subpath \"{dir}\"))")),
+                "{name}: {profile}"
+            );
+            assert!(
+                !profile.contains(&format!(
+                    "(allow file-read* file-write* (subpath \"{dir}\"))"
+                )),
+                "{name}: {profile}"
+            );
+            // Not the home, nor its parent directory of the runtime.
+            assert!(
+                !profile.contains(&format!("(allow file-read* (subpath \"{home}\"))")),
+                "{name}: {profile}"
+            );
+            let args = render_bwrap_args(&policy, &[]).unwrap();
+            assert!(
+                args.windows(3)
+                    .any(|w| w[0] == "--ro-bind" && w[1] == dir && w[2] == dir),
+                "{name}: {args:?}"
+            );
+            assert!(
+                !args.windows(3).any(|w| w[0] == "--bind" && w[1] == dir),
+                "{name}: {args:?}"
+            );
+        }
     }
 
     #[test]

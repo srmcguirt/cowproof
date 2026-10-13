@@ -638,6 +638,27 @@ async fn runtime_met(
     Ok(Ok(()))
 }
 
+/// `reason` for a skip, plus a sentence when the capsule's proof had runtime directories this
+/// verifier was not given: the likely cause, and what to pass.
+fn with_runtime_note(reason: String, run: &PortRun<'_>) -> String {
+    let missing: Vec<&str> = run
+        .capsule
+        .runtime_dirs
+        .iter()
+        .filter(|d| !run.runtime_dirs.contains(d))
+        .map(String::as_str)
+        .collect();
+    if missing.is_empty() {
+        return reason;
+    }
+    format!(
+        "{reason}; the capsule's proof was made with the runtime director{} {}, which this \
+         verifier was not given (pass --runtime-dir <dir> or set COWPROOF_RUNTIME_DIRS)",
+        if missing.len() == 1 { "y" } else { "ies" },
+        missing.join(", ")
+    )
+}
+
 /// Everything [`run_port`] needs from the verification in progress.
 pub(crate) struct PortRun<'a> {
     pub capsule_dir: &'a Path,
@@ -649,6 +670,8 @@ pub(crate) struct PortRun<'a> {
     pub pk_exe: &'a Path,
     pub runner: &'a dyn CheckRunner,
     pub timeout: Duration,
+    /// The runtime directories the runner was granted (`--runtime-dir`).
+    pub runtime_dirs: &'a [String],
 }
 
 /// Replay the packet's fixtures and the director's held-out cases in the rebuilt tree.
@@ -668,6 +691,7 @@ pub(crate) async fn run_port(run: PortRun<'_>) -> Result<PortOutcome, VerifyErro
         pk_exe,
         runner,
         timeout,
+        runtime_dirs,
     } = run;
     let out_dir = workdir.join(PORT_DIR);
     fs::create_dir_all(&out_dir).map_err(|e| infra(format!("port work directory: {e}")))?;
@@ -727,6 +751,7 @@ pub(crate) async fn run_port(run: PortRun<'_>) -> Result<PortOutcome, VerifyErro
         pk_exe,
         runner,
         timeout,
+        runtime_dirs,
     })
     .await?;
     if held_out.state == "failed" {
@@ -771,7 +796,7 @@ async fn held_out(run: &PortRun<'_>) -> Result<PortHeldOut, VerifyError> {
     {
         return Ok(PortHeldOut {
             state: "skipped".into(),
-            reason: Some(reason),
+            reason: Some(with_runtime_note(reason, run)),
             cases: 0,
             surfaces: BTreeMap::new(),
         });

@@ -1279,3 +1279,85 @@ cd '{rw}' && git init -q . 2>> '{err}' && git -c user.name=t -c user.email=t@loc
     );
     assert!(rw.join(".git/HEAD").exists(), "git init did not run");
 }
+
+// ---------------------------------------------------------------- runtime directories
+
+/// A reference runtime under the hidden home (nvm, pyenv): without the grant the sandbox
+/// cannot see it; with `with_runtime_dirs` the verifier and the builder's `run_check` read and
+/// run it, cannot write, rename or add to it, and the rest of the home stays hidden.
+#[test]
+fn live_runtime_dir_is_readable_and_runnable_never_writable_and_widens_nothing() {
+    if !sandbox_available() {
+        return;
+    }
+    use cowproof_run::runtime_dirs::resolve;
+    let f = Fixture::new();
+    let cache = f.root.join("cache");
+    std::fs::create_dir_all(cache.join(".cargo")).unwrap();
+    let rt = f.lane.real_home.join("nvm/node22");
+    std::fs::create_dir_all(rt.join("bin")).unwrap();
+    std::fs::create_dir_all(rt.join("lib")).unwrap();
+    std::fs::create_dir_all(f.lane.real_home.join("nvm/other")).unwrap();
+    std::fs::write(f.lane.real_home.join("nvm/other/x"), "OTHER-SECRET").unwrap();
+    std::fs::write(rt.join("lib/data"), "runtime-data").unwrap();
+    {
+        let tool = rt.join("bin/fakenode");
+        std::fs::write(&tool, "#!/bin/sh\necho fakenode-v22\n").unwrap();
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let granted = resolve(std::slice::from_ref(&rt), &f.lane.real_home, &[]).unwrap();
+    let r = rt.display();
+    let h = f.lane.real_home.display();
+    let script = format!(
+        r#"
+echo "R_DATA:$(cat '{r}/lib/data' 2>&1)"
+echo "RUN:$('{r}/bin/fakenode' 2>&1)"
+echo "R_OTHER:$(cat '{h}/nvm/other/x' 2>&1)"
+echo "R_HOME:$(cat '{h}/secret.txt' 2>&1)"
+echo x >> '{r}/lib/data' 2>/dev/null; echo "W_DATA:$?"
+echo x > '{r}/lib/new' 2>/dev/null; echo "C_NEW:$?"
+echo x > '{r}/bin/fakenode' 2>/dev/null; echo "W_EXE:$?"
+mv '{r}/lib/data' '{r}/lib/moved' 2>/dev/null; echo "MV:$?"
+rm '{r}/lib/data' 2>/dev/null; echo "RM:$?"
+echo ok > '{k}/clone-write'; echo "W_CLONE:$?"
+"#,
+        k = f.lane.clone.display()
+    );
+    for (name, policy) in [
+        ("verifier", SandboxPolicy::verifier(&f.lane, &cache)),
+        ("run_check", SandboxPolicy::run_check(&f.lane)),
+    ] {
+        // Control: with no grant the runtime sits in the hidden home.
+        let o = run(&policy, &f.lane_root, &script);
+        let out = stdout(&o);
+        assert!(out.contains("W_CLONE:0"), "{name}: {}", describe(&o));
+        assert!(!out.contains("runtime-data"), "{name}: {}", describe(&o));
+        assert!(!out.contains("fakenode-v22"), "{name}: {}", describe(&o));
+
+        let o = run(&policy.with_runtime_dirs(&granted), &f.lane_root, &script);
+        let out = stdout(&o);
+        let why = describe(&o);
+        assert!(
+            out.contains("W_CLONE:0"),
+            "{name}: sandbox did not run\n{why}"
+        );
+        assert!(out.contains("R_DATA:runtime-data"), "{name}\n{why}");
+        assert!(out.contains("RUN:fakenode-v22"), "{name}\n{why}");
+        for denied in ["W_DATA", "C_NEW", "W_EXE", "MV", "RM"] {
+            assert!(
+                !out.contains(&format!("{denied}:0")),
+                "{name}: {denied} succeeded\n{why}"
+            );
+        }
+        // A sibling under the same hidden prefix, and the rest of the home, stay hidden.
+        assert!(!out.contains("OTHER-SECRET"), "{name}\n{why}");
+        assert!(!out.contains(HOME_SECRET), "{name}\n{why}");
+        // And the files are exactly as they were.
+        assert_eq!(read(rt.join("lib/data")), "runtime-data", "{name}");
+        assert_eq!(
+            read(rt.join("bin/fakenode")),
+            "#!/bin/sh\necho fakenode-v22\n"
+        );
+        assert!(!rt.join("lib/new").exists() && !rt.join("lib/moved").exists());
+    }
+}

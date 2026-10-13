@@ -364,6 +364,20 @@ struct RunOneArgs {
     /// content cannot choose whose bill a lane runs on
     #[arg(long, value_enum, default_value_t = run::CredentialArg::ApiKey)]
     credential: run::CredentialArg,
+    /// A directory holding a reference runtime (nvm, pyenv, Homebrew: node, python3, ...), by
+    /// absolute path; repeatable, and `COWPROOF_RUNTIME_DIRS` (colon-separated) adds more. The
+    /// verifier's sandbox and the builder's `run_check` sandbox may READ it (never write), and
+    /// its `bin` directory (or the directory itself, when it is named `bin`) goes on their
+    /// `PATH` ahead of the system directories, so a held-out case that needs the runtime runs
+    /// instead of being skipped. Refused, before the lane starts: a relative path, `/`, the
+    /// home or an ancestor of it, a directory that is or holds a credential location (`.ssh`,
+    /// `.aws`, `.gnupg`, `.config`, `.claude`, `.codex`, `.docker`, `.kube`, `.netrc`,
+    /// `.cargo/credentials*`, `Library/Keychains`), the lanes root and the repository. Recorded
+    /// in `run.json` and the capsule; `cowproof verify` of that capsule needs them again. A
+    /// flag and an environment variable and not a `cowproof.toml` setting, so repository
+    /// content cannot choose what of this machine the sandbox can read. Not with `--host`
+    #[arg(long = "runtime-dir", value_name = "DIR")]
+    runtime_dir: Vec<PathBuf>,
 }
 
 #[derive(Parser)]

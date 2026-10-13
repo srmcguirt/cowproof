@@ -43,7 +43,7 @@ use crate::openrouter::{self, Opencode, OpencodeLaunch, opencode_builder_command
 use crate::preflight::{CheckStatus, PreflightOptions, preflight};
 use crate::remote::{self, BuilderSpecParts, LocalSide, RemoteHost, RemoteLane};
 use crate::root::resolve_executable;
-use crate::verify::{Rebuild, fetch_dependencies, verifier_runner};
+use crate::verify::{Rebuild, director_runtime_dirs, fetch_dependencies, verifier_runner};
 use anyhow::{Context, Result, anyhow, bail};
 use cowproof_core::{
     LinkedFile, PORT_CLASS, Profiles, Routing, Rung, Runtime, class_limit_at_commit, get_slot_dir,
@@ -78,7 +78,9 @@ use cowproof_run::{
     models::{ModelPrice, PriceRecord},
     prefix::{assemble_prompt, prefix_version},
     proxy::{MetricsLog, Provider, ProxyConfig, ProxyServer},
-    render_macos_profile, sandbox_command, stall,
+    render_macos_profile,
+    runtime_dirs::{self, Protected, RuntimeDir},
+    sandbox_command, stall,
     stream::{MeterSummary, StreamMeter, UsageProbe},
     tools::{
         self, CheckEnd, CheckOutcome, CheckTable, LiveChecks, RunCheck, SessionEnd,
@@ -2460,7 +2462,10 @@ pub(crate) fn sandboxed_command(
 /// What `run_check` needs, shared by every call of one lane.
 struct CheckContext {
     layout: LaneLayout,
+    /// The checks' `PATH`: the builder's, with the runtime directories' executables in front.
     path: String,
+    /// The director's runtime directories, read-only in every check's sandbox.
+    runtime_dirs: Vec<RuntimeDir>,
     commands: RwLock<BTreeMap<String, String>>,
     /// One check at a time per lane (a builder can open several connections).
     slot: Semaphore,
@@ -2505,7 +2510,10 @@ async fn run_declared_check(ctx: Arc<CheckContext>, id: String) -> CheckOutcome 
     }
     run_check_command(
         &ctx.layout,
-        &ctx.path,
+        CheckEnv {
+            path: &ctx.path,
+            runtime: &ctx.runtime_dirs,
+        },
         command,
         Some(ctx.port_base),
         ctx.check_timeout,
@@ -2514,6 +2522,14 @@ async fn run_declared_check(ctx: Arc<CheckContext>, id: String) -> CheckOutcome 
     )
     .await
     .outcome
+}
+
+/// What a check command sees of the director's machine: its `PATH`, and the runtime
+/// directories (`--runtime-dir`) its sandbox may read.
+#[derive(Clone, Copy)]
+pub(crate) struct CheckEnv<'a> {
+    pub path: &'a str,
+    pub runtime: &'a [RuntimeDir],
 }
 
 /// What running one check command did.
@@ -2536,7 +2552,7 @@ pub(crate) struct CheckRun {
 /// longer reaches the check, so the caller ends `groups` itself when it is signalled.
 pub(crate) async fn run_check_command(
     layout: &LaneLayout,
-    path: &str,
+    env: CheckEnv<'_>,
     command: &str,
     port_base: Option<u16>,
     timeout: Duration,
@@ -2547,11 +2563,11 @@ pub(crate) async fn run_check_command(
         outcome,
         timed_out: false,
     };
-    let policy = SandboxPolicy::run_check(layout);
+    let policy = SandboxPolicy::run_check(layout).with_runtime_dirs(env.runtime);
     let started = Instant::now();
     let argv = ["/bin/sh".to_string(), "-c".to_string(), command.to_string()];
     let mut env = vec![
-        ("PATH".to_string(), path.to_string()),
+        ("PATH".to_string(), env.path.to_string()),
         (
             "HOME".to_string(),
             layout.home.to_string_lossy().into_owned(),
@@ -2923,6 +2939,9 @@ struct RunKind<'a> {
     credential: Credential,
     /// The remote host that ran the builder, if any.
     host: Option<&'a str>,
+    /// The runtime directories the director granted (`--runtime-dir`), recorded as
+    /// `runtimeDirs`.
+    runtime_dirs: &'a [String],
 }
 
 /// Where a run was when the signal came, recorded in `run.json` as `phase`: waiting for a
@@ -2980,6 +2999,7 @@ fn record_interrupted(
         "credentialKind": kind.credential.kind(),
         // Every credential stays in the director's proxy (D24): no lane holds one.
         "credentialInLane": false,
+        "runtimeDirs": kind.runtime_dirs,
         "signal": signal_name,
         "phase": kind.phase.name(),
         "exitCode": INTERRUPTED_EXIT_CODE,
@@ -3174,6 +3194,44 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
     let real_home =
         PathBuf::from(std::env::var_os("HOME").ok_or_else(|| anyhow!("HOME is not set"))?);
     let lanes_root = lanes_root(args.lanes_root.as_deref(), &cwd, &real_home);
+    // 1b. The reference-runtime directories the director grants (`--runtime-dir`,
+    // `COWPROOF_RUNTIME_DIRS`), read once here and checked before anything exists. Only the
+    // director names them, never the repository; a refused directory stops the run.
+    let cache_root = cowproof_run::deps::cache_root(&real_home);
+    let runtime = match director_runtime_dirs(
+        &args.runtime_dir,
+        &real_home,
+        &[
+            Protected {
+                what: "the repository",
+                path: &repo,
+            },
+            Protected {
+                what: "the lanes root",
+                path: &lanes_root,
+            },
+            Protected {
+                what: "the cowproof cache",
+                path: &cache_root,
+            },
+        ],
+    ) {
+        Ok(dirs) => dirs,
+        Err(e) => {
+            eprintln!("runtime directory refused: {e:#}");
+            eprintln!("nothing was started");
+            return Ok(INFRASTRUCTURE_EXIT_CODE);
+        }
+    };
+    if remote_host.is_some() && !runtime.is_empty() {
+        eprintln!(
+            "runtime directories refused: they name directories of this machine, and a remote \
+             lane's checks run on the host (unset COWPROOF_RUNTIME_DIRS or drop --runtime-dir)"
+        );
+        eprintln!("nothing was started");
+        return Ok(INFRASTRUCTURE_EXIT_CODE);
+    }
+    let runtime_names = runtime_dirs::names(&runtime);
     let preflight_checks = preflight(&PreflightOptions {
         repo: &repo,
         lanes_root: &lanes_root,
@@ -3579,6 +3637,7 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
         unsandboxed: args.unsandboxed,
                                 credential,
                                 host: None,
+                                runtime_dirs: &runtime_names,
                             },
                         );
                         return Ok(INTERRUPTED_EXIT_CODE);
@@ -3648,7 +3707,8 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
     let check_groups = Arc::new(GroupSet::new());
     let context = Arc::new(CheckContext {
         layout: layout.clone(),
-        path: path.clone(),
+        path: runtime_dirs::prepend_to_path(&path, &runtime),
+        runtime_dirs: runtime.clone(),
         commands: RwLock::new(
             checks
                 .iter()
@@ -3766,6 +3826,7 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
                         unsandboxed: args.unsandboxed,
                         credential,
                         host: Some(remote.alias()),
+                        runtime_dirs: &runtime_names,
                     },
                 );
                 return Ok(INTERRUPTED_EXIT_CODE);
@@ -3917,6 +3978,7 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
                     unsandboxed: args.unsandboxed,
                     credential,
                     host: remote.as_ref().map(|r| r.alias()),
+                    runtime_dirs: &runtime_names,
                 },
             );
             eprintln!(
@@ -4106,6 +4168,8 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
         run["authMode"] = json!(launcher.credential.name());
         run["credentialKind"] = json!(launcher.credential.kind());
         run["credentialInLane"] = json!(false);
+        // The runtime directories the director granted the checks and the verifier.
+        run["runtimeDirs"] = json!(runtime_names);
         // The director's override of the Anthropic upstream (null otherwise).
         run["anthropicUpstream"] =
             json!(anthropic_upstream_overridden.then_some(anthropic_upstream.as_str()));
@@ -4205,6 +4269,7 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
                 host: remote.as_ref().map(|r| r.alias()),
                 runs: &runs,
                 packet_versions: &lane_run.packet_versions,
+                runtime_dirs: &runtime,
             },
             results,
         )
@@ -4258,6 +4323,7 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
             unsandboxed: args.unsandboxed,
             credential,
             host: remote.as_ref().map(|r| r.alias()),
+            runtime_dirs: &runtime_names,
         },
     );
     Ok(INTERRUPTED_EXIT_CODE)
@@ -4488,6 +4554,9 @@ struct ProofInput<'a> {
     runs: &'a BTreeMap<String, CheckRunRecord>,
     /// Every version of the packet the lane ran under (see `LaneRun::packet_versions`).
     packet_versions: &'a [(Option<String>, String)],
+    /// The runtime directories the director granted (`--runtime-dir`): read-only and on the
+    /// `PATH` of the verifier, and recorded in the capsule.
+    runtime_dirs: &'a [RuntimeDir],
 }
 
 /// Find the lane's held-out checks (D5): the explicit `--heldout` path, which must exist,
@@ -4770,6 +4839,7 @@ async fn replay_and_gate(
     capsule.traced = input.trace["traced"].as_bool().unwrap_or(false);
     capsule.trace_totals = input.trace_totals.clone();
     capsule.host = input.host.map(str::to_string);
+    capsule.runtime_dirs = runtime_dirs::names(input.runtime_dirs);
     if let Some(port) = &header.port {
         // The packet's own epsilon, else the project's at the base commit: a patch cannot
         // raise it.
@@ -4869,7 +4939,7 @@ async fn replay_and_gate(
         return Ok(());
     }
     let verify_dir = layout.scratch.join("verify");
-    let mut runner = verifier_runner(layout, &verify_dir, deps_dir.as_deref())?
+    let mut runner = verifier_runner(layout, &verify_dir, deps_dir.as_deref(), input.runtime_dirs)?
         .with_port_block(input.port_base)
         .with_groups(input.groups.clone());
     // A port packet's replay runs `cowproof pk port replay` in the verifier's sandbox: this
@@ -4894,6 +4964,7 @@ async fn replay_and_gate(
         // refusal of an unsandboxed capsule is skipped, which `cowproof verify` keeps.
         allow_unsandboxed: input.unsandboxed,
         pk_exe,
+        runtime_dirs: runtime_dirs::names(input.runtime_dirs),
         ..VerifyOptions::default()
     };
     match verify(&capsule_dir, input.repo, &verify_dir, &runner, options).await {

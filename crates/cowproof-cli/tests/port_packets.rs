@@ -417,6 +417,97 @@ fn a_verifier_without_the_reference_runtime_reports_held_out_skipped() {
     assert_eq!(result.held_out.cases, 0);
 }
 
+/// A reference runtime the director installed under its (hidden) home, with a version
+/// minimum: `fakenode --version` is what the verifier probes, so the fake must really run.
+fn fake_node(lane: &Lane) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = lane.home.path().join(".nvm/versions/node/v22");
+    fs::create_dir_all(dir.join("bin")).unwrap();
+    let _g = common::fork_lock();
+    let exe = dir.join("bin/fakenode");
+    fs::write(&exe, "#!/bin/sh\necho v22.3.0\n").unwrap();
+    fs::set_permissions(&exe, fs::Permissions::from_mode(0o755)).unwrap();
+    dir.canonicalize().unwrap()
+}
+
+#[test]
+fn a_runtime_dir_makes_a_held_out_case_run_instead_of_being_skipped() {
+    if workspace::skipped("a_runtime_dir_makes_a_held_out_case_run_instead_of_being_skipped") {
+        return;
+    }
+    if !sandbox_available() {
+        return;
+    }
+    let lane = lane_with(&honest(), &|t| {
+        t.replace("\"runtime\":\"sh\"", "\"runtime\":\"fakenode>=22\"")
+    });
+    let node = fake_node(&lane);
+    let heldout = heldout();
+    let out = lane.run(&[
+        Path::new("--heldout"),
+        &heldout,
+        Path::new("--runtime-dir"),
+        &node,
+    ]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    assert_eq!(lane.verdict()["verdict"], "proved");
+    let report = stdout(&out);
+    assert!(!report.contains("held-out: skipped"), "{report}");
+    // The held-out cases were captured against the reference and replayed, not skipped.
+    let capsule = Capsule::read(&lane.capsule_dir()).unwrap();
+    assert_eq!(capsule.runtime_dirs, [node.to_str().unwrap()]);
+    let held = capsule.port.as_ref().unwrap().result.as_ref().unwrap();
+    assert_eq!(held.held_out.state, "passed", "{:?}", held.held_out);
+    assert_eq!(held.held_out.cases, 2);
+
+    let verify = |envs: &[(&str, &Path)], args: &[&Path]| {
+        let mut cmd = lane.cowproof_cmd();
+        cmd.arg("verify")
+            .arg(lane.capsule_dir())
+            .arg("--repo")
+            .arg(&lane.repo)
+            .args(args)
+            .env_remove("COWPROOF_RUNTIME_DIRS");
+        for (k, v) in envs {
+            cmd.env(k, v);
+        }
+        common::output(&mut cmd)
+    };
+    // The same directory again, by flag or by environment: replayed, nothing skipped.
+    for out in [
+        verify(&[], &[Path::new("--runtime-dir"), &node]),
+        verify(&[("COWPROOF_RUNTIME_DIRS", &node)], &[]),
+    ] {
+        assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+        assert!(stdout(&out).contains("reproduced"), "{}", text(&out));
+        assert!(
+            !stdout(&out).contains("held-out: skipped"),
+            "{}",
+            text(&out)
+        );
+    }
+    // Without it the held-out cases are skipped exactly as before, and the message names the
+    // capsule's list and what to pass.
+    let out = verify(&[], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    let report = stdout(&out);
+    assert!(
+        report.contains("held-out: skipped (the verifier's sandbox has no fakenode"),
+        "{report}"
+    );
+    assert!(
+        report.contains(&format!(
+            "the capsule's proof was made with the runtime directory {}",
+            node.display()
+        )),
+        "{report}"
+    );
+    assert!(
+        report.contains("--runtime-dir <dir> or set COWPROOF_RUNTIME_DIRS"),
+        "{report}"
+    );
+}
+
 /// The held-out port cases need a runtime nobody has, so the verifier skips them. The base
 /// commit's `cowproof.toml` is the fixture's, with `require_heldout = <value>` added under its
 /// `[proof]` table when `setting` is given.

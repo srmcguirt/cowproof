@@ -1,5 +1,6 @@
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
+use cowproof_run::runtime_dirs::RuntimeDir;
 use cowproof_run::tools::CheckEnd;
 use cowproof_run::{LaneLayout, RustupEnv, SandboxPolicy, render_macos_profile, sandbox_command};
 use std::ffi::OsStr;
@@ -569,12 +570,21 @@ const SYSTEM_PATH_DIRS: [&str; 5] = ["/usr/local/bin", "/usr/bin", "/bin", "/usr
 /// the director runs. The verifier's environment is otherwise cleared and its home is
 /// hidden, so without this a check that needs `cargo` could not find it.
 ///
+/// `runtime` is the executables directory of each runtime the director granted
+/// (`--runtime-dir`): after the cargo bin directory and ahead of the system directories,
+/// in the order given, like the director's own `PATH` would have them.
+///
 /// An empty entry means "the current directory" and a relative entry resolves against
 /// it, which is the builder-controlled tree, so a builder could plant a fake `git` or
 /// `cargo` there. Both are refused, as is an entry containing the `:` separator.
-fn compose_path(cargo_dir: Option<&Path>, cargo_bin: Option<&Path>) -> Result<String, InfraError> {
+fn compose_path(
+    cargo_dir: Option<&Path>,
+    cargo_bin: Option<&Path>,
+    runtime: &[RuntimeDir],
+) -> Result<String, InfraError> {
     let mut entries: Vec<&Path> = Vec::new();
     entries.extend(cargo_bin);
+    entries.extend(runtime.iter().map(|r| r.path_entry.as_path()));
     entries.extend(SYSTEM_PATH_DIRS.iter().map(Path::new));
     // The same directory twice adds nothing.
     entries.extend(cargo_dir.filter(|d| Some(*d) != cargo_bin));
@@ -628,7 +638,10 @@ pub fn verifier_toolchain(real_home: &Path) -> Result<(String, Option<PathBuf>),
     );
     let cargo = cargo_dir.as_ref().map(|d| d.join("cargo"));
     let path = director_cargo_bin(real_home);
-    Ok((compose_path(cargo_dir.as_deref(), path.as_deref())?, cargo))
+    Ok((
+        compose_path(cargo_dir.as_deref(), path.as_deref(), &[])?,
+        cargo,
+    ))
 }
 
 /// The director's cargo bin directory, when the director's own `PATH` lists it (see
@@ -660,9 +673,14 @@ pub struct SandboxedRunner {
     /// Where every check's process group is listed while it runs, so the caller can end
     /// them when it is interrupted ([`SandboxedRunner::with_groups`]). `None` lists none.
     groups: Option<std::sync::Arc<GroupSet>>,
-    /// Resolved once, here, in the caller's environment and outside any sandbox. An
-    /// unusable `PATH` is reported when the first check runs.
-    path: Result<String, InfraError>,
+    /// The `cargo` directory and the director's cargo bin directory, resolved once, here, in
+    /// the caller's environment and outside any sandbox. They and `runtime_dirs` make the
+    /// `PATH` ([`compose_path`]); an unusable one is reported when the first check runs.
+    cargo_dir: Option<PathBuf>,
+    cargo_bin: Option<PathBuf>,
+    /// The runtime directories the director granted (`--runtime-dir`): read-only in every
+    /// check's sandbox, their executables on its `PATH`.
+    runtime_dirs: Vec<RuntimeDir>,
 }
 
 impl SandboxedRunner {
@@ -680,7 +698,9 @@ impl SandboxedRunner {
         );
         let cargo_bin = director_cargo_bin(&lane.real_home);
         Self {
-            path: compose_path(cargo_dir.as_deref(), cargo_bin.as_deref()),
+            cargo_dir,
+            cargo_bin,
+            runtime_dirs: Vec::new(),
             lane,
             cache_dir,
             platform,
@@ -691,11 +711,30 @@ impl SandboxedRunner {
         }
     }
 
+    /// The `PATH` every check gets ([`compose_path`]).
+    fn path(&self) -> Result<String, InfraError> {
+        compose_path(
+            self.cargo_dir.as_deref(),
+            self.cargo_bin.as_deref(),
+            &self.runtime_dirs,
+        )
+    }
+
     /// Mount the fetched dependency cache at `deps_dir` (`<cache root>/deps/<key>`) into
     /// every check, read-only. The caller links it into the verifier's `CARGO_HOME`
     /// (`cowproof_run::link_dependency_cache`).
     pub fn with_dependency_cache(mut self, deps_dir: PathBuf) -> Self {
         self.deps_cache = Some(deps_dir);
+        self
+    }
+
+    /// Grant the director's runtime directories (`--runtime-dir`, already checked by
+    /// `cowproof_run::runtime_dirs::resolve`) to every check: read-only, with their
+    /// executables on `PATH` ahead of the system directories. A reference runtime installed
+    /// outside the system directories (nvm, pyenv, Homebrew) is then found by the
+    /// verifier's held-out capture instead of being skipped.
+    pub fn with_runtime_dirs(mut self, dirs: Vec<RuntimeDir>) -> Self {
+        self.runtime_dirs = dirs;
         self
     }
 
@@ -733,12 +772,13 @@ impl CheckRunner for SandboxedRunner {
         command: &str,
         timeout: Duration,
     ) -> Result<CheckOutcome, InfraError> {
-        let path = self.path.clone()?;
+        let path = self.path()?;
         // The rebuilt tree is the verifier's clone: it is the one writable tree, so
         // the policy is built around it, not around the lane's own clone.
         let mut lane = self.lane.clone();
         lane.clone = tree.to_path_buf();
-        let mut policy = SandboxPolicy::verifier(&lane, &self.cache_dir);
+        let mut policy =
+            SandboxPolicy::verifier(&lane, &self.cache_dir).with_runtime_dirs(&self.runtime_dirs);
         if let Some(deps) = &self.deps_cache {
             policy = policy.with_dependency_cache(deps);
         }
@@ -1239,7 +1279,7 @@ pub(crate) mod tests {
 
     #[test]
     fn path_refuses_an_empty_entry() {
-        match compose_path(Some(Path::new("")), None) {
+        match compose_path(Some(Path::new("")), None, &[]) {
             Err(InfraError::SpawnError(msg)) => assert!(msg.contains("empty"), "{msg}"),
             other => panic!("expected a refusal, got {other:?}"),
         }
@@ -1247,7 +1287,7 @@ pub(crate) mod tests {
 
     #[test]
     fn path_refuses_a_relative_entry() {
-        match compose_path(Some(Path::new("target/debug")), None) {
+        match compose_path(Some(Path::new("target/debug")), None, &[]) {
             Err(InfraError::SpawnError(msg)) => {
                 assert!(
                     msg.contains("target/debug") && msg.contains("not absolute"),
@@ -1261,11 +1301,11 @@ pub(crate) mod tests {
     #[test]
     fn path_is_the_system_dirs_plus_the_cargo_dir() {
         assert_eq!(
-            compose_path(Some(Path::new("/opt/cargo/bin")), None).unwrap(),
+            compose_path(Some(Path::new("/opt/cargo/bin")), None, &[]).unwrap(),
             "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/cargo/bin"
         );
         assert_eq!(
-            compose_path(None, None).unwrap(),
+            compose_path(None, None, &[]).unwrap(),
             "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
         );
     }
@@ -1277,7 +1317,8 @@ pub(crate) mod tests {
         assert_eq!(
             compose_path(
                 Some(Path::new("/opt/tc/bin")),
-                Some(Path::new("/h/.cargo/bin"))
+                Some(Path::new("/h/.cargo/bin")),
+                &[]
             )
             .unwrap(),
             "/h/.cargo/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/tc/bin"
@@ -1285,12 +1326,37 @@ pub(crate) mod tests {
         assert_eq!(
             compose_path(
                 Some(Path::new("/h/.cargo/bin")),
-                Some(Path::new("/h/.cargo/bin"))
+                Some(Path::new("/h/.cargo/bin")),
+                &[]
             )
             .unwrap(),
             "/h/.cargo/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
         );
-        assert!(compose_path(None, Some(Path::new("rel/bin"))).is_err());
+        assert!(compose_path(None, Some(Path::new("rel/bin")), &[]).is_err());
+    }
+
+    /// The director's runtime directories sit after the cargo bin directory and ahead of the
+    /// system directories, in the order given.
+    #[test]
+    fn path_puts_the_runtime_bins_between_the_cargo_bin_and_the_system_dirs() {
+        let rt = |dir: &str| RuntimeDir {
+            dir: PathBuf::from(dir),
+            path_entry: PathBuf::from(format!("{dir}/bin")),
+        };
+        assert_eq!(
+            compose_path(
+                Some(Path::new("/opt/tc/bin")),
+                Some(Path::new("/h/.cargo/bin")),
+                &[rt("/n/node22"), rt("/p/py3")]
+            )
+            .unwrap(),
+            "/h/.cargo/bin:/n/node22/bin:/p/py3/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/tc/bin"
+        );
+        let relative = RuntimeDir {
+            dir: PathBuf::from("rel"),
+            path_entry: PathBuf::from("rel/bin"),
+        };
+        assert!(compose_path(None, None, &[relative]).is_err());
     }
 
     /// The current directory holds a file with the searched name, so an empty entry, `.`
@@ -1690,6 +1756,67 @@ mod sandbox_tests {
         );
     }
 
+    /// A reference runtime the director names (`with_runtime_dirs`) under the hidden real home:
+    /// a check finds it on `PATH`, runs it and reads its files; it cannot write to it; without
+    /// the grant the same check finds nothing. Nothing else of the home comes with it.
+    #[tokio::test]
+    async fn sandboxed_runner_runs_a_granted_runtime_read_only() {
+        if !sandbox_available() {
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let fx = SandboxFixture::new();
+        let rt = fx.root.join("realhome/.nvm/node22");
+        std::fs::create_dir_all(rt.join("bin")).unwrap();
+        std::fs::create_dir_all(rt.join("lib")).unwrap();
+        std::fs::write(rt.join("lib/data"), "runtime-data").unwrap();
+        std::fs::write(fx.root.join("realhome/.nvm/secret"), "SIBLING").unwrap();
+        let tool = rt.join("bin/fakenode");
+        std::fs::write(
+            &tool,
+            format!(
+                "#!/bin/sh\necho fakenode-v22 $(cat {}/lib/data)\n",
+                rt.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let granted =
+            cowproof_run::runtime_dirs::resolve(std::slice::from_ref(&rt), &fx.lane.real_home, &[])
+                .unwrap();
+        let tree = &fx.lane.clone;
+        let sibling = fx.root.join("realhome/.nvm/secret");
+        let probe = format!(
+            "fakenode; (echo x >> {rt}/lib/data) 2>/dev/null && echo WROTE; \
+             (echo x > {rt}/lib/new) 2>/dev/null && echo CREATED; cat {sib} 2>&1",
+            rt = rt.display(),
+            sib = sibling.display()
+        );
+
+        let without = fx.runner().run(tree, "fakenode", LIMIT).await.unwrap();
+        assert_ne!(without.exit_status, 0, "{}", without.output);
+
+        let with = fx
+            .runner()
+            .with_runtime_dirs(granted)
+            .run(tree, &probe, LIMIT)
+            .await
+            .unwrap();
+        assert!(
+            with.output.contains("fakenode-v22 runtime-data"),
+            "{}",
+            with.output
+        );
+        assert!(!with.output.contains("WROTE"), "{}", with.output);
+        assert!(!with.output.contains("CREATED"), "{}", with.output);
+        assert!(!with.output.contains("SIBLING"), "{}", with.output);
+        assert_eq!(
+            std::fs::read_to_string(rt.join("lib/data")).unwrap(),
+            "runtime-data"
+        );
+        assert!(!rt.join("lib/new").exists());
+    }
+
     /// A rust toolchain reached through a rustup proxy finds its toolchains through
     /// `RUSTUP_HOME`. The verifier's check starts from an empty environment, so the policy
     /// must name the director's rustup home in it (here: the fake real home's `.rustup`,
@@ -1770,7 +1897,7 @@ mod sandbox_tests {
         }
         let fx = SandboxFixture::new();
         let runner = fx.runner();
-        let expected = runner.path.clone().unwrap();
+        let expected = runner.path().unwrap();
 
         let outcome = runner
             .run(&fx.lane.clone, "echo \"$PATH\"", LIMIT)

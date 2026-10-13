@@ -401,6 +401,7 @@ fn test_opts(work: &Path) -> VerifyOptions {
         held_slot_path: None,
         allow_unsandboxed: false,
         pk_exe: None,
+        runtime_dirs: Vec::new(),
     }
 }
 
@@ -1525,6 +1526,7 @@ async fn test_class_slot_caps_concurrent_verifications() {
         held_slot_path: None,
         allow_unsandboxed: false,
         pk_exe: None,
+        runtime_dirs: Vec::new(),
     };
 
     let (a, b, d) = tokio::join!(
@@ -2669,4 +2671,33 @@ fn test_a_port_capsule_adds_the_port_replay_gate_and_records_the_held_out_state(
         );
         assert_eq!(report.any_failed, !success);
     }
+}
+
+/// The runtime directories a proof was granted (`runtime_dirs`) are in `capsule.json`, sealed
+/// and read back; a capsule with none writes no key at all, so every capsule from before the
+/// setting keeps its bytes and its seal.
+#[test]
+fn test_capsule_records_the_granted_runtime_dirs_sealed_and_absent_when_none() {
+    let dir = TempDir::new().unwrap();
+    let mut capsule = Capsule::new(
+        "abc123".to_string(),
+        "tree_hash_123".to_string(),
+        fingerprint(),
+        "haiku".to_string(),
+        "api-key".to_string(),
+    );
+    capsule.write(dir.path()).unwrap();
+    let json = std::fs::read_to_string(dir.path().join("capsule.json")).unwrap();
+    assert!(!json.contains("runtime_dirs"), "{json}");
+    assert!(Capsule::read(dir.path()).unwrap().runtime_dirs.is_empty());
+
+    capsule.runtime_dirs = vec!["/opt/node22".to_string(), "/opt/py312".to_string()];
+    capsule.write(dir.path()).unwrap();
+    assert_eq!(
+        Capsule::read(dir.path()).unwrap().runtime_dirs,
+        ["/opt/node22", "/opt/py312"]
+    );
+    // The seal covers it: dropping a directory by hand is refused.
+    edit_capsule_json(dir.path(), "\"/opt/node22\",", "");
+    assert_capsule_json_mismatch(dir.path());
 }

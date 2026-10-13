@@ -1268,6 +1268,26 @@ fn unsandboxed_is_refused_with_host() {
 }
 
 #[test]
+fn runtime_dirs_are_refused_with_host() {
+    // They name directories of this machine, and a remote lane's checks run on the host.
+    let remote = Remote::new("true\n", checks());
+    let rt = var_tmp("cp-remote-rt-");
+    fs::create_dir_all(rt.path().join("bin")).unwrap();
+    let rt_path = rt.path().to_str().unwrap().to_string();
+    let by_flag = remote.command(&["--runtime-dir", &rt_path]);
+    let mut by_env = remote.command(&[]);
+    by_env.env("COWPROOF_RUNTIME_DIRS", &rt_path);
+    for cmd in [by_flag, by_env] {
+        let out = finish(cmd);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(4), "{}", text(&out));
+        assert!(stderr.contains("runtime directories refused"), "{stderr}");
+        assert!(stderr.contains("nothing was started"), "{stderr}");
+        assert!(remote.log().is_empty(), "ssh was started");
+    }
+}
+
+#[test]
 fn the_hosts_file_comes_from_the_environment_then_the_user_config() {
     // Each run stops at the alias lookup, and the error names the file it read.
     let lane = Lane::new("true\n", checks());

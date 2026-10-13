@@ -94,10 +94,10 @@ use self::config::{HostConfig, Loaded};
 use crate::preflight::{Check, CheckStatus, PreflightOptions, preflight};
 use crate::remote::is_bare_char;
 use crate::run::{
-    BuilderLaunch, CHECK_TERM_GRACE, CHECK_TIMEOUT, INTERRUPTED_EXIT_CODE, MAX_STDERR_LINE,
-    PUMP_DRAIN, TERM_GRACE, builder_command, builder_path, capture_patch, pump_stderr,
-    redact_ready, resumable, run_check_command, sibling_pk, sleep_until_opt, valid_model,
-    write_lane_files,
+    BuilderLaunch, CHECK_TERM_GRACE, CHECK_TIMEOUT, CheckEnv, INTERRUPTED_EXIT_CODE,
+    MAX_STDERR_LINE, PUMP_DRAIN, TERM_GRACE, builder_command, builder_path, capture_patch,
+    pump_stderr, redact_ready, resumable, run_check_command, sibling_pk, sleep_until_opt,
+    valid_model, write_lane_files,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use cowproof_core::{PORT_BASE, PORT_BLOCK_SIZE, redact};
@@ -1870,9 +1870,13 @@ async fn check(lane_id: &str, check_id: &str, root: &Path) -> Result<Value> {
     // The check is the leader of its own process group, so a signal to this process does not
     // reach it: the group set lets this process end exactly the group it started.
     let groups = GroupSet::new();
+    // A remote lane takes no runtime directories (`cowproof run` refuses the combination).
     let ran = run_check_command(
         &layout,
-        &path,
+        CheckEnv {
+            path: &path,
+            runtime: &[],
+        },
         &spec.command,
         spec.port_base,
         Duration::from_secs(spec.timeout_secs),
