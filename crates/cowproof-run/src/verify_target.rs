@@ -799,4 +799,83 @@ mod tests {
         // The directory was made read-only again after its children were written.
         assert_eq!(dir_mode, Some(0o555));
     }
+    /// Prune everything the size pass may remove (a limit of 0 bytes, nothing aged out by time).
+    fn prune_all(root: &Path, home: &Path) -> cache::PruneReport {
+        let opts = cache::PruneOptions {
+            older_than: Duration::from_secs(86_400 * 3650),
+            max_bytes: Some(0),
+            dry_run: false,
+            now: SystemTime::now(),
+        };
+        cache::prune(root, home, &opts, &alive).unwrap()
+    }
+
+    fn lease_of_this_process(entry: &Path) -> PathBuf {
+        entry
+            .join(cache::LEASES)
+            .join(std::process::id().to_string())
+    }
+
+    #[test]
+    fn an_install_and_a_hit_each_lease_the_seed_and_touch_its_marker_so_a_prune_keeps_it() {
+        let t = tmp();
+        let root = root(&t);
+        let home = t.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        let key = key(&inputs());
+        let entry = entry_dir(&root, &key);
+        let long_ago = SystemTime::now() - Duration::from_secs(86_400 * 40);
+
+        // The install path: no lease or marker is written but by `install` itself.
+        let before = SystemTime::now() - Duration::from_secs(2);
+        let new = fresh(t.path(), &[("debug/app", "binary")]);
+        assert_eq!(
+            install(&new, &root, &key, &alive).unwrap(),
+            Installed::Built
+        );
+        assert!(
+            lease_of_this_process(&entry).is_file(),
+            "an install takes a lease"
+        );
+        let installed_at = fs::metadata(entry.join(cache::LAST_USED))
+            .unwrap()
+            .modified()
+            .unwrap();
+        assert!(installed_at > before, "an install touches the marker");
+        let report = prune_all(&root, &home);
+        assert!(report.removed.is_empty(), "{report:?}");
+        assert!(complete(&entry), "a prune kept the installed seed");
+
+        // The hit path: age the marker and drop the lease, as if nobody had used it for weeks,
+        // then look it up. The lookup alone must make it a used, leased seed again.
+        fs::remove_dir_all(entry.join(cache::LEASES)).unwrap();
+        cache::set_last_used(&entry, long_ago).unwrap();
+        let before = SystemTime::now() - Duration::from_secs(2);
+        assert_eq!(lookup(&root, &key, &alive).unwrap(), Lookup::Hit);
+        assert!(
+            lease_of_this_process(&entry).is_file(),
+            "a hit takes this process's lease"
+        );
+        let touched = fs::metadata(entry.join(cache::LAST_USED))
+            .unwrap()
+            .modified()
+            .unwrap();
+        assert!(
+            touched > before && touched > long_ago,
+            "a hit touches the marker"
+        );
+        let report = prune_all(&root, &home);
+        assert!(report.removed.is_empty(), "{report:?}");
+        assert!(complete(&entry), "a prune kept the seed a hit leased");
+        assert_eq!(
+            fs::read_to_string(seed_target(&entry).join("debug/app")).unwrap(),
+            "binary"
+        );
+
+        // The control: the same prune does remove a seed nobody holds a lease on.
+        fs::remove_dir_all(entry.join(cache::LEASES)).unwrap();
+        let report = prune_all(&root, &home);
+        assert_eq!(report.removed.len(), 1, "{report:?}");
+        assert!(!entry.exists());
+    }
 }
