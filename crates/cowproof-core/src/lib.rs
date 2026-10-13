@@ -16,6 +16,7 @@ pub mod port;
 pub mod profiles;
 pub mod redact;
 pub mod status;
+pub mod text;
 
 pub use git_show::{LinkedFile, git_show_following_links, git_show_optional};
 pub use ladder::{PACKET_CLASSES, Routing, Rung, RungSource, Runtime, valid_model_name};
@@ -26,6 +27,7 @@ pub use port::{
 pub use profiles::{Profiles, Requirement};
 pub use redact::redact;
 pub use status::{LaneStatus, StatusClass, StatusFacts, classify_opencode, classify_status};
+pub use text::{escape_capped, one_line};
 
 /// The first port of the lanes' port blocks.
 ///

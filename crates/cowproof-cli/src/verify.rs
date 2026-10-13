@@ -9,7 +9,9 @@
 use crate::compile_cache;
 use anyhow::{Context, Result, anyhow, bail};
 use clap::Parser;
-use cowproof_core::{PORT_CLASS, class_limit_at_commit, get_slot_dir, port_base_for_slot};
+use cowproof_core::{
+    PORT_CLASS, class_limit_at_commit, get_slot_dir, one_line, port_base_for_slot,
+};
 use cowproof_prove::{
     Capsule, VerifyError,
     runner::{
@@ -494,7 +496,7 @@ pub async fn verify_capsule(args: VerifyArgs) -> Result<i32> {
     let deps_dir = match capsule_dependencies(&capsule_dir, &repo, &layout).await {
         Ok(dir) => dir,
         Err(why) => {
-            eprintln!("infrastructure: {why}");
+            eprintln!("infrastructure: {}", one_line(&why));
             if ours {
                 let _ = fs::remove_dir_all(&root);
             }
@@ -542,7 +544,7 @@ pub async fn verify_capsule(args: VerifyArgs) -> Result<i32> {
                     Some((class_slot, port_slot))
                 }
                 Err(why) => {
-                    eprintln!("infrastructure: {why}");
+                    eprintln!("infrastructure: {}", one_line(&why));
                     if ours {
                         let _ = fs::remove_dir_all(&root);
                     }
@@ -580,11 +582,11 @@ pub async fn verify_capsule(args: VerifyArgs) -> Result<i32> {
             "hit" | "built" => eprintln!(
                 "compile cache: {} ({})",
                 record.status,
-                record.copy.as_deref().unwrap_or("")
+                one_line(record.copy.as_deref().unwrap_or(""))
             ),
             "failed" => eprintln!(
                 "compile cache: failed, the checks ran without a seed: {}",
-                record.note.as_deref().unwrap_or("")
+                one_line(record.note.as_deref().unwrap_or(""))
             ),
             _ => {}
         }
@@ -594,7 +596,7 @@ pub async fn verify_capsule(args: VerifyArgs) -> Result<i32> {
         Ok(report) => {
             // A skipped held-out port case is said out loud, whatever else is.
             if let Some(note) = report.port.as_ref().and_then(|p| p.skipped_note()) {
-                println!("{note}");
+                println!("{}", one_line(&note));
             }
             // Printed after the result line, whatever it is: a note, never a failure. Only pass
             // or fail is compared with the builder's record.
@@ -630,25 +632,28 @@ pub async fn verify_capsule(args: VerifyArgs) -> Result<i32> {
                 VerifyResult::PortFailed { failures } => {
                     println!("diverged: the port replay failed");
                     for failure in failures {
-                        println!("port: {failure}");
+                        println!("port: {}", one_line(&failure));
                     }
                     2
                 }
             };
             for why in &setup_failures {
-                println!("setup: {why}");
+                println!("setup: {}", one_line(why));
             }
             for note in notes {
-                println!("note: {note}");
+                println!("note: {}", one_line(&note));
             }
             code
         }
         Err(VerifyError::Capsule(e)) => {
-            eprintln!("refused: the capsule was tampered with or is damaged: {e}");
+            eprintln!(
+                "refused: the capsule was tampered with or is damaged: {}",
+                one_line(&e.to_string())
+            );
             4
         }
         Err(e) => {
-            eprintln!("infrastructure: {e}");
+            eprintln!("infrastructure: {}", one_line(&e.to_string()));
             4
         }
     };

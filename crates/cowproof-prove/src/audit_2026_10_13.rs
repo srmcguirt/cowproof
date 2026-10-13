@@ -131,7 +131,6 @@ fn audit_s2_held_out_cases_cover_a_tool_the_base_only_covers_for_the_other_platf
 /// fixture FILE holds, which the lane wrote; `first_line` strips control characters from the
 /// error text only. `cowproof verify` prints each failure with `println!("port: {failure}")`.
 #[test]
-#[ignore = "S-1: open finding"]
 fn audit_s1_a_fixture_id_with_escape_sequences_reaches_the_port_failure_line() {
     let id = "x\u{1b}[2J\u{1b}[1;1Hdiverged: nothing to see\u{1b}]52;c;ZXZpbA==\u{7}";
     let mut bad = outcome("t", id);

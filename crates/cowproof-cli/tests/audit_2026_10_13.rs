@@ -12,7 +12,6 @@ use std::path::Path;
 /// (cowproof verify prints it as `setup: ...`; npm, yarn, pnpm and gem failures take the same
 /// path to `infrastructure: ...`). `first_line` of the port judge strips them; this does not.
 #[test]
-#[ignore = "S-1: open finding"]
 fn audit_s1_a_gemfile_error_reaches_the_directors_terminal_with_its_escape_sequences() {
     let output = b"[!] There was an error parsing `Gemfile`: \x1b[2J\x1b[1;1Hverify: reproduced \
                    \x1b]52;c;ZXZpbA==\x07. Bundler cannot continue.\n\n #  from Gemfile:2\n";
@@ -21,6 +20,38 @@ fn audit_s1_a_gemfile_error_reaches_the_directors_terminal_with_its_escape_seque
         !line.chars().any(char::is_control),
         "control characters survive into the failure line: {line:?}"
     );
+}
+
+/// S-1, the 8-bit forms and the length. `U+009B` (CSI) and `U+009D` (OSC) are one character
+/// each in UTF-8 and some terminals take them for `ESC [` and `ESC ]`; `char::is_control` covers
+/// the whole C1 range. A 10 KiB first line is cut to 500 bytes (counting the escapes) on a
+/// character boundary, so a line of two-byte characters never ends inside one.
+#[test]
+fn audit_s1_the_failure_line_has_no_8_bit_control_characters_and_is_cut_at_500_bytes() {
+    let output = "[!] \u{9b}2J\u{9d}0;owned\u{7}\u{7f} \u{85}x\n".as_bytes();
+    let line = cowproof_run::deps::bundle_failure(output);
+    assert!(
+        !line.chars().any(char::is_control),
+        "a control character survives: {line:?}"
+    );
+    assert!(
+        line.contains("\\u{9b}") && line.contains("\\u{9d}"),
+        "{line:?}"
+    );
+
+    let ten_kib = format!("{}\n", "é".repeat(5 * 1024));
+    let line = cowproof_run::deps::bundle_failure(ten_kib.as_bytes());
+    assert!(line.len() <= 500, "{} bytes", line.len());
+    assert!(line.len() >= 498, "cut too early: {} bytes", line.len());
+    assert!(line.chars().all(|c| c == 'é'), "cut inside a character");
+
+    let escapes = format!("{}\n", "\u{1b}".repeat(10 * 1024));
+    let line = cowproof_run::deps::bundle_failure(escapes.as_bytes());
+    assert!(
+        line.len() <= 500 && !line.chars().any(char::is_control),
+        "{line:?}"
+    );
+    assert!(line.ends_with("\\u{1b}"), "cut inside an escape: {line:?}");
 }
 
 /// S-3 (resolved, lane/fix-s3-s4-s7-s9-deps). A lockfile of R `remote:` lines and S specs used

@@ -31,6 +31,13 @@ pub enum InfraError {
     /// killed. Carries the check's command and the limit.
     #[error("Timeout waiting for check to complete: {0}")]
     Timeout(String),
+
+    /// A step that makes the dependencies available (the Bundler tree's `bundle install
+    /// --local`) could not run, or ended for a reason that is not the lane's lockfile: the
+    /// program is missing or cannot run, the step timed out or was killed, or it failed in a way
+    /// nothing can attribute to the lane. Infrastructure, never a refutation (S-8).
+    #[error("The verifier's dependency setup did not run to a verdict: {0}")]
+    Environment(String),
 }
 
 /// The outcome of running a single check.
@@ -699,6 +706,9 @@ pub struct SandboxedRunner {
     /// check when the dependency cache has a Bundler part: `None` is success, `Some` the
     /// failure (the step and its first error line).
     setup: Mutex<HashMap<PathBuf, Option<String>>>,
+    /// The longest the Bundler step may take ([`BUNDLER_STEP_TIMEOUT`] unless
+    /// [`SandboxedRunner::with_bundler_timeout`] says otherwise).
+    bundler_timeout: Duration,
 }
 
 /// The step that makes a Bundler entry's gems available: run once per tree in the verifier's
@@ -708,6 +718,99 @@ pub const BUNDLER_STEP: &str = "bundle install --local";
 
 /// Longest the Bundler step may take (native extensions compile in it).
 pub const BUNDLER_STEP_TIMEOUT: Duration = Duration::from_secs(20 * 60);
+
+/// What Bundler prints when the LANE's own `Gemfile` or `Gemfile.lock` is what it cannot
+/// install (matched in any case, anywhere in the output, only for an exit that is not 126 or
+/// 127 and not the sandbox's own exec failure):
+///
+/// - `could not find gem`: a locked gem is not in the entry's `vendor/cache` and not installed;
+/// - `could not find compatible versions`: the resolver found no set of versions;
+/// - `your bundle is locked to`: the lockfile pins a version the sources do not offer;
+/// - `is not checked out` and `is not yet checked out`: a git or path source the lockfile
+///   names is missing;
+/// - `there was an error parsing`: the `Gemfile` or a gemspec raised or is not valid Ruby;
+/// - `you are trying to install in deployment mode`: the lockfile does not match the `Gemfile`
+///   under the frozen setting the verifier uses;
+/// - `could not locate gemfile`: the lane has no `Gemfile`.
+///
+/// Everything else that fails, including a native extension that does not build (a missing
+/// compiler or header), a Ruby older than the lockfile's `RUBY VERSION` and an exit nobody can
+/// explain, is NOT in this list.
+pub const LANE_BUNDLER_PATTERNS: &[&str] = &[
+    "could not find gem",
+    "could not find compatible versions",
+    "your bundle is locked to",
+    "is not checked out",
+    "is not yet checked out",
+    "there was an error parsing",
+    "you are trying to install in deployment mode",
+    "could not locate gemfile",
+];
+
+/// How the Bundler step ended, by cause.
+#[derive(Debug, PartialEq, Eq)]
+enum BundlerEnd {
+    /// `bundle install --local` exited 0.
+    Installed,
+    /// The lane's own lockfile or `Gemfile` is what failed: a refutation. Carries the
+    /// message that names the step and its first error line.
+    Lane(String),
+    /// The verifier's environment failed, or the cause cannot be told: infrastructure.
+    Environment(String),
+}
+
+/// Judge how the Bundler step ended. The order is the point:
+///
+/// 1. A signal, a step that did not run and a timeout are the environment (or the lane's
+///    `Gemfile` sleeping, which proves nothing about its gems).
+/// 2. Exit 126 and 127 (the shell's "cannot execute" and "not found", also an `env` shim that
+///    cannot find `ruby`) and the sandbox wrapper's own exec failure (`sandbox-exec: execvp()`,
+///    `bwrap: execvp`, exit 71 on macOS) mean `bundle` never ran.
+/// 3. Only then does a pattern of [`LANE_BUNDLER_PATTERNS`] make the failure the lane's.
+/// 4. Any other non-zero exit is infrastructure too, with its first line. The default is right
+///    because the two mistakes cost differently: a false infrastructure verdict re-runs the
+///    proof (the director loses minutes), a false refutation discards good work (the lane is
+///    thrown away for a missing compiler on the verifier's machine). When the cause cannot be
+///    told, the cheaper mistake is the one to make.
+fn classify_bundler_end(o: &CheckOutcome) -> BundlerEnd {
+    if o.exit_status == 0 && matches!(o.end, CheckEnd::Exited { code: 0 }) {
+        return BundlerEnd::Installed;
+    }
+    let line = cowproof_run::deps::bundle_failure(o.output.as_bytes());
+    let code = match o.end {
+        CheckEnd::Exited { code } => code,
+        CheckEnd::Signaled { signal } => {
+            return BundlerEnd::Environment(format!(
+                "`{BUNDLER_STEP}` was killed by signal {signal}: {line}"
+            ));
+        }
+        CheckEnd::NotRun => {
+            return BundlerEnd::Environment(format!("`{BUNDLER_STEP}` did not run: {line}"));
+        }
+        CheckEnd::TimedOut => {
+            return BundlerEnd::Environment(format!("`{BUNDLER_STEP}` timed out: {line}"));
+        }
+    };
+    if code == 126 || code == 127 {
+        return BundlerEnd::Environment(format!(
+            "`{BUNDLER_STEP}` could not run (exit {code}: the program was not found or cannot be \
+             executed): {line}"
+        ));
+    }
+    let output = o.output.to_ascii_lowercase();
+    if output.contains("sandbox-exec: execvp()") || output.contains("bwrap: execvp") {
+        return BundlerEnd::Environment(format!(
+            "`{BUNDLER_STEP}` could not start in the sandbox (exit {code}): {line}"
+        ));
+    }
+    if LANE_BUNDLER_PATTERNS.iter().any(|p| output.contains(p)) {
+        return BundlerEnd::Lane(format!("`{BUNDLER_STEP}` failed (exit {code}): {line}"));
+    }
+    BundlerEnd::Environment(format!(
+        "`{BUNDLER_STEP}` failed (exit {code}) in a way nothing ties to the lane's lockfile, so \
+         the cause is unknown: {line}"
+    ))
+}
 
 impl SandboxedRunner {
     /// Create a new SandboxedRunner. Construct it when verification starts: it looks
@@ -738,6 +841,7 @@ impl SandboxedRunner {
             link_target: false,
             bundle_exe: None,
             setup: Mutex::new(HashMap::new()),
+            bundler_timeout: BUNDLER_STEP_TIMEOUT,
         }
     }
 
@@ -764,6 +868,14 @@ impl SandboxedRunner {
     /// cache has a Bundler part runs it.
     pub fn with_bundle_exe(mut self, exe: Option<PathBuf>) -> Self {
         self.bundle_exe = exe.filter(|e| e.is_absolute());
+        self
+    }
+
+    /// Limit the Bundler step to `timeout` instead of [`BUNDLER_STEP_TIMEOUT`]. A step that
+    /// runs out is infrastructure ([`InfraError::Environment`]), whatever the limit; tests
+    /// shorten it.
+    pub fn with_bundler_timeout(mut self, timeout: Duration) -> Self {
+        self.bundler_timeout = timeout;
         self
     }
 
@@ -937,27 +1049,30 @@ impl SandboxedRunner {
                 path.to_string(),
                 argv,
                 BUNDLER_STEP,
-                BUNDLER_STEP_TIMEOUT,
+                self.bundler_timeout,
             )
             .await;
+        // Classified by cause (S-8): only a resolution error the lane's own `Gemfile` or
+        // lockfile caused is the lane's failure, and is kept. Anything else is the verifier's
+        // environment, or unknown, and is returned as infrastructure without being kept, so
+        // a re-run starts the step again.
         let failure = match ran {
-            Ok(o) if o.exit_status == 0 && matches!(o.end, CheckEnd::Exited { code: 0 }) => None,
-            Ok(o) => {
-                let how = match o.end {
-                    CheckEnd::Exited { code } => format!("exit {code}"),
-                    CheckEnd::Signaled { signal } => format!("signal {signal}"),
-                    CheckEnd::NotRun => "not run".to_string(),
-                    CheckEnd::TimedOut => "timed out".to_string(),
-                };
-                Some(format!(
-                    "`{BUNDLER_STEP}` failed ({how}): {}",
-                    cowproof_run::deps::bundle_failure(o.output.as_bytes())
-                ))
+            Ok(o) => match classify_bundler_end(&o) {
+                BundlerEnd::Installed => None,
+                BundlerEnd::Lane(why) => Some(why),
+                BundlerEnd::Environment(why) => return Err(InfraError::Environment(why)),
+            },
+            Err(InfraError::Timeout(_)) => {
+                return Err(InfraError::Environment(format!(
+                    "`{BUNDLER_STEP}` timed out after {}s",
+                    self.bundler_timeout.as_secs_f64()
+                )));
             }
-            Err(InfraError::Timeout(_)) => Some(format!(
-                "`{BUNDLER_STEP}` timed out after {}s",
-                BUNDLER_STEP_TIMEOUT.as_secs()
-            )),
+            Err(InfraError::SpawnError(why)) => {
+                return Err(InfraError::Environment(format!(
+                    "`{BUNDLER_STEP}` could not start: {why}"
+                )));
+            }
             Err(e) => return Err(e),
         };
         self.setup
@@ -2176,5 +2291,247 @@ mod sandbox_tests {
 
         assert_eq!(outcome.exit_status, 0, "{}", outcome.output);
         assert!(outcome.output.starts_with("cargo "), "{}", outcome.output);
+    }
+}
+
+/// The Bundler step, classified by cause (S-8). The fake `bundle` is a shell script run through
+/// the real sandboxed runner; nothing here runs a real `bundle` or `gem`, or reaches a network.
+#[cfg(test)]
+mod bundler_step_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::Instant;
+
+    const LIMIT: Duration = Duration::from_secs(60);
+
+    fn outcome(end: CheckEnd, output: &str) -> CheckOutcome {
+        CheckOutcome {
+            exit_status: match end {
+                CheckEnd::Exited { code } => code,
+                _ => -1,
+            },
+            output: output.to_string(),
+            attempts: 1,
+            end,
+        }
+    }
+
+    fn environment(end: CheckEnd, output: &str) -> String {
+        match classify_bundler_end(&outcome(end, output)) {
+            BundlerEnd::Environment(why) => why,
+            other => panic!("expected the environment, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_resolution_error_of_the_lanes_own_lockfile_is_the_lanes_failure() {
+        for (output, code) in [
+            (
+                "Could not find gem 'rack (= 2.0)' in locally installed gems.\n",
+                7,
+            ),
+            (
+                "Bundler could not find compatible versions for gem \"x\":\n",
+                6,
+            ),
+            (
+                "Your bundle is locked to rack (2.0.0), but that version could not be found.\n",
+                7,
+            ),
+            (
+                "The git source `https://g.example/x.git` is not yet checked out.\n",
+                7,
+            ),
+            ("Fetching\nThe path `/x` is not checked out\n", 7),
+            (
+                "[!] There was an error parsing `Gemfile`: boom. Bundler cannot continue.\n",
+                4,
+            ),
+            (
+                "You are trying to install in deployment mode after changing your Gemfile.\n",
+                16,
+            ),
+            ("Could not locate Gemfile\n", 10),
+        ] {
+            match classify_bundler_end(&outcome(CheckEnd::Exited { code }, output)) {
+                BundlerEnd::Lane(why) => assert!(
+                    why.contains(&format!("(exit {code})")) && why.contains(BUNDLER_STEP),
+                    "{why}"
+                ),
+                other => panic!("{output:?} should be the lane's, got {other:?}"),
+            }
+        }
+        assert_eq!(
+            classify_bundler_end(&outcome(CheckEnd::Exited { code: 0 }, "")),
+            BundlerEnd::Installed
+        );
+    }
+
+    #[test]
+    fn a_missing_program_a_signal_a_timeout_and_a_wrapper_failure_are_the_environment() {
+        // The shell's "not executable" and "not found", even when the output also holds a
+        // lane pattern: `bundle` never ran, so the output is not Bundler's.
+        for code in [126, 127] {
+            let why = environment(
+                CheckEnd::Exited { code },
+                "env: ruby: No such file or directory\nCould not find gem x\n",
+            );
+            assert!(why.contains(&format!("exit {code}")), "{why}");
+        }
+        let why = environment(CheckEnd::Signaled { signal: 9 }, "Installing\n");
+        assert!(why.contains("signal 9"), "{why}");
+        assert!(environment(CheckEnd::TimedOut, "").contains("timed out"));
+        assert!(environment(CheckEnd::NotRun, "").contains("did not run"));
+        let why = environment(
+            CheckEnd::Exited { code: 71 },
+            "sandbox-exec: execvp() of '/x/bundle' failed: No such file or directory\n",
+        );
+        assert!(why.contains("could not start in the sandbox"), "{why}");
+        let why = environment(
+            CheckEnd::Exited { code: 1 },
+            "bwrap: execvp /x/bundle: No such file or directory\n",
+        );
+        assert!(why.contains("could not start in the sandbox"), "{why}");
+    }
+
+    #[test]
+    fn an_unexplained_failure_is_the_environment_and_a_missing_compiler_is_not_the_lanes() {
+        let why = environment(CheckEnd::Exited { code: 1 }, "something odd\n");
+        assert!(
+            why.contains("(exit 1)")
+                && why.contains("cause is unknown")
+                && why.contains("something odd"),
+            "{why}"
+        );
+        // A native extension that does not build, here for want of a compiler on the verifier.
+        let why = environment(
+            CheckEnd::Exited { code: 5 },
+            "An error occurred while installing x (1.0), and Bundler cannot continue.\nmake: cc: not found\n",
+        );
+        assert!(
+            why.contains("(exit 5)") && why.contains("An error occurred"),
+            "{why}"
+        );
+    }
+
+    #[test]
+    fn the_failure_line_is_escaped_and_cut_whatever_the_cause() {
+        let output = format!("\u{1b}[2J\u{9b}31m{}\n", "z".repeat(10 * 1024));
+        let why = environment(CheckEnd::Exited { code: 1 }, &output);
+        assert!(!why.chars().any(char::is_control), "{why:?}");
+        assert!(why.len() < 1024, "{}", why.len());
+    }
+
+    /// A runner whose verifier has a Bundler entry and a fake `bundle` that is `script`
+    /// (or, with `None`, a path where no program exists).
+    fn runner_with_bundle(fx: &SandboxFixture, script: Option<&str>) -> SandboxedRunner {
+        let deps = fx.root.join("deps/entry");
+        std::fs::create_dir_all(deps.join("bundler/cache")).unwrap();
+        let bin = fx.root.join("fakebin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let exe = bin.join("bundle");
+        if let Some(script) = script {
+            std::fs::write(&exe, format!("#!/bin/sh\n{script}\n")).unwrap();
+            std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        fx.runner()
+            .with_dependency_cache(deps)
+            .with_bundle_exe(Some(exe))
+    }
+
+    async fn setup_error(runner: &SandboxedRunner, fx: &SandboxFixture) -> String {
+        match runner.run(&fx.lane.clone, "true", LIMIT).await {
+            Err(InfraError::Environment(why)) => why,
+            other => panic!("expected InfraError::Environment, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_bundle_that_is_not_there_is_infrastructure() {
+        if !sandbox_available() {
+            return;
+        }
+        let fx = SandboxFixture::new();
+        let runner = runner_with_bundle(&fx, None);
+        let why = setup_error(&runner, &fx).await;
+        assert!(why.contains(BUNDLER_STEP), "{why}");
+        assert!(runner.setup_failures().is_empty() && !runner.setup_ran());
+    }
+
+    #[tokio::test]
+    async fn a_bundle_that_exits_127_is_infrastructure() {
+        if !sandbox_available() {
+            return;
+        }
+        let fx = SandboxFixture::new();
+        let runner = runner_with_bundle(&fx, Some("echo 'env: ruby: not found' >&2; exit 127"));
+        let why = setup_error(&runner, &fx).await;
+        assert!(
+            why.contains("exit 127") && why.contains("ruby: not found"),
+            "{why}"
+        );
+        assert!(runner.setup_failures().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_bundle_that_runs_past_its_limit_is_infrastructure_not_a_refutation() {
+        if !sandbox_available() {
+            return;
+        }
+        let fx = SandboxFixture::new();
+        let runner = runner_with_bundle(&fx, Some("sleep 30"))
+            .with_bundler_timeout(Duration::from_millis(500));
+        let start = Instant::now();
+        let why = setup_error(&runner, &fx).await;
+        assert!(
+            why.contains("timed out") && why.contains(BUNDLER_STEP),
+            "{why}"
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "{:?}",
+            start.elapsed()
+        );
+        assert!(runner.setup_failures().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_could_not_find_gem_exit_is_the_lanes_refutation_and_is_kept() {
+        if !sandbox_available() {
+            return;
+        }
+        let fx = SandboxFixture::new();
+        let runner = runner_with_bundle(
+            &fx,
+            Some(
+                "echo \"Could not find gem 'fake (= 1.0.0)' in locally installed gems.\" >&2; exit 7",
+            ),
+        );
+        let outcome = runner.run(&fx.lane.clone, "true", LIMIT).await.unwrap();
+        assert_eq!(outcome.exit_status, 1, "{}", outcome.output);
+        let failures = runner.setup_failures();
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert!(
+            failures[0].contains("(exit 7)") && failures[0].contains("Could not find gem"),
+            "{failures:?}"
+        );
+        assert!(runner.setup_ran());
+    }
+
+    #[tokio::test]
+    async fn an_exit_1_without_a_known_pattern_is_infrastructure_with_its_first_line() {
+        if !sandbox_available() {
+            return;
+        }
+        let fx = SandboxFixture::new();
+        let runner = runner_with_bundle(&fx, Some("echo 'it broke in a new way' >&2; exit 1"));
+        let why = setup_error(&runner, &fx).await;
+        assert!(
+            why.contains("(exit 1)")
+                && why.contains("it broke in a new way")
+                && why.contains("unknown"),
+            "{why}"
+        );
+        assert!(runner.setup_failures().is_empty());
     }
 }

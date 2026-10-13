@@ -1813,8 +1813,14 @@ fn first_error_line(output: &[u8], prefixes: &[&str]) -> String {
         })
         .or_else(|| lines().next())
         .unwrap_or("no output");
-    line.chars().take(300).collect()
+    // The line is a tool's, and a tool echoes what a lane wrote (a `Gemfile` that `puts` an
+    // escape sequence): control characters are shown as escapes, and the line is cut to
+    // `ERROR_LINE_MAX_BYTES` on a character boundary.
+    cowproof_core::escape_capped(line, ERROR_LINE_MAX_BYTES)
 }
+
+/// The longest error line [`first_error_line`] returns, in bytes.
+pub const ERROR_LINE_MAX_BYTES: usize = 500;
 
 /// The first line npm reported as an error (`npm ERR!` or `npm error`), else its first line
 /// of output, cut to a sensible length.

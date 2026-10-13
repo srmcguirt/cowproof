@@ -48,7 +48,7 @@ use crate::verify::{Rebuild, director_runtime_dirs, fetch_dependencies, verifier
 use anyhow::{Context, Result, anyhow, bail};
 use cowproof_core::{
     LinkedFile, PORT_CLASS, Profiles, Routing, Rung, Runtime, class_limit_at_commit, get_slot_dir,
-    git_show_following_links, parse_header, port_base_for_slot, port_block_env, redact,
+    git_show_following_links, one_line, parse_header, port_base_for_slot, port_block_env, redact,
     valid_model_name,
 };
 use cowproof_prove::{
@@ -4539,8 +4539,10 @@ struct Evidence {
     /// Held-out checks that failed on the verifier's rebuilt tree.
     heldout_failed: Vec<String>,
     /// A step that makes the dependencies available to the verifier's checks failed (the
-    /// Bundler tree's `bundle install --local`): the step and its first error line. The lane's
-    /// own gems did not install, so it is refuted, not an infrastructure failure.
+    /// Bundler tree's `bundle install --local`): the step and its first error line. Only a
+    /// resolution error of the lane's own `Gemfile` or lockfile lands here, so it is refuted;
+    /// a missing `bundle`, a timeout, a signal or a failure nothing ties to the lane is
+    /// `infrastructure` (S-8).
     setup_failed: Vec<String>,
     /// What the proof wants the director to see that is neither a failure nor a pass, for
     /// instance `held-out: skipped (...)` on a port packet. Printed after the verdict line.
@@ -4615,21 +4617,6 @@ fn judge(e: &Evidence, unsandboxed: bool) -> Verdict {
         Outcome::Proved
     };
     Verdict { outcome, reasons }
-}
-
-/// Builder-controlled text (file names in gate evidence) reaches the
-/// director's terminal: control characters are shown as escapes, and the
-/// result is one line.
-fn one_line(text: &str) -> String {
-    text.chars()
-        .map(|c| {
-            if c.is_control() {
-                c.escape_default().to_string()
-            } else {
-                c.to_string()
-            }
-        })
-        .collect()
 }
 
 /// What the proof needs from the run.

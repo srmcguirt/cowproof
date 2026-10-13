@@ -101,12 +101,26 @@ for g in vendor/cache/*.gem; do basename "$g" >> "$BUNDLE_PATH/installed.txt"; d
 exit 0
 "#;
 
-/// A FAKE `bundle` whose install fails the way a native extension that does not build does.
+/// A FAKE `bundle` whose install fails the way a lockfile does that names a gem the entry does
+/// not hold: a resolution error of the lane's own, so the lane is refuted (S-8).
 const FAKE_BUNDLE_FAILS: &str = r#"#!/bin/sh
 echo "Fetching gem metadata from rubygems" >&2
-echo "Installing fake-gem 1.0.0 with native extensions" >&2
-echo "An error occurred while installing fake-gem (1.0.0), and Bundler cannot continue." >&2
-exit 5
+echo "Could not find gem 'fake-gem (= 1.0.0)' in locally installed gems." >&2
+exit 7
+"#;
+
+/// A FAKE `bundle` that fails in a way nothing ties to the lane (no Bundler resolution error):
+/// the verifier cannot tell its own environment from the lane, so it is infrastructure.
+const FAKE_BUNDLE_UNKNOWN: &str = r#"#!/bin/sh
+echo "something nobody has seen before went wrong" >&2
+exit 1
+"#;
+
+/// A FAKE `bundle` whose resolution error carries what a hostile `Gemfile` would print first: a
+/// screen clear, a cursor move, an OSC 52 clipboard write, and an 8-bit CSI (UTF-8 `C2 9B`).
+const FAKE_BUNDLE_HOSTILE: &str = r#"#!/bin/sh
+printf 'Could not find gem \033[2J\033[1;1Hverify: reproduced \033]52;c;ZXZpbA==\007 \302\233 31m\n' >&2
+exit 7
 "#;
 
 fn sha256(text: &str) -> String {
@@ -874,10 +888,9 @@ fn a_failing_bundle_install_ends_the_lane_refuted_naming_the_step_and_its_first_
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();
     assert!(
         stdout.contains("refuted")
-            && stdout.contains("`bundle install --local` failed (exit 5)")
-            && stdout.contains(
-                "An error occurred while installing fake-gem (1.0.0), and Bundler cannot continue."
-            ),
+            && stdout.contains("`bundle install --local` failed (exit 7)")
+            && stdout
+                .contains("Could not find gem 'fake-gem (= 1.0.0)' in locally installed gems."),
         "{}",
         text(&out)
     );
@@ -893,7 +906,7 @@ fn a_failing_bundle_install_ends_the_lane_refuted_naming_the_step_and_its_first_
     assert_eq!(c.dependency_fetch_outcome.as_deref(), Some("fetched"));
     assert!(
         c.dependency_fetch_notes.iter().any(|n| n.starts_with(
-            "bundler: the verifier's step failed: `bundle install --local` failed (exit 5)"
+            "bundler: the verifier's step failed: `bundle install --local` failed (exit 7)"
         )),
         "{:?}",
         c.dependency_fetch_notes
@@ -1055,7 +1068,7 @@ fn verify_on_another_cache_root_fetches_the_gems_again_and_reproduces() {
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();
     assert!(
         stdout.starts_with("diverged: check \"ok\"")
-            && stdout.contains("setup: `bundle install --local` failed (exit 5): An error occurred while installing fake-gem (1.0.0)"),
+            && stdout.contains("setup: `bundle install --local` failed (exit 7): Could not find gem 'fake-gem (= 1.0.0)'"),
         "{}",
         text(&out)
     );
@@ -1230,4 +1243,120 @@ fn a_remote_the_base_lockfile_names_is_reached_and_one_it_does_not_name_is_refus
         text(&out)
     );
     assert_eq!(refused.accepted.load(Ordering::SeqCst), 0);
+}
+
+/// A clone of the lane's repository in its own directory, for a `cowproof verify` away from the
+/// lane's checkout.
+fn fresh_clone(lane: &Lane) -> (tempfile::TempDir, PathBuf) {
+    let fresh = var_tmp("cp-gem-fresh-");
+    let clone = fresh.path().join("repo");
+    let cloned = output(
+        Command::new("git")
+            .args(["clone", "-q"])
+            .arg(&lane.repo)
+            .arg(&clone),
+    );
+    assert!(cloned.status.success(), "{}", text(&cloned));
+    (fresh, clone)
+}
+
+/// `cowproof verify` of the lane's capsule in a fresh clone, with its own cache root and the
+/// `bundle` at `bundle`.
+fn verify_with_bundle(lane: &Lane, bundle: &Path) -> std::process::Output {
+    let (fresh, clone) = fresh_clone(lane);
+    let cache = var_tmp("cp-gem-vcache-");
+    let workdir = var_tmp("cp-gem-vwd-");
+    output(
+        lane.cowproof_cmd()
+            .env("COWPROOF_CACHE_ROOT", cache.path())
+            .env("COWPROOF_FETCH_NETWORK", "none")
+            .env("COWPROOF_BUNDLE", bundle)
+            .current_dir(fresh.path())
+            .arg("verify")
+            .arg(lane.capsule_dir())
+            .arg("--repo")
+            .arg(&clone)
+            .arg("--workdir")
+            .arg(workdir.path()),
+    )
+}
+
+/// S-1 and S-8, the print: what a `Gemfile` writes before Bundler gives up reaches the director's
+/// terminal through `cowproof verify`'s `setup:` line, and must arrive as escapes. Only the
+/// line's own newline may be a control character in what verify prints.
+#[test]
+fn verify_prints_a_bundler_setup_failure_with_its_escape_sequences_shown_not_sent() {
+    if !sandbox_available() {
+        return;
+    }
+    let cache = var_tmp("cp-gem-cache-");
+    let (_gem_dir, gem) = fake_tool("gem", FAKE_GEM_OK);
+    let (_bundle_dir, bundle) = fake_tool("bundle", FAKE_BUNDLE_OK);
+    let lane = new_lane(&bundler_project(), cache.path(), &gem, &bundle);
+    let held = var_tmp("cp-gem-held-");
+    run_with(&lane, &heldout(held.path(), NEEDS_GEMS), 0);
+
+    let (_hostile_dir, hostile) = fake_tool("bundle", FAKE_BUNDLE_HOSTILE);
+    let out = verify_with_bundle(&lane, &hostile);
+    assert_eq!(out.status.code(), Some(2), "{}", text(&out));
+    for (name, bytes) in [("stdout", &out.stdout), ("stderr", &out.stderr)] {
+        let shown = String::from_utf8_lossy(bytes);
+        assert!(
+            !shown.chars().any(|c| c.is_control() && c != '\n'),
+            "{name} holds a control character: {shown:?}"
+        );
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let setup = stdout
+        .lines()
+        .find(|l| l.starts_with("setup: "))
+        .unwrap_or_else(|| panic!("no setup line:\n{stdout}"));
+    assert!(
+        setup.contains("\\u{1b}[2J") && setup.contains("\\u{9b}") && setup.contains("\\u{7}"),
+        "{setup}"
+    );
+}
+
+/// S-8: a `bundle` that fails in a way nothing ties to the lane's lockfile does not refute the
+/// lane. `cowproof run` ends `infrastructure` (exit 4) and `cowproof verify` exits 4, each
+/// naming the cause, and neither prints a `setup:` line.
+#[test]
+fn an_unexplained_bundle_failure_is_infrastructure_in_run_and_in_verify() {
+    if !sandbox_available() {
+        return;
+    }
+    let cache = var_tmp("cp-gem-cache-");
+    let (_gem_dir, gem) = fake_tool("gem", FAKE_GEM_OK);
+    let (_bundle_dir, bundle) = fake_tool("bundle", FAKE_BUNDLE_OK);
+    let ok_lane = new_lane(&bundler_project(), cache.path(), &gem, &bundle);
+    let held = var_tmp("cp-gem-held-");
+    run_with(&ok_lane, &heldout(held.path(), NEEDS_GEMS), 0);
+    let (_unknown_dir, unknown) = fake_tool("bundle", FAKE_BUNDLE_UNKNOWN);
+    let out = verify_with_bundle(&ok_lane, &unknown);
+    assert_eq!(out.status.code(), Some(4), "{}", text(&out));
+    let err = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(
+        err.contains("infrastructure: ")
+            && err.contains("`bundle install --local` failed (exit 1)")
+            && err.contains("cause is unknown")
+            && err.contains("something nobody has seen before went wrong"),
+        "{err}"
+    );
+    assert!(
+        !String::from_utf8_lossy(&out.stdout).contains("setup: "),
+        "{}",
+        text(&out)
+    );
+
+    let run_cache = var_tmp("cp-gem-cache-");
+    let lane = new_lane(&bundler_project(), run_cache.path(), &gem, &unknown);
+    let held = var_tmp("cp-gem-held-");
+    let out = run_with(&lane, &heldout(held.path(), NEEDS_GEMS), 4);
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(
+        stdout.contains("infrastructure") && stdout.contains("cause is unknown"),
+        "{}",
+        text(&out)
+    );
+    assert_eq!(lane.verdict()["verdict"], "infrastructure");
 }

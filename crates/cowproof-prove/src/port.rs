@@ -640,6 +640,12 @@ fn judge(
             ));
         }
     }
+    // A failure names the `tool` and `id` that a lane-written fixture file holds, and the
+    // verifier prints it: show any control character as an escape (S-1). Escaping is
+    // idempotent, so a line that `first_line` already cleaned is unchanged.
+    for failure in &mut replayed.failures {
+        *failure = cowproof_core::one_line(failure);
+    }
 }
 
 fn shorten(value: &Value) -> Value {
