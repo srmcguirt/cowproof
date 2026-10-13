@@ -794,6 +794,75 @@ fn retagging_a_base_fixture_for_another_platform_cannot_skip_it() {
     );
 }
 
+/// The project whose only `shout` fixture in the base is tagged for the OTHER platform.
+fn other_platform_base_lane(body: &str) -> Lane {
+    let (_, other) = platforms();
+    let project = var_tmp("cp-port-other-base-");
+    copy_tree(&fixture().join("project"), project.path());
+    let dir = project.path().join("ports/upper/fixtures/shout");
+    fs::remove_file(dir.join("hi.json")).unwrap();
+    let doc = json!({"tool": "shout", "id": format!("hi@{other}"), "platform": other,
+        "input": {"text": "hi there"}, "expected": {"result": "HI THERE!"}});
+    fs::write(
+        dir.join(format!("hi@{other}.json")),
+        serde_json::to_string_pretty(&doc).unwrap(),
+    )
+    .unwrap();
+    Lane::from_project(body, project.path(), &|id| packet(id, &|t| t))
+}
+
+/// S-2 end to end: the base holds only a fixture for the other platform for `shout`, there are
+/// no held-out port cases, and the lane adds an untagged `shout` fixture its port answers. The
+/// verifier counts coverage from the base, so the lane is not proved on this platform.
+#[test]
+fn a_lane_added_fixture_does_not_cover_a_tool_the_base_only_covers_for_the_other_platform() {
+    if workspace::skipped(
+        "a_lane_added_fixture_does_not_cover_a_tool_the_base_only_covers_for_the_other_platform",
+    ) {
+        return;
+    }
+    if !sandbox_available() {
+        return;
+    }
+    let (host, other) = platforms();
+    let own = write_fixture(
+        "shout",
+        "lane-own",
+        &json!({"tool": "shout", "id": "lane-own",
+                "input": {"text": "hi there"}, "expected": {"result": "HI THERE!"}}),
+    );
+    let lane = other_platform_base_lane(&builder(
+        &TEXT_RS.replace("{SHOUT}", "!"),
+        &["upper", "shout"],
+        &own,
+    ));
+    // No `--heldout`: the packet has no held-out port cases.
+    let out = lane.run(&[]);
+    assert_eq!(out.status.code(), Some(2), "{}", text(&out));
+    let verdict = lane.verdict();
+    assert_eq!(verdict["verdict"], "refuted", "{verdict}");
+    assert!(
+        verdict["failedGates"].to_string().contains("port_replay"),
+        "{verdict}"
+    );
+    let gates = gates(&lane);
+    let evidence = gate(&gates, "port_replay")["evidence"].to_string();
+    assert!(
+        evidence.contains(&format!(
+            "tool \\\"shout\\\" has no fixture for {host} (its fixtures cover {other}), so it was never proved on this platform"
+        )),
+        "{evidence}"
+    );
+    // The lane's own fixture was replayed and passed; the failure is only the platform rule.
+    let result = Capsule::read(&lane.capsule_dir())
+        .unwrap()
+        .port
+        .unwrap()
+        .result
+        .unwrap();
+    assert_eq!(result.failures.len(), 1, "{:?}", result.failures);
+}
+
 /// The project with the `shout` fixtures removed: a base that records none for that tool.
 fn empty_base_lane(body: &str) -> Lane {
     let project = var_tmp("cp-port-empty-base-");
