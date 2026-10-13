@@ -268,28 +268,46 @@ fn a_real_lane_rolls_up_to_what_its_own_files_say() {
     assert!(table.contains("1/1 100%"), "{table}");
 }
 
-/// Give an already written lane `traceTotals.deliveredBytes`, the way a traced lane's
-/// `run.json` has it.
-fn trace(root: &Path, id: &str, delivered_bytes: u64) {
+/// Give an already written lane `traceTotals`, the way a traced lane's `run.json` has them.
+fn trace(root: &Path, id: &str, totals: Value) {
     let path = root.join(id).join("control/run.json");
     let mut run: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
-    run["traceTotals"] = json!({"calls": 3, "deliveredBytes": delivered_bytes});
+    run["traceTotals"] = totals;
     fs::write(&path, run.to_string()).unwrap();
 }
 
 #[test]
-fn the_rollup_shows_mean_delivered_bytes_per_proved_traced_lane_by_start_rung() {
+fn the_rollup_shows_the_trace_means_per_proved_traced_lane_by_start_rung() {
     let dir = var_tmp("cp-rollcli-delivered-");
     let root = dir.path();
     put(root, "a", ("claude", "haiku"), "rust", "proved", false);
     put(root, "b", ("claude", "haiku"), "light", "proved", false);
     put(root, "c", ("claude", "haiku"), "light", "proved", false);
-    // Refuted: traced, but not a proved lane, so not in the mean.
+    // Refuted: traced, but not a proved lane, so not in any mean.
     put(root, "d", ("claude", "haiku"), "light", "refuted", false);
     put(root, "e", ("claude", "sonnet"), "light", "proved", false);
-    trace(root, "a", 1000);
-    trace(root, "b", 3000);
-    trace(root, "d", 99_999);
+    // Traced before the rollup figures: only its delivered bytes count.
+    put(root, "f", ("claude", "haiku"), "light", "proved", false);
+    trace(
+        root,
+        "a",
+        json!({"calls": 3, "deliveredBytes": 1000, "savedBytes": 400, "rejected": 2,
+               "rereadRate": 0.5}),
+    );
+    // No call named a target: no re-read rate (null), so it is left out of that mean.
+    trace(
+        root,
+        "b",
+        json!({"calls": 3, "deliveredBytes": 3000, "savedBytes": 1000, "rejected": 0,
+               "rereadRate": null}),
+    );
+    trace(
+        root,
+        "d",
+        json!({"calls": 3, "deliveredBytes": 99_999, "savedBytes": 99_999, "rejected": 99,
+               "rereadRate": 1.0}),
+    );
+    trace(root, "f", json!({"calls": 3, "deliveredBytes": 5000}));
 
     let out = rollup(&["--json"], &[root]);
     assert!(out.status.success(), "{}", text(&out));
@@ -297,25 +315,60 @@ fn the_rollup_shows_mean_delivered_bytes_per_proved_traced_lane_by_start_rung() 
     assert_eq!(
         doc["delivered"],
         json!([
-            {"startRung": "claude:haiku", "provedLanes": 3, "tracedProvedLanes": 2,
-             "meanDeliveredBytes": 2000.0},
+            {"startRung": "claude:haiku", "provedLanes": 4, "tracedProvedLanes": 3,
+             "meanDeliveredBytes": 3000.0, "meanSavedBytes": 700.0, "meanRejected": 1.0,
+             "meanRereadRate": 0.5},
             {"startRung": "claude:sonnet", "provedLanes": 1, "tracedProvedLanes": 0,
-             "meanDeliveredBytes": null},
+             "meanDeliveredBytes": null, "meanSavedBytes": null, "meanRejected": null,
+             "meanRereadRate": null},
         ])
     );
+    let lane = |id: &str| {
+        doc["lanes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|l| l["id"] == id)
+            .unwrap()
+            .clone()
+    };
+    assert_eq!(lane("a")["savedBytes"], 400);
+    assert_eq!(lane("a")["rejected"], 2);
+    assert_eq!(lane("a")["rereadRate"], 0.5);
+    assert!(lane("b")["rereadRate"].is_null(), "{}", lane("b"));
+    assert!(lane("f")["savedBytes"].is_null(), "{}", lane("f"));
 
     let table = stdout(&rollup(&[], &[root]));
     assert!(
-        table.contains("Context delivered (mean bytes per proved traced lane)"),
+        table.contains("Context per proved traced lane (means)"),
         "{table}"
     );
     // The figures come from files the builder can write: the heading says so.
     assert!(table.contains("builder-written, informational"), "{table}");
+    assert!(
+        table.contains("delivered") && table.contains("saved") && table.contains("rejected"),
+        "{table}"
+    );
     let row = table
         .lines()
-        .find(|l| l.contains("claude:haiku") && l.contains("2000 bytes"))
-        .unwrap_or_else(|| panic!("no delivered row in:\n{table}"));
-    assert!(row.contains("2 of 3 proved traced"), "{row}");
+        .find(|l| l.contains("claude:haiku") && l.contains("3 of 4"))
+        .unwrap_or_else(|| panic!("no haiku trace row in:\n{table}"));
+    let cells: Vec<&str> = row.split_whitespace().collect();
+    assert_eq!(
+        cells,
+        ["claude:haiku", "3000", "700", "1.0", "50%", "3", "of", "4"],
+        "{row}"
+    );
+    // A rung with no traced proved lane shows dashes, not zeros.
+    let sonnet = table
+        .lines()
+        .find(|l| l.contains("claude:sonnet") && l.contains("0 of 1"))
+        .unwrap_or_else(|| panic!("no sonnet trace row in:\n{table}"));
+    assert_eq!(
+        sonnet.split_whitespace().collect::<Vec<_>>(),
+        ["claude:sonnet", "-", "-", "-", "-", "0", "of", "1"],
+        "{sonnet}"
+    );
     for line in table.lines() {
         assert!(line.chars().count() <= 80, "{line:?}");
     }

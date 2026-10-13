@@ -117,18 +117,28 @@ pub struct Climbed {
     pub ended_on: BTreeMap<String, usize>,
 }
 
-/// The usage monitor's figure for the lanes that started on a rung: of the proved lanes whose
-/// `run.json` carries `traceTotals` (traced Claude lanes), the mean `deliveredBytes`, the
-/// bytes that reached the builder's context. Untraced proved lanes are not in it.
+/// The usage monitor's figures for the lanes that started on a rung: of the proved lanes whose
+/// `run.json` carries `traceTotals` (traced Claude lanes), the mean `deliveredBytes` (what
+/// reached the builder's context), the mean `savedBytes` (what the budget kept out), the mean
+/// `rejected` calls and the mean `rereadRate`. Untraced proved lanes are not in them, and a
+/// traced lane whose `run.json` predates a figure is left out of that figure's mean only. All
+/// of it is the builder's own account (the builder can write its trace): informational.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Delivered {
     pub start_rung: String,
     /// Proved lanes of the rung, traced or not.
     pub proved_lanes: usize,
-    /// Of those, the lanes with trace totals: the mean is over these.
+    /// Of those, the lanes with trace totals: the means are over these.
     pub traced_proved_lanes: usize,
     pub mean_delivered_bytes: Option<f64>,
+    /// Over the traced proved lanes that carry `savedBytes`.
+    pub mean_saved_bytes: Option<f64>,
+    /// Over the traced proved lanes that carry `rejected`.
+    pub mean_rejected: Option<f64>,
+    /// Over the traced proved lanes with a numeric `rereadRate` (a lane whose calls named no
+    /// target has none and is left out).
+    pub mean_reread_rate: Option<f64>,
 }
 
 /// One lane that was read (not running, not skipped).
@@ -151,6 +161,12 @@ pub struct LaneRow {
     pub turns: Option<u64>,
     /// `traceTotals.deliveredBytes` of `run.json`, for a traced lane.
     pub delivered_bytes: Option<u64>,
+    /// `traceTotals.savedBytes`, when the lane's `run.json` has it.
+    pub saved_bytes: Option<u64>,
+    /// `traceTotals.rejected`, when the lane's `run.json` has it.
+    pub rejected: Option<u64>,
+    /// `traceTotals.rereadRate`, when the lane's `run.json` has a number there.
+    pub reread_rate: Option<f64>,
     pub reassigns: usize,
     pub rung_source: Option<String>,
     pub remote: bool,
@@ -241,20 +257,37 @@ pub fn rollup(roots: &[PathBuf], options: &Options) -> Result<Rollup> {
         *c.ended_on.entry(row.final_rung.clone()).or_default() += 1;
     }
 
-    let mut delivered: BTreeMap<&str, (usize, Vec<u64>)> = BTreeMap::new();
-    for row in rows.iter().filter(|r| r.state == "counted" && r.proved) {
-        let entry = delivered.entry(row.first_rung.as_str()).or_default();
-        entry.0 += 1;
-        entry.1.extend(row.delivered_bytes);
+    #[derive(Default)]
+    struct Acc {
+        proved: usize,
+        traced: usize,
+        delivered: Vec<f64>,
+        saved: Vec<f64>,
+        rejected: Vec<f64>,
+        reread: Vec<f64>,
     }
-    let delivered: Vec<Delivered> = delivered
+    let mut accs: BTreeMap<&str, Acc> = BTreeMap::new();
+    for row in rows.iter().filter(|r| r.state == "counted" && r.proved) {
+        let acc = accs.entry(row.first_rung.as_str()).or_default();
+        acc.proved += 1;
+        if let Some(bytes) = row.delivered_bytes {
+            acc.traced += 1;
+            acc.delivered.push(bytes as f64);
+            acc.saved.extend(row.saved_bytes.map(|v| v as f64));
+            acc.rejected.extend(row.rejected.map(|v| v as f64));
+            acc.reread.extend(row.reread_rate);
+        }
+    }
+    let delivered: Vec<Delivered> = accs
         .into_iter()
-        .map(|(rung, (proved, bytes))| Delivered {
+        .map(|(rung, acc)| Delivered {
             start_rung: rung.to_string(),
-            proved_lanes: proved,
-            traced_proved_lanes: bytes.len(),
-            mean_delivered_bytes: (!bytes.is_empty())
-                .then(|| bytes.iter().sum::<u64>() as f64 / bytes.len() as f64),
+            proved_lanes: acc.proved,
+            traced_proved_lanes: acc.traced,
+            mean_delivered_bytes: mean(&acc.delivered),
+            mean_saved_bytes: mean(&acc.saved),
+            mean_rejected: mean(&acc.rejected),
+            mean_reread_rate: mean(&acc.reread),
         })
         .collect();
 
@@ -267,6 +300,11 @@ pub fn rollup(roots: &[PathBuf], options: &Options) -> Result<Rollup> {
         delivered,
         lanes: rows,
     })
+}
+
+/// The mean, or none for no values.
+fn mean(values: &[f64]) -> Option<f64> {
+    (!values.is_empty()).then(|| values.iter().sum::<f64>() / values.len() as f64)
 }
 
 fn group(rung: &str, class: &str, lanes: &[&LaneRow]) -> Group {
@@ -456,10 +494,12 @@ fn read_lane(dir: &Path, id: &str, root: &Path, options: &Options) -> Found {
         cost_usd,
         cost_is_estimate,
         turns: turns_of(&run),
-        delivered_bytes: run
-            .get("traceTotals")
-            .and_then(|t| t.get("deliveredBytes"))
-            .and_then(Value::as_u64),
+        delivered_bytes: trace_figure(&run, "deliveredBytes").and_then(Value::as_u64),
+        saved_bytes: trace_figure(&run, "savedBytes").and_then(Value::as_u64),
+        rejected: trace_figure(&run, "rejected").and_then(Value::as_u64),
+        reread_rate: trace_figure(&run, "rereadRate")
+            .and_then(Value::as_f64)
+            .filter(|r| r.is_finite() && (0.0..=1.0).contains(r)),
         reassigns: rungs.reassigns,
         rung_source: str_of(&run, "rungSource"),
         remote: host.is_some(),
@@ -467,6 +507,11 @@ fn read_lane(dir: &Path, id: &str, root: &Path, options: &Options) -> Found {
         unsandboxed,
         legacy: rungs.legacy,
     }))
+}
+
+/// One figure of `run.json`'s `traceTotals` (a traced lane's, the builder's own account).
+fn trace_figure<'a>(run: &'a serde_json::Map<String, Value>, key: &str) -> Option<&'a Value> {
+    run.get("traceTotals")?.get(key)
 }
 
 struct Rungs {
@@ -676,21 +721,29 @@ impl Rollup {
 
         if self.delivered.iter().any(|d| d.traced_proved_lanes > 0) {
             out.push_str(
-                "\nContext delivered (mean bytes per proved traced lane)\n  \
+                "\nContext per proved traced lane (means)\n  \
                  builder-written, informational: the builder can write its trace\n",
             );
+            out.push_str(&format!(
+                "  {:<26} {:>9} {:>9} {:>8} {:>7}  {}\n",
+                "start rung", "delivered", "saved", "rejected", "re-read", "traced"
+            ));
             for d in &self.delivered {
-                let mean = d
-                    .mean_delivered_bytes
-                    .map_or("-".to_string(), |m| format!("{m:.0}"));
+                let bytes = |m: Option<f64>| m.map_or("-".to_string(), |m| format!("{m:.0}"));
                 out.push_str(&format!(
-                    "  {:<36} {:>9} bytes, {} of {} proved traced\n",
-                    clip(&d.start_rung, 36),
-                    mean,
+                    "  {:<26} {:>9} {:>9} {:>8} {:>7}  {} of {}\n",
+                    clip(&d.start_rung, 26),
+                    bytes(d.mean_delivered_bytes),
+                    bytes(d.mean_saved_bytes),
+                    d.mean_rejected
+                        .map_or("-".to_string(), |m| format!("{m:.1}")),
+                    d.mean_reread_rate
+                        .map_or("-".to_string(), |r| format!("{:.0}%", 100.0 * r)),
                     d.traced_proved_lanes,
                     d.proved_lanes
                 ));
             }
+            out.push_str("  bytes are per lane; rejected is calls per lane\n");
         }
 
         let mut notes: Vec<String> = Vec::new();

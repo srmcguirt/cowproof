@@ -271,7 +271,7 @@ pub struct ToolTotals {
 /// read from `<lane>/portkit/traces/*.jsonl` at lane end and describe how the lane was
 /// watched; they never enter the verdict. The builder can write its own trace directory, so
 /// the figures are the builder's own account, not a measurement the runner made.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TraceTotals {
     /// Records read.
@@ -280,6 +280,21 @@ pub struct TraceTotals {
     pub delivered_bytes: u64,
     /// Bytes the tools produced before any budget (`produced_bytes`), summed.
     pub produced_bytes: u64,
+    /// Bytes the budget kept out of context: `produced_bytes` minus `delivered_bytes` of the
+    /// sums, floored at zero, as portkit's `Summary::saved_bytes` has it. Absent in capsules
+    /// written before it, which read as 0.
+    #[serde(default)]
+    pub saved_bytes: u64,
+    /// Calls that ended `rejected` (refused before the tool ran), as portkit's `Summary`
+    /// counts them. Absent in older capsules, which read as 0.
+    #[serde(default)]
+    pub rejected: u64,
+    /// Of the calls that name a target, the share whose `(tool, target)` an earlier call of the
+    /// lane already named: a ratio in 0..=1. Null when no call names a target (portkit stores
+    /// only a target, never the arguments, so a call without one cannot be told from another).
+    /// Absent in older capsules, which read as null.
+    #[serde(default)]
+    pub reread_rate: Option<f64>,
     /// Calls and delivered bytes by tool name.
     pub by_tool: BTreeMap<String, ToolTotals>,
     /// `Bash` calls whose command head is `pk-read`, and what they delivered. The trace keeps

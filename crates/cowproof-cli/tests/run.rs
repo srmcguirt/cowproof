@@ -4674,7 +4674,7 @@ fn with_no_pk_beside_cowproof_there_are_no_hooks_and_the_lane_is_untraced_but_pr
 }
 
 /// A builder-written trace file full of absurd figures, beside the real hook's record.
-const ABSURD_RECORD: &str = r#"{"tool":"Read","surface":"agent","outcome":"ok","at":"2026-10-11T00:00:00Z","duration_ms":0.0,"input_bytes":1,"produced_bytes":18446744073709551615,"delivered_bytes":18446744073709551615}"#;
+const ABSURD_RECORD: &str = r#"{"tool":"Read","surface":"agent","outcome":"rejected","at":"2026-10-11T00:00:00Z","duration_ms":0.0,"input_bytes":1,"produced_bytes":18446744073709551615,"delivered_bytes":18446744073709551615}"#;
 
 /// The trace figures are builder-written and informational (design R2-10): a builder that
 /// writes absurd records into its own state dir changes the totals in `run.json` and the
@@ -4700,11 +4700,20 @@ fn absurd_builder_written_trace_totals_leave_the_verdict_as_an_untraced_lane_get
     // The figures are the builder's own: absurd, and labelled so.
     assert_eq!(run["traceTotals"]["deliveredBytes"], u64::MAX, "{run}");
     assert_eq!(run["traceTotals"]["malformedLines"], 1, "{run}");
+    // The new figures are as absurd and as informational: sums that saturate, a rejected call
+    // the builder invented, and a re-read rate that is still a ratio.
+    assert_eq!(run["traceTotals"]["producedBytes"], u64::MAX, "{run}");
+    assert_eq!(run["traceTotals"]["savedBytes"], 0, "{run}");
+    assert_eq!(run["traceTotals"]["rejected"], 1, "{run}");
+    let ratio = run["traceTotals"]["rereadRate"].as_f64();
+    assert!(ratio.is_none_or(|r| (0.0..=1.0).contains(&r)), "{run}");
     assert_eq!(run["traceBuilderWritten"], true, "{run}");
     assert_eq!(untraced.run_json()["traceBuilderWritten"], true);
     let capsule = Capsule::read(&traced.lane().join("control/capsule")).unwrap();
     assert!(capsule.traced);
-    assert_eq!(capsule.trace_totals.unwrap().delivered_bytes, u64::MAX);
+    let totals = capsule.trace_totals.unwrap();
+    assert_eq!(totals.delivered_bytes, u64::MAX);
+    assert_eq!((totals.saved_bytes, totals.rejected), (0, 1));
 
     // The same verdict, the same reasons.
     let (a, b) = (untraced.verdict(), traced.verdict());
@@ -5655,9 +5664,10 @@ fn hooks(calls: &[(&str, Value, usize)]) -> String {
 }
 
 /// An earlier trace file of the same lane (named to sort before today's) with one record and
-/// one line that is not a record. The totals must add both files up.
+/// one line that is not a record. The totals must add both files up. Its record is a rejected
+/// call that the budget trimmed by 500 bytes, so the new totals have something to count.
 const EARLIER_TRACE: &str = r#"mkdir -p "$PORTKIT_STATE_DIR/traces"
-printf '%s\n%s\n' '{"tool":"Read","surface":"agent","outcome":"ok","at":"1999-01-01T00:00:00Z","duration_ms":0.0,"input_bytes":1,"produced_bytes":1000,"delivered_bytes":1000,"target":"old.md"}' 'not a record' > "$PORTKIT_STATE_DIR/traces/1999-01-01-earlier.jsonl"
+printf '%s\n%s\n' '{"tool":"Read","surface":"agent","outcome":"rejected","at":"1999-01-01T00:00:00Z","duration_ms":0.0,"input_bytes":1,"produced_bytes":1500,"delivered_bytes":1000,"target":"old.md"}' 'not a record' > "$PORTKIT_STATE_DIR/traces/1999-01-01-earlier.jsonl"
 "#;
 
 #[test]
@@ -5685,11 +5695,16 @@ fn a_traced_lane_records_exact_trace_totals_in_run_json_and_the_capsule() {
     assert_eq!(h.verdict()["verdict"], "proved");
     assert_eq!(h.run_json()["trace"]["traced"], true);
 
-    // Six records over two files: the earlier file's Read (1000) and the five hooks.
+    // Six records over two files: the earlier file's Read (1000 delivered of 1500 produced,
+    // rejected) and the five hooks. Both `pk-read src/lib.rs` calls name one target, so one of
+    // the six calls (every one names a target) is a re-read.
     let expected = json!({
         "calls": 6,
         "deliveredBytes": 1145,
-        "producedBytes": 1145,
+        "producedBytes": 1645,
+        "savedBytes": 500,
+        "rejected": 1,
+        "rereadRate": 1.0 / 6.0,
         "byTool": {
             "Bash": {"calls": 3, "deliveredBytes": 110},
             "Read": {"calls": 3, "deliveredBytes": 1035},

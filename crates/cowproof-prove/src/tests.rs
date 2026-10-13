@@ -2733,6 +2733,9 @@ async fn absurd_trace_totals_and_the_traced_flag_do_not_change_a_verification() 
         calls: u64::MAX,
         delivered_bytes: u64::MAX,
         produced_bytes: 0,
+        saved_bytes: u64::MAX,
+        rejected: u64::MAX,
+        reread_rate: Some(42.0),
         malformed_lines: u64::MAX,
         ..TraceTotals::default()
     };
@@ -2768,6 +2771,9 @@ fn test_trace_totals_round_trip_are_sealed_and_older_capsules_still_read() {
         calls: 3,
         delivered_bytes: 4242,
         produced_bytes: 5000,
+        saved_bytes: 758,
+        rejected: 1,
+        reread_rate: Some(0.5),
         ..TraceTotals::default()
     };
     totals.by_tool.insert(
@@ -2789,10 +2795,62 @@ fn test_trace_totals_round_trip_are_sealed_and_older_capsules_still_read() {
         serde_json::from_slice(&std::fs::read(dir.path().join("capsule.json")).unwrap()).unwrap();
     assert_eq!(raw["trace_totals"]["deliveredBytes"], 4242);
     assert_eq!(raw["trace_totals"]["byTool"]["Read"]["calls"], 3);
+    assert_eq!(raw["trace_totals"]["savedBytes"], 758);
+    assert_eq!(raw["trace_totals"]["rejected"], 1);
+    assert_eq!(raw["trace_totals"]["rereadRate"], 0.5);
 
     // The seal covers them: a hand edit is refused.
     edit_capsule_json(dir.path(), "4242", "1");
     assert_capsule_json_mismatch(dir.path());
+}
+
+/// A capsule sealed before the rollup figures (saved bytes, rejected calls, re-read rate) has
+/// `trace_totals` without them. It reads, the missing figures take their defaults, and it is
+/// sealed again over its own bytes, so the seal still checks.
+#[test]
+fn test_a_capsule_whose_trace_totals_lack_the_rollup_figures_still_reads_and_seals() {
+    use crate::capsule::TraceTotals;
+    let dir = TempDir::new().unwrap();
+    let mut capsule = Capsule::new(
+        "abc".to_string(),
+        "def".to_string(),
+        fingerprint(),
+        "claude:haiku".to_string(),
+        "api-key".to_string(),
+    );
+    capsule.traced = true;
+    capsule.trace_totals = Some(TraceTotals {
+        calls: 3,
+        delivered_bytes: 4242,
+        produced_bytes: 5000,
+        saved_bytes: 758,
+        rejected: 1,
+        reread_rate: Some(0.5),
+        ..TraceTotals::default()
+    });
+    capsule.write(dir.path()).unwrap();
+
+    let path = dir.path().join("capsule.json");
+    let mut json: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let totals = json["trace_totals"].as_object_mut().unwrap();
+    for key in ["savedBytes", "rejected", "rereadRate"] {
+        assert!(totals.remove(key).is_some(), "{key} is written");
+    }
+    let raw = serde_json::to_vec_pretty(&json).unwrap();
+    std::fs::write(&path, &raw).unwrap();
+    std::fs::write(dir.path().join("capsule.sha256"), Capsule::hash_bytes(&raw)).unwrap();
+
+    let read = Capsule::read(dir.path()).expect("an older capsule reads");
+    let totals = read.trace_totals.expect("the older totals are kept");
+    assert_eq!(
+        (totals.calls, totals.delivered_bytes, totals.produced_bytes),
+        (3, 4242, 5000)
+    );
+    assert_eq!(
+        (totals.saved_bytes, totals.rejected, totals.reread_rate),
+        (0, 0, None)
+    );
 }
 
 #[test]

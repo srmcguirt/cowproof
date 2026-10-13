@@ -231,8 +231,9 @@ impl Summary {
             Outcome::Rejected => self.rejected += 1,
             Outcome::Failed => self.failed += 1,
         }
-        self.produced_bytes += r.produced_bytes;
-        self.delivered_bytes += r.delivered_bytes;
+        // Saturating: a trace file is data, and cowproof sums a lane's builder-written one.
+        self.produced_bytes = self.produced_bytes.saturating_add(r.produced_bytes);
+        self.delivered_bytes = self.delivered_bytes.saturating_add(r.delivered_bytes);
         self.total_ms += r.duration_ms;
     }
 }
@@ -286,6 +287,16 @@ mod tests {
         s.add(&rec("b", 10, 10, Outcome::Rejected));
         s.add(&rec("c", 10, 10, Outcome::Failed));
         assert_eq!((s.calls, s.ok, s.rejected, s.failed), (3, 1, 1, 1));
+    }
+
+    #[test]
+    fn a_summary_saturates_instead_of_overflowing_on_absurd_records() {
+        let mut s = Summary::default();
+        s.add(&rec("a", usize::MAX, usize::MAX, Outcome::Ok));
+        s.add(&rec("b", usize::MAX, 1, Outcome::Ok));
+        assert_eq!(s.produced_bytes, usize::MAX);
+        assert_eq!(s.delivered_bytes, usize::MAX);
+        assert_eq!(s.saved_bytes(), 0);
     }
 
     #[test]

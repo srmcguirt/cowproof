@@ -546,3 +546,116 @@ fn watch_does_not_follow_a_verdict_symlink() {
     let states = watch_states(root);
     assert_eq!(states["linked"], "finished");
 }
+
+// ---- CTX-SAVED: the bytes the budget kept out of a traced lane's context (D5) -----------
+
+/// `cowproof watch` over `lanes_root`: the raw table, header first.
+fn watch_table_text(lanes_root: &std::path::Path) -> Vec<Vec<String>> {
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_cowproof"))
+        .args(["watch", "--lanes-root"])
+        .arg(lanes_root)
+        .args(["--cache-ttl", "1h"])
+        .output()
+        .expect("failed to run cowproof watch");
+    assert!(out.status.success(), "{out:?}");
+    String::from_utf8(out.stdout)
+        .unwrap()
+        .lines()
+        .map(|l| l.split('\t').map(str::to_string).collect())
+        .collect()
+}
+
+#[test]
+fn watch_shows_ctx_saved_for_traced_lanes_and_a_dash_for_the_rest() {
+    let dir = tempfile::tempdir_in("/var/tmp").unwrap();
+    let root = dir.path();
+    let traced = r#"{"status":"finished","trace":{"traced":true},"traceTotals":{"calls":4,"savedBytes":12345}}"#;
+    lane_with(root, "a-traced", Some(traced), None);
+    // Traced, nothing saved: a real zero.
+    lane_with(
+        root,
+        "b-zero",
+        Some(r#"{"status":"finished","traceTotals":{"calls":1,"savedBytes":0}}"#),
+        None,
+    );
+    // An untraced lane: totals are null.
+    lane_with(
+        root,
+        "c-untraced",
+        Some(r#"{"status":"finished","traceTotals":null}"#),
+        None,
+    );
+    // Traced before this figure existed.
+    lane_with(
+        root,
+        "d-older",
+        Some(r#"{"status":"finished","traceTotals":{"calls":2,"deliveredBytes":50}}"#),
+        None,
+    );
+    // Still running: the runner writes the totals at lane end, so there are none yet.
+    lane_with(root, "e-running", None, None);
+    // Its trace is garbage and run.json says nothing about it: watch never opens the trace.
+    lane_with(
+        root,
+        "f-bad-trace",
+        Some(r#"{"status":"finished","trace":{"traced":true}}"#),
+        None,
+    );
+    let traces = root.join("f-bad-trace/portkit/traces");
+    fs::create_dir_all(&traces).unwrap();
+    fs::write(
+        traces.join("2026-10-12.jsonl"),
+        "{ truncated\n\0\0 not json",
+    )
+    .unwrap();
+    // A traced lane with no trace directory at all.
+    lane_with(
+        root,
+        "g-missing-trace",
+        Some(r#"{"status":"finished","trace":{"traced":true}}"#),
+        None,
+    );
+
+    let table = watch_table_text(root);
+    assert_eq!(
+        table[0],
+        [
+            "LANE",
+            "STATE",
+            "PARKED",
+            "AGE",
+            "NOTES",
+            "LAST EVENT",
+            "CTX-SAVED"
+        ]
+    );
+    let saved = |id: &str| -> &str {
+        let row = table.iter().find(|r| r[0] == id).unwrap();
+        assert_eq!(row.len(), 7, "{row:?}");
+        &row[6]
+    };
+    assert_eq!(saved("a-traced"), "12.3k");
+    assert_eq!(saved("b-zero"), "0");
+    for untraced in [
+        "c-untraced",
+        "d-older",
+        "e-running",
+        "f-bad-trace",
+        "g-missing-trace",
+    ] {
+        assert_eq!(saved(untraced), "-", "{untraced}");
+    }
+    assert_eq!(table.len(), 8);
+}
+
+#[test]
+fn watch_has_no_ctx_saved_column_when_no_lane_has_trace_totals() {
+    let dir = tempfile::tempdir_in("/var/tmp").unwrap();
+    lane_with(dir.path(), "a", Some(r#"{"status":"finished"}"#), None);
+    lane_with(dir.path(), "b", None, None);
+    let table = watch_table_text(dir.path());
+    assert_eq!(
+        table[0],
+        ["LANE", "STATE", "PARKED", "AGE", "NOTES", "LAST EVENT"]
+    );
+}

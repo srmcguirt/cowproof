@@ -9,7 +9,8 @@
 //! and the runner's lane-end totals both read through it, so there is one trace parser.
 
 use cowproof_prove::{ToolTotals, TraceTotals};
-use portkit_core::trace::CallRecord;
+use portkit_core::trace::{CallRecord, Summary};
+use std::collections::HashSet;
 use std::fs;
 use std::io::Read;
 use std::path::Path;
@@ -144,19 +145,28 @@ pub fn lane_trace_totals(lane_dir: &Path) -> Option<TraceTotals> {
         .then(|| trace_totals(&traces.records, traces.malformed_lines as u64))
 }
 
-/// Add up records: calls and delivered bytes by tool, the sums, and what `pk-read` delivered.
+/// Add up records: calls, rejected calls, produced, delivered and saved bytes (portkit's own
+/// [`Summary`], so the sums are the ones `pk trace` prints), the re-read rate, calls and
+/// delivered bytes by tool, and what `pk-read` delivered. This is the one place the lane totals
+/// are computed.
 pub fn trace_totals(records: &[CallRecord], malformed_lines: u64) -> TraceTotals {
+    let mut summary = Summary::default();
+    let mut seen: HashSet<(&str, &str)> = HashSet::new();
+    let (mut targeted, mut reread) = (0u64, 0u64);
     let mut totals = TraceTotals {
         malformed_lines,
         ..TraceTotals::default()
     };
     for record in records {
+        summary.add(record);
         let delivered = record.delivered_bytes as u64;
-        totals.calls += 1;
-        totals.delivered_bytes = totals.delivered_bytes.saturating_add(delivered);
-        totals.produced_bytes = totals
-            .produced_bytes
-            .saturating_add(record.produced_bytes as u64);
+        if let Some(target) = record.target.as_deref() {
+            targeted += 1;
+            // `insert` is false when the pair was already there: this call is a re-read.
+            if !seen.insert((record.tool.as_str(), target)) {
+                reread += 1;
+            }
+        }
         let tool: &mut ToolTotals = totals.by_tool.entry(record.tool.clone()).or_default();
         tool.calls += 1;
         tool.delivered_bytes = tool.delivered_bytes.saturating_add(delivered);
@@ -166,6 +176,12 @@ pub fn trace_totals(records: &[CallRecord], malformed_lines: u64) -> TraceTotals
                 totals.pk_read.delivered_bytes.saturating_add(delivered);
         }
     }
+    totals.calls = summary.calls as u64;
+    totals.rejected = summary.rejected as u64;
+    totals.produced_bytes = summary.produced_bytes as u64;
+    totals.delivered_bytes = summary.delivered_bytes as u64;
+    totals.saved_bytes = summary.saved_bytes() as u64;
+    totals.reread_rate = (targeted > 0).then(|| reread as f64 / targeted as f64);
     totals
 }
 
@@ -244,6 +260,122 @@ mod tests {
                 delivered_bytes: 12
             }
         );
+    }
+
+    fn full(
+        tool: &str,
+        target: Option<&str>,
+        outcome: Outcome,
+        produced: usize,
+        delivered: usize,
+    ) -> CallRecord {
+        CallRecord {
+            outcome,
+            produced_bytes: produced,
+            delivered_bytes: delivered,
+            ..record(tool, target, 0)
+        }
+    }
+
+    #[test]
+    fn totals_carry_saved_bytes_and_rejected_calls_the_way_portkit_sums_them() {
+        let records = [
+            full("Read", Some("a"), Outcome::Ok, 1000, 200),
+            full("Read", Some("b"), Outcome::Ok, 500, 500),
+            full("Edit", Some("c"), Outcome::Rejected, 30, 30),
+            full("Edit", Some("d"), Outcome::Rejected, 30, 30),
+            full("Bash", None, Outcome::Failed, 70, 10),
+        ];
+        let t = trace_totals(&records, 0);
+        assert_eq!(t.calls, 5);
+        assert_eq!(t.rejected, 2, "a failed call is not a rejected one");
+        assert_eq!((t.produced_bytes, t.delivered_bytes), (1630, 770));
+        assert_eq!(t.saved_bytes, 1630 - 770);
+
+        // Summed, not per record: a call that delivered more than it produced does not make
+        // the lane's saved bytes negative or hide the other calls' savings.
+        let over = [
+            full("Read", Some("a"), Outcome::Ok, 100, 400),
+            full("Read", Some("b"), Outcome::Ok, 1000, 100),
+        ];
+        assert_eq!(trace_totals(&over, 0).saved_bytes, 1100 - 500);
+        let all_over = [full("Read", Some("a"), Outcome::Ok, 1, 400)];
+        assert_eq!(trace_totals(&all_over, 0).saved_bytes, 0);
+        assert_eq!(trace_totals(&[], 0).saved_bytes, 0);
+        assert_eq!(trace_totals(&[], 0).rejected, 0);
+    }
+
+    #[test]
+    fn the_reread_rate_counts_a_repeated_tool_and_target_but_never_the_first_call() {
+        let records = [
+            record("Read", Some("a.rs"), 1),
+            record("Read", Some("b.rs"), 1),
+            record("Read", Some("a.rs"), 1),
+            // The same target through another tool is not a re-read of the first tool's.
+            record("Grep", Some("a.rs"), 1),
+            record("Read", Some("a.rs"), 1),
+            // No target: in neither the numerator nor the denominator.
+            record("Bash", None, 1),
+        ];
+        let t = trace_totals(&records, 0);
+        assert_eq!(t.calls, 6);
+        // Five calls name a target; the third and the fifth repeat (Read, a.rs).
+        assert_eq!(t.reread_rate, Some(2.0 / 5.0));
+
+        let fresh = [record("Read", Some("a"), 1), record("Read", Some("b"), 1)];
+        assert_eq!(trace_totals(&fresh, 0).reread_rate, Some(0.0));
+        let one = [record("Read", Some("a"), 1)];
+        assert_eq!(trace_totals(&one, 0).reread_rate, Some(0.0));
+        let twice = [record("Read", Some("a"), 1), record("Read", Some("a"), 1)];
+        assert_eq!(trace_totals(&twice, 0).reread_rate, Some(0.5));
+    }
+
+    #[test]
+    fn the_reread_rate_is_null_when_no_call_names_a_target() {
+        let records = [record("Read", None, 1), record("Bash", None, 1)];
+        let t = trace_totals(&records, 0);
+        assert_eq!(t.calls, 2);
+        assert_eq!(t.reread_rate, None);
+        assert_eq!(trace_totals(&[], 0).reread_rate, None);
+        let json = serde_json::to_value(&t).unwrap();
+        assert!(json["rereadRate"].is_null(), "{json}");
+    }
+
+    #[test]
+    fn malformed_lines_do_not_count_as_calls_or_as_rereads() {
+        let lane = tempfile::tempdir_in("/var/tmp").unwrap();
+        let traces = lane.path().join("portkit/traces");
+        fs::create_dir_all(&traces).unwrap();
+        let good = |target: &str| {
+            format!(
+                r#"{{"tool":"Read","target":"{target}","surface":"agent","outcome":"ok","at":"x","duration_ms":0.0,"input_bytes":1,"produced_bytes":90,"delivered_bytes":40}}"#
+            )
+        };
+        // A re-read of `a`, a cut-off line that also names `a`, and a line that is not JSON.
+        let text = format!(
+            "{}\n{}\n{{\"tool\":\"Read\",\"target\":\"a\",\"surf\nnot json\n",
+            good("a"),
+            good("a")
+        );
+        fs::write(traces.join("2026-10-12.jsonl"), text).unwrap();
+        let t = lane_trace_totals(lane.path()).expect("a traced lane");
+        assert_eq!(t.malformed_lines, 2);
+        assert_eq!(t.calls, 2);
+        assert_eq!(t.reread_rate, Some(0.5));
+        assert_eq!((t.saved_bytes, t.rejected), (100, 0));
+    }
+
+    #[test]
+    fn absurd_records_saturate_instead_of_panicking() {
+        let records = [
+            full("Read", Some("a"), Outcome::Ok, usize::MAX, usize::MAX),
+            full("Read", Some("a"), Outcome::Ok, usize::MAX, 0),
+        ];
+        let t = trace_totals(&records, 0);
+        assert_eq!(t.produced_bytes, u64::MAX);
+        assert_eq!(t.delivered_bytes, u64::MAX);
+        assert_eq!(t.saved_bytes, 0);
+        assert_eq!(t.reread_rate, Some(0.5));
     }
 
     #[test]

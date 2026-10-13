@@ -361,10 +361,10 @@ impl LaneCredential {
     }
 }
 
-/// The credential mode recorded in the lane's `control/run.json`, when it is not `api-key`. The
-/// file is read without following a link and only up to a bound; the label is a file the builder
-/// cannot write, printed in a table, so it is held to a short lower-case alphabet anyway.
-fn lane_credential(lane_dir: &Path) -> Option<LaneCredential> {
+/// `control/run.json` of a lane, read without following a link and only up to a bound; none
+/// when it is absent, not a file, too large or not JSON. The runner writes it at lane end, so
+/// a lane that is still running has none.
+fn read_run_json(lane_dir: &Path) -> Option<serde_json::Value> {
     let path = lane_dir.join("control/run.json");
     let meta = fs::symlink_metadata(&path).ok()?;
     if !meta.is_file() || meta.len() > 4 * 1024 * 1024 {
@@ -376,7 +376,14 @@ fn lane_credential(lane_dir: &Path) -> Option<LaneCredential> {
         .take(4 * 1024 * 1024)
         .read_to_string(&mut text)
         .ok()?;
-    let doc: serde_json::Value = serde_json::from_str(&text).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+/// The credential mode recorded in the lane's `control/run.json`, when it is not `api-key`. The
+/// file is read without following a link and only up to a bound; the label is a file the builder
+/// cannot write, printed in a table, so it is held to a short lower-case alphabet anyway.
+fn lane_credential(lane_dir: &Path) -> Option<LaneCredential> {
+    let doc = read_run_json(lane_dir)?;
     let label = |v: &serde_json::Value| {
         v.as_str()
             .filter(|n| {
@@ -398,6 +405,38 @@ fn lane_credential(lane_dir: &Path) -> Option<LaneCredential> {
     })
 }
 
+/// The bytes the budget kept out of a traced lane's context: `traceTotals.savedBytes` of
+/// `control/run.json` (D5). The runner reads the lane's trace once, at lane end, and writes the
+/// totals into `run.json` then, so a lane that is still running, an untraced lane, an older
+/// `run.json` without the figure and a `run.json` that cannot be read all have none. This never
+/// opens the trace files, so a missing or malformed trace cannot fail `watch`. The figure is
+/// the builder's own account (it can write its trace): informational.
+fn lane_ctx_saved(lane_dir: &Path) -> Option<u64> {
+    read_run_json(lane_dir)?
+        .get("traceTotals")?
+        .get("savedBytes")?
+        .as_u64()
+}
+
+/// Bytes as a short human figure: `950`, `12.3k`, `4.5M`, `1.2G` (decimal units).
+fn human_bytes(bytes: u64) -> String {
+    if bytes < 1000 {
+        return bytes.to_string();
+    }
+    let mut value = bytes as f64;
+    for unit in ["k", "M", "G", "T", "P", "E"] {
+        value /= 1000.0;
+        // `999_999` is `1.0M`, not `1000.0k`.
+        if format!("{value:.1}")
+            .parse::<f64>()
+            .is_ok_and(|v| v < 1000.0)
+        {
+            return format!("{value:.1}{unit}");
+        }
+    }
+    format!("{value:.1}E")
+}
+
 /// One lane as the table and the director's `lanes` tool show it.
 #[derive(Debug, Clone, Serialize)]
 pub struct LaneSnapshot {
@@ -412,6 +451,10 @@ pub struct LaneSnapshot {
     /// The credential mode, present only when it is not the default API key.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub credential: Option<LaneCredential>,
+    /// Bytes the budget kept out of the lane's context, once the lane has ended with trace
+    /// totals (`traceTotals.savedBytes`); none while it runs, and for an untraced lane.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ctx_saved_bytes: Option<u64>,
 }
 
 /// Every lane under `lanes_root`, sorted by name, as data.
@@ -434,6 +477,7 @@ pub fn lane_snapshots(
             pending_notes: notes.ok(),
             last_event_ms: get_last_event_time(&lane_dir),
             credential: lane_credential(&lane_dir),
+            ctx_saved_bytes: lane_ctx_saved(&lane_dir),
         });
     }
     Ok(rows)
@@ -442,15 +486,27 @@ pub fn lane_snapshots(
 fn watch_table(lanes_root: &Path, cache_ttl_ms: u64) -> Result<()> {
     let now_ms = now_ms();
     let rows = lane_snapshots(lanes_root, now_ms, cache_ttl_ms)?;
+    print!("{}", render_table(&rows, now_ms));
+    Ok(())
+}
 
-    // The credential column appears only when some lane is not on the default API key, so the
-    // table of API-key lanes is unchanged.
+/// The table `watch` prints, tab separated, one line per lane after the header.
+///
+/// Two columns are optional so that the table of plain lanes is unchanged: `CTX-SAVED` appears
+/// when some lane has trace totals, and `CREDENTIAL` when some lane is not on the default API
+/// key. `CTX-SAVED` is `-` for a lane without a figure (untraced, still running, or an older
+/// `run.json`).
+fn render_table(rows: &[LaneSnapshot], now_ms: u64) -> String {
+    let show_saved = rows.iter().any(|r| r.ctx_saved_bytes.is_some());
     let show_credential = rows.iter().any(|r| r.credential.is_some());
-    if show_credential {
-        println!("LANE\tSTATE\tPARKED\tAGE\tNOTES\tLAST EVENT\tCREDENTIAL");
-    } else {
-        println!("LANE\tSTATE\tPARKED\tAGE\tNOTES\tLAST EVENT");
+    let mut header = "LANE\tSTATE\tPARKED\tAGE\tNOTES\tLAST EVENT".to_string();
+    if show_saved {
+        header.push_str("\tCTX-SAVED");
     }
+    if show_credential {
+        header.push_str("\tCREDENTIAL");
+    }
+    let mut out = header + "\n";
 
     for row in rows {
         let (parked_info, parked_age) = if row.queue_unreadable {
@@ -472,24 +528,26 @@ fn watch_table(lanes_root: &Path, cache_ttl_ms: u64) -> Result<()> {
             None => "-".to_string(),
         };
 
+        let mut line = format!(
+            "{}\t{}\t{}\t{}\t{}\t{}",
+            row.id, row.state, parked_info, parked_age, notes, last_event
+        );
+        if show_saved {
+            line.push('\t');
+            line.push_str(&row.ctx_saved_bytes.map_or("-".to_string(), human_bytes));
+        }
         if show_credential {
-            let credential = row
-                .credential
-                .as_ref()
-                .map_or_else(|| "api-key".to_string(), LaneCredential::cell);
-            println!(
-                "{}\t{}\t{}\t{}\t{}\t{}\t{}",
-                row.id, row.state, parked_info, parked_age, notes, last_event, credential
-            );
-        } else {
-            println!(
-                "{}\t{}\t{}\t{}\t{}\t{}",
-                row.id, row.state, parked_info, parked_age, notes, last_event
+            line.push('\t');
+            line.push_str(
+                &row.credential
+                    .as_ref()
+                    .map_or_else(|| "api-key".to_string(), LaneCredential::cell),
             );
         }
+        out.push_str(&line);
+        out.push('\n');
     }
-
-    Ok(())
+    out
 }
 
 /// One queue event as `watch --events` prints it and the `events` tool returns it.
@@ -872,5 +930,137 @@ mod tests {
             lane_credential(odd.path()).unwrap().cell(),
             "api-key (in lane)"
         );
+    }
+
+    #[test]
+    fn human_bytes_are_short_decimal_figures() {
+        for (bytes, shown) in [
+            (0, "0"),
+            (950, "950"),
+            (999, "999"),
+            (1000, "1.0k"),
+            (12_345, "12.3k"),
+            (999_999, "1.0M"),
+            (4_500_000, "4.5M"),
+            (1_200_000_000, "1.2G"),
+            (u64::MAX, "18.4E"),
+        ] {
+            assert_eq!(human_bytes(bytes), shown, "{bytes}");
+        }
+    }
+
+    #[test]
+    fn ctx_saved_is_the_saved_bytes_of_a_traced_lanes_totals_and_none_otherwise() {
+        let saved = lane_with_run_json(r#"{"traceTotals":{"calls":3,"savedBytes":12345}}"#);
+        assert_eq!(lane_ctx_saved(saved.path()), Some(12_345));
+        let zero = lane_with_run_json(r#"{"traceTotals":{"savedBytes":0}}"#);
+        assert_eq!(lane_ctx_saved(zero.path()), Some(0));
+
+        // Untraced (null totals), an older run.json (totals without the figure), a figure that
+        // is not a count, and a run.json that is not JSON all show nothing, and none fails.
+        for json in [
+            r#"{"traceTotals":null}"#,
+            r#"{"status":"finished"}"#,
+            r#"{"traceTotals":{"calls":3,"deliveredBytes":9}}"#,
+            r#"{"traceTotals":{"savedBytes":"12"}}"#,
+            r#"{"traceTotals":{"savedBytes":-1}}"#,
+            "not json",
+            "",
+        ] {
+            assert_eq!(
+                lane_ctx_saved(lane_with_run_json(json).path()),
+                None,
+                "{json}"
+            );
+        }
+        // A lane that is still running has no run.json yet.
+        let running = tempfile::tempdir().unwrap();
+        fs::create_dir_all(running.path().join("control")).unwrap();
+        assert_eq!(lane_ctx_saved(running.path()), None);
+    }
+
+    #[test]
+    fn a_malformed_or_missing_trace_never_reaches_the_watch_column() {
+        // `watch` reads run.json only. A lane whose trace directory is garbage (or a symlink
+        // loop, or absent) and whose run.json has no totals still shows `-`.
+        let lane = lane_with_run_json(r#"{"status":"finished"}"#);
+        let traces = lane.path().join("portkit/traces");
+        fs::create_dir_all(&traces).unwrap();
+        fs::write(traces.join("2026-10-12.jsonl"), "{ truncated\n\u{0}\u{0}").unwrap();
+        assert_eq!(lane_ctx_saved(lane.path()), None);
+    }
+
+    fn snapshot(id: &str, saved: Option<u64>) -> LaneSnapshot {
+        LaneSnapshot {
+            id: id.into(),
+            state: "proved".into(),
+            parked: None,
+            queue_unreadable: false,
+            pending_notes: Some(0),
+            last_event_ms: None,
+            credential: None,
+            ctx_saved_bytes: saved,
+        }
+    }
+
+    #[test]
+    fn the_ctx_saved_column_is_a_figure_for_a_traced_lane_and_a_dash_for_any_other() {
+        let rows = [
+            snapshot("lane-a", Some(12_345)),
+            snapshot("lane-b", None),
+            snapshot("lane-c", Some(0)),
+        ];
+        let table = render_table(&rows, 0);
+        let lines: Vec<Vec<&str>> = table.lines().map(|l| l.split('\t').collect()).collect();
+        assert_eq!(
+            lines[0],
+            [
+                "LANE",
+                "STATE",
+                "PARKED",
+                "AGE",
+                "NOTES",
+                "LAST EVENT",
+                "CTX-SAVED"
+            ]
+        );
+        let saved = |id: &str| lines.iter().find(|l| l[0] == id).unwrap()[6];
+        assert_eq!(saved("lane-a"), "12.3k");
+        // An untraced lane (or one with no totals yet) is `-`, never `0`; a traced lane that
+        // saved nothing is a real `0`.
+        assert_eq!(saved("lane-b"), "-");
+        assert_eq!(saved("lane-c"), "0");
+        assert!(lines.iter().all(|l| l.len() == 7), "{table}");
+    }
+
+    #[test]
+    fn the_table_of_lanes_without_trace_totals_is_unchanged() {
+        let table = render_table(&[snapshot("lane-a", None), snapshot("lane-b", None)], 0);
+        assert!(
+            table.starts_with("LANE\tSTATE\tPARKED\tAGE\tNOTES\tLAST EVENT\n"),
+            "{table}"
+        );
+        assert!(!table.contains("CTX-SAVED"), "{table}");
+        assert!(table.lines().all(|l| l.split('\t').count() == 6), "{table}");
+    }
+
+    #[test]
+    fn ctx_saved_comes_before_the_credential_column() {
+        let mut sub = snapshot("lane-a", Some(2_000));
+        sub.credential = Some(LaneCredential {
+            mode: "subscription".into(),
+            kind: Some("claude-oauth-token".into()),
+            in_lane: false,
+        });
+        let table = render_table(&[sub, snapshot("lane-b", None)], 0);
+        let header = table.lines().next().unwrap();
+        assert!(header.ends_with("\tCTX-SAVED\tCREDENTIAL"), "{header}");
+        let a = table.lines().nth(1).unwrap();
+        assert!(
+            a.ends_with("\t2.0k\tsubscription (claude-oauth-token)"),
+            "{a}"
+        );
+        let b = table.lines().nth(2).unwrap();
+        assert!(b.ends_with("\t-\tapi-key"), "{b}");
     }
 }
