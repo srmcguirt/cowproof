@@ -1561,6 +1561,39 @@ fn finish(mut child: Child) -> Output {
     }
 }
 
+/// What a run that ended unexpectedly says about why, for a failure message: the runner's
+/// stderr (a watched run only), `run.json`'s status, clocks and segment ends, and the
+/// verdict with its reasons when the lane got that far. Never panics: a file the run did not
+/// get to write is reported as missing.
+fn how_the_run_ended(h: &Harness) -> String {
+    // The runner has exited, so its stderr reader is at end of file in a moment.
+    std::thread::sleep(Duration::from_millis(300));
+    let stderr = match h
+        .runner_stderr
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+    {
+        Some(stderr) => stderr.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+        None => "(this run's stderr is not collected; use start_watched to see it)".to_string(),
+    };
+    let file = |rel: &str| {
+        fs::read_to_string(h.lane().join(rel)).unwrap_or_else(|e| format!("(unreadable: {e})"))
+    };
+    let run: Option<Value> = serde_json::from_str(&file("control/run.json")).ok();
+    let summary = match &run {
+        Some(j) => format!(
+            "status {}, timeoutSecs {}, durationMs {}, activeMs {}, segments {}",
+            j["status"], j["timeoutSecs"], j["durationMs"], j["activeMs"], j["segments"]
+        ),
+        None => format!("run.json: {}", file("control/run.json")),
+    };
+    format!(
+        "the runner's stderr:\n{stderr}\nrun.json: {summary}\nverdict.json: {}",
+        file("control/verdict.json")
+    )
+}
+
 /// The id of the `nth` (1-based) escalation the queue file shows as asked,
 /// waiting for it to appear.
 fn wait_for_ask(h: &Harness, child: &mut Child, nth: usize) -> String {
@@ -1577,10 +1610,12 @@ fn wait_for_ask(h: &Harness, child: &mut Child, nth: usize) -> String {
         if let Some(id) = asked.get(nth - 1) {
             return id.clone();
         }
-        assert!(
-            child.try_wait().unwrap().is_none(),
-            "the run ended before ask {nth}: {text}"
-        );
+        if child.try_wait().unwrap().is_some() {
+            panic!(
+                "the run ended before ask {nth}: {text}\n{}",
+                how_the_run_ended(h)
+            );
+        }
         assert!(Instant::now() < deadline, "ask {nth} never appeared");
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -3939,14 +3974,18 @@ fn the_headers_timeout_min_beats_the_flag() {
 
 /// The wall-clock limit of the parked-time test, in seconds. Only the two launches count
 /// (a sandbox start and the park, then a resumed start and two checks run in sandboxes):
-/// a fraction of a second to a few seconds on a macOS machine, many times that on a loaded
-/// Linux host where every sandbox start queues. The limit is wide enough for the counted
-/// time to stay well under it.
-const PARKED_TEST_LIMIT_SECS: u64 = 30;
+/// a fraction of a second to a few seconds on an idle machine. A gate that shared a macOS
+/// host (load average about 19) with two other full test runs ran past a 30-second limit in
+/// the first launch alone, before the builder's first ask, so the limit is wider again.
+/// The counted time must stay under it, and the test's own length is this plus
+/// `PARKED_TEST_WAIT_SECS`, so it cannot grow much more.
+const PARKED_TEST_LIMIT_SECS: u64 = 50;
 
-/// How long the director leaves the lane parked: longer than the whole limit, so that
-/// counting the wait would end the resumed launch at once.
-const PARKED_TEST_WAIT_SECS: u64 = PARKED_TEST_LIMIT_SECS + 4;
+/// How long the director leaves the lane parked, from the moment its ask appears: longer
+/// than the whole limit, so that counting the wait would end the resumed launch at once
+/// whatever the first launch took. The two seconds over are all the margin that property
+/// needs: a run that counted the park would have used the limit up before the ruling.
+const PARKED_TEST_WAIT_SECS: u64 = PARKED_TEST_LIMIT_SECS + 2;
 
 #[test]
 fn time_parked_waiting_for_a_ruling_does_not_count_toward_the_timeout() {
@@ -3955,26 +3994,23 @@ fn time_parked_waiting_for_a_ruling_does_not_count_toward_the_timeout() {
     }
     // The builder parks on a blocking ask at once, the director rules more than the whole
     // limit later, and the resumed builder runs its checks. Only the time inside the two
-    // launches counts, so the lane is proved.
+    // launches counts, so the lane is proved. The run is watched, so that a run which ends
+    // before its ask (the limit spent in the first launch, say) says why.
     let limit = PARKED_TEST_LIMIT_SECS;
     let wait = PARKED_TEST_WAIT_SECS;
     let h = owned_packet(&asks_first("Choose A or B?", true, &then_checks()));
-    let mut child = {
-        let _g = fork_lock();
-        h.command(h.lanes.path())
-            .args(["--timeout-secs", &limit.to_string()])
-            .env("ANTHROPIC_API_KEY", REAL_KEY)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap()
-    };
-    let id = wait_for_ask(&h, &mut child, 1);
+    let mut run = start_watched(&h, &["--timeout-secs", &limit.to_string()]);
+    let id = wait_for_ask(&h, &mut run.child, 1);
     std::thread::sleep(Duration::from_secs(wait));
     rule(&h, &id, &["--answer", "use option B"]);
-    let out = finish(child);
-    assert_eq!(out.status.code(), Some(0), "{}", stdout_of(&out));
+    let out = finish(run.child);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}\n{}",
+        stdout_of(&out),
+        how_the_run_ended(&h)
+    );
     assert_eq!(
         stdout_of(&out).lines().last().unwrap(),
         format!("{}: proved", h.id)
