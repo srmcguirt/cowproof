@@ -18,7 +18,7 @@ use cowproof_prove::{
         GroupEnd, GroupSet, SandboxedRunner, SlotGuard, acquire_slot_notifying, host_platform,
         run_in_group_blocking, verifier_toolchain,
     },
-    verify::{VerifyOptions, VerifyResult, remove_launch_paths, verify},
+    verify::{VerifyOptions, VerifyReport, VerifyResult, remove_launch_paths, verify},
 };
 use cowproof_run::{
     LaneLayout,
@@ -594,54 +594,12 @@ pub async fn verify_capsule(args: VerifyArgs) -> Result<i32> {
 
     let code = match verify(&capsule_dir, &repo, &verify_dir, &runner, options).await {
         Ok(report) => {
-            // A skipped held-out port case is said out loud, whatever else is.
-            if let Some(note) = report.port.as_ref().and_then(|p| p.skipped_note()) {
-                println!("{}", one_line(&note));
-            }
-            // Printed after the result line, whatever it is: a note, never a failure. Only pass
-            // or fail is compared with the builder's record.
-            let notes: Vec<String> = report
-                .checks
-                .iter()
-                .filter_map(|m| m.output_note())
-                .collect();
             // A Bundler tree whose `bundle install --local` failed in the verifier fails every
             // check with the same text: it is a divergence even when the capsule's own record
             // was a failure too.
-            let setup_failures = runner.setup_failures();
-            let code = match report.result {
-                VerifyResult::Reproduced if !setup_failures.is_empty() => {
-                    println!("diverged: the verifier's dependency setup failed");
-                    2
-                }
-                VerifyResult::Reproduced => {
-                    println!("reproduced");
-                    0
-                }
-                VerifyResult::Diverged { check_ids } => {
-                    println!("diverged: check {}", quote_ids(&check_ids));
-                    for id in report.heldout.iter().filter(|o| !o.passed) {
-                        println!("held-out check {:?} failed", id.check_id);
-                    }
-                    2
-                }
-                VerifyResult::HeldOutFailed { check_ids } => {
-                    println!("diverged: held-out check {} failed", quote_ids(&check_ids));
-                    2
-                }
-                VerifyResult::PortFailed { failures } => {
-                    println!("diverged: the port replay failed");
-                    for failure in failures {
-                        println!("port: {}", one_line(&failure));
-                    }
-                    2
-                }
-            };
-            for why in &setup_failures {
-                println!("setup: {}", one_line(why));
-            }
-            for note in notes {
-                println!("note: {}", one_line(&note));
+            let (code, lines) = result_lines(&report, &runner.setup_failures());
+            for line in lines {
+                println!("{line}");
             }
             code
         }
@@ -664,6 +622,63 @@ pub async fn verify_capsule(args: VerifyArgs) -> Result<i32> {
         eprintln!("rebuilt tree kept in {}", verify_dir.join("tree").display());
     }
     Ok(code)
+}
+
+/// The lines `cowproof verify` prints to stdout for `report`, and its exit code. Every line
+/// that holds text from the lane (a fixture's tool and id, a Bundler error, a check's output
+/// note) goes through [`one_line`] here, whatever escaping the text had before: the terminal
+/// is the last place to be sure of it (S-1).
+fn result_lines(report: &VerifyReport, setup_failures: &[String]) -> (i32, Vec<String>) {
+    let mut lines = Vec::new();
+    // A skipped held-out port case is said out loud, whatever else is.
+    if let Some(note) = report.port.as_ref().and_then(|p| p.skipped_note()) {
+        lines.push(one_line(&note));
+    }
+    // Printed after the result line, whatever it is: a note, never a failure. Only pass
+    // or fail is compared with the builder's record.
+    let notes: Vec<String> = report
+        .checks
+        .iter()
+        .filter_map(|m| m.output_note())
+        .collect();
+    let code = match &report.result {
+        VerifyResult::Reproduced if !setup_failures.is_empty() => {
+            lines.push("diverged: the verifier's dependency setup failed".to_string());
+            2
+        }
+        VerifyResult::Reproduced => {
+            lines.push("reproduced".to_string());
+            0
+        }
+        VerifyResult::Diverged { check_ids } => {
+            lines.push(format!("diverged: check {}", quote_ids(check_ids)));
+            for id in report.heldout.iter().filter(|o| !o.passed) {
+                lines.push(format!("held-out check {:?} failed", id.check_id));
+            }
+            2
+        }
+        VerifyResult::HeldOutFailed { check_ids } => {
+            lines.push(format!(
+                "diverged: held-out check {} failed",
+                quote_ids(check_ids)
+            ));
+            2
+        }
+        VerifyResult::PortFailed { failures } => {
+            lines.push("diverged: the port replay failed".to_string());
+            for failure in failures {
+                lines.push(format!("port: {}", one_line(failure)));
+            }
+            2
+        }
+    };
+    for why in setup_failures {
+        lines.push(format!("setup: {}", one_line(why)));
+    }
+    for note in notes {
+        lines.push(format!("note: {}", one_line(&note)));
+    }
+    (code, lines)
 }
 
 /// One slot of `class`, held by the caller until the replay ends (D12): the capsule's own
@@ -690,4 +705,74 @@ fn quote_ids(ids: &[String]) -> String {
         .map(|id| format!("{id:?}"))
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const HOSTILE: &str =
+        "\u{1b}[2J\u{1b}[1;1Hverify: reproduced \u{1b}]52;c;ZXZpbA==\u{7} \u{9b}31m";
+
+    fn report(result: VerifyResult) -> VerifyReport {
+        VerifyReport {
+            result,
+            checks: Vec::new(),
+            heldout: Vec::new(),
+            port: None,
+        }
+    }
+
+    fn assert_one_line_each(lines: &[String]) {
+        for line in lines {
+            assert!(
+                !line.chars().any(char::is_control),
+                "a control character reaches the terminal: {line:?}"
+            );
+        }
+    }
+
+    /// S-1: whatever the text was before, the `setup:` line is escaped where it is printed.
+    #[test]
+    fn a_setup_failure_is_printed_as_escapes_after_either_result() {
+        let setup = [format!(
+            "`bundle install --local` failed (exit 7): {HOSTILE}"
+        )];
+        for result in [
+            VerifyResult::Reproduced,
+            VerifyResult::Diverged {
+                check_ids: vec!["ok".to_string()],
+            },
+        ] {
+            let (code, lines) = result_lines(&report(result), &setup);
+            assert_eq!(code, 2);
+            assert_one_line_each(&lines);
+            let line = lines.iter().find(|l| l.starts_with("setup: ")).unwrap();
+            assert!(
+                line.contains("\\u{1b}[2J") && line.contains("\\u{9b}31m"),
+                "{line}"
+            );
+        }
+    }
+
+    /// S-1: a port failure names a tool and an id that a lane-written fixture holds.
+    #[test]
+    fn a_port_failure_line_is_printed_as_escapes() {
+        let failures = vec![format!("direct t/{HOSTILE}: differs from the reference")];
+        let (code, lines) = result_lines(&report(VerifyResult::PortFailed { failures }), &[]);
+        assert_eq!(code, 2);
+        assert_one_line_each(&lines);
+        assert_eq!(lines[0], "diverged: the port replay failed");
+        assert!(
+            lines[1].starts_with("port: direct t/\\u{1b}[2J"),
+            "{}",
+            lines[1]
+        );
+    }
+
+    #[test]
+    fn a_clean_reproduction_prints_one_word_and_exits_zero() {
+        let (code, lines) = result_lines(&report(VerifyResult::Reproduced), &[]);
+        assert_eq!((code, lines), (0, vec!["reproduced".to_string()]));
+    }
 }
