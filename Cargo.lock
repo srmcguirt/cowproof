@@ -466,6 +466,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "libc",
  "portkit-core",
  "portkit-port",
  "regex",
@@ -547,6 +548,7 @@ dependencies = [
  "anyhow",
  "cowproof-core",
  "cowproof-prove",
+ "libc",
  "portkit-core",
  "regex",
  "serde",

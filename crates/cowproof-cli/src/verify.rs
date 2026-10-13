@@ -384,12 +384,7 @@ async fn capsule_dependencies(
 
 /// Remove `path` whatever it is, without following a symlink.
 fn remove_path(path: &Path) -> std::io::Result<()> {
-    match fs::symlink_metadata(path) {
-        Ok(m) if m.is_dir() => fs::remove_dir_all(path),
-        Ok(_) => fs::remove_file(path),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(e),
-    }
+    cowproof_core::fsutil::remove_tree(path)
 }
 
 /// Replay the capsule; the return value is the process exit code.
@@ -616,8 +611,9 @@ pub async fn verify_capsule(args: VerifyArgs) -> Result<i32> {
         }
     };
     if ours && code == 0 {
-        // The directory was created here and holds only the rebuilt tree.
-        let _ = fs::remove_dir_all(&root);
+        // The directory was created here and holds only the rebuilt tree (and the compile
+        // cache's private copy, which can hold a read-only directory).
+        let _ = cowproof_core::fsutil::remove_tree(&root);
     } else {
         eprintln!("rebuilt tree kept in {}", verify_dir.join("tree").display());
     }

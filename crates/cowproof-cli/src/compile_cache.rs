@@ -159,7 +159,7 @@ async fn prepare(req: &Request<'_>) -> Result<(PathBuf, VerifyCache), VerifyCach
     let method: CopyMethod = match copied {
         Ok(method) => method,
         Err(e) => {
-            let _ = fs::remove_dir_all(&dest);
+            let _ = cowproof_core::fsutil::remove_tree(&dest);
             return Err(fail(format!(
                 "copying the seed into {}: {e}",
                 req.verify_dir.display()

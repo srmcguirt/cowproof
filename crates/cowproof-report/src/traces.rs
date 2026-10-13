@@ -6,7 +6,8 @@
 //! symlink is followed at any step (the lane's `portkit` directory, its `traces` directory
 //! and each trace file are all builder-writable), a file larger than 32 MiB is unreadable,
 //! the walk as a whole stops at 64 MiB and 256 files (what is left is counted, not read), only
-//! the 4096 smallest names of the directory are ever held,
+//! the 4096 smallest names of the directory are ever held, each file is opened with
+//! `O_NOFOLLOW | O_NONBLOCK` and only a regular file (checked on the descriptor) is read,
 //! and a line that is not a record is counted, not fatal. `cowproof report port-candidates`
 //! and the runner's lane-end totals both read through it, so there is one trace parser.
 
@@ -16,6 +17,7 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, BinaryHeap, HashSet};
 use std::fs;
 use std::io::Read;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 
 /// A trace file larger than this is unreadable (a day of one lane is KBs).
@@ -123,9 +125,9 @@ pub fn read_lane_traces(lane_dir: &Path) -> LaneTraces {
             out.symlinked += 1;
             continue;
         }
-        if !kind.is_file() {
-            continue;
-        }
+        // Not `kind.is_file()`: a FIFO or a directory named `x.jsonl` goes to the open below,
+        // which decides on the descriptor (a name can change type between the listing and the
+        // open).
         if out.files >= MAX_LANE_FILES {
             out.unread_files += 1;
             continue;
@@ -203,10 +205,25 @@ enum Unread {
     OverBudget,
 }
 
-/// The file, or why not. The read is bounded as well as the size checked: a file can grow
+/// The file, or why not. The file is opened with `O_NOFOLLOW | O_NONBLOCK` and the checks are
+/// made on the opened descriptor (`fstat`), never on the name: a builder that outlived the
+/// group kill can swap a trace file for a FIFO between the listing and this open, and a plain
+/// open of a FIFO blocks until a writer comes (a hang at lane end). With `O_NONBLOCK` the open
+/// returns at once, a symlink is refused, and anything that is not a regular file (a FIFO, a
+/// directory, a device) is unreadable. `O_NONBLOCK` does nothing to reads of a regular file,
+/// so it is not cleared. The read is bounded as well as the size checked: a file can grow
 /// between the two. `budget` is what the lane has left of its aggregate bound.
 fn read_bounded(path: &Path, budget: u64) -> Result<Vec<u8>, Unread> {
-    let len = fs::metadata(path).map_err(|_| Unread::Unreadable)?.len();
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .map_err(|_| Unread::Unreadable)?;
+    let meta = file.metadata().map_err(|_| Unread::Unreadable)?;
+    if !meta.is_file() {
+        return Err(Unread::Unreadable);
+    }
+    let len = meta.len();
     if len > MAX_FILE_BYTES {
         return Err(Unread::Unreadable);
     }
@@ -214,9 +231,7 @@ fn read_bounded(path: &Path, budget: u64) -> Result<Vec<u8>, Unread> {
         return Err(Unread::OverBudget);
     }
     let mut bytes = Vec::new();
-    fs::File::open(path)
-        .map_err(|_| Unread::Unreadable)?
-        .take(MAX_FILE_BYTES + 1)
+    file.take(MAX_FILE_BYTES + 1)
         .read_to_end(&mut bytes)
         .map_err(|_| Unread::Unreadable)?;
     let read = bytes.len() as u64;
@@ -654,6 +669,93 @@ mod tests {
 
     fn line() -> String {
         r#"{"tool":"Read","target":"a","surface":"agent","outcome":"ok","at":"x","duration_ms":0.0,"input_bytes":1,"produced_bytes":90,"delivered_bytes":40}"#.to_string()
+    }
+
+    /// Make a FIFO at `path` with the `mkfifo` program.
+    fn make_fifo(path: &Path) {
+        let status = std::process::Command::new("mkfifo")
+            .arg(path)
+            .status()
+            .expect("mkfifo runs");
+        assert!(status.success());
+    }
+
+    /// Run `f` on a thread; fail if it has not finished within `secs`. On a timeout the
+    /// FIFO at `release` is opened for writing so the blocked thread can end.
+    fn within<T: Send + 'static>(
+        secs: u64,
+        release: &Path,
+        f: impl FnOnce() -> T + Send + 'static,
+    ) -> T {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(f());
+        });
+        match rx.recv_timeout(std::time::Duration::from_secs(secs)) {
+            Ok(v) => v,
+            Err(_) => {
+                let _ = fs::OpenOptions::new()
+                    .write(true)
+                    .custom_flags(libc::O_NONBLOCK)
+                    .open(release);
+                panic!("the walk did not return within {secs} s: it blocked on a FIFO");
+            }
+        }
+    }
+
+    #[test]
+    fn a_fifo_named_like_a_trace_file_is_skipped_promptly_and_counted() {
+        let lane = tempfile::tempdir_in("/var/tmp").unwrap();
+        let traces = lane.path().join("portkit/traces");
+        fs::create_dir_all(&traces).unwrap();
+        trace_file(&traces, "a.jsonl", 0);
+        let fifo = traces.join("x.jsonl");
+        make_fifo(&fifo);
+        let dir = lane.path().to_path_buf();
+        let walk = within(2, &fifo, move || read_lane_traces(&dir));
+        assert_eq!(walk.state, LaneState::Traced);
+        assert_eq!((walk.files, walk.unreadable, walk.symlinked), (1, 1, 0));
+        assert_eq!(walk.records.len(), 1);
+    }
+
+    #[test]
+    fn a_file_swapped_for_a_fifo_after_the_listing_is_refused_on_the_descriptor() {
+        // The listing's type check is gone: `read_bounded` is handed a FIFO directly, as if
+        // the swap happened between the listing and the open.
+        let lane = tempfile::tempdir_in("/var/tmp").unwrap();
+        let fifo = lane.path().join("x.jsonl");
+        make_fifo(&fifo);
+        let path = fifo.clone();
+        let got = within(2, &fifo, move || read_bounded(&path, MAX_LANE_BYTES));
+        assert!(matches!(got, Err(Unread::Unreadable)));
+        // A directory and a symlink are refused the same way.
+        let dir = lane.path().join("d.jsonl");
+        fs::create_dir(&dir).unwrap();
+        assert!(matches!(
+            read_bounded(&dir, MAX_LANE_BYTES),
+            Err(Unread::Unreadable)
+        ));
+        let real = lane.path().join("real");
+        fs::write(&real, line()).unwrap();
+        let link = lane.path().join("l.jsonl");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert!(matches!(
+            read_bounded(&link, MAX_LANE_BYTES),
+            Err(Unread::Unreadable)
+        ));
+    }
+
+    #[test]
+    fn a_symlinked_trace_file_is_still_skipped_and_counted_as_a_link() {
+        let lane = tempfile::tempdir_in("/var/tmp").unwrap();
+        let traces = lane.path().join("portkit/traces");
+        fs::create_dir_all(&traces).unwrap();
+        trace_file(&traces, "a.jsonl", 0);
+        std::os::unix::fs::symlink(traces.join("a.jsonl"), traces.join("b.jsonl")).unwrap();
+        let walk = read_lane_traces(lane.path());
+        assert_eq!(walk.state, LaneState::Traced);
+        assert_eq!((walk.files, walk.symlinked, walk.unreadable), (1, 1, 0));
+        assert_eq!(walk.records.len(), 1);
     }
 
     #[test]

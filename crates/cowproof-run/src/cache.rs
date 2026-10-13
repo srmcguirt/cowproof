@@ -625,7 +625,7 @@ fn remove_entry(root: &Path, e: &Entry, alive: Alive) -> Result<Taken> {
         fs::rename(&trash, &e.path)?;
         return Ok(Taken::InUse(live));
     }
-    fs::remove_dir_all(&trash)?;
+    cowproof_core::fsutil::remove_tree(&trash)?;
     Ok(Taken::Removed)
 }
 
@@ -659,12 +659,10 @@ fn sweep_work(root: &Path, alive: Alive, dry_run: bool) -> Result<WorkSweep> {
         }
         let path = work.join(&name);
         if !dry_run {
-            let gone = match fs::symlink_metadata(&path) {
-                Ok(m) if m.is_dir() => fs::remove_dir_all(&path),
-                Ok(_) => fs::remove_file(&path),
-                Err(_) => continue,
-            };
-            if gone.is_err() {
+            if fs::symlink_metadata(&path).is_err() {
+                continue;
+            }
+            if cowproof_core::fsutil::remove_tree(&path).is_err() {
                 continue;
             }
         }
@@ -1228,6 +1226,51 @@ mod tests {
         assert_eq!(keys(&report), ["stale"]);
         assert_eq!(report.removed[0].reason, Reason::Size);
         assert!(!c.has_seed("stale") && c.has_seed("a-newest"));
+    }
+
+    /// A read-only directory (0555) with a file inside it, under `parent`, and a symlink
+    /// inside it that points at `outside`.
+    fn read_only_dir_with_a_link(parent: &Path, outside: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        let ro = parent.join("ro");
+        fs::create_dir_all(ro.join("inner")).unwrap();
+        fs::write(ro.join("inner/data"), "x").unwrap();
+        fs::write(ro.join("file"), "y").unwrap();
+        std::os::unix::fs::symlink(outside, ro.join("link")).unwrap();
+        fs::set_permissions(ro.join("inner"), fs::Permissions::from_mode(0o555)).unwrap();
+        fs::set_permissions(&ro, fs::Permissions::from_mode(0o555)).unwrap();
+    }
+
+    #[test]
+    fn a_seed_an_entry_and_a_stale_work_directory_with_a_read_only_directory_are_pruned() {
+        use std::os::unix::fs::PermissionsExt;
+        let c = Cache::new();
+        let outside = c.root.parent().unwrap().join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("keep"), "keep").unwrap();
+        fs::set_permissions(&outside, fs::Permissions::from_mode(0o555)).unwrap();
+        let seed = c.seed("ro-seed", 100, 40);
+        let entry = c.entry("ro-deps", 100, 40);
+        read_only_dir_with_a_link(&seed.join("target/debug"), &outside);
+        read_only_dir_with_a_link(&entry.join("cargo"), &outside);
+        let work = c.root.join(DEPS_WORK).join(format!("{DEAD}-1"));
+        fs::create_dir_all(&work).unwrap();
+        read_only_dir_with_a_link(&work, &outside);
+
+        let report = c.prune(&c.opts(30));
+        let outside_mode = fs::metadata(&outside).unwrap().permissions().mode() & 0o777;
+        let kept = fs::read_to_string(outside.join("keep"));
+        // Leave the temp tree removable whatever the assertions find.
+        fs::set_permissions(&outside, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(report.failed.is_empty(), "{:?}", report.failed);
+        let mut gone = keys(&report);
+        gone.sort();
+        assert_eq!(gone, ["ro-deps", "ro-seed"]);
+        assert!(!c.has_seed("ro-seed") && !c.has("ro-deps"));
+        assert!(!work.exists(), "a stale work directory is swept");
+        assert_eq!(report.work_removed.len(), 1, "{:?}", report.work_removed);
+        assert_eq!(outside_mode, 0o555, "a link was not followed to a chmod");
+        assert_eq!(kept.unwrap(), "keep");
     }
 
     #[test]

@@ -8,6 +8,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+pub mod fsutil;
 pub mod git_show;
 pub mod heldout;
 pub mod ladder;

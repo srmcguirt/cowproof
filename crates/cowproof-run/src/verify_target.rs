@@ -213,7 +213,7 @@ pub fn install(fresh: &Path, cache_root: &Path, key: &str, alive: Alive) -> Resu
         Ok(()) => Installed::Built,
         Err(e) => {
             if complete(&entry) {
-                let _ = fs::remove_dir_all(fresh);
+                let _ = cowproof_core::fsutil::remove_tree(fresh);
                 Installed::Existing
             } else {
                 return Err(anyhow!(e).context(format!("moving the seed to {}", entry.display())));
@@ -291,13 +291,9 @@ fn copy_tree_with(src: &Path, dst: &Path, clone: bool) -> io::Result<CopyMethod>
     })
 }
 
+/// Remove a copy (or a part of one) whatever modes it holds: [`cowproof_core::fsutil::remove_tree`].
 fn remove_all(path: &Path) -> io::Result<()> {
-    match fs::symlink_metadata(path) {
-        Ok(m) if m.is_dir() => fs::remove_dir_all(path),
-        Ok(_) => fs::remove_file(path),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(e),
-    }
+    cowproof_core::fsutil::remove_tree(path)
 }
 
 #[derive(Default)]
@@ -799,6 +795,38 @@ mod tests {
         // The directory was made read-only again after its children were written.
         assert_eq!(dir_mode, Some(0o555));
     }
+    #[test]
+    fn a_copy_that_holds_a_read_only_directory_is_removed_and_a_link_in_it_is_not_followed() {
+        let t = tmp();
+        let (src, dst) = (t.path().join("seed"), t.path().join("copy"));
+        let outside = t.path().join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("keep"), "keep").unwrap();
+        fs::set_permissions(&outside, fs::Permissions::from_mode(0o555)).unwrap();
+        fs::create_dir_all(src.join("ro-dir/inner")).unwrap();
+        fs::write(src.join("ro-dir/inner/data"), "data").unwrap();
+        std::os::unix::fs::symlink(&outside, src.join("ro-dir/link")).unwrap();
+        fs::set_permissions(src.join("ro-dir/inner"), fs::Permissions::from_mode(0o555)).unwrap();
+        fs::set_permissions(src.join("ro-dir"), fs::Permissions::from_mode(0o555)).unwrap();
+
+        let copied = copy_tree_with(&src, &dst, false);
+        let copy_mode = fs::metadata(dst.join("ro-dir"))
+            .ok()
+            .map(|m| m.permissions().mode() & 0o777);
+        let removed_copy = remove_all(&dst);
+        let removed_seed = remove_all(&src);
+        let outside_mode = fs::metadata(&outside).unwrap().permissions().mode() & 0o777;
+        let kept = fs::read_to_string(outside.join("keep"));
+        fs::set_permissions(&outside, fs::Permissions::from_mode(0o755)).unwrap();
+        copied.unwrap();
+        assert_eq!(copy_mode, Some(0o555), "the copy kept the read-only mode");
+        removed_copy.unwrap();
+        removed_seed.unwrap();
+        assert!(fs::symlink_metadata(&dst).is_err() && fs::symlink_metadata(&src).is_err());
+        assert_eq!(outside_mode, 0o555, "a link was not followed to a chmod");
+        assert_eq!(kept.unwrap(), "keep");
+    }
+
     /// Prune everything the size pass may remove (a limit of 0 bytes, nothing aged out by time).
     fn prune_all(root: &Path, home: &Path) -> cache::PruneReport {
         let opts = cache::PruneOptions {

@@ -13,6 +13,7 @@ path = "src/lib.rs"
 
 [dependencies]
 anyhow = "1"
+libc = "0.2"
 cowproof-core.workspace = true
 cowproof-prove.workspace = true
 portkit-core = { version = "0.1.0", path = "../portkit/core" }

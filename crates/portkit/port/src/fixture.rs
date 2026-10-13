@@ -65,6 +65,44 @@ pub struct Fixture {
 /// hosts the harness supports.
 pub const PLATFORMS: [&str; 2] = ["linux", "macos"];
 
+/// The most bytes a fixture's `tool` or `id` may have.
+pub const MAX_COMPONENT_BYTES: usize = 128;
+
+/// Check that `value` (the `what` of a fixture or case: `"tool"` or `"id"`) can be one path
+/// component: non-empty, at most [`MAX_COMPONENT_BYTES`] bytes, no `/`, no `\\`, no NUL, and
+/// not `.` or `..`. A fixture is written to `<root>/<tool>/<id>.json`, so a value that is more
+/// than one component would write outside the fixtures directory; the cases file is the
+/// director's today, and this keeps it safe when it is not. An `@<platform>` id suffix is
+/// ordinary text here.
+pub fn check_path_component(what: &str, value: &str) -> std::result::Result<(), String> {
+    let refuse = |why: &str| {
+        Err(format!(
+            "the {what} {value:?} {why}; a {what} is one path component (no `/`, `\\`, NUL, `.` or `..`, at most {MAX_COMPONENT_BYTES} bytes)"
+        ))
+    };
+    if value.is_empty() {
+        return Err(format!(
+            "the {what} is empty; a {what} is one path component"
+        ));
+    }
+    if value.len() > MAX_COMPONENT_BYTES {
+        return Err(format!(
+            "the {what} is {} bytes; a {what} is one path component of at most {MAX_COMPONENT_BYTES} bytes",
+            value.len()
+        ));
+    }
+    if value == "." || value == ".." {
+        return refuse("is a directory reference");
+    }
+    if value.contains('/') || value.contains('\\') {
+        return refuse("holds a path separator");
+    }
+    if value.contains('\0') {
+        return refuse("holds a NUL");
+    }
+    Ok(())
+}
+
 /// The platform this process runs on, as a fixture's `platform` names it.
 pub fn host_platform() -> &'static str {
     std::env::consts::OS
@@ -142,6 +180,8 @@ impl Fixture {
     /// with `@<platform>`; an untagged fixture's id does not end with a platform tag (it would
     /// look tagged and replay everywhere).
     pub fn validate(&self) -> std::result::Result<(), String> {
+        check_path_component("tool", &self.tool)?;
+        check_path_component("id", &self.id)?;
         match (self.platform.as_deref(), id_platform(&self.id)) {
             (None, None) => Ok(()),
             (None, Some(tag)) => Err(format!(
@@ -162,12 +202,17 @@ impl Fixture {
 
     /// `<root>/<tool>/<id>.json` — grouped by tool so a partial port can
     /// replay just the tools it has finished.
-    pub fn path_within(&self, root: &Path) -> PathBuf {
-        root.join(&self.tool).join(format!("{}.json", self.id))
+    ///
+    /// An error, not a joined path, when `tool` or `id` is not one path component
+    /// ([`check_path_component`]).
+    pub fn path_within(&self, root: &Path) -> Result<PathBuf> {
+        check_path_component("tool", &self.tool).map_err(Error::Fixture)?;
+        check_path_component("id", &self.id).map_err(Error::Fixture)?;
+        Ok(root.join(&self.tool).join(format!("{}.json", self.id)))
     }
 
     pub fn write(&self, root: &Path) -> Result<PathBuf> {
-        let path = self.path_within(root);
+        let path = self.path_within(root)?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -226,6 +271,12 @@ pub fn load_cases(path: &Path) -> Result<Vec<Case>> {
             // otherwise miserable to debug.
             Error::Fixture(format!("{}:{}: {e}", path.display(), i + 1))
         })?;
+        let bad_component = check_path_component("tool", &case.tool).and_then(|()| {
+            case.id
+                .as_deref()
+                .map_or(Ok(()), |id| check_path_component("id", id))
+        });
+        bad_component.map_err(|e| Error::Fixture(format!("{}:{}: {e}", path.display(), i + 1)))?;
         cases.push(case);
     }
 
@@ -395,5 +446,92 @@ mod tests {
         assert_eq!(tagged_id("a", "linux").unwrap(), "a@linux");
         assert_eq!(tagged_id("a@linux", "linux").unwrap(), "a@linux");
         assert!(tagged_id("a@macos", "linux").unwrap_err().contains("macos"));
+    }
+
+    #[test]
+    fn a_tool_or_id_that_is_not_one_path_component_is_refused() {
+        let base = dir("component");
+        let long = "x".repeat(200);
+        for (what, bad, needle) in [
+            ("a parent id", "../x", "path separator"),
+            ("a nested id", "a/b", "path separator"),
+            ("a backslash id", "a\\b", "path separator"),
+            ("a dot id", ".", "directory reference"),
+            ("a dot-dot id", "..", "directory reference"),
+            ("an empty id", "", "is empty"),
+            ("a 200-byte id", long.as_str(), "200 bytes"),
+            ("a NUL id", "a\0b", "NUL"),
+        ] {
+            let fixture = Fixture {
+                tool: "t".into(),
+                id: bad.into(),
+                input: json!({}),
+                expected: json!({}),
+                captured_at: None,
+                source: None,
+                note: None,
+                accepted: Vec::new(),
+                env: BTreeMap::new(),
+                expect_error: false,
+                normalized: None,
+                platform: None,
+            };
+            let err = fixture.path_within(&base).expect_err(what).to_string();
+            assert!(err.contains("id") && err.contains(needle), "{what}: {err}");
+            assert!(fixture.write(&base).is_err(), "{what} was written");
+            let err = read(&base, doc(bad, None)).expect_err(what).to_string();
+            assert!(err.contains(needle), "{what} on read: {err}");
+            // A tool name is held to the same rule.
+            let mut doc = doc("001", None);
+            doc["tool"] = json!(bad);
+            let err = read(&base, doc).expect_err(what).to_string();
+            assert!(
+                err.contains("tool") && err.contains(needle),
+                "{what} as tool: {err}"
+            );
+        }
+        assert!(
+            std::fs::read_dir(&base).unwrap().all(|e| {
+                // Only the file the reads above wrote.
+                e.unwrap().file_name() == "f.json"
+            }),
+            "a refused fixture wrote nothing"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_platform_tagged_id_and_a_128_byte_id_are_accepted() {
+        let base = dir("accepted");
+        let id = format!("id@{}", host_platform());
+        let fixture = read(&base, doc(&id, Some(host_platform()))).unwrap();
+        let path = fixture.path_within(&base).unwrap();
+        assert!(path.ends_with(format!("t/{id}.json")), "{path:?}");
+        let edge = "y".repeat(MAX_COMPONENT_BYTES);
+        assert!(read(&base, doc(&edge, None)).is_ok());
+        assert!(read(&base, doc(&format!("{edge}z"), None)).is_err());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_cases_file_with_a_bad_tool_or_id_is_refused_with_its_line() {
+        let base = dir("cases");
+        let file = base.join("cases.jsonl");
+        for (line, needle) in [
+            (r#"{"tool":"t","id":"../x","input":{}}"#, "path separator"),
+            (r#"{"tool":"t","id":"","input":{}}"#, "is empty"),
+            (r#"{"tool":"a/b","input":{}}"#, "path separator"),
+            (r#"{"tool":"..","input":{}}"#, "directory reference"),
+        ] {
+            std::fs::write(&file, format!("# comment\n{line}\n")).unwrap();
+            let err = load_cases(&file).expect_err(line).to_string();
+            assert!(
+                err.contains("cases.jsonl:2:") && err.contains(needle),
+                "{line}: {err}"
+            );
+        }
+        std::fs::write(&file, "{\"tool\":\"t\",\"id\":\"id@linux\",\"input\":{}}\n").unwrap();
+        assert_eq!(load_cases(&file).unwrap().len(), 1);
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
