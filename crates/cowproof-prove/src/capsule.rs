@@ -192,6 +192,28 @@ pub struct VerifierRun {
     pub output_len: u64,
 }
 
+/// What the verifier's compile cache did for a verification (R3, D11): informational, and never
+/// part of a verdict. The seed is a cargo target directory built from the BASE commit
+/// (`cowproof_run::verify_target`); each verification checks against a private copy of it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VerifyCache {
+    /// `hit` (a seed was there), `built` (this verification built it), `off`
+    /// (`COWPROOF_VERIFY_CACHE=off`), `failed` (the seed could not be made or copied, and the
+    /// verification ran as if there were none; `note` says why) or `not_cargo` (the base tree
+    /// has no `Cargo.toml` at its root).
+    pub status: String,
+    /// The seed's key, when one was computed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+    /// How the private copy was made: `clone` (copy-on-write) or `copy` (bytes). Present exactly
+    /// when the verification used a seed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub copy: Option<String>,
+    /// Why the seed was not used, for `failed`; absent otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
 /// One entry of `packets/versions.json`: a version of the packet the lane ran under.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PacketVersion {
@@ -398,6 +420,13 @@ pub struct Capsule {
     /// real registry.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dependency_fetch_resolve: Option<String>,
+    /// What the verifier's compile cache did when `cowproof run` replayed this lane: the seed's
+    /// key, `hit`/`built`/`off`/`failed`/`not_cargo`, and how the private copy was made. Written
+    /// when the replay ran and the capsule was sealed again; absent from a capsule the replay
+    /// did not reach and from every capsule from before the field, which still read and verify.
+    /// Informational: it never enters a verdict or a gate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verify_cache: Option<VerifyCache>,
     /// The reference-runtime directories the director granted the verifier (`--runtime-dir`
     /// or `COWPROOF_RUNTIME_DIRS`), canonical, read-only: what this proof saw beyond the
     /// system directories. Absent when none was granted, so existing capsules and their seals
@@ -502,6 +531,7 @@ impl Capsule {
             dependency_ecosystems: Vec::new(),
             dependency_fetch_notes: Vec::new(),
             dependency_fetch_resolve: None,
+            verify_cache: None,
             runtime_dirs: Vec::new(),
             prefix_version: None,
             project_instructions_sha256: None,

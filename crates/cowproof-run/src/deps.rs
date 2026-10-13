@@ -110,7 +110,7 @@ use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 /// The environment variable that overrides the cache root.
 pub const CACHE_ROOT_ENV: &str = "COWPROOF_CACHE_ROOT";
@@ -997,26 +997,9 @@ pub fn prefetch(
     config: &FetchConfig,
 ) -> Result<Option<Prefetch>> {
     let alive = config.alive;
-    // Ask first, create after: a root that already holds things cowproof did not make is
-    // not swept (below), though the fetch still works there.
-    let owned = cache::require_owned(cache_root, &lane.real_home);
-    let work_root = cache_root.join("deps-work");
-    fs::create_dir_all(&work_root).context("creating the dependency work directory")?;
-    fs::create_dir_all(cache_root.join("deps")).context("creating the dependency cache")?;
-    // The one place a cache root is first created: mark it as cowproof's.
-    cache::write_marker(cache_root).context("marking the dependency cache root")?;
-    // A `cowproof` that was interrupted left its work directory behind (nothing removes it
-    // but the run that made it): clear the ones whose process is gone. Best effort, and
-    // never a directory whose process is alive, nor one in a root cowproof did not make.
-    match owned {
-        Ok(()) => {
-            let _ = cache::remove_stale_work(cache_root, &lane.real_home, alive);
-        }
-        Err(e) => eprintln!("warning: not sweeping stale dependency work directories: {e:#}"),
-    }
-    let stamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
-    let work = work_root.join(format!("{}-{stamp}", std::process::id()));
-    fs::create_dir(&work).context("creating the dependency work directory")?;
+    cache::prepare(cache_root, &lane.real_home, cache::Area::Deps, alive)
+        .context("preparing the dependency cache")?;
+    let work = cache::new_work_dir(cache_root).context("creating the dependency work directory")?;
     let result = prefetch_in(&work, rebuild, cache_root, lane, config);
     let _ = fs::remove_dir_all(&work);
     result
@@ -1850,6 +1833,7 @@ fn tail(bytes: &[u8], max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::SystemTime;
     use tempfile::TempDir;
 
     const CARGO: Needs = Needs {

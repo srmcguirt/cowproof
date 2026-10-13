@@ -23,6 +23,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 mod cache;
 mod codex;
+mod compile_cache;
 mod director_tools;
 mod doctor;
 mod host_agent;

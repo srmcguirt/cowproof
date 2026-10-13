@@ -30,6 +30,7 @@ pub mod stall;
 pub mod steps;
 pub mod stream;
 pub mod tools;
+pub mod verify_target;
 pub mod wire;
 
 use sha2::{Digest, Sha256};

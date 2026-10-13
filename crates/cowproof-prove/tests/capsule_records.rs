@@ -201,3 +201,58 @@ fn an_index_naming_a_file_outside_packets_is_refused() {
         Err(CapsuleError::InvalidFormat(_))
     ));
 }
+
+#[test]
+fn the_compile_cache_record_round_trips_under_the_seal_and_older_capsules_read_without_it() {
+    use cowproof_prove::capsule::VerifyCache;
+
+    // No record: the key is not written at all, so an older capsule's bytes and seal are the same.
+    let dir = tempfile::tempdir().unwrap();
+    sealed(dir.path());
+    let plain = fs::read_to_string(dir.path().join("capsule.json")).unwrap();
+    assert!(!plain.contains("verify_cache"), "{plain}");
+    assert_eq!(Capsule::read(dir.path()).unwrap().verify_cache, None);
+
+    // A record written, sealed and read back.
+    let record = VerifyCache {
+        status: "built".to_string(),
+        key: Some("a".repeat(64)),
+        copy: Some("clone".to_string()),
+        note: None,
+    };
+    let mut capsule = Capsule::read(dir.path()).unwrap();
+    capsule.verify_cache = Some(record.clone());
+    capsule.write(dir.path()).unwrap();
+    let json = fs::read_to_string(dir.path().join("capsule.json")).unwrap();
+    assert!(json.contains("\"verify_cache\""), "{json}");
+    assert!(
+        !json.contains("\"note\""),
+        "an absent note is not written: {json}"
+    );
+    assert_eq!(
+        Capsule::read(dir.path()).unwrap().verify_cache,
+        Some(record.clone())
+    );
+
+    // It is under the seal: changing what it says is refused.
+    let path = dir.path().join("capsule.json");
+    fs::write(&path, json.replace("\"built\"", "\"hit\"")).unwrap();
+    assert!(matches!(
+        Capsule::read(dir.path()),
+        Err(CapsuleError::HashMismatch(name, _, _)) if name == "capsule.json"
+    ));
+    fs::write(&path, &json).unwrap();
+    Capsule::read(dir.path()).expect("restored, it reads again");
+
+    // A record holding only its status (the fields are optional) still parses.
+    let minimal: VerifyCache = serde_json::from_value(json!({"status": "off"})).unwrap();
+    assert_eq!(
+        minimal,
+        VerifyCache {
+            status: "off".to_string(),
+            key: None,
+            copy: None,
+            note: None,
+        }
+    );
+}

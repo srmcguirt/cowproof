@@ -686,6 +686,9 @@ pub struct SandboxedRunner {
     /// The runtime directories the director granted (`--runtime-dir`): read-only in every
     /// check's sandbox, their executables on its `PATH`.
     runtime_dirs: Vec<RuntimeDir>,
+    /// The cargo target directory every command gets as `CARGO_TARGET_DIR`
+    /// ([`SandboxedRunner::with_target_dir`]); `None` sets nothing.
+    target_dir: Option<PathBuf>,
     /// The `bundle` that installs a Bundler entry's gems ([`SandboxedRunner::with_bundle_exe`]);
     /// `None` runs the `bundle` on the checks' `PATH`.
     bundle_exe: Option<PathBuf>,
@@ -728,6 +731,7 @@ impl SandboxedRunner {
             port_base: None,
             executables: Vec::new(),
             groups: None,
+            target_dir: None,
             bundle_exe: None,
             setup: Mutex::new(HashMap::new()),
         }
@@ -806,6 +810,15 @@ impl SandboxedRunner {
         self
     }
 
+    /// Point every command's `CARGO_TARGET_DIR` at `dir`: the verifier's private copy of its
+    /// compile-cache seed ([`cowproof_run::verify_target`]). `dir` must be inside a directory the
+    /// sandbox may write (the verifier's scratch), and it is the caller's to make. Without this
+    /// the variable is not set and cargo builds in the tree's own `target/`.
+    pub fn with_target_dir(mut self, dir: PathBuf) -> Self {
+        self.target_dir = Some(dir);
+        self
+    }
+
     /// Give every check the lane's port block: `COWPROOF_PORT_BASE=<port_base>` and
     /// `COWPROOF_PORT_COUNT=20`, the same two variables the builder and its `run_check`
     /// get. Without it the checks see neither.
@@ -852,6 +865,19 @@ impl SandboxedRunner {
         // the caller's environment, which may carry API keys.
         let mut env = vec![("PATH".to_string(), path)];
         policy.apply_env(&mut env);
+        if let Some(dir) = &self.target_dir {
+            let value = dir.to_string_lossy().into_owned();
+            match env
+                .iter_mut()
+                .find(|(k, _)| k == cowproof_run::verify_target::TARGET_DIR_ENV)
+            {
+                Some(slot) => slot.1 = value,
+                None => env.push((
+                    cowproof_run::verify_target::TARGET_DIR_ENV.to_string(),
+                    value,
+                )),
+            }
+        }
         if let Some(port_base) = self.port_base {
             env.extend(cowproof_core::port_block_env(port_base));
         }
@@ -1792,6 +1818,32 @@ mod sandbox_tests {
                 .trim(),
             "from-sandbox"
         );
+    }
+
+    /// `with_target_dir` puts `CARGO_TARGET_DIR` in every command's environment, and without it
+    /// the variable is not there (the sandbox starts from an empty environment).
+    #[tokio::test]
+    async fn the_target_dir_is_set_only_when_the_runner_is_given_one() {
+        if !sandbox_available() {
+            return;
+        }
+        let fx = SandboxFixture::new();
+        let tree = &fx.lane.clone;
+        let probe = "printf '%s' \"${CARGO_TARGET_DIR-unset}\"";
+
+        let without = fx.runner().run(tree, probe, LIMIT).await.unwrap();
+        assert_eq!(without.exit_status, 0, "{}", without.output);
+        assert_eq!(without.output, "unset");
+
+        let target = fx.lane.scratch.join("target");
+        let with = fx
+            .runner()
+            .with_target_dir(target.clone())
+            .run(tree, probe, LIMIT)
+            .await
+            .unwrap();
+        assert_eq!(with.exit_status, 0, "{}", with.output);
+        assert_eq!(with.output, target.to_string_lossy());
     }
 
     /// The same read that works unsandboxed fails under the sandbox, and fails because

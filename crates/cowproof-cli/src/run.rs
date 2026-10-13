@@ -39,6 +39,7 @@
 //! the builder sees only the proxy's placeholder key.
 
 use crate::codex::{self, Codex, CodexConfig, CodexLaunch, codex_builder_command};
+use crate::compile_cache;
 use crate::openrouter::{self, Opencode, OpencodeLaunch, opencode_builder_command};
 use crate::preflight::{CheckStatus, PreflightOptions, preflight};
 use crate::remote::{self, BuilderSpecParts, LocalSide, RemoteHost, RemoteLane};
@@ -3305,6 +3306,16 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
             return Ok(INFRASTRUCTURE_EXIT_CODE);
         }
     };
+    // The verifier's compile cache switch (`COWPROOF_VERIFY_CACHE`), read once here like the
+    // runtime directories: a typo stops the run before anything exists.
+    let compile_cache_mode = match cowproof_run::verify_target::Mode::from_env() {
+        Ok(mode) => mode,
+        Err(e) => {
+            eprintln!("refused: {e:#}");
+            eprintln!("nothing was started");
+            return Ok(INFRASTRUCTURE_EXIT_CODE);
+        }
+    };
     if remote_host.is_some() && !runtime.is_empty() {
         eprintln!(
             "runtime directories refused: they name directories of this machine, and a remote \
@@ -4377,6 +4388,7 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
                 check_timeout,
                 packet_versions: &lane_run.packet_versions,
                 runtime_dirs: &runtime,
+                compile_cache: compile_cache_mode,
             },
             results,
         )
@@ -4682,6 +4694,8 @@ struct ProofInput<'a> {
     /// The runtime directories the director granted (`--runtime-dir`): read-only and on the
     /// `PATH` of the verifier, and recorded in the capsule.
     runtime_dirs: &'a [RuntimeDir],
+    /// Whether the verifier builds and uses a compile-cache seed (`COWPROOF_VERIFY_CACHE`).
+    compile_cache: cowproof_run::verify_target::Mode,
 }
 
 /// Find the lane's held-out checks (D5): the explicit `--heldout` path, which must exist,
@@ -5118,6 +5132,34 @@ async fn replay_and_gate(
         runtime_dirs: runtime_dirs::names(input.runtime_dirs),
         ..VerifyOptions::default()
     };
+    // The verifier's compile cache (R3): a private copy of the base commit's seed, with
+    // `CARGO_TARGET_DIR` pointing at it, before the first check. What it did is recorded in
+    // the capsule (sealed again below) and never enters a verdict; a seed that could not be
+    // made is a note, and the checks run as they did without one.
+    let (with_cache, cache_record) = compile_cache::attach(
+        runner,
+        &compile_cache::Request {
+            mode: input.compile_cache,
+            repo: input.repo,
+            base_commit: &input.prepared.base_commit,
+            base_tree_hash: &capsule.base_tree_hash,
+            layout,
+            deps: deps_dir.as_deref(),
+            runtime: input.runtime_dirs,
+            groups: Some(input.groups.clone()),
+            verify_dir: &verify_dir,
+            timeout: options.default_timeout,
+        },
+    )
+    .await;
+    runner = with_cache;
+    if cache_record.status == "failed" {
+        evidence.notes.push(format!(
+            "compile cache: no seed was used ({})",
+            cache_record.note.as_deref().unwrap_or("no reason given")
+        ));
+    }
+    capsule.verify_cache = Some(cache_record);
     match verify(&capsule_dir, input.repo, &verify_dir, &runner, options).await {
         Ok(report) => {
             // A Bundler tree's `bundle install --local` ran in the verifier before its first

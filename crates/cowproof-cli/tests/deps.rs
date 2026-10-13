@@ -641,3 +641,439 @@ fn a_tree_with_a_cargo_lock_and_a_package_lock_fetches_both_into_one_entry() {
     assert!(entry.join("cargo/registry").is_dir());
     assert!(entry.join("npm/node_modules/fake-pkg/index.js").is_file());
 }
+
+// ---------------------------------------------------------------------------------------
+// The verifier's compile cache (R3): a seed target directory built from the BASE commit, never
+// written by a verification; every verification checks against a private copy of it.
+// ---------------------------------------------------------------------------------------
+
+/// The marker the poisoning checks write. Unique, so a grep for it finds only a plant.
+const POISON: &str = "cowproof-poison-7f3a";
+
+/// The seeds under the cache root `cache`: the names in `verify-target/`.
+fn seeds(cache: &Path) -> Vec<String> {
+    entries(&cache.join("verify-target"))
+}
+
+/// What the capsule records the compile cache did.
+fn cache_record(lane: &Lane) -> cowproof_prove::capsule::VerifyCache {
+    capsule(lane)
+        .verify_cache
+        .expect("`cowproof run` records what the compile cache did")
+}
+
+/// A hash over every path, file content and symlink target under `dir` (not the use marker
+/// or the leases, which a hit touches by design): two directories hash alike exactly when they
+/// hold the same files with the same bytes.
+fn tree_hash(dir: &Path) -> String {
+    let mut lines = Vec::new();
+    let mut pending = vec![dir.to_path_buf()];
+    while let Some(d) = pending.pop() {
+        for e in fs::read_dir(&d).unwrap().flatten() {
+            let path = e.path();
+            let rel = path.strip_prefix(dir).unwrap().display().to_string();
+            let kind = e.file_type().unwrap();
+            if kind.is_dir() {
+                pending.push(path);
+                lines.push(format!("d {rel}"));
+            } else if kind.is_symlink() {
+                lines.push(format!(
+                    "l {rel} {}",
+                    fs::read_link(&path).unwrap().display()
+                ));
+            } else {
+                lines.push(format!(
+                    "f {rel} {}",
+                    Capsule::hash_bytes(&fs::read(&path).unwrap())
+                ));
+            }
+        }
+    }
+    lines.sort();
+    Capsule::hash_bytes(lines.join("\n").as_bytes())
+}
+
+/// The cargo target directory of the seed `key` under the cache root `cache`.
+fn seed_target(cache: &Path, key: &str) -> PathBuf {
+    cache.join("verify-target").join(key).join("target")
+}
+
+/// A lane over the vendored project with the one check `command`, run to exit code `code`.
+fn seed_lane(cache: &Path, command: &str) -> Lane {
+    lane(
+        &vendored_project(None),
+        &run_checks(&["probe"]),
+        json!([{"id": "probe", "command": command}]),
+        cache,
+    )
+}
+
+#[test]
+fn the_first_verification_builds_the_seed_and_the_next_one_hits_it() {
+    if !sandbox_available() {
+        return;
+    }
+    let cache = var_tmp("cp-deps-cache-");
+    let started = std::time::Instant::now();
+    let first = lane(
+        &vendored_project(None),
+        &run_checks(&["build"]),
+        build_check(),
+        cache.path(),
+    );
+    run_expecting(&first, 0);
+    let built_in = started.elapsed();
+    let a = cache_record(&first);
+    assert_eq!(a.status, "built", "{a:?}");
+    let key = a.key.clone().expect("the seed's key is recorded");
+    assert_eq!(key.len(), 64, "{key}");
+    assert!(matches!(a.copy.as_deref(), Some("clone" | "copy")), "{a:?}");
+    assert_eq!(a.note, None);
+    assert_eq!(seeds(cache.path()), vec![key.clone()]);
+    let seed = seed_target(cache.path(), &key);
+    assert!(
+        seed.join("debug").is_dir(),
+        "the seed holds a cargo target dir"
+    );
+    assert!(
+        cache
+            .path()
+            .join("verify-target")
+            .join(&key)
+            .join("leases")
+            .is_dir(),
+        "the build took a lease, as a dependency hit does"
+    );
+    assert!(
+        entries(&cache.path().join("deps-work")).is_empty(),
+        "the seed's work directory is removed"
+    );
+    let sealed = fs::read_to_string(first.capsule_dir().join("capsule.json")).unwrap();
+    assert!(sealed.contains("\"verify_cache\""), "{sealed}");
+
+    let started = std::time::Instant::now();
+    let second = lane(
+        &vendored_project(None),
+        &run_checks(&["build"]),
+        build_check(),
+        cache.path(),
+    );
+    run_expecting(&second, 0);
+    let hit_in = started.elapsed();
+    let b = cache_record(&second);
+    assert_eq!(b.status, "hit", "{b:?}");
+    assert_eq!(b.key.as_deref(), Some(key.as_str()), "the same key");
+    assert_eq!(seeds(cache.path()).len(), 1, "a hit makes no second seed");
+    eprintln!("compile cache timings: built run {built_in:?}, hit run {hit_in:?}");
+}
+
+#[test]
+fn a_check_that_plants_in_its_target_directory_leaves_the_seed_and_the_next_copy_untouched() {
+    if !sandbox_available() {
+        return;
+    }
+    let cache = var_tmp("cp-deps-cache-");
+    // The first lane builds the seed; its hash is the reference.
+    let clean = seed_lane(cache.path(), "true");
+    run_expecting(&clean, 0);
+    let key = cache_record(&clean).key.unwrap();
+    let seed = seed_target(cache.path(), &key);
+    let before = tree_hash(&seed);
+
+    // The poisoning check writes a marker into CARGO_TARGET_DIR and changes an artifact that
+    // is already in it (the dependency info of the app). In the builder `CARGO_TARGET_DIR` is
+    // unset, so it plants in the clone's own gitignored `target/` and passes there too.
+    let plant = format!(
+        "d=\"${{CARGO_TARGET_DIR:-target}}\"; mkdir -p \"$d\" \"$d/debug/deps\"; \
+         echo {POISON} > \"$d/{POISON}\"; echo {POISON} > \"$d/debug/deps/{POISON}\"; \
+         find \"$d\" -type f -name '*.d' -exec sh -c 'echo {POISON} >> \"$0\"' {{}} \\; ; true"
+    );
+    let poisoner = seed_lane(cache.path(), &plant);
+    run_expecting(&poisoner, 0);
+    assert_eq!(cache_record(&poisoner).status, "hit");
+    assert_eq!(cache_record(&poisoner).key.as_deref(), Some(key.as_str()));
+    assert_eq!(
+        tree_hash(&seed),
+        before,
+        "a verification's changes to its target directory reached the seed"
+    );
+    assert!(!seed.join(POISON).exists());
+    assert_eq!(seeds(cache.path()), vec![key.clone()]);
+
+    // The next verification's copy has none of it: its check fails if it finds the marker
+    // anywhere in CARGO_TARGET_DIR (in the builder the directory is missing, which passes).
+    let reader = seed_lane(
+        cache.path(),
+        &format!(
+            "d=\"${{CARGO_TARGET_DIR:-target}}\"; test ! -e \"$d/{POISON}\" \
+             && ! grep -rq {POISON} \"$d\" 2>/dev/null"
+        ),
+    );
+    run_expecting(&reader, 0);
+    assert_eq!(reader.verdict()["verdict"], "proved");
+    assert_eq!(tree_hash(&seed), before);
+}
+
+#[test]
+fn the_verifiers_checks_get_a_private_copy_inside_its_scratch_as_cargo_target_dir() {
+    if !sandbox_available() {
+        return;
+    }
+    let cache = var_tmp("cp-deps-cache-");
+    // Only the verifier runs the held-out check, so it can say where the directory is.
+    let lane = seed_lane(cache.path(), "true");
+    let held = var_tmp("cp-deps-held-");
+    let heldout = common::heldout(
+        held.path(),
+        "case \"$CARGO_TARGET_DIR\" in */scratch/verify/target) test -d \"$CARGO_TARGET_DIR/debug\" ;; *) exit 1 ;; esac",
+    );
+    common::run_with(&lane, &heldout, 0);
+    assert_eq!(lane.verdict()["verdict"], "proved");
+    assert!(
+        cache_record(&lane).copy.is_some(),
+        "the copy method is recorded"
+    );
+}
+
+#[test]
+fn a_check_sees_cargo_target_dir_with_the_cache_on_and_not_with_it_off() {
+    if !sandbox_available() {
+        return;
+    }
+    // `-z` is true for the builder (unset) and false for the verifier when it has a copy, so
+    // the verifier diverges exactly when it set the variable.
+    let command = "test -z \"${CARGO_TARGET_DIR:-}\"";
+    let on = var_tmp("cp-deps-cache-");
+    let lane_on = seed_lane(on.path(), command);
+    run_expecting(&lane_on, 2);
+    assert_eq!(lane_on.verdict()["diverged"], json!(["probe"]));
+
+    let off = var_tmp("cp-deps-cache-");
+    let mut lane_off = seed_lane(off.path(), command);
+    lane_off.set_env("COWPROOF_VERIFY_CACHE", "off");
+    run_expecting(&lane_off, 0);
+    assert_eq!(lane_off.verdict()["verdict"], "proved");
+    let record = cache_record(&lane_off);
+    assert_eq!(record.status, "off", "{record:?}");
+    assert_eq!((record.key, record.copy, record.note), (None, None, None));
+    assert!(
+        seeds(off.path()).is_empty(),
+        "nothing was built or copied: {:?}",
+        entries(off.path())
+    );
+    assert!(!off.path().join("verify-target").exists());
+}
+
+#[test]
+fn a_typo_in_the_cache_switch_is_refused_before_anything_starts() {
+    let cache = var_tmp("cp-deps-cache-");
+    let mut lane = seed_lane(cache.path(), "true");
+    lane.set_env("COWPROOF_VERIFY_CACHE", "of");
+    let out = lane.run(&[]);
+    assert_eq!(out.status.code(), Some(4), "{}", text(&out));
+    let said = text(&out);
+    assert!(
+        said.contains("COWPROOF_VERIFY_CACHE must be `on` or `off`")
+            && said.contains("nothing was started"),
+        "{said}"
+    );
+}
+
+#[test]
+fn a_base_that_does_not_compile_makes_no_seed_and_the_lane_is_still_proved() {
+    if !sandbox_available() {
+        return;
+    }
+    let cache = var_tmp("cp-deps-cache-");
+    // The base reads a file only the lane creates (`created.txt`, which the fake builder makes):
+    // the BASE commit does not compile, the lane's tree does. A seed built from the lane's tree
+    // would succeed, so only a seed built from the base fails here.
+    let mut project = vendored_project(None);
+    project[3].1 =
+        "fn main() { println!(\"{} {}\", tinydep::answer(), include_str!(\"../created.txt\")); }\n"
+            .into();
+    let lane = lane(
+        &project,
+        &run_checks(&["build"]),
+        build_check(),
+        cache.path(),
+    );
+    let out = run_expecting(&lane, 0);
+    assert_eq!(lane.verdict()["verdict"], "proved", "{}", text(&out));
+    let record = cache_record(&lane);
+    assert_eq!(record.status, "failed", "{record:?}");
+    assert!(record.key.is_some() && record.copy.is_none(), "{record:?}");
+    let note = record.note.expect("the capsule says why");
+    assert!(
+        note.contains("seed build") && note.contains("base commit"),
+        "{note}"
+    );
+    assert!(
+        seeds(cache.path()).is_empty(),
+        "a failed build leaves no seed"
+    );
+    assert!(entries(&cache.path().join("deps-work")).is_empty());
+    // The verdict names the note, as an informational line.
+    assert!(
+        text(&out).contains("compile cache: no seed was used"),
+        "{}",
+        text(&out)
+    );
+}
+
+#[test]
+fn a_tree_without_a_root_cargo_toml_gets_no_seed_and_no_target_dir() {
+    if !sandbox_available() {
+        return;
+    }
+    let cache = var_tmp("cp-deps-cache-");
+    let mut lane = Lane::new(
+        &run_checks(&["probe"]),
+        json!([{"id": "probe", "command": "test -z \"${CARGO_TARGET_DIR:-}\""}]),
+    );
+    lane.set_env("COWPROOF_CACHE_ROOT", cache.path());
+    lane.set_env("COWPROOF_FETCH_NETWORK", "none");
+    run_expecting(&lane, 0);
+    assert_eq!(lane.verdict()["verdict"], "proved");
+    let record = cache_record(&lane);
+    assert_eq!(record.status, "not_cargo", "{record:?}");
+    assert_eq!((record.key, record.copy, record.note), (None, None, None));
+    assert!(!cache.path().join("verify-target").exists());
+}
+
+#[test]
+fn verifications_racing_for_one_seed_all_succeed_and_leave_one_sound_seed() {
+    if !sandbox_available() {
+        return;
+    }
+    let cache = var_tmp("cp-deps-cache-");
+    let lanes: Vec<Lane> = (0..3)
+        .map(|_| {
+            lane(
+                &vendored_project(None),
+                &run_checks(&["build"]),
+                build_check(),
+                cache.path(),
+            )
+        })
+        .collect();
+    std::thread::scope(|scope| {
+        for lane in &lanes {
+            scope.spawn(move || {
+                run_expecting(lane, 0);
+            });
+        }
+    });
+    let records: Vec<_> = lanes.iter().map(cache_record).collect();
+    let key = records[0].key.clone().unwrap();
+    for r in &records {
+        assert!(matches!(r.status.as_str(), "built" | "hit"), "{r:?}");
+        assert_eq!(r.key.as_deref(), Some(key.as_str()));
+    }
+    assert!(
+        records.iter().any(|r| r.status == "built"),
+        "somebody built it: {records:?}"
+    );
+    assert_eq!(seeds(cache.path()), vec![key.clone()]);
+    assert!(seed_target(cache.path(), &key).join("debug").is_dir());
+    assert!(entries(&cache.path().join("deps-work")).is_empty());
+    // A fourth verification still copies it and is proved.
+    let later = lane(
+        &vendored_project(None),
+        &run_checks(&["build"]),
+        build_check(),
+        cache.path(),
+    );
+    run_expecting(&later, 0);
+    assert_eq!(cache_record(&later).status, "hit");
+}
+
+#[test]
+fn a_capsule_without_the_cache_record_still_reproduces() {
+    if !sandbox_available() {
+        return;
+    }
+    let cache = var_tmp("cp-deps-cache-");
+    let lane = seed_lane(cache.path(), "true");
+    run_expecting(&lane, 0);
+    let capsule_dir = lane.capsule_dir();
+    let path = capsule_dir.join("capsule.json");
+    let mut json: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    assert!(
+        json.as_object_mut()
+            .unwrap()
+            .remove("verify_cache")
+            .is_some(),
+        "the new run writes the key"
+    );
+    let raw = serde_json::to_vec_pretty(&json).unwrap();
+    fs::write(&path, &raw).unwrap();
+    fs::write(
+        capsule_dir.join("capsule.sha256"),
+        Capsule::hash_bytes(&raw),
+    )
+    .unwrap();
+    let old = Capsule::read(&capsule_dir).expect("an older capsule reads");
+    assert_eq!(old.verify_cache, None);
+
+    let fresh = var_tmp("cp-deps-fresh-");
+    let clone = fresh.path().join("repo");
+    let cloned = output(
+        Command::new("git")
+            .args(["clone", "-q"])
+            .arg(&lane.repo)
+            .arg(&clone),
+    );
+    assert!(cloned.status.success(), "{}", text(&cloned));
+    let workdir = var_tmp("cp-deps-wd-");
+    let out = output(
+        lane.cowproof_cmd()
+            .current_dir(fresh.path())
+            .arg("verify")
+            .arg(&capsule_dir)
+            .arg("--repo")
+            .arg(&clone)
+            .arg("--workdir")
+            .arg(workdir.path()),
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).lines().next(),
+        Some("reproduced")
+    );
+    // `cowproof verify` used the seed run already made: the same cache root.
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("compile cache: hit"),
+        "{}",
+        text(&out)
+    );
+}
+
+#[test]
+fn a_base_without_a_lockfile_says_so_and_is_verified_without_a_seed() {
+    if !sandbox_available() {
+        return;
+    }
+    let cache = var_tmp("cp-deps-cache-");
+    // A crate with no dependencies and no Cargo.lock: nothing to fetch, and `--locked` cannot
+    // build it, so there is no seed to make.
+    let project = vec![
+        (".gitignore".to_string(), GITIGNORE.to_string()),
+        (
+            "Cargo.toml".to_string(),
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n".to_string(),
+        ),
+        ("src/main.rs".to_string(), "fn main() {}\n".to_string()),
+    ];
+    let lane = lane(
+        &project,
+        &run_checks(&["ok"]),
+        json!([{"id": "ok", "command": "true"}]),
+        cache.path(),
+    );
+    run_expecting(&lane, 0);
+    let record = cache_record(&lane);
+    assert_eq!(record.status, "failed", "{record:?}");
+    assert!(record.note.unwrap().contains("Cargo.lock"));
+    assert!(seeds(cache.path()).is_empty());
+}

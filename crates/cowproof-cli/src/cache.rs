@@ -1,5 +1,5 @@
-//! `cowproof cache`: the dependency cache at a glance (`ls`, the default) and its upkeep
-//! (`prune`). The logic lives in `cowproof_run::cache`; this is the command line.
+//! `cowproof cache`: the cache at a glance (`ls`, the default) and its upkeep (`prune`): the
+//! fetched dependencies and the verifier's compile-cache seeds. The logic lives in `cowproof_run::cache`; this is the command line.
 
 use anyhow::{Result, anyhow, bail};
 use cowproof_prove::runner::pid_exists;
@@ -20,10 +20,12 @@ pub enum CacheAction {
     Ls,
     /// Remove cache entries that have not been used lately, and stale work directories
     ///
-    /// An entry's last use is the last time a fetch hit it or a verifier was handed it.
-    /// Entries unused for `--older-than` days go; with `--max-size`, least recently used
-    /// entries then go until the cache fits. An entry a live `cowproof` holds a lease on
-    /// is never removed, however old; a lease whose process is gone protects nothing.
+    /// An entry is a fetched dependency cache (`deps/<key>`) or a verifier compile-cache seed
+    /// (`verify-target/<key>`, shown with that prefix). An entry's last use is the last time a
+    /// fetch hit it or a verifier was handed it. Entries unused for `--older-than` days go;
+    /// with `--max-size`, least recently used entries then go until the cache fits. An entry a
+    /// live `cowproof` holds a lease on is never removed, however old; a lease whose process is
+    /// gone protects nothing.
     /// Directories left in `deps-work/` by a process that is gone are removed too. The cache
     /// root is `~/.cache/cowproof`, or `$COWPROOF_CACHE_ROOT`; a root that is `/` or the
     /// home directory is refused.
@@ -107,7 +109,7 @@ fn prune_text(root: &std::path::Path, r: &PruneReport, now: SystemTime) -> Strin
         };
         out.push(format!(
             "{go} {}  {}  last used {} ({}; {why})",
-            e.key,
+            e.area.label(&e.key),
             size(e.bytes),
             utc(e.last_used),
             ago(e.last_used, now)

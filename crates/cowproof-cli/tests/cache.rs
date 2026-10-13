@@ -71,6 +71,21 @@ impl Fixture {
         dir
     }
 
+    /// A verifier compile-cache seed (`verify-target/<key>/target`) of `bytes` bytes, last used
+    /// `days` days ago.
+    fn seed(&self, label: &str, bytes: usize, days: u32) -> PathBuf {
+        let dir = self.root.join("verify-target").join(key(label));
+        fs::create_dir_all(dir.join("target/debug")).unwrap();
+        fs::write(dir.join("target/debug/artifact"), vec![b'x'; bytes]).unwrap();
+        let marker = fs::File::create(dir.join(".last-used")).unwrap();
+        marker.set_modified(SystemTime::now() - DAY * days).unwrap();
+        dir
+    }
+
+    fn has_seed(&self, label: &str) -> bool {
+        self.root.join("verify-target").join(key(label)).exists()
+    }
+
     fn lease(&self, dir: &Path, pid: u32) {
         fs::create_dir_all(dir.join("leases")).unwrap();
         fs::write(dir.join("leases").join(pid.to_string()), "").unwrap();
@@ -206,6 +221,51 @@ fn a_live_lease_protects_an_old_entry_and_a_dead_one_does_not() {
         "{out}"
     );
     assert!(f.has("held") && !f.has("stale"), "{out}");
+}
+
+#[test]
+fn prune_removes_an_unused_compile_cache_seed_and_keeps_a_leased_one() {
+    let f = Fixture::new();
+    let sleeper = Sleeper::start();
+    f.seed("unused", 700, 90);
+    let held = f.seed("held", 700, 90);
+    f.lease(&held, sleeper.pid());
+    f.seed("recent", 700, 1);
+
+    // `cache` counts seeds with the dependency entries.
+    let ls = f.cowproof(&["cache"]);
+    let out = String::from_utf8_lossy(&ls.stdout).into_owned();
+    assert!(
+        out.contains("entries: 3") && out.contains("(2100 bytes)"),
+        "{out}"
+    );
+
+    let dry = f.cowproof(&["cache", "prune", "--dry-run"]);
+    let out = String::from_utf8_lossy(&dry.stdout).into_owned();
+    assert!(
+        out.contains(&format!("would remove verify-target/{}", key("unused"))),
+        "{out}"
+    );
+    assert!(f.has_seed("unused"), "a dry run removes nothing");
+
+    let o = f.cowproof(&["cache", "prune"]);
+    assert!(o.status.success(), "{}", text(&o));
+    let out = String::from_utf8_lossy(&o.stdout).into_owned();
+    assert!(
+        out.contains(&format!("removed verify-target/{}", key("unused"))),
+        "{out}"
+    );
+    assert!(
+        out.contains(&format!(
+            "kept verify-target/{}: in use by pid {}",
+            key("held"),
+            sleeper.pid()
+        )),
+        "{out}"
+    );
+    assert!(out.contains("removed 1 of 3 entries"), "{out}");
+    assert!(!f.has_seed("unused"));
+    assert!(f.has_seed("held") && f.has_seed("recent"));
 }
 
 #[test]

@@ -6,6 +6,7 @@
 //! capsule carries, runs in the same no-network verifier sandbox `cowproof run` uses
 //! ([`verifier_runner`] is the one constructor both call).
 
+use crate::compile_cache;
 use anyhow::{Context, Result, anyhow, bail};
 use clap::Parser;
 use cowproof_core::{PORT_CLASS, class_limit_at_commit, get_slot_dir, port_base_for_slot};
@@ -26,6 +27,7 @@ use cowproof_run::{
     fetch_proxy::Resolver,
     lane_tmp, link_dependency_cache,
     runtime_dirs::{self, Protected, RUNTIME_DIRS_ENV, RuntimeDir},
+    verify_target,
 };
 use std::fs;
 use std::io::Write;
@@ -56,7 +58,14 @@ outbound network; or `none`) when it is absent, and mounts it read-only for the 
 (node_modules appears in the tree, read-only). A Gemfile.lock is fetched as `.gem` files by `gem \
 fetch` (no Gemfile is evaluated and `bundle` is not run; the tool is $COWPROOF_GEM or the first on \
 PATH), which appear as vendor/cache, read-only, and the verifier runs `bundle install --local` \
-once ($COWPROOF_BUNDLE or the first on PATH) before the first check.")]
+once ($COWPROOF_BUNDLE or the first on PATH) before the first check.
+
+Compile cache: for a base commit with a Cargo.toml at its root the verifier compiles the BASE \
+commit's tree once, with `cargo test --workspace --locked --offline --no-run` in the same \
+sandbox, into <cache root>/verify-target/<key> (never from the capsule's patches, and never \
+written by a check), and gives the checks a private copy of that target directory as \
+CARGO_TARGET_DIR (copy-on-write where the filesystem has it). A seed that cannot be built \
+changes nothing: the checks run as without one. $COWPROOF_VERIFY_CACHE=off turns it off.")]
 pub struct VerifyArgs {
     /// The capsule directory (`control/capsule` of a lane)
     capsule_dir: PathBuf,
@@ -153,7 +162,7 @@ pub(crate) struct Rebuild {
 impl Rebuild {
     /// Build the tree in `tree`, an empty directory. The registry configuration is the
     /// tree's BEFORE `lane.patch` (D14): a patch that touches it changes nothing here.
-    fn build(&self, tree: &Path) -> Result<()> {
+    pub(crate) fn build(&self, tree: &Path) -> Result<()> {
         git(
             None,
             &["clone", "--quiet", "--no-checkout", "--"],
@@ -392,6 +401,15 @@ pub async fn verify_capsule(args: VerifyArgs) -> Result<i32> {
     if !args.repo.is_dir() {
         bail!("repository does not exist: {}", args.repo.display());
     }
+    // Read once, before anything is created: a typo is refused, never taken for `on`.
+    let compile_cache_mode = match verify_target::Mode::from_env() {
+        Ok(mode) => mode,
+        Err(e) => {
+            eprintln!("refused: {e:#}");
+            eprintln!("nothing was started");
+            return Ok(4);
+        }
+    };
     let capsule_dir = args.capsule_dir.canonicalize()?;
     let repo = args.repo.canonicalize()?;
     let real_home =
@@ -534,6 +552,43 @@ pub async fn verify_capsule(args: VerifyArgs) -> Result<i32> {
         }
         None => None,
     };
+
+    // The verifier's compile cache (R3): a private copy of the base commit's seed, made now
+    // that the slots are held, before the first check. A capsule `verify` is about to refuse
+    // gets none.
+    if let Some(capsule) = &capsule {
+        let (with_cache, record) = compile_cache::attach(
+            runner,
+            &compile_cache::Request {
+                mode: compile_cache_mode,
+                repo: &repo,
+                base_commit: &capsule.base_commit,
+                base_tree_hash: &capsule.base_tree_hash,
+                layout: &layout,
+                deps: deps_dir.as_deref(),
+                runtime: &runtime,
+                groups: None,
+                verify_dir: &verify_dir,
+                timeout: options.default_timeout,
+            },
+        )
+        .await;
+        runner = with_cache;
+        // A seed in use, or one that was wanted and could not be made, is said; the rest
+        // changes nothing the director sees.
+        match record.status.as_str() {
+            "hit" | "built" => eprintln!(
+                "compile cache: {} ({})",
+                record.status,
+                record.copy.as_deref().unwrap_or("")
+            ),
+            "failed" => eprintln!(
+                "compile cache: failed, the checks ran without a seed: {}",
+                record.note.as_deref().unwrap_or("")
+            ),
+            _ => {}
+        }
+    }
 
     let code = match verify(&capsule_dir, &repo, &verify_dir, &runner, options).await {
         Ok(report) => {

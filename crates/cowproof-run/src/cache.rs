@@ -32,11 +32,17 @@
 //!   `<pid>-<digits>[-prune]`. Even in a marked root a prune lists and removes only names of
 //!   that shape.
 //!
-//! Everything here removes things only under `<root>/deps` and `<root>/deps-work`, never
-//! follows a symlink (a link is measured as nothing and removed as a link), and refuses a
+//! * `verify-target/<key>/` is a **verifier compile-cache seed** ([`crate::verify_target`]): the
+//!   cargo target directory a build of a base commit left, in `verify-target/<key>/target`. It
+//!   is an entry like a dependency entry, with the same `.last-used` marker and per-pid leases
+//!   (taken by [`claim`]), and it is listed, measured and pruned by the same code, by the same
+//!   rules. Its private build directory is a `deps-work/<pid>-<nanos>` like a fetch's.
+//!
+//! Everything here removes things only under `<root>/deps`, `<root>/verify-target` and
+//! `<root>/deps-work`, never follows a symlink (a link is measured as nothing and removed as a link), and refuses a
 //! root that is empty, relative, `/` or the home directory ([`check_root`]).
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use std::collections::BTreeMap;
 use std::fs;
 use std::io;
@@ -52,6 +58,40 @@ pub const LEASES: &str = "leases";
 pub const DEPS: &str = "deps";
 /// The directory of private work directories under the root.
 pub const DEPS_WORK: &str = "deps-work";
+/// The directory of verifier compile-cache seeds under the root.
+pub const VERIFY_TARGET: &str = "verify-target";
+
+/// A kind of cache entry: both live under the cache root, are named by a 64-hex key, carry a
+/// use marker and leases, and are pruned together.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Area {
+    /// A fetched dependency cache, `deps/<key>`.
+    Deps,
+    /// A verifier compile-cache seed, `verify-target/<key>`.
+    VerifyTarget,
+}
+
+impl Area {
+    /// Every kind, in listing order.
+    pub const ALL: [Area; 2] = [Area::Deps, Area::VerifyTarget];
+
+    /// The directory under the cache root.
+    pub fn dir(self) -> &'static str {
+        match self {
+            Area::Deps => DEPS,
+            Area::VerifyTarget => VERIFY_TARGET,
+        }
+    }
+
+    /// How a report names an entry of this kind: the bare key for a dependency entry (as it
+    /// always was), `verify-target/<key>` for a seed.
+    pub fn label(self, key: &str) -> String {
+        match self {
+            Area::Deps => key.to_string(),
+            Area::VerifyTarget => format!("{VERIFY_TARGET}/{key}"),
+        }
+    }
+}
 
 /// The ownership marker at the cache root.
 pub const MARKER: &str = ".cowproof-cache";
@@ -129,8 +169,8 @@ fn has_marker(root: &Path) -> bool {
 }
 
 /// Refuse a root cowproof did not make. Fine: a root with the marker; a root with no
-/// `deps/` and no `deps-work/` entries at all (nothing there to lose); a root without the
-/// marker whose every `deps/` name is a key and every `deps-work/` name is a work name (an
+/// `deps/`, `verify-target/` and `deps-work/` entries at all (nothing there to lose); a root without the
+/// marker whose every `deps/` and `verify-target/` name is a key and every `deps-work/` name is a work name (an
 /// older cowproof's cache), which gets the marker now. Anything else is an error that says
 /// how to make a cache there.
 pub fn require_owned(root: &Path, home: &Path) -> Result<()> {
@@ -142,6 +182,7 @@ pub fn require_owned(root: &Path, home: &Path) -> Result<()> {
     let mut any = false;
     for (sub, ok) in [
         (DEPS, is_key as fn(&str) -> bool),
+        (VERIFY_TARGET, is_key as fn(&str) -> bool),
         (DEPS_WORK, |n: &str| work_pid(n).is_some()),
     ] {
         let dir = root.join(sub);
@@ -172,6 +213,38 @@ pub fn require_owned(root: &Path, home: &Path) -> Result<()> {
             root.display()
         ),
     }
+}
+
+/// Make the cache root ready for a new entry of `area`: create `deps-work/` and the area's
+/// directory, mark the root as cowproof's, and sweep the stale work directories of
+/// interrupted runs. The one place a cache root is first created, for a dependency fetch
+/// and for a compile-cache seed alike. Ownership is asked first and the sweep is skipped in
+/// a root cowproof did not make (the entry is still made there), so a root that holds things
+/// cowproof did not make is never swept.
+pub fn prepare(root: &Path, home: &Path, area: Area, alive: Alive) -> Result<()> {
+    let owned = require_owned(root, home);
+    fs::create_dir_all(root.join(DEPS_WORK)).context("creating the work directory")?;
+    fs::create_dir_all(root.join(area.dir()))
+        .with_context(|| format!("creating the {} directory", area.dir()))?;
+    write_marker(root).context("marking the cache root")?;
+    match owned {
+        Ok(()) => {
+            let _ = remove_stale_work(root, home, alive);
+        }
+        Err(e) => eprintln!("warning: not sweeping stale work directories: {e:#}"),
+    }
+    Ok(())
+}
+
+/// A new private work directory `deps-work/<pid>-<nanos>` of this process (the name a stale
+/// sweep recognises), created empty. Remove it when done.
+pub fn new_work_dir(root: &Path) -> Result<PathBuf> {
+    let stamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+    let work = root
+        .join(DEPS_WORK)
+        .join(format!("{}-{stamp}", std::process::id()));
+    fs::create_dir(&work).context("creating the work directory")?;
+    Ok(work)
 }
 
 /// A lease file's pid: its name.
@@ -256,6 +329,8 @@ pub fn set_last_used(entry: &Path, when: SystemTime) -> io::Result<()> {
 /// One cache entry as a prune sees it.
 #[derive(Debug, Clone)]
 pub struct Entry {
+    /// Which kind of entry this is.
+    pub area: Area,
     /// The directory name: the cache key.
     pub key: String,
     pub path: PathBuf,
@@ -297,18 +372,27 @@ fn is_plain_dir(path: &Path) -> bool {
     fs::symlink_metadata(path).is_ok_and(|m| m.is_dir())
 }
 
-/// Every entry under `<root>/deps`, oldest use first. `deps` that is a symlink is refused.
+/// Every entry under `<root>/deps` and `<root>/verify-target`, oldest use first. An area
+/// directory that is a symlink is refused.
 pub fn list(root: &Path, home: &Path, alive: Alive) -> Result<Vec<Entry>> {
     require_owned(root, home)?;
-    let deps = root.join(DEPS);
-    match fs::symlink_metadata(&deps) {
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+    let mut entries = Vec::new();
+    for area in Area::ALL {
+        list_area(root, area, alive, &mut entries)?;
+    }
+    entries.sort_by(|a, b| (a.last_used, &a.key).cmp(&(b.last_used, &b.key)));
+    Ok(entries)
+}
+
+fn list_area(root: &Path, area: Area, alive: Alive, entries: &mut Vec<Entry>) -> Result<()> {
+    let dir = root.join(area.dir());
+    match fs::symlink_metadata(&dir) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(e) => return Err(e.into()),
-        Ok(m) if !m.is_dir() => bail!("{} is not a plain directory", deps.display()),
+        Ok(m) if !m.is_dir() => bail!("{} is not a plain directory", dir.display()),
         Ok(_) => {}
     }
-    let mut entries = Vec::new();
-    for item in fs::read_dir(&deps)?.flatten() {
+    for item in fs::read_dir(&dir)?.flatten() {
         let path = item.path();
         let key = item.file_name().to_string_lossy().into_owned();
         // Only what has a cache key's name is cowproof's, marker or not.
@@ -337,6 +421,7 @@ pub fn list(root: &Path, home: &Path, alive: Alive) -> Result<Vec<Entry>> {
             .modified()
             .unwrap_or(UNIX_EPOCH);
         entries.push(Entry {
+            area,
             key,
             bytes: if plain { dir_bytes(&path) } else { 0 },
             link: !plain,
@@ -346,8 +431,14 @@ pub fn list(root: &Path, home: &Path, alive: Alive) -> Result<Vec<Entry>> {
             stale_leases,
         });
     }
-    entries.sort_by(|a, b| (a.last_used, &a.key).cmp(&(b.last_used, &b.key)));
-    Ok(entries)
+    Ok(())
+}
+
+impl Entry {
+    /// How a report names this entry ([`Area::label`]).
+    pub fn label(&self) -> String {
+        self.area.label(&self.key)
+    }
 }
 
 /// What `cowproof cache` prints: the cache at a glance.
@@ -392,6 +483,7 @@ pub enum Reason {
 /// An entry a prune removed (or, in a dry run, would remove).
 #[derive(Debug, Clone)]
 pub struct Removed {
+    pub area: Area,
     pub key: String,
     pub bytes: u64,
     pub last_used: SystemTime,
@@ -403,13 +495,14 @@ pub struct Removed {
 pub struct PruneReport {
     pub dry_run: bool,
     pub removed: Vec<Removed>,
-    /// Entries that would otherwise go but a live process is using: `(key, pids)`.
+    /// Entries that would otherwise go but a live process is using: `(label, pids)`
+    /// ([`Entry::label`]).
     pub in_use: Vec<(String, Vec<u32>)>,
     /// Stale work directories removed (or that would be).
     pub work_removed: Vec<String>,
     /// Work directories of live processes, left alone.
     pub work_kept: Vec<String>,
-    /// Entries that could not be removed: `(key, why)`.
+    /// Entries that could not be removed: `(label, why)`.
     pub failed: Vec<(String, String)>,
     pub bytes_before: u64,
     /// How many entries the cache held before.
@@ -423,9 +516,10 @@ impl PruneReport {
     }
 }
 
-/// Remove the unused part of the cache under `root` (see the module comment): entries
-/// not used within `older_than`, then least recently used entries until `max_bytes` fits,
-/// skipping any entry a live process holds a lease on, then every stale work directory.
+/// Remove the unused part of the cache under `root` (see the module comment): entries of
+/// either kind not used within `older_than`, then least recently used entries until
+/// `max_bytes` fits, skipping any entry a live process holds a lease on, then every stale
+/// work directory.
 pub fn prune(root: &Path, home: &Path, opts: &PruneOptions, alive: Alive) -> Result<PruneReport> {
     let entries = list(root, home, alive)?;
     let mut report = PruneReport {
@@ -471,7 +565,7 @@ pub fn prune(root: &Path, home: &Path, opts: &PruneOptions, alive: Alive) -> Res
             // budget, so the director sees why an old entry stays.
             let idle = opts.now.duration_since(e.last_used).unwrap_or_default();
             if !e.live.is_empty() && idle >= opts.older_than {
-                report.in_use.push((e.key.clone(), e.live.clone()));
+                report.in_use.push((e.label(), e.live.clone()));
             }
             if !opts.dry_run {
                 for stale in &e.stale_leases {
@@ -481,6 +575,7 @@ pub fn prune(root: &Path, home: &Path, opts: &PruneOptions, alive: Alive) -> Res
             continue;
         };
         let removed = Removed {
+            area: e.area,
             key: e.key.clone(),
             bytes: e.bytes,
             last_used: e.last_used,
@@ -492,8 +587,8 @@ pub fn prune(root: &Path, home: &Path, opts: &PruneOptions, alive: Alive) -> Res
         }
         match remove_entry(root, e, alive) {
             Ok(Taken::Removed) => report.removed.push(removed),
-            Ok(Taken::InUse(pids)) => report.in_use.push((e.key.clone(), pids)),
-            Err(why) => report.failed.push((e.key.clone(), format!("{why:#}"))),
+            Ok(Taken::InUse(pids)) => report.in_use.push((e.label(), pids)),
+            Err(why) => report.failed.push((e.label(), format!("{why:#}"))),
         }
     }
     let work = sweep_work(root, alive, opts.dry_run)?;
@@ -646,6 +741,19 @@ mod tests {
             fs::write(dir.join("cargo/registry/crate"), vec![b'x'; bytes]).unwrap();
             set_last_used(&dir, self.now - DAY * days as u32).unwrap();
             dir
+        }
+
+        /// A compile-cache seed of `bytes` bytes, last used `days` days ago.
+        fn seed(&self, label: &str, bytes: usize, days: u64) -> PathBuf {
+            let dir = self.root.join(VERIFY_TARGET).join(key(label));
+            fs::create_dir_all(dir.join("target/debug")).unwrap();
+            fs::write(dir.join("target/debug/artifact"), vec![b'x'; bytes]).unwrap();
+            set_last_used(&dir, self.now - DAY * days as u32).unwrap();
+            dir
+        }
+
+        fn has_seed(&self, label: &str) -> bool {
+            self.root.join(VERIFY_TARGET).join(key(label)).exists()
         }
 
         fn lease(&self, dir: &Path, pid: u32) {
@@ -1064,5 +1172,74 @@ mod tests {
         for bad in ["123", "123-", "123-abc", "0-1", "x-1", "-1", "123-1-other"] {
             assert_eq!(work_pid(bad), None, "{bad}");
         }
+    }
+    #[test]
+    fn an_unused_seed_is_pruned_by_the_same_rules_and_a_leased_one_is_kept() {
+        let c = Cache::new();
+        c.seed("old-seed", 300, 40);
+        let held = c.seed("held-seed", 300, 40);
+        c.lease(&held, LIVE);
+        c.seed("recent-seed", 300, 2);
+        c.entry("old-deps", 100, 40);
+        let o = c.opts(30);
+        let overview = overview(&c.root, &c.home, &alive).unwrap();
+        assert_eq!(overview.entries, 4, "both kinds are counted");
+        assert_eq!(overview.bytes, 300 * 3 + 100);
+
+        let report = c.prune(&o);
+        let mut gone: Vec<(Area, String)> = report
+            .removed
+            .iter()
+            .map(|r| (r.area, label(&r.key)))
+            .collect();
+        gone.sort_by_key(|(_, l)| l.clone());
+        assert_eq!(
+            gone,
+            [
+                (Area::Deps, "old-deps".to_string()),
+                (Area::VerifyTarget, "old-seed".to_string())
+            ]
+        );
+        assert!(!c.has_seed("old-seed") && !c.has("old-deps"));
+        assert!(c.has_seed("held-seed"), "a live lease protects a seed");
+        assert!(c.has_seed("recent-seed"));
+        assert_eq!(
+            report.in_use,
+            [(format!("verify-target/{}", key("held-seed")), vec![LIVE])]
+        );
+        assert!(
+            fs::read_dir(c.root.join(DEPS_WORK))
+                .map(|r| r.count())
+                .unwrap_or(0)
+                == 0,
+            "the removed seed left nothing in deps-work"
+        );
+    }
+
+    #[test]
+    fn a_seed_whose_only_lease_is_dead_is_pruned_and_the_size_pass_counts_seeds() {
+        let c = Cache::new();
+        let stale = c.seed("stale", 500, 5);
+        c.lease(&stale, DEAD);
+        c.seed("a-newest", 500, 1);
+        let mut o = c.opts(30);
+        o.max_bytes = Some(500);
+        let report = c.prune(&o);
+        assert_eq!(keys(&report), ["stale"]);
+        assert_eq!(report.removed[0].reason, Reason::Size);
+        assert!(!c.has_seed("stale") && c.has_seed("a-newest"));
+    }
+
+    #[test]
+    fn an_unmarked_root_with_a_foreign_name_in_verify_target_is_not_adopted() {
+        let t = tmp();
+        let root = t.path().join("cache");
+        fs::create_dir_all(root.join(VERIFY_TARGET).join("not-a-key")).unwrap();
+        let err = require_owned(&root, &t.path().join("home")).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("verify-target/not-a-key"),
+            "{err:#}"
+        );
+        assert!(!root.join(MARKER).exists());
     }
 }
