@@ -33,13 +33,28 @@ refused. Equivalent data prints identical bytes from the Node adapter.
 Pinned when set (unset leaves the module alone):
   PORTKIT_NOW   an RFC 3339 time: time.time(), time.time_ns(), time.localtime()/gmtime()/
                 ctime()/strftime() without a time, datetime.now()/utcnow()/today() and
-                date.today() return it.
-  PORTKIT_SEED  an integer: random.seed(seed) for the module-level random functions.
+                date.today() return it. time.monotonic, monotonic_ns, perf_counter and
+                perf_counter_ns start at 0. time.sleep(s) does not sleep: it advances the
+                monotonic clocks and the wall clock by s, so a pinned clock moves only when the
+                module sleeps (a busy-wait on it never ends). uuid.uuid1() is built from the
+                pinned time, a fixed node (01:00:00:00:00:01) and clock_seq 0; a call made at
+                the same pinned instant as the last gets the next 100 ns tick, so values differ.
+                asyncio keeps its own real clock, so asyncio.sleep still waits.
+  PORTKIT_SEED  an integer: random.seed(seed) for the module-level random functions. One byte
+                stream also feeds os.urandom, secrets (token_bytes, token_hex, token_urlsafe,
+                randbelow, choice), random.SystemRandom and uuid.uuid4: block i is
+                SHA-256(b"portkit-bytes\\0" + decimal(seed) + b"\\0" + i as 8 bytes big-endian),
+                consumed byte by byte, so the Node adapter draws the same bytes for the same
+                seed. When numpy can be imported, numpy.random.seed(seed % 2**32) is called and
+                numpy.random.default_rng() without a seed gets a seed derived from it (the n-th
+                such generator is default_rng([seed % 2**32, n])). Without numpy nothing happens.
   TZ            set to UTC when the environment has none.
   PYTHONHASHSEED  set to 0 when the environment has none, by restarting once, so set and dict
                   iteration of str is repeatable.
-Not pinned: time.monotonic and perf_counter, sleep, file times, random.Random() instances made
-without a seed, SystemRandom, secrets, uuid4, os.urandom, numpy.
+Not pinned: file times, process_time and thread_time, uuid.uuid6/7/8 beyond the pinned clock and
+bytes above, numpy.random.RandomState() made without a seed, generators a module seeds from its
+own entropy, native extensions, and anything that waits on a real clock (threads, sockets,
+asyncio).
 
 Anything the module writes to stdout while it runs goes to stderr, so it cannot corrupt the result.
 Python 3.12 changed sum() of floats to compensated summation: pin the Python version of a
@@ -60,12 +75,16 @@ if (
     os.execv(sys.executable, [sys.executable, os.path.abspath(__file__)] + sys.argv[1:])
 
 import asyncio
+import asyncio.base_events
 import calendar
 import datetime
+import hashlib
 import importlib
 import importlib.util
 import inspect
 import json
+import math
+import operator
 import random
 import re
 import time
@@ -106,16 +125,54 @@ def _pin_clock(text):
     except ValueError:
         _fail("PORTKIT_NOW must be an RFC 3339 time such as 2026-01-02T03:04:05Z, got %r" % text)
     epoch = seconds + micro / 1e6
+    base_ns = seconds * 1000000000 + micro * 1000
     utc = datetime.timezone.utc
+    slept = [0]  # nanoseconds the pinned sleep has advanced the clocks by
+
+    def wall():
+        return epoch + slept[0] / 1e9
+
+    # asyncio schedules by time.monotonic: keep its clock real, or call_later never comes due.
+    real_monotonic, real_monotonic_ns = time.monotonic, time.monotonic_ns
+    real_perf_counter, real_perf_counter_ns = time.perf_counter, time.perf_counter_ns
+
+    class _LoopTime:
+        monotonic = staticmethod(real_monotonic)
+        monotonic_ns = staticmethod(real_monotonic_ns)
+        perf_counter = staticmethod(real_perf_counter)
+        perf_counter_ns = staticmethod(real_perf_counter_ns)
+
+        def __getattr__(self, name):
+            return getattr(time, name)
+
+    if getattr(asyncio.base_events, "time", None) is time:
+        asyncio.base_events.time = _LoopTime()
+
+    def sleep(secs):
+        if isinstance(secs, bool) or not isinstance(secs, (int, float)):
+            raise TypeError("'%s' object cannot be interpreted as an integer or float" % type(secs).__name__)
+        if secs != secs:
+            raise ValueError("Invalid value NaN (not a number)")
+        if secs < 0:
+            raise ValueError("sleep length must be non-negative")
+        if math.isinf(secs):
+            raise OverflowError("timestamp too large to convert to C _PyTime_t")
+        slept[0] += int(round(secs * 1e9))
 
     real_localtime, real_gmtime = time.localtime, time.gmtime
     real_ctime, real_strftime = time.ctime, time.strftime
-    time.time = lambda: epoch
-    time.time_ns = lambda: seconds * 1000000000 + micro * 1000
-    time.localtime = lambda secs=None: real_localtime(epoch if secs is None else secs)
-    time.gmtime = lambda secs=None: real_gmtime(epoch if secs is None else secs)
-    time.ctime = lambda secs=None: real_ctime(epoch if secs is None else secs)
-    time.strftime = lambda fmt, t=None: real_strftime(fmt, real_localtime(epoch) if t is None else t)
+    time.time = wall
+    time.time_ns = lambda: base_ns + slept[0]
+    time.monotonic = lambda: slept[0] / 1e9
+    time.monotonic_ns = lambda: slept[0]
+    time.perf_counter = time.monotonic
+    time.perf_counter_ns = time.monotonic_ns
+    time.sleep = sleep
+    time.localtime = lambda secs=None: real_localtime(wall() if secs is None else secs)
+    time.gmtime = lambda secs=None: real_gmtime(wall() if secs is None else secs)
+    time.ctime = lambda secs=None: real_ctime(wall() if secs is None else secs)
+    time.strftime = lambda fmt, t=None: real_strftime(fmt, real_localtime(wall()) if t is None else t)
+    _pin_uuid1(lambda: base_ns + slept[0])
 
     # isinstance against the pinned classes still answers for the real ones.
     class _DateMeta(type):
@@ -129,29 +186,160 @@ def _pin_clock(text):
     class PinnedDate(_REAL_DATE, metaclass=_DateMeta):
         @classmethod
         def today(cls):
-            return cls.fromtimestamp(epoch)
+            return cls.fromtimestamp(wall())
 
     class PinnedDatetime(_REAL_DATETIME, metaclass=_DatetimeMeta):
         @classmethod
         def now(cls, tz=None):
-            return cls.fromtimestamp(epoch, tz)
+            return cls.fromtimestamp(wall(), tz)
 
         @classmethod
         def utcnow(cls):
-            return cls.fromtimestamp(epoch, utc).replace(tzinfo=None)
+            return cls.fromtimestamp(wall(), utc).replace(tzinfo=None)
 
         @classmethod
         def today(cls):
-            return cls.fromtimestamp(epoch)
+            return cls.fromtimestamp(wall())
 
     datetime.date = PinnedDate
     datetime.datetime = PinnedDatetime
 
 
+# The fixed node of the pinned uuid1: the multicast bit is set, as RFC 4122 asks of a random node.
+_UUID1_NODE = 0x010000000001
+_UUID_EPOCH_TICKS = 0x01B21DD213814000  # 100 ns ticks from 1582-10-15 to 1970-01-01
+
+
+def _pin_uuid1(now_ns):
+    import uuid
+
+    last = [None]
+
+    def uuid1(node=None, clock_seq=None):
+        ticks = now_ns() // 100 + _UUID_EPOCH_TICKS
+        if last[0] is not None and ticks <= last[0]:
+            ticks = last[0] + 1
+        last[0] = ticks
+        seq = 0 if clock_seq is None else clock_seq
+        fields = (
+            ticks & 0xFFFFFFFF,
+            (ticks >> 32) & 0xFFFF,
+            (ticks >> 48) & 0x0FFF,
+            (seq >> 8) & 0x3F,
+            seq & 0xFF,
+            _UUID1_NODE if node is None else node,
+        )
+        return uuid.UUID(fields=fields, version=1)
+
+    uuid.uuid1 = uuid1
+
+
+class _Stream:
+    """The pinned byte stream: SHA-256 in counter mode over the seed."""
+
+    def __init__(self, seed):
+        self._prefix = b"portkit-bytes\0" + str(seed).encode("ascii") + b"\0"
+        self._counter = 0
+        self._buffer = b""
+
+    def read(self, size):
+        while len(self._buffer) < size:
+            self._buffer += hashlib.sha256(self._prefix + self._counter.to_bytes(8, "big")).digest()
+            self._counter += 1
+        out, self._buffer = self._buffer[:size], self._buffer[size:]
+        return out
+
+
+def _pin_entropy(seed):
+    import base64
+    import secrets
+    import uuid
+
+    stream = _Stream(seed)
+
+    def urandom(size):
+        size = operator.index(size)
+        if size < 0:
+            raise ValueError("negative argument not allowed")
+        return stream.read(size)
+
+    class SystemRandom(random.Random):
+        def random(self):
+            return (int.from_bytes(stream.read(7), "big") >> 3) * (2.0 ** -53)
+
+        def getrandbits(self, k):
+            k = operator.index(k)
+            if k < 0:
+                raise ValueError("number of bits must be non-negative")
+            size = (k + 7) // 8
+            return int.from_bytes(stream.read(size), "big") >> (size * 8 - k)
+
+        def randbytes(self, n):
+            return stream.read(operator.index(n))
+
+        def seed(self, *args, **kwargs):
+            return None
+
+        def getstate(self):
+            raise NotImplementedError("System entropy source does not have state.")
+
+        setstate = getstate
+
+    system = SystemRandom()
+    entropy = getattr(secrets, "DEFAULT_ENTROPY", 32)
+
+    def token_bytes(nbytes=None):
+        return stream.read(operator.index(entropy if nbytes is None else nbytes))
+
+    def randbelow(exclusive_upper_bound):
+        if exclusive_upper_bound <= 0:
+            raise ValueError("Upper bound must be positive.")
+        return system.randrange(exclusive_upper_bound)
+
+    os.urandom = urandom
+    random.SystemRandom = SystemRandom
+    secrets.SystemRandom = SystemRandom
+    secrets._sysrand = system
+    secrets.token_bytes = token_bytes
+    secrets.token_hex = lambda nbytes=None: token_bytes(nbytes).hex()
+    secrets.token_urlsafe = lambda nbytes=None: base64.urlsafe_b64encode(token_bytes(nbytes)).rstrip(b"=").decode("ascii")
+    secrets.randbelow = randbelow
+    secrets.choice = system.choice
+    uuid.uuid4 = lambda: uuid.UUID(bytes=stream.read(16), version=4)
+
+
+def _pin_numpy(seed):
+    """Seed numpy when it can be imported; do nothing, and never fail, when it cannot."""
+    try:
+        if importlib.util.find_spec("numpy") is None:
+            return
+        import numpy
+        import numpy.random
+
+        word = seed % 2**32
+        numpy.random.seed(word)
+        real_default_rng = numpy.random.default_rng
+        unseeded = [0]
+
+        def default_rng(seed=None):
+            if seed is None:
+                n = unseeded[0]
+                unseeded[0] += 1
+                return real_default_rng([word, n])
+            return real_default_rng(seed)
+
+        numpy.random.default_rng = default_rng
+    except Exception:
+        pass
+
+
 def _pin_random(text):
     if not re.match(r"^-?\d+$", text):
         _fail("PORTKIT_SEED must be an integer, got %r" % text)
-    random.seed(int(text))
+    seed = int(text)
+    random.seed(seed)
+    _pin_entropy(seed)
+    _pin_numpy(seed)
 
 
 # ---- canonical output ----------------------------------------------------------------------

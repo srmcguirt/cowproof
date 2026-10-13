@@ -28,10 +28,12 @@ mod workspace;
 use common::{Lane, fork_lock, run_checks, sandbox_available, text, var_tmp};
 use cowproof_prove::Capsule;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+use std::time::Instant;
 
 // ---- paths ---------------------------------------------------------------------------------
 
@@ -594,6 +596,11 @@ fn the_clock_and_randomness_are_pinned_when_asked_and_left_alone_otherwise() {
         assert_eq!(a.stdout, b.stdout);
         assert_ne!(a.stdout, c.stdout);
         assert_eq!(one_json_line(&a).as_array().unwrap().len(), 3);
+        // The stream is part of every fixture captured so far: mulberry32 from the seed, fixed.
+        assert_eq!(
+            one_json_line(&a),
+            json!([0.6011037519201636, 0.44829055899754167, 0.8524657934904099])
+        );
         let free1 = NODE.tool(NODE_CLOCK, "dice", json!({}), &[]);
         let free2 = NODE.tool(NODE_CLOCK, "dice", json!({}), &[]);
         assert_ne!(free1.stdout, free2.stdout);
@@ -617,13 +624,463 @@ fn the_clock_and_randomness_are_pinned_when_asked_and_left_alone_otherwise() {
         // random.seed(42): the first draw of Python's generator, fixed by its documentation.
         let a =
             one_json_line(&PYTHON.tool(PYTHON_CLOCK, "dice", json!({}), &[("PORTKIT_SEED", "42")]));
-        assert_eq!(a[0], json!(0.6394267984578837));
+        assert_eq!(
+            a,
+            json!([0.6394267984578837, 0.025010755222666936, 0.27502931836911926])
+        );
         let b = PYTHON.tool(PYTHON_CLOCK, "dice", json!({}), &[("PORTKIT_SEED", "42")]);
         assert_eq!(one_json_line(&b), a);
         let free1 = PYTHON.tool(PYTHON_CLOCK, "dice", json!({}), &[]);
         let free2 = PYTHON.tool(PYTHON_CLOCK, "dice", json!({}), &[]);
         assert_ne!(free1.stdout, free2.stdout);
     }
+}
+
+// ---- entropy and monotonic clocks ------------------------------------------------------------
+
+/// The first `len` bytes of the pinned byte stream, derived here from its documentation:
+/// SHA-256(b"portkit-bytes\0" + decimal(seed) + b"\0" + block number as 8 bytes big-endian).
+fn stream_bytes(seed: &str, len: usize) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut block = 0u64;
+    while out.len() < len {
+        let mut h = Sha256::new();
+        h.update(b"portkit-bytes\0");
+        h.update(seed.as_bytes());
+        h.update(b"\0");
+        h.update(block.to_be_bytes());
+        out.extend_from_slice(&h.finalize());
+        block += 1;
+    }
+    out.truncate(len);
+    out
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// The v4 UUID that 16 bytes make: version and variant bits set.
+fn uuid_v4_of(seed: &str) -> String {
+    let mut b = stream_bytes(seed, 16);
+    b[6] = (b[6] & 0x0f) | 0x40;
+    b[8] = (b[8] & 0x3f) | 0x80;
+    let h = hex(&b);
+    format!(
+        "{}-{}-{}-{}-{}",
+        &h[..8],
+        &h[8..12],
+        &h[12..16],
+        &h[16..20],
+        &h[20..]
+    )
+}
+
+fn is_uuid_v4(s: &str) -> bool {
+    let b = s.as_bytes();
+    b.len() == 36
+        && [8, 13, 18, 23].iter().all(|&i| b[i] == b'-')
+        && b[14] == b'4'
+        && matches!(b[19], b'8' | b'9' | b'a' | b'b')
+        && s.chars()
+            .enumerate()
+            .all(|(i, c)| [8, 13, 18, 23].contains(&i) || matches!(c, '0'..='9' | 'a'..='f'))
+}
+
+/// Every key of `tool`'s object result: the same seed gives the same value, another seed gives a
+/// different one, and with no seed two captures differ. Returns the seed-42 result.
+fn each_source_is_pinned(kind: Kind, source: &str, tool: &str) -> Value {
+    let run = |envs: &[(&str, &str)]| one_json_line(&kind.tool(source, tool, json!({}), envs));
+    let a = run(&[("PORTKIT_SEED", "42")]);
+    let b = run(&[("PORTKIT_SEED", "42")]);
+    let c = run(&[("PORTKIT_SEED", "43")]);
+    let free1 = run(&[]);
+    let free2 = run(&[]);
+    let keys: Vec<&String> = a.as_object().unwrap().keys().collect();
+    assert!(keys.len() >= 6, "{keys:?}");
+    for key in keys {
+        assert_eq!(a[key], b[key], "{} {key}: same seed", kind.name);
+        assert_ne!(a[key], c[key], "{} {key}: another seed", kind.name);
+        assert_ne!(free1[key], free2[key], "{} {key}: no seed", kind.name);
+    }
+    a
+}
+
+const NODE_ENTROPY: &str = r#"
+import crypto, { randomBytes as named, randomUUID as namedUuid } from "node:crypto";
+const hex = (view) => Buffer.from(view.buffer, view.byteOffset, view.byteLength).toString("hex");
+export function entropy() {
+  return {
+    random_bytes: crypto.randomBytes(16).toString("hex"),
+    named_import: named(8).toString("hex"),
+    fill_sync: hex(crypto.randomFillSync(new Uint8Array(8))),
+    get_random_values: hex(crypto.getRandomValues(new Uint32Array(2))),
+    web_get_random_values: hex(globalThis.crypto.getRandomValues(new Uint8Array(8))),
+    random_uuid: crypto.randomUUID(),
+    named_uuid: namedUuid(),
+    web_random_uuid: globalThis.crypto.randomUUID(),
+    random_int: crypto.randomInt(281474976710655),
+    random_int_range: crypto.randomInt(100000000, 200000000),
+  };
+}
+export function first_uuid() { return crypto.randomUUID(); }
+export function first_bytes() { return crypto.randomBytes(16).toString("hex"); }
+export async function callbacks() {
+  const bytes = await new Promise((res, rej) => crypto.randomBytes(8, (e, b) => (e ? rej(e) : res(b.toString("hex")))));
+  const int = await new Promise((res, rej) => crypto.randomInt(5, 10, (e, n) => (e ? rej(e) : res(n))));
+  return { bytes, int, in_range: int >= 5 && int < 10 };
+}
+"#;
+
+const PYTHON_ENTROPY: &str = r#"
+import os, random, secrets, uuid
+from secrets import token_hex as imported_token_hex
+from uuid import uuid4 as imported_uuid4
+
+def entropy(request):
+    system = random.SystemRandom()
+    return {
+        "urandom": os.urandom(16).hex(),
+        "token_bytes": secrets.token_bytes(8).hex(),
+        "token_hex": secrets.token_hex(8),
+        "token_urlsafe": secrets.token_urlsafe(8),
+        "randbelow": secrets.randbelow(10**15),
+        "choice": secrets.choice(range(10**12)),
+        "system_random": system.random(),
+        "system_getrandbits": system.getrandbits(64),
+        "system_randint": system.randint(0, 10**15),
+        "uuid4": str(uuid.uuid4()),
+        "imported_token_hex": imported_token_hex(8),
+        "imported_uuid4": str(imported_uuid4()),
+    }
+
+def first_uuid(request):
+    return str(uuid.uuid4())
+
+def first_bytes(request):
+    return secrets.token_hex(16)
+
+def refusals(request):
+    out = {}
+    for name, call in [("randbelow", lambda: secrets.randbelow(0)), ("urandom", lambda: os.urandom(-1))]:
+        try:
+            call()
+            out[name] = "no error"
+        except ValueError as e:
+            out[name] = str(e)
+    return out
+"#;
+
+#[test]
+fn crypto_and_secrets_draw_one_seeded_stream_and_are_left_alone_unseeded() {
+    let golden_hex = hex(&stream_bytes("42", 16));
+    let golden_uuid = uuid_v4_of("42");
+    assert!(is_uuid_v4(&golden_uuid));
+    assert_eq!(golden_hex, "0278f48fa03dbb5fbc94c7f218641fae");
+    let mut seen = Vec::new();
+    if have("node") {
+        let a = each_source_is_pinned(NODE, NODE_ENTROPY, "entropy");
+        for key in ["random_uuid", "named_uuid", "web_random_uuid"] {
+            assert!(is_uuid_v4(a[key].as_str().unwrap()), "{key}: {}", a[key]);
+        }
+        let int = a["random_int_range"].as_u64().unwrap();
+        assert!((100_000_000..200_000_000).contains(&int), "{int}");
+        // The stream is the documented one: the first draw is the first bytes of block 0.
+        let first = |tool: &str| {
+            one_json_line(&NODE.tool(NODE_ENTROPY, tool, json!({}), &[("PORTKIT_SEED", "42")]))
+        };
+        assert_eq!(first("first_bytes"), json!(golden_hex));
+        assert_eq!(first("first_uuid"), json!(golden_uuid));
+        // randomBytes and randomInt with callbacks draw from it too.
+        let cb = |seed: &str| {
+            NODE.tool(NODE_ENTROPY, "callbacks", json!({}), &[("PORTKIT_SEED", seed)])
+        };
+        let (x, y, z) = (cb("42"), cb("42"), cb("43"));
+        assert_eq!(x.stdout, y.stdout);
+        assert_ne!(x.stdout, z.stdout);
+        assert_eq!(one_json_line(&x)["in_range"], true);
+        assert_eq!(one_json_line(&x)["bytes"], json!(golden_hex[..16]));
+        seen.push("node");
+    }
+    if have("python3") {
+        let a = each_source_is_pinned(PYTHON, PYTHON_ENTROPY, "entropy");
+        for key in ["uuid4", "imported_uuid4"] {
+            assert!(is_uuid_v4(a[key].as_str().unwrap()), "{key}: {}", a[key]);
+        }
+        assert_eq!(a["urandom"], json!(golden_hex));
+        let first = |tool: &str| {
+            one_json_line(&PYTHON.tool(PYTHON_ENTROPY, tool, json!({}), &[("PORTKIT_SEED", "42")]))
+        };
+        assert_eq!(first("first_bytes"), json!(golden_hex));
+        assert_eq!(first("first_uuid"), json!(golden_uuid));
+        // The pinned sources keep the real ones' refusals.
+        let refusals = one_json_line(&PYTHON.tool(
+            PYTHON_ENTROPY,
+            "refusals",
+            json!({}),
+            &[("PORTKIT_SEED", "42")],
+        ));
+        assert_eq!(refusals["randbelow"], "Upper bound must be positive.");
+        assert_eq!(refusals["urandom"], "negative argument not allowed");
+        seen.push("python");
+    }
+    // Both adapters draw the same bytes for the same seed (each file checked above against the
+    // stream derived here), and the seed is read as a number: 042 is 42.
+    if seen.len() == 2 {
+        let padded = one_json_line(&NODE.tool(
+            NODE_ENTROPY,
+            "first_bytes",
+            json!({}),
+            &[("PORTKIT_SEED", "042")],
+        ));
+        assert_eq!(padded, json!(golden_hex));
+    }
+}
+
+const PYTHON_UUID1: &str = r#"
+import uuid
+def ids(request):
+    a = uuid.uuid1()
+    b = uuid.uuid1()
+    return {"a": str(a), "b": str(b), "a_time": a.time, "b_time": b.time, "node": a.node,
+            "version": a.version, "variant": a.variant}
+"#;
+
+#[test]
+fn python_uuid1_is_built_from_the_pinned_clock_and_a_fixed_node() {
+    if !have("python3") {
+        return;
+    }
+    // 2026-01-02T01:04:05Z is 1767315845 s; UUID time counts 100 ns from 1582-10-15.
+    const NOW: &str = "2026-01-02T01:04:05Z";
+    let ticks = 1_767_315_845u64 * 10_000_000 + 0x01B2_1DD2_1381_4000;
+    let run = |envs: &[(&str, &str)]| PYTHON.tool(PYTHON_UUID1, "ids", json!({}), envs);
+    let a = run(&[("PORTKIT_NOW", NOW)]);
+    let b = run(&[("PORTKIT_NOW", NOW)]);
+    assert_eq!(a.stdout, b.stdout);
+    let v = one_json_line(&a);
+    assert_eq!(v["a_time"].as_u64(), Some(ticks));
+    assert_eq!(v["b_time"].as_u64(), Some(ticks + 1));
+    assert_eq!(v["node"].as_u64(), Some(0x0100_0000_0001));
+    assert_eq!(v["version"], 1);
+    assert_ne!(v["a"], v["b"]);
+    // Unpinned it is the real uuid1: two captures differ.
+    let free1 = run(&[]);
+    let free2 = run(&[]);
+    assert_ne!(free1.stdout, free2.stdout);
+}
+
+const PYTHON_MONOTONIC: &str = r#"
+import datetime, time
+
+def snap():
+    return [time.monotonic(), time.monotonic_ns(), time.perf_counter(), time.perf_counter_ns(),
+            time.time(), time.time_ns()]
+
+def mono(request):
+    a = snap()
+    time.sleep(1.5)
+    b = snap()
+    time.sleep(3600)
+    c = snap()
+    return {"a": a, "b": b, "c": c, "now": datetime.datetime.now().isoformat()}
+
+def refused(request):
+    out = []
+    for value in (-1, "1"):
+        try:
+            time.sleep(value)
+            out.append("no error")
+        except (TypeError, ValueError) as e:
+            out.append(type(e).__name__)
+    return out
+
+def real(request):
+    a = time.monotonic_ns()
+    time.sleep(0.05)
+    return {"a": a, "b": time.monotonic_ns(), "c": time.perf_counter()}
+"#;
+
+const PYTHON_ASYNC: &str = r#"
+import asyncio
+
+async def nap(request):
+    await asyncio.sleep(0.01)
+    return "done"
+"#;
+
+#[test]
+fn python_monotonic_clocks_start_at_zero_and_follow_the_pinned_sleep() {
+    if !have("python3") {
+        return;
+    }
+    const NOW: &str = "2026-01-02T01:04:05Z";
+    let started = Instant::now();
+    let out = PYTHON.tool(PYTHON_MONOTONIC, "mono", json!({}), &[("PORTKIT_NOW", NOW)]);
+    // An hour of pinned sleep takes no time at all.
+    assert!(started.elapsed().as_secs() < 30, "{:?}", started.elapsed());
+    let v = one_json_line(&out);
+    let check = |snap: &Value, secs: f64, ns: u64, wall: f64, wall_ns: u64| {
+        for i in [0, 2] {
+            assert_eq!(snap[i].as_f64(), Some(secs), "{snap}");
+        }
+        for i in [1, 3] {
+            assert_eq!(snap[i].as_u64(), Some(ns), "{snap}");
+        }
+        assert_eq!(snap[4].as_f64(), Some(wall), "{snap}");
+        assert_eq!(snap[5].as_u64(), Some(wall_ns), "{snap}");
+    };
+    check(&v["a"], 0.0, 0, 1767315845.0, 1_767_315_845_000_000_000);
+    check(&v["b"], 1.5, 1_500_000_000, 1767315846.5, 1_767_315_846_500_000_000);
+    check(&v["c"], 3601.5, 3_601_500_000_000, 1767319446.5, 1_767_319_446_500_000_000);
+    assert_eq!(v["now"], "2026-01-02T02:04:06.500000");
+    // Sleep keeps its refusals.
+    let refused = one_json_line(&PYTHON.tool(
+        PYTHON_MONOTONIC,
+        "refused",
+        json!({}),
+        &[("PORTKIT_NOW", NOW)],
+    ));
+    assert_eq!(refused, json!(["ValueError", "TypeError"]));
+    // asyncio keeps a real clock, so a pinned monotonic cannot hang its timers.
+    let nap = PYTHON.tool(PYTHON_ASYNC, "nap", json!({}), &[("PORTKIT_NOW", NOW)]);
+    assert_eq!(one_json_line(&nap), json!("done"));
+    // Without the pin the real clocks and the real sleep stay: not zero, and 50 ms really pass.
+    let real = one_json_line(&PYTHON.tool(PYTHON_MONOTONIC, "real", json!({}), &[]));
+    let (a, b) = (real["a"].as_u64().unwrap(), real["b"].as_u64().unwrap());
+    assert_ne!(a, 0);
+    assert!(b - a >= 50_000_000, "{a} {b}");
+    assert_ne!(real["c"].as_f64(), Some(0.0));
+}
+
+const NODE_MONOTONIC: &str = r#"
+import { setTimeout as sleepPromise } from "node:timers/promises";
+import { promisify } from "node:util";
+
+const snap = () => [performance.now(), process.hrtime(), Number(process.hrtime.bigint()), Date.now()];
+
+export async function clock() {
+  const a = snap();
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  const b = snap();
+  await sleepPromise(25);
+  const c = snap();
+  await promisify(setTimeout)(5);
+  await new Promise((resolve) => {
+    let n = 0;
+    const id = setInterval(() => { if (++n === 3) { clearInterval(id); resolve(); } }, 10);
+  });
+  const d = snap();
+  return { a, b, c, d, diff: process.hrtime(a[1]), origin: performance.timeOrigin };
+}
+
+export async function real() {
+  const a = performance.now();
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  return { a, b: performance.now(), h: Number(process.hrtime.bigint()) };
+}
+"#;
+
+#[test]
+fn node_monotonic_clocks_start_at_zero_and_follow_the_pinned_timers() {
+    if !have("node") {
+        return;
+    }
+    const NOW: &str = "2026-01-02T01:04:05Z";
+    const MS: u64 = 1_767_315_845_000;
+    let out = NODE.tool(NODE_MONOTONIC, "clock", json!({}), &[("PORTKIT_NOW", NOW)]);
+    let v = one_json_line(&out);
+    let step = |elapsed_ms: u64| {
+        json!([elapsed_ms, [0, elapsed_ms * 1_000_000], elapsed_ms * 1_000_000, MS + elapsed_ms])
+    };
+    assert_eq!(v["a"], step(0));
+    assert_eq!(v["b"], step(50));
+    assert_eq!(v["c"], step(75));
+    assert_eq!(v["d"], step(110));
+    assert_eq!(v["diff"], json!([0, 110_000_000]));
+    assert_eq!(v["origin"].as_u64(), Some(MS));
+    // Another run reads the same.
+    let again = NODE.tool(NODE_MONOTONIC, "clock", json!({}), &[("PORTKIT_NOW", NOW)]);
+    assert_eq!(out.stdout, again.stdout);
+    // Without the pin the real clocks stay: not zero, and the 50 ms timer really waits.
+    let real = one_json_line(&NODE.tool(NODE_MONOTONIC, "real", json!({}), &[]));
+    assert!(real["a"].as_f64().unwrap() > 0.0, "{real}");
+    assert!(real["b"].as_f64().unwrap() - real["a"].as_f64().unwrap() >= 45.0, "{real}");
+    assert_ne!(real["h"].as_f64(), Some(0.0));
+}
+
+const PYTHON_NUMPY: &str = r#"
+import numpy
+
+def draws(request):
+    g1 = numpy.random.default_rng()
+    g2 = numpy.random.default_rng()
+    return {
+        "legacy": numpy.random.rand(3).tolist(),
+        "expect_legacy": numpy.random.RandomState(42).rand(3).tolist(),
+        "rng1": g1.random(3).tolist(),
+        "rng2": g2.random(3).tolist(),
+        "explicit": numpy.random.default_rng(7).random(2).tolist(),
+        "expect_explicit": numpy.random.Generator(numpy.random.PCG64(7)).random(2).tolist(),
+    }
+"#;
+
+const PYTHON_PLAIN: &str = r#"
+import random
+def draw(request):
+    return random.random()
+"#;
+
+#[test]
+fn numpy_is_seeded_when_it_can_be_imported_and_never_fails_the_capture_when_it_cannot() {
+    if !have("python3") {
+        return;
+    }
+    // A numpy that fails to import must not fail the capture, seed or no seed.
+    let dir = PYTHON.module(PYTHON_PLAIN);
+    fs::write(
+        dir.path().join("numpy.py"),
+        "raise ImportError('numpy is not installed')\n",
+    )
+    .unwrap();
+    let request = json!({"tool": "draw", "input": {}}).to_string();
+    let broken = PYTHON.call(dir.path(), &["m.py"], &request, &[("PORTKIT_SEED", "42")]);
+    assert_eq!(one_json_line(&broken), json!(0.6394267984578837));
+
+    let importable = {
+        let _g = fork_lock();
+        Command::new("python3")
+            .args(["-c", "import numpy"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    };
+    if !importable {
+        eprintln!("SKIP: numpy is not importable here; the seeded-numpy assertions did not run");
+        return;
+    }
+    let run = |envs: &[(&str, &str)]| one_json_line(&PYTHON.tool(PYTHON_NUMPY, "draws", json!({}), envs));
+    let a = run(&[("PORTKIT_SEED", "42")]);
+    let b = run(&[("PORTKIT_SEED", "42")]);
+    let c = run(&[("PORTKIT_SEED", "43")]);
+    assert_eq!(a, b);
+    // The global generator is seeded with the seed itself.
+    assert_eq!(a["legacy"], a["expect_legacy"]);
+    assert_ne!(c["legacy"], c["expect_legacy"]);
+    assert_ne!(a["legacy"], c["legacy"]);
+    // A generator made without a seed is seeded, and each one differs from the last.
+    assert_ne!(a["rng1"], c["rng1"]);
+    assert_ne!(a["rng1"], a["rng2"]);
+    // A seed the module gives is its own.
+    assert_eq!(a["explicit"], a["expect_explicit"]);
+    // Unseeded numpy is left alone.
+    let free1 = run(&[]);
+    let free2 = run(&[]);
+    assert_ne!(free1["legacy"], free2["legacy"]);
+    assert_ne!(free1["rng1"], free2["rng1"]);
 }
 
 // ---- TypeScript ----------------------------------------------------------------------------
