@@ -26,6 +26,7 @@ pub mod prefix;
 pub mod proxy;
 pub mod runtime_dirs;
 pub mod stall;
+pub mod steps;
 pub mod stream;
 pub mod tools;
 pub mod wire;

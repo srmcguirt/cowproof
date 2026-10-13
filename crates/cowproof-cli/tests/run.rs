@@ -3467,6 +3467,40 @@ fn a_signal_while_the_lane_waits_for_a_ruling_ends_the_run_without_a_builder() {
     );
     assert_interrupted_cleanly(&h, status, &run);
     assert_eq!(h.launches(), 1);
+    // The runner names its slow steps: an exit that took a second or more is followed by a
+    // line with every step's time, and a faster one by none. (The recorded time is read
+    // before the line is written, so only the slow side is a certainty.)
+    if took >= SLOW_EXIT {
+        let line = slow_exit_line(&stderr)
+            .unwrap_or_else(|| panic!("the exit took {took:?} but no steps were named:\n{stderr}"));
+        for step in [
+            "raise the interrupt",
+            "remove the tools socket",
+            "write run.json",
+        ] {
+            assert!(line.contains(step), "no '{step}' in {line}");
+        }
+    }
+}
+
+/// The runner's `SLOW_EXIT`: an exit slower than this names its steps.
+const SLOW_EXIT: Duration = Duration::from_secs(1);
+
+/// The runner's line with each step of a slow exit, if it printed one.
+fn slow_exit_line(stderr: &str) -> Option<&str> {
+    stderr
+        .lines()
+        .find(|l| l.contains("slow exit: ending the run took "))
+}
+
+/// The milliseconds the slow-exit `line` gives for `step` ("<step> N ms").
+fn step_ms(line: &str, step: &str) -> Option<u64> {
+    line.split(&format!("{step} "))
+        .nth(1)?
+        .split(" ms")
+        .next()?
+        .parse()
+        .ok()
 }
 
 /// A grace constant of the runner (`TERM_GRACE`, `CHECK_TERM_GRACE`), read from its source
@@ -5957,6 +5991,21 @@ fn a_verifier_check_that_ignores_sigterm_is_killed_after_the_grace() {
             "the check was killed after {took:?}, before its {:?} grace:\n{}",
             check_term_grace(),
             run.stderr()
+        );
+        // The wait is a step of the exit, and the runner names it: the grace is the long
+        // pole, the file steps after it are not.
+        let stderr = run.stderr();
+        let line = slow_exit_line(&stderr)
+            .unwrap_or_else(|| panic!("a {took:?} exit named no steps:\n{stderr}"));
+        let waited = step_ms(line, "end the check groups")
+            .unwrap_or_else(|| panic!("no 'end the check groups' step in {line}"));
+        assert!(
+            waited >= check_term_grace().as_millis() as u64,
+            "the grace was {waited} ms in {line}"
+        );
+        assert!(
+            step_ms(line, "write run.json").is_some_and(|ms| ms < 1000),
+            "run.json took too long in {line}"
         );
     }
     assert_heartbeat_stopped(

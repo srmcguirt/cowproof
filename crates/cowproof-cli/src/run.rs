@@ -81,6 +81,7 @@ use cowproof_run::{
     render_macos_profile,
     runtime_dirs::{self, Protected, RuntimeDir},
     sandbox_command, stall,
+    steps::{SLOW_EXIT, StepClock},
     stream::{MeterSummary, StreamMeter, UsageProbe},
     tools::{
         self, CheckEnd, CheckOutcome, CheckTable, LiveChecks, RunCheck, SessionEnd,
@@ -1666,6 +1667,43 @@ fn interrupt_recorded_line(signal_name: &str, took: Duration) -> String {
     )
 }
 
+/// Says, on stderr, where the time went when ending an interrupted run took longer than
+/// [`SLOW_EXIT`]: one line with every step's elapsed time and, on a host that exposes them,
+/// the kernel's stall counters over the exit (`cowproof_run::hostload`, the same sentence the
+/// director's lines carry). A fast exit prints nothing.
+///
+/// Nothing on the exit path was found that waits for seconds (the launcher and check-group
+/// waits are bounded graces and are steps here), and the stall watchdog cannot see a block
+/// on the `run_one` thread, which is not a worker. This line is how the next slow exit names
+/// its step.
+fn report_slow_exit(lane_id: &str, clock: &StepClock, os_late: Option<Duration>) {
+    let Some(line) = clock.slow_line(SLOW_EXIT) else {
+        return;
+    };
+    let host = match os_late {
+        Some(late) if stall::host_was_late(late, clock.elapsed()) => format!(
+            "; the watchdog's OS thread was {} ms late over the exit: the host did not run this process",
+            late.as_millis()
+        ),
+        Some(late) => format!(
+            "; the watchdog's OS thread was {} ms late over the exit: this process ran, and the wait is inside one step",
+            late.as_millis()
+        ),
+        None => String::new(),
+    };
+    eprintln!("[{lane_id}] {line}{host}");
+}
+
+/// The clock for ending an interrupted run, started at the signal. It also zeroes the
+/// watchdog's record of how late its OS thread was, so [`report_slow_exit`] speaks of this
+/// exit only.
+fn start_exit_clock(watch: Option<&stall::StallWatch>) -> StepClock {
+    if let Some(watch) = watch {
+        let _ = watch.os_thread_late();
+    }
+    StepClock::start()
+}
+
 /// How the lane's builder launches ended.
 #[derive(Debug, PartialEq, Eq)]
 enum LaneEnd {
@@ -2974,7 +3012,10 @@ impl Phase {
 /// [`Phase`]. `run.json` is written whole to a temporary file and renamed over the
 /// old one, so a reader sees the finished record of a run that got that far or this
 /// one, never half of either. Nothing here waits, so a second signal never has to cut
-/// it short.
+/// it short. Each step is marked on `clock` (the caller's, started at the signal), so a
+/// slow file operation shows up in [`report_slow_exit`] under its own name.
+// The clock is the eighth argument; the call sites are four and each already names its own values.
+#[allow(clippy::too_many_arguments)]
 fn record_interrupted(
     layout: &LaneLayout,
     lane_id: &str,
@@ -2983,13 +3024,17 @@ fn record_interrupted(
     proxy_socket: &Path,
     started: Instant,
     kind: RunKind<'_>,
+    clock: &mut StepClock,
 ) {
     if let Some(pgid) = builder_pgid {
         kill_process_group(pgid);
     }
-    let _ = fs::remove_file(&layout.sock);
-    let _ = fs::remove_file(layout.control.join("director.sock"));
-    let _ = fs::remove_file(proxy_socket);
+    clock.mark("kill the builder group");
+    let _ = clock.time("remove the tools socket", || fs::remove_file(&layout.sock));
+    let _ = clock.time("remove the director socket", || {
+        fs::remove_file(layout.control.join("director.sock"))
+    });
+    let _ = clock.time("remove the proxy socket", || fs::remove_file(proxy_socket));
     let run = json!({
         "id": lane_id,
         "host": kind.host,
@@ -3005,10 +3050,13 @@ fn record_interrupted(
         "exitCode": INTERRUPTED_EXIT_CODE,
         "durationMs": started.elapsed().as_millis() as u64,
     });
-    if let Err(e) = write_atomically(
-        &layout.control.join("run.json"),
-        &serde_json::to_vec_pretty(&run).unwrap_or_default(),
-    ) {
+    let written = clock.time("write run.json", || {
+        write_atomically(
+            &layout.control.join("run.json"),
+            &serde_json::to_vec_pretty(&run).unwrap_or_default(),
+        )
+    });
+    if let Err(e) = written {
         eprintln!("[{lane_id}] writing run.json: {e}");
     }
 }
@@ -3624,6 +3672,7 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
                             "[{}] {name} while waiting for a {slot_class} slot: ending the run",
                             header.id
                         );
+                        let mut clock = start_exit_clock(None);
                         // `taken` drops here and gives back the class slot, if it was held.
                         record_interrupted(
                             &layout,
@@ -3639,7 +3688,9 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
                                 host: None,
                                 runtime_dirs: &runtime_names,
                             },
+                            &mut clock,
                         );
+                        report_slow_exit(&header.id, &clock, None);
                         return Ok(INTERRUPTED_EXIT_CODE);
                     }
                 };
@@ -3810,10 +3861,15 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
             }
             Err(signal_name) => {
                 eprintln!("[{}] {signal_name}: ending the run", header.id);
+                let mut clock = start_exit_clock(Some(&_stall_watch));
                 remote.finish().await;
+                clock.mark("finish the remote lane");
                 drop(_tools);
+                clock.mark("drop the tools task");
                 drop(_director);
+                clock.mark("drop the director thread");
                 drop(_proxy);
+                clock.mark("drop the proxy task");
                 record_interrupted(
                     &layout,
                     &header.id,
@@ -3828,7 +3884,9 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
                         host: Some(remote.alias()),
                         runtime_dirs: &runtime_names,
                     },
+                    &mut clock,
                 );
+                report_slow_exit(&header.id, &clock, Some(_stall_watch.os_thread_late()));
                 return Ok(INTERRUPTED_EXIT_CODE);
             }
         }
@@ -3938,8 +3996,9 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
         Ok(run) => run,
         Err(signal_name) => {
             eprintln!("[{}] {signal_name}: ending the run", header.id);
-            let signalled = Instant::now();
+            let mut clock = start_exit_clock(Some(&_stall_watch));
             interrupt.raise();
+            clock.mark("raise the interrupt");
             // A builder is running: the launcher ends its group and returns.
             // With none (waiting for a ruling, say) there is nothing to wait for.
             if interrupt.builder_pgid().is_some() {
@@ -3951,6 +4010,7 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
                     }
                 }
             }
+            clock.mark("wait for the builder's launch");
             // A check the builder had running is in a group of its own and did not get the
             // signal: end it the polite way, or at once on a second signal.
             tokio::select! {
@@ -3960,12 +4020,17 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
                     check_groups.kill_all();
                 }
             }
+            clock.mark("end the check groups");
             drop(_tools);
+            clock.mark("drop the tools task");
             drop(_director);
+            clock.mark("drop the director thread");
             drop(_proxy);
+            clock.mark("drop the proxy task");
             if let Some(remote) = &remote {
                 remote.finish().await;
             }
+            clock.mark("finish the remote lane");
             record_interrupted(
                 &layout,
                 &header.id,
@@ -3980,12 +4045,18 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
                     host: remote.as_ref().map(|r| r.alias()),
                     runtime_dirs: &runtime_names,
                 },
+                &mut clock,
             );
             eprintln!(
                 "[{}] {}",
                 header.id,
-                interrupt_recorded_line(signal_name, signalled.elapsed())
+                interrupt_recorded_line(signal_name, clock.elapsed())
             );
+            // The watchdog thread is stopped inside the window too, so its drop is a step.
+            let os_late = _stall_watch.os_thread_late();
+            drop(_stall_watch);
+            clock.mark("drop the stall watchdog");
+            report_slow_exit(&header.id, &clock, Some(os_late));
             return Ok(INTERRUPTED_EXIT_CODE);
         }
     };
@@ -4290,7 +4361,9 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
         header.id,
         phase.get().name()
     );
+    let mut clock = start_exit_clock(Some(&_stall_watch));
     interrupt.raise();
+    clock.mark("raise the interrupt");
     // The proof's checks (and the builder's, if the capture was cut short) are groups of
     // their own: TERM, a grace, then KILL, or KILL at once on a second signal. The
     // future keeps being polled meanwhile, so each command's own code reaps its group and
@@ -4305,12 +4378,17 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
         _ = check_groups.end_all(CHECK_TERM_GRACE) => {}
         _ = &mut after_builder => {}
     }
+    clock.mark("end the check groups");
     drop(after_builder);
+    clock.mark("drop the proof future");
     check_groups.kill_all();
+    clock.mark("kill the check groups");
     drop(_director);
+    clock.mark("drop the director thread");
     if let Some(remote) = &remote {
         remote.finish().await;
     }
+    clock.mark("finish the remote lane");
     record_interrupted(
         &layout,
         &header.id,
@@ -4325,7 +4403,9 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
             host: remote.as_ref().map(|r| r.alias()),
             runtime_dirs: &runtime_names,
         },
+        &mut clock,
     );
+    report_slow_exit(&header.id, &clock, Some(_stall_watch.os_thread_late()));
     Ok(INTERRUPTED_EXIT_CODE)
 }
 

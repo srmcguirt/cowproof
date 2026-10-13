@@ -24,6 +24,13 @@ pub const TICK: Duration = Duration::from_millis(100);
 /// How late the runtime's tick must be before a stall is reported.
 pub const THRESHOLD: Duration = Duration::from_millis(1500);
 
+/// Whether an OS thread that woke `os_late` late over a stretch of `stretch` says the host did
+/// not run this process (it was late for half the stretch or more), as opposed to the process
+/// running and its own code being the wait.
+pub fn host_was_late(os_late: Duration, stretch: Duration) -> bool {
+    os_late * 2 >= stretch
+}
+
 /// One late tick of the runtime, with how late the OS thread was over the same time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Stall {
@@ -41,7 +48,7 @@ impl Stall {
 
     /// The same line for another watcher (`who` is "runner", "director thread", ...).
     pub fn describe_for(&self, who: &str) -> String {
-        let cause = if self.os_late * 2 >= self.runtime_late {
+        let cause = if host_was_late(self.os_late, self.runtime_late) {
             "the host did not run this process"
         } else {
             "the runner's runtime was blocked while the host was not"
@@ -54,9 +61,36 @@ impl Stall {
     }
 }
 
+/// What the OS thread knows, for a reader that asks later (see [`StallWatch::os_thread_late`]).
+struct OsTicks {
+    base: Instant,
+    tick: Duration,
+    /// When the thread last woke, in milliseconds after `base`.
+    last_wake_ms: AtomicU64,
+    /// The latest it has woken since the last read.
+    peak_late_ms: AtomicU64,
+}
+
 /// Stops the watchdog when dropped.
 pub struct StallWatch {
     stop: Arc<AtomicBool>,
+    os: Arc<OsTicks>,
+}
+
+impl StallWatch {
+    /// How late the OS thread has been since this was last called (or since the watch began):
+    /// the latest it woke after its sleep, or, if it has not woken for longer than it sleeps,
+    /// how long it is overdue now. Reading resets it. A caller that times a stretch of its own
+    /// code calls this before and after: a value near the stretch's length says the host did
+    /// not run this process, and a value near zero says the process ran and its own code was
+    /// the wait.
+    pub fn os_thread_late(&self) -> Duration {
+        let peak = Duration::from_millis(self.os.peak_late_ms.swap(0, Ordering::Relaxed));
+        let since_wake = self.os.base.elapsed().saturating_sub(Duration::from_millis(
+            self.os.last_wake_ms.load(Ordering::Relaxed),
+        ));
+        peak.max(since_wake.saturating_sub(self.os.tick))
+    }
 }
 
 impl Drop for StallWatch {
@@ -79,9 +113,16 @@ pub fn watch_with(
 ) -> StallWatch {
     let stop = Arc::new(AtomicBool::new(false));
     let os_late_ms = Arc::new(AtomicU64::new(0));
+    let os = Arc::new(OsTicks {
+        base: Instant::now(),
+        tick,
+        last_wake_ms: AtomicU64::new(0),
+        peak_late_ms: AtomicU64::new(0),
+    });
     {
         let stop = stop.clone();
         let os_late_ms = os_late_ms.clone();
+        let os = os.clone();
         // A watchdog that cannot start is not a reason to stop the run.
         let _ = std::thread::Builder::new()
             .name("cowproof-stall-os".into())
@@ -91,6 +132,10 @@ pub fn watch_with(
                     std::thread::sleep(tick);
                     let late = asked.elapsed().saturating_sub(tick);
                     os_late_ms.fetch_max(late.as_millis() as u64, Ordering::Relaxed);
+                    os.peak_late_ms
+                        .fetch_max(late.as_millis() as u64, Ordering::Relaxed);
+                    os.last_wake_ms
+                        .store(os.base.elapsed().as_millis() as u64, Ordering::Relaxed);
                 }
             });
     }
@@ -110,7 +155,7 @@ pub fn watch_with(
             }
         }
     });
-    StallWatch { stop }
+    StallWatch { stop, os }
 }
 
 #[cfg(test)]
@@ -137,6 +182,39 @@ mod tests {
     /// A task that blocks the runtime's only worker for 2.5 s is reported as a blocked
     /// runtime: the task on the runtime woke at least two seconds late while the OS thread
     /// (which nothing blocked) did not.
+    /// A watch with no thread behind it, so the test decides what the thread did.
+    fn watch_without_a_thread(tick: Duration) -> StallWatch {
+        StallWatch {
+            stop: Arc::new(AtomicBool::new(false)),
+            os: Arc::new(OsTicks {
+                base: Instant::now(),
+                tick,
+                last_wake_ms: AtomicU64::new(0),
+                peak_late_ms: AtomicU64::new(0),
+            }),
+        }
+    }
+
+    /// A thread that has not woken for longer than its tick is overdue by the difference,
+    /// whether or not it has woken to say so; a late wake it did report is kept until read.
+    #[test]
+    fn the_os_threads_lateness_is_read_on_demand_and_resets() {
+        let watch = watch_without_a_thread(Duration::from_millis(50));
+        // Within its tick: not late.
+        assert_eq!(watch.os_thread_late(), Duration::ZERO);
+        // No wake for 400 ms of a 50 ms tick: overdue by at least 300 ms.
+        std::thread::sleep(Duration::from_millis(400));
+        assert!(watch.os_thread_late() >= Duration::from_millis(300));
+        // A wake that was late by 700 ms is reported once, then forgotten.
+        watch.os.peak_late_ms.store(700, Ordering::Relaxed);
+        watch.os.last_wake_ms.store(
+            watch.os.base.elapsed().as_millis() as u64,
+            Ordering::Relaxed,
+        );
+        assert_eq!(watch.os_thread_late(), Duration::from_millis(700));
+        assert!(watch.os_thread_late() < Duration::from_millis(700));
+    }
+
     #[test]
     fn a_blocked_runtime_is_reported_with_the_os_thread_on_time() {
         let rt = tokio::runtime::Builder::new_multi_thread()

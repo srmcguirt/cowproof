@@ -832,6 +832,60 @@ mod tests {
         );
     }
 
+    /// The exit of an interrupted run drops the director thread while a handler may be in the
+    /// middle of a request. The drop must not wait for it: here a request is held on the
+    /// queue's mutex for several seconds (a slow append on a loaded disk looks the same), and
+    /// dropping the thread still returns at once. Add a `join` to `DirectorThread::drop`, or
+    /// a wait for the thread's runtime, and this fails.
+    #[test]
+    fn dropping_the_director_thread_does_not_wait_for_a_request_in_flight() {
+        const HELD: std::time::Duration = std::time::Duration::from_secs(4);
+        let tmp = TempDir::new().unwrap();
+        let sock = tmp.path().join("director.sock");
+        let queue = Arc::new(Mutex::new(
+            Queue::new(tmp.path(), Box::new(SystemClock)).unwrap(),
+        ));
+        let thread = serve_on_thread(
+            bind_std(&sock).unwrap(),
+            "lane".to_string(),
+            queue.clone(),
+            None,
+        )
+        .unwrap();
+
+        // Something else holds the queue, as a slow append would.
+        let (held_tx, held_rx) = std::sync::mpsc::channel::<()>();
+        let holder = {
+            let queue = queue.clone();
+            std::thread::spawn(move || {
+                let guard = queue.lock().unwrap();
+                held_tx.send(()).unwrap();
+                std::thread::sleep(HELD);
+                drop(guard);
+            })
+        };
+        held_rx.recv().unwrap();
+
+        // A request that cannot finish until the hold ends: the handler is stuck on the lock,
+        // and with it the director thread's only worker.
+        let client = std::thread::spawn({
+            let sock = sock.clone();
+            move || note_round_trip(&sock)
+        });
+        std::thread::sleep(std::time::Duration::from_millis(500));
+
+        let started = std::time::Instant::now();
+        drop(thread);
+        let dropped = started.elapsed();
+        assert!(
+            dropped < std::time::Duration::from_secs(1),
+            "dropping the director thread took {dropped:?} with a request in flight for {HELD:?}"
+        );
+        // The request is answered once the hold is over (the thread was not torn down under it).
+        holder.join().unwrap();
+        let _ = client.join();
+    }
+
     #[test]
     fn dropping_the_director_thread_closes_its_socket() {
         let tmp = TempDir::new().unwrap();
