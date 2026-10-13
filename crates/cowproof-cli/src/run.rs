@@ -4232,6 +4232,10 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
             "projectInstructionsSha256": &launcher.project_instructions_sha256,
             "trace": trace,
             "traceTotals": trace_totals,
+            // `trace` and `traceTotals` rest on files in the lane's portkit state dir, which
+            // the builder can write: informational, never read by a verdict or a gate. The
+            // marker is a sibling so the shape of both stays as readers (the rollup) expect.
+            "traceBuilderWritten": true,
         });
         // The Codex the lane could use, and the director's override of the OpenAI upstream.
         run["codexVersion"] = json!(launcher.codex.as_ref().map(|c| c.version.as_str()));

@@ -693,6 +693,64 @@ mod tests {
         assert_eq!(count_pending_notes(dir.path(), "lane-b").unwrap(), 1);
     }
 
+    /// A queue file as `cowproof run` can leave it: events, a line that is not JSON, a
+    /// half-written last line. `control/escalations.jsonl` under a fresh lane directory.
+    fn lane_with_queue(lines: &[&str]) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir_in("/var/tmp").unwrap();
+        let control = dir.path().join("control");
+        fs::create_dir_all(&control).unwrap();
+        fs::write(control.join("escalations.jsonl"), lines.join("\n")).unwrap();
+        (dir, control)
+    }
+
+    const NOTE_1: &str =
+        r#"{"event":"note","lane":"lane-a","id":"lane-a:N1","text":"first","at_ms":10}"#;
+    const NOTE_2: &str =
+        r#"{"event":"note","lane":"lane-a","id":"lane-a:N2","text":"second","at_ms":20}"#;
+    const NOTE_1_DELIVERED: &str =
+        r#"{"event":"note-delivered","lane":"lane-a","id":"lane-a:N1","at_ms":30}"#;
+    const RULED: &str = r#"{"event":"ruled","lane":"lane-a","id":"lane-a:E1","verdict":{"verdict":"answer","text":"go"},"at_ms":500}"#;
+
+    /// A malformed line is skipped, as the queue's own parser skips it, and the well-formed
+    /// events around it, a ruling among them, give the last-event time and the pending count
+    /// the by-hand reader gave.
+    #[test]
+    fn a_malformed_line_is_skipped_and_the_ruling_still_sets_the_last_event_time() {
+        let (dir, control) = lane_with_queue(&[
+            NOTE_1,
+            "this is not json",
+            RULED,
+            NOTE_2,
+            NOTE_1_DELIVERED,
+            r#"{"event":"note","lane":"lane-a","id":"lane-a:N3","te"#,
+        ]);
+        assert_eq!(get_last_event_time(dir.path()), Some(500));
+        assert_eq!(count_pending_notes(&control, "lane-a").unwrap(), 1);
+        assert_eq!(count_pending_notes(&control, "lane-b").unwrap(), 0);
+    }
+
+    /// A line the builder wrote that looks like a ruling or a note but is not a valid
+    /// `QueueEvent` (a verdict that does not exist, a note with no text, a time that is not a
+    /// number) changes neither figure. The by-hand reader counted the note and took the time.
+    #[test]
+    fn lines_that_look_like_events_but_are_not_valid_do_not_change_the_figures() {
+        let valid = [NOTE_1, NOTE_2, NOTE_1_DELIVERED, RULED];
+        let lookalikes = [
+            r#"{"event":"ruled","lane":"lane-a","id":"lane-a:E9","verdict":{"verdict":"approve"},"at_ms":999999}"#,
+            r#"{"event":"note","lane":"lane-a","id":"lane-a:N9","at_ms":999999}"#,
+            r#"{"event":"note","lane":"lane-a","id":"lane-a:N8","text":"x","at_ms":"999999"}"#,
+            r#"{"event":"note-delivered","lane":"lane-a","at_ms":999999}"#,
+        ];
+        let (clean, clean_control) = lane_with_queue(&valid);
+        let mixed: Vec<&str> = valid.iter().chain(lookalikes.iter()).copied().collect();
+        let (dirty, dirty_control) = lane_with_queue(&mixed);
+
+        assert_eq!(get_last_event_time(clean.path()), Some(500));
+        assert_eq!(get_last_event_time(dirty.path()), Some(500));
+        assert_eq!(count_pending_notes(&clean_control, "lane-a").unwrap(), 1);
+        assert_eq!(count_pending_notes(&dirty_control, "lane-a").unwrap(), 1);
+    }
+
     #[test]
     fn test_parse_duration_hours() {
         let d = parse_duration("1h").unwrap();

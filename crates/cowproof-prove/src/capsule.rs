@@ -399,14 +399,19 @@ pub struct Capsule {
     /// Whether the lane was traced: `pk doctor` found at least one recorded hook
     /// call in the lane's portkit state dir at lane end (D5). Sealed in
     /// `capsule.json`. A lane without `pk`, without hooks or whose doctor failed is
-    /// untraced, as are Codex and OpenRouter lanes by construction. It says how the
-    /// lane was watched and never enters the verdict. Absent in older capsules, which
+    /// untraced, as are Codex and OpenRouter lanes by construction. It is builder-side,
+    /// informational data: portkit's hooks and state dir run inside the lane's writable
+    /// area, so the builder can write the records it rests on. It says how the lane was
+    /// watched and never enters the verdict or any gate. Absent in older capsules, which
     /// read as false.
     #[serde(default)]
     pub traced: bool,
     /// What the lane's portkit trace adds up to (calls by tool, bytes delivered into context),
-    /// present exactly when `traced` is true. Sealed in `capsule.json`; absent in older
-    /// capsules, which read as null and still verify.
+    /// present exactly when `traced` is true. Read from the lane's portkit state dir, which
+    /// the builder can write: builder-written, informational data, never a measurement the
+    /// runner made, and never read by a verdict or a gate. Sealed in `capsule.json` (the seal
+    /// covers the figures as recorded, not their truth); absent in older capsules, which read
+    /// as null and still verify.
     #[serde(default)]
     pub trace_totals: Option<TraceTotals>,
     /// The alias of the remote host that ran the builder (D27), or null for a lane run on the

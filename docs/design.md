@@ -483,6 +483,8 @@ Stop: CONVERGENCE
 
 > Label trace totals in the capsule as builder-side, informational data, or collect them through the runner socket.
 
+**Resolution (2026-10-13):** labelled, not moved: `traced` and `trace_totals` are documented as builder-written, informational data that no verdict or gate reads; `run.json` carries `traceBuilderWritten: true` beside `trace` and `traceTotals`, the rollup's `Context delivered` heading says so, and tests prove absurd totals leave the verdict and a verification unchanged.
+
 ### R2-11 — clarity (minor)
 
 **Problem**

@@ -309,6 +309,8 @@ fn the_rollup_shows_mean_delivered_bytes_per_proved_traced_lane_by_start_rung() 
         table.contains("Context delivered (mean bytes per proved traced lane)"),
         "{table}"
     );
+    // The figures come from files the builder can write: the heading says so.
+    assert!(table.contains("builder-written, informational"), "{table}");
     let row = table
         .lines()
         .find(|l| l.contains("claude:haiku") && l.contains("2000 bytes"))

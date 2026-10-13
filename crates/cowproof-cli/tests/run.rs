@@ -4673,6 +4673,46 @@ fn with_no_pk_beside_cowproof_there_are_no_hooks_and_the_lane_is_untraced_but_pr
     assert_eq!(raw["traced"], false);
 }
 
+/// A builder-written trace file full of absurd figures, beside the real hook's record.
+const ABSURD_RECORD: &str = r#"{"tool":"Read","surface":"agent","outcome":"ok","at":"2026-10-11T00:00:00Z","duration_ms":0.0,"input_bytes":1,"produced_bytes":18446744073709551615,"delivered_bytes":18446744073709551615}"#;
+
+/// The trace figures are builder-written and informational (design R2-10): a builder that
+/// writes absurd records into its own state dir changes the totals in `run.json` and the
+/// capsule and nothing about the verdict, which is the one an untraced lane gets. `run.json`
+/// says the figures are builder-written.
+#[test]
+fn absurd_builder_written_trace_totals_leave_the_verdict_as_an_untraced_lane_gets_it() {
+    if !sandbox_available() {
+        return;
+    }
+    let untraced = owned_packet(&run_checks(&["edit", "made"]));
+    untraced.run_expecting(0);
+    assert_eq!(untraced.run_json()["trace"]["traced"], false);
+
+    let body = format!(
+        "{}\nprintf '%s\\nnot a record\\n' '{ABSURD_RECORD}' > \"$PORTKIT_STATE_DIR/traces/absurd.jsonl\"\n",
+        hook_once_then_checks()
+    );
+    let traced = owned_packet(&body);
+    traced.run_expecting(0);
+    let run = traced.run_json();
+    assert_eq!(run["trace"]["traced"], true, "{run}");
+    // The figures are the builder's own: absurd, and labelled so.
+    assert_eq!(run["traceTotals"]["deliveredBytes"], u64::MAX, "{run}");
+    assert_eq!(run["traceTotals"]["malformedLines"], 1, "{run}");
+    assert_eq!(run["traceBuilderWritten"], true, "{run}");
+    assert_eq!(untraced.run_json()["traceBuilderWritten"], true);
+    let capsule = Capsule::read(&traced.lane().join("control/capsule")).unwrap();
+    assert!(capsule.traced);
+    assert_eq!(capsule.trace_totals.unwrap().delivered_bytes, u64::MAX);
+
+    // The same verdict, the same reasons.
+    let (a, b) = (untraced.verdict(), traced.verdict());
+    assert_eq!(a["verdict"], "proved", "{a}");
+    assert_eq!(b["verdict"], a["verdict"], "{b}");
+    assert_eq!(b["reasons"], a["reasons"], "{b}");
+}
+
 #[test]
 fn a_doctor_that_fails_makes_the_lane_untraced_and_never_changes_the_verdict() {
     if !sandbox_available() {

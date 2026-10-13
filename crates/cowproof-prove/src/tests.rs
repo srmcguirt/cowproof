@@ -2364,6 +2364,73 @@ async fn a_sealed_capsule_still_verifies() {
     assert_eq!(report.checks[0].check_id, "visible");
 }
 
+/// `traced` and `trace_totals` are builder-written and informational: a capsule that says the
+/// lane was traced with absurd totals verifies exactly as one that says it was untraced, with
+/// the same result and the same checks (D5, design R2-10).
+#[tokio::test]
+async fn absurd_trace_totals_and_the_traced_flag_do_not_change_a_verification() {
+    use crate::capsule::{ToolTotals, TraceTotals};
+    let c = chain();
+    let (_, work_untraced) = dirs();
+    let (_, work_traced) = dirs();
+    let capsule_dir = capsule_with_heldout(&c, HELDOUT_PASSING);
+
+    async fn run(capsule_dir: &Path, c: &Chain, work: &Path) -> (String, Vec<String>) {
+        let report = verify(
+            capsule_dir,
+            c.repo.path(),
+            work,
+            &ProcessRunner::new(),
+            test_opts(work),
+        )
+        .await
+        .unwrap();
+        let checks = report
+            .checks
+            .iter()
+            .map(|check| {
+                format!(
+                    "{}:{}:{}:{}:{}",
+                    check.check_id,
+                    check.passed,
+                    check.matched_capsule,
+                    check.capsule_exit_status,
+                    check.actual_exit_status
+                )
+            })
+            .collect();
+        (format!("{:?}", report.result), checks)
+    }
+
+    let mut capsule = Capsule::read(capsule_dir.path()).unwrap();
+    capsule.traced = false;
+    capsule.trace_totals = None;
+    capsule.write(capsule_dir.path()).unwrap();
+    let untraced = run(capsule_dir.path(), &c, work_untraced.path()).await;
+    assert!(untraced.0.starts_with("Reproduced"), "{untraced:?}");
+
+    let mut absurd = TraceTotals {
+        calls: u64::MAX,
+        delivered_bytes: u64::MAX,
+        produced_bytes: 0,
+        malformed_lines: u64::MAX,
+        ..TraceTotals::default()
+    };
+    absurd.by_tool.insert(
+        "Read".to_string(),
+        ToolTotals {
+            calls: u64::MAX,
+            delivered_bytes: u64::MAX,
+        },
+    );
+    capsule.traced = true;
+    capsule.trace_totals = Some(absurd);
+    capsule.write(capsule_dir.path()).unwrap();
+    let traced = run(capsule_dir.path(), &c, work_traced.path()).await;
+
+    assert_eq!(traced, untraced);
+}
+
 /// The trace totals are in `capsule.json`, which the seal covers, and an older capsule without
 /// them still reads (D5, D23).
 #[test]

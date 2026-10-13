@@ -675,7 +675,10 @@ impl Rollup {
         }
 
         if self.delivered.iter().any(|d| d.traced_proved_lanes > 0) {
-            out.push_str("\nContext delivered (mean bytes per proved traced lane)\n");
+            out.push_str(
+                "\nContext delivered (mean bytes per proved traced lane)\n  \
+                 builder-written, informational: the builder can write its trace\n",
+            );
             for d in &self.delivered {
                 let mean = d
                     .mean_delivered_bytes
