@@ -461,11 +461,24 @@ async fn async_main() -> std::process::ExitCode {
         command => match dispatch(command).await {
             Ok(()) => std::process::ExitCode::SUCCESS,
             Err(err) => {
-                eprintln!("Error: {err:?}");
+                eprintln!("Error: {}", error_report(&err));
                 std::process::ExitCode::FAILURE
             }
         },
     }
+}
+
+/// The top-level error as printed: anyhow's report (the message, then `Caused by:` and one
+/// numbered line per cause), each line shown with its control characters as escapes. An error
+/// message or context can carry lane-derived text (a path, a fixture id, a tool's output), and
+/// a terminal acts on `ESC [2J` or `ESC ]52`. The newlines between lines are the report's own
+/// and are kept.
+fn error_report(err: &anyhow::Error) -> String {
+    format!("{err:?}")
+        .split('\n')
+        .map(cowproof_core::one_line)
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 async fn dispatch(command: Action) -> Result<()> {
@@ -1119,7 +1132,10 @@ fn plan_run(repo: &Path, max: Option<usize>, dry_run: bool) -> Result<()> {
         let facts = match get_host_facts(alias, value) {
             Ok(facts) => facts,
             Err(e) => {
-                eprintln!("warning: host {alias} unavailable: {e:#}");
+                eprintln!(
+                    "warning: host {alias} unavailable: {}",
+                    cowproof_core::one_line(&format!("{e:#}"))
+                );
                 continue;
             }
         };
@@ -1660,11 +1676,11 @@ fn print_sent(result: Result<Value, director_tools::SendError>) -> Result<()> {
             Ok(())
         }
         Err(e @ director_tools::SendError::NotRunning(_)) => {
-            eprintln!("{e}");
+            eprintln!("{}", cowproof_core::one_line(&e.to_string()));
             std::process::exit(2);
         }
         Err(e) => {
-            eprintln!("error: {e}");
+            eprintln!("error: {}", cowproof_core::one_line(&e.to_string()));
             std::process::exit(1);
         }
     }
@@ -1688,7 +1704,7 @@ async fn print_forwarded(op: lane_tools::Op, socket: &Path, input: &Value) -> Re
             Ok(())
         }
         Err(e) => {
-            eprintln!("error: {e}");
+            eprintln!("error: {}", cowproof_core::one_line(&e.to_string()));
             std::process::exit(1);
         }
     }
@@ -1757,6 +1773,20 @@ async fn check_command(args: CheckArgs) -> Result<()> {
 #[cfg(test)]
 mod cli_tests {
     use super::*;
+
+    #[test]
+    fn the_top_level_error_report_escapes_every_line_and_keeps_the_chain() {
+        let err = anyhow!("disk \u{1b}[2Jfull")
+            .context("fixture \u{9b}31m\u{1b}]52;c;ZXZpbA==\u{7} failed");
+        let report = error_report(&err);
+        assert!(
+            !report.chars().any(|c| c.is_control() && c != '\n'),
+            "{report:?}"
+        );
+        assert!(report.contains("\\u{1b}[2Jfull"), "{report:?}");
+        assert!(report.contains("\\u{9b}31m\\u{1b}]52"), "{report:?}");
+        assert!(report.contains("\nCaused by:\n"), "{report:?}");
+    }
 
     #[test]
     fn a_lane_gets_its_own_directory_and_not_one_of_a_lane_whose_id_extends_its_own() {

@@ -625,6 +625,88 @@ fn a_lane_that_drops_checksums_is_still_held_to_the_bases_checksum() {
     );
 }
 
+/// A cache hit is checked again against THIS run's base. The key holds the lane's lockfile and
+/// not the base's, so an entry fetched under a base that pinned nothing is hit under a base
+/// that pins another sha256 for the same gem; the hit must not stand.
+#[test]
+fn a_cache_hit_is_checked_against_the_current_bases_checksums() {
+    if !sandbox_available() {
+        return;
+    }
+    let remote = "https://rubygems.org/";
+    let (_ok_dir, gem_ok) = fake_tool("gem", FAKE_GEM_OK);
+    let (_no_dir, gem_must_not_run) = fake_tool("gem", FAKE_GEM_MUST_NOT_RUN);
+    let (_bundle_dir, bundle) = fake_tool("bundle", FAKE_BUNDLE_OK);
+    let cache = var_tmp("cp-gem-cache-");
+    // Every lane writes this lockfile, so every lane has the one cache key.
+    let lane_lock = lockfile(remote, ONE_GEM, "");
+    let base_with = |sums: &str| {
+        vec![
+            ("Gemfile", GEMFILE.to_string()),
+            // Another `BUNDLED WITH`, so the lane's rewrite is a real patch.
+            (
+                "Gemfile.lock",
+                lockfile(remote, ONE_GEM, sums).replace("2.5.3", "2.5.2"),
+            ),
+        ]
+    };
+    let held = var_tmp("cp-gem-held-");
+
+    // Base A pins nothing: the gem is fetched and the entry installed.
+    let first = lane_rewriting_lockfile(&base_with(""), &lane_lock, cache.path(), &gem_ok, &bundle);
+    run_with(&first, &heldout(held.path(), NEEDS_GEMS), 0);
+    let a = capsule(&first);
+    assert_eq!(a.dependency_fetch_outcome.as_deref(), Some("fetched"));
+
+    // Base B pins another sha256 for the same gem. The entry is hit (same key), the gem is not
+    // fetched again, and the hit is infrastructure naming the gem and both hashes.
+    let wrong = sha256("another file altogether\n");
+    let pinned = format!("  fake-gem (1.0.0) sha256={wrong}\n");
+    let second = lane_rewriting_lockfile(
+        &base_with(&pinned),
+        &lane_lock,
+        cache.path(),
+        &gem_must_not_run,
+        &bundle,
+    );
+    let out = second.run(&[]);
+    assert_eq!(out.status.code(), Some(4), "{}", text(&out));
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(
+        stdout.contains("dependency fetch failed: ")
+            && stdout.contains("checksum mismatch for fake-gem (1.0.0)")
+            && stdout.contains("the base's lockfile lists sha256")
+            && stdout.contains(&wrong)
+            && stdout.contains(&sha256(GEM_BODY)),
+        "{}",
+        text(&out)
+    );
+    assert_eq!(second.verdict()["verdict"], "infrastructure");
+    let b = capsule(&second);
+    assert_eq!(b.dependency_fetch_outcome.as_deref(), Some("failed"));
+    assert_eq!(b.dependency_cache_key, a.dependency_cache_key);
+    assert_eq!(
+        fs::read_dir(cache.path().join("deps")).unwrap().count(),
+        1,
+        "the entry is left for the director to prune, and nothing is fetched into a second one"
+    );
+
+    // Base C pins the right sha256: the same entry is a hit and the lane is proved.
+    let right = format!("  fake-gem (1.0.0) sha256={}\n", sha256(GEM_BODY));
+    let third = lane_rewriting_lockfile(
+        &base_with(&right),
+        &lane_lock,
+        cache.path(),
+        &gem_must_not_run,
+        &bundle,
+    );
+    run_with(&third, &heldout(held.path(), NEEDS_GEMS), 0);
+    assert_eq!(third.verdict()["verdict"], "proved");
+    let c = capsule(&third);
+    assert_eq!(c.dependency_fetch_outcome.as_deref(), Some("hit"));
+    assert_eq!(c.dependency_cache_key, a.dependency_cache_key);
+}
+
 #[test]
 fn a_base_gem_the_lane_moves_to_another_remote_is_not_fetched_naming_both_remotes() {
     if !sandbox_available() {

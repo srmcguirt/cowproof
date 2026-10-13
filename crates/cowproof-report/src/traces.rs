@@ -5,13 +5,15 @@
 //! `portkit_core::trace::CallRecord` per line. [`read_lane_traces`] is the safe walk: no
 //! symlink is followed at any step (the lane's `portkit` directory, its `traces` directory
 //! and each trace file are all builder-writable), a file larger than 32 MiB is unreadable,
-//! the walk as a whole stops at 64 MiB and 256 files (what is left is counted, not read),
+//! the walk as a whole stops at 64 MiB and 256 files (what is left is counted, not read), only
+//! the 4096 smallest names of the directory are ever held,
 //! and a line that is not a record is counted, not fatal. `cowproof report port-candidates`
 //! and the runner's lane-end totals both read through it, so there is one trace parser.
 
 use cowproof_prove::{ToolTotals, TraceTotals};
 use portkit_core::trace::{CallRecord, Summary};
-use std::collections::{BTreeMap, HashSet};
+use std::cmp::Ordering;
+use std::collections::{BTreeMap, BinaryHeap, HashSet};
 use std::fs;
 use std::io::Read;
 use std::path::Path;
@@ -27,6 +29,13 @@ pub const MAX_LANE_BYTES: u64 = 64 * 1024 * 1024;
 /// The walk of one lane reads at most this many trace files (audit S-5). A lane writes one
 /// file a day.
 pub const MAX_LANE_FILES: usize = 256;
+
+/// The walk of one lane lists at most this many `.jsonl` names from the `traces` directory
+/// (S-5 follow-up): a builder owns that directory and can fill it with millions of entries,
+/// and the director's process held every one to sort them. Only this many entries are held
+/// at a time, and they are the smallest by name, so what is read does not depend on the order
+/// the directory returns names in. The names beyond it are counted in `unread_files`.
+pub const MAX_LANE_LISTING: usize = 4096;
 
 /// `by_tool` keeps this many tool names; the rest are folded into [`OTHER_TOOLS`] (audit S-5).
 pub const MAX_TOOL_NAMES: usize = 64;
@@ -101,14 +110,11 @@ pub fn read_lane_traces(lane_dir: &Path) -> LaneTraces {
         out.state = LaneState::Skipped;
         return out;
     };
-    let mut files: Vec<_> = read.filter_map(Result::ok).collect();
-    files.sort_by_key(|e| e.file_name());
+    let (files, overflow) = list_bounded(read, MAX_LANE_LISTING);
+    out.unread_files += overflow;
     let mut budget = MAX_LANE_BYTES;
     for file in files {
         let path = file.path();
-        if path.extension().is_none_or(|ext| ext != "jsonl") {
-            continue;
-        }
         let Ok(kind) = file.file_type() else {
             out.unreadable += 1;
             continue;
@@ -138,6 +144,55 @@ pub fn read_lane_traces(lane_dir: &Path) -> LaneTraces {
         out.state = LaneState::Traced;
     }
     out
+}
+
+/// A directory entry ordered by its name, for the bounded listing.
+struct Named(fs::DirEntry);
+
+impl PartialEq for Named {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.file_name() == other.0.file_name()
+    }
+}
+
+impl Eq for Named {}
+
+impl PartialOrd for Named {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Named {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.0.file_name().cmp(&other.0.file_name())
+    }
+}
+
+/// The `.jsonl` entries of `read` with the `limit` smallest names, sorted by name, and how
+/// many more `.jsonl` entries there were. The whole directory is walked but at most `limit`
+/// entries are held: a max-heap on the name drops the largest whenever it is full. A
+/// directory returns its names in an order of its own, so stopping after `limit` entries
+/// would read a different set on each run; keeping the smallest names reads the same set
+/// whatever the order (a name is unique in a directory, so there are no ties).
+fn list_bounded(read: fs::ReadDir, limit: usize) -> (Vec<fs::DirEntry>, usize) {
+    let mut heap: BinaryHeap<Named> = BinaryHeap::with_capacity(limit.min(1024) + 1);
+    let mut overflow = 0usize;
+    for entry in read.filter_map(Result::ok) {
+        if Path::new(&entry.file_name())
+            .extension()
+            .is_none_or(|ext| ext != "jsonl")
+        {
+            continue;
+        }
+        heap.push(Named(entry));
+        if heap.len() > limit {
+            heap.pop();
+            overflow += 1;
+        }
+    }
+    let files = heap.into_sorted_vec().into_iter().map(|n| n.0).collect();
+    (files, overflow)
 }
 
 /// Why a trace file was not read.
@@ -636,6 +691,43 @@ mod tests {
             lane_trace_totals(lane.path())
         );
         assert_eq!(lane_trace_totals(lane.path()).unwrap().unread_files, 5);
+    }
+
+    #[test]
+    fn the_listing_of_a_huge_directory_holds_a_bounded_set_of_the_smallest_names() {
+        let lane = tempfile::tempdir_in("/var/tmp").unwrap();
+        let traces = lane.path().join("portkit/traces");
+        fs::create_dir_all(&traces).unwrap();
+        for n in 0..5000 {
+            fs::write(traces.join(format!("{n:05}.jsonl")), line() + "\n").unwrap();
+        }
+        // Not a trace file: neither held nor counted.
+        fs::write(traces.join("00000.txt"), "x").unwrap();
+
+        let (held, overflow) = list_bounded(fs::read_dir(&traces).unwrap(), MAX_LANE_LISTING);
+        assert_eq!(held.len(), MAX_LANE_LISTING);
+        assert_eq!(overflow, 5000 - MAX_LANE_LISTING);
+        let names: Vec<String> = held
+            .iter()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        let expected: Vec<String> = (0..MAX_LANE_LISTING)
+            .map(|n| format!("{n:05}.jsonl"))
+            .collect();
+        assert_eq!(names, expected, "the smallest names, in name order");
+
+        // The whole walk: 256 read, the other 4744 counted (3840 past the file bound, 904
+        // past the listing), and the same lane walked twice gives the same totals.
+        let walk = read_lane_traces(lane.path());
+        assert_eq!(walk.state, LaneState::Traced);
+        assert_eq!((walk.files, walk.unread_files), (MAX_LANE_FILES, 4744));
+        let first = lane_trace_totals(lane.path()).unwrap();
+        let second = lane_trace_totals(lane.path()).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(
+            (first.calls, first.unread_files),
+            (MAX_LANE_FILES as u64, 4744)
+        );
     }
 
     #[test]

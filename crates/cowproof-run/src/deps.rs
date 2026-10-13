@@ -69,7 +69,8 @@
 //!     --clear-sources --source <remote>` (one script, one sandbox, one proxy), and the `.gem`
 //!     files land in `<entry>/bundler/cache`. Only `ruby` and the host's platform variants are
 //!     downloaded (CPU and OS; see [`crate::bundler`]). A `sha256` in the `CHECKSUMS` section
-//!     is compared with each download (a mismatch is an error naming the gem) and a gem
+//!     is compared with each download, and again on a cache hit against the current base's
+//!     checksums ([`check_bundler_hit`]) (a mismatch is an error naming the gem) and a gem
 //!     `gem fetch` did not produce is an error. `GIT`, `PATH` and `PLUGIN SOURCE` sections, a
 //!     lockfile that does not parse, a remote that is not https with no checksum, and a tree
 //!     that already has a `vendor/cache` are [`FetchOutcome::NotFetched`], naming the cause.
@@ -1231,11 +1232,18 @@ fn prefetch_in(
     // An entry a prune removed between the look and the claim is looked at again.
     for _ in 0..3 {
         match entry_state(&dir, needs) {
-            EntryState::Complete => match claim() {
-                Ok(()) => return done(FetchOutcome::Hit),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(e) => return done(FetchOutcome::Failed(claim_failure(&dir, &e))),
-            },
+            EntryState::Complete => {
+                if needs.bundler
+                    && let Err(e) = check_bundler_hit(&dir, &tree)
+                {
+                    return done(FetchOutcome::Failed(format!("{e:#}")));
+                }
+                match claim() {
+                    Ok(()) => return done(FetchOutcome::Hit),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(e) => return done(FetchOutcome::Failed(claim_failure(&dir, &e))),
+                }
+            }
             EntryState::Absent => break,
             EntryState::Incomplete => {
                 return done(FetchOutcome::Failed(format!(
@@ -1752,14 +1760,33 @@ fn fetch_bundler(
         },
     )?;
 
+    check_gems(&cache, &fetch, file, GemsFrom::Fetch)
+}
+
+/// Where the `.gem` files [`check_gems`] looks at came from.
+#[derive(Clone, Copy)]
+enum GemsFrom {
+    /// Just downloaded by `gem fetch` into the fresh entry.
+    Fetch,
+    /// Already in a cache entry another run made (a hit).
+    Entry,
+}
+
+/// Every gem `fetch` lists must be a regular file in `cache` and, when a lockfile gives a
+/// sha256 for it ([`Download::checksum`]: the BASE's when the base lists the gem with one, else
+/// the lane's), must hash to it. The one comparison of the Bundler fetch: it runs on a fresh
+/// download and again on a cache hit, where the entry may have been fetched under another
+/// base whose checksums differed (the key holds the lane's lockfile, not the base's).
+fn check_gems(cache: &Path, fetch: &Fetch, file: &str, from: GemsFrom) -> Result<()> {
     for d in &fetch.downloads {
         let name = d.spec.file_name();
         let path = cache.join(&name);
         if !is_regular(&path) {
-            bail!(
-                "gem fetch did not produce {name} for {} (from {file})",
-                d.spec.label()
-            );
+            let missing = match from {
+                GemsFrom::Fetch => "gem fetch did not produce",
+                GemsFrom::Entry => "the cache entry does not hold",
+            };
+            bail!("{missing} {name} for {} (from {file})", d.spec.label());
         }
         if let Some(want) = &d.checksum {
             let got = sha256_hex(&path)?;
@@ -1769,8 +1796,12 @@ fn fetch_bundler(
                 } else {
                     file
                 };
+                let is = match from {
+                    GemsFrom::Fetch => "the download is",
+                    GemsFrom::Entry => "the cached gem is",
+                };
                 bail!(
-                    "checksum mismatch for {}: {whose} lists sha256 {}, the download is {got}",
+                    "checksum mismatch for {}: {whose} lists sha256 {}, {is} {got}",
                     d.spec.label(),
                     want.sha256
                 );
@@ -1778,6 +1809,26 @@ fn fetch_bundler(
         }
     }
     Ok(())
+}
+
+/// A cache hit for a tree with Bundler gems, re-checked against THIS run's base. The key holds
+/// the lane's lockfile and not the base's (so older keys stay valid), so an entry fetched under
+/// one base can be hit under another that pins different checksums for the same gems; nothing
+/// else would look. Each gem the current plan lists is hashed in the entry and compared by
+/// [`check_gems`], the same comparison as the fetch (the plan is [`gem_plan`], so the base's
+/// lockfile decides exactly as it does at fetch time). A mismatch or a missing gem is an error
+/// naming the gem and both hashes; the entry is left for the director to prune.
+fn check_bundler_hit(dir: &Path, tree: &Path) -> Result<()> {
+    let GemPlan::Fetch(file, fetch) = gem_plan(tree, &Host::current()) else {
+        return Ok(());
+    };
+    let cache = dir.join(BUNDLER_ENTRY_DIR).join(BUNDLER_CACHE);
+    check_gems(&cache, &fetch, file, GemsFrom::Entry).with_context(|| {
+        format!(
+            "the cache entry {} does not match this run's base lockfile (remove it to fetch again)",
+            dir.display()
+        )
+    })
 }
 
 /// `path` with the directory of `tool` appended (when it is an absolute directory not already
