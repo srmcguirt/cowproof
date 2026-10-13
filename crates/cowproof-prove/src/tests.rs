@@ -2461,6 +2461,7 @@ fn port_entry(success: bool, held_out: &str) -> crate::port::PortCapsule {
             state: held_out.to_string(),
             reason: (held_out == "skipped").then(|| "no node".to_string()),
             cases: 2,
+            fixture_hash: String::new(),
             surfaces: std::collections::BTreeMap::new(),
         },
         failures: if success {

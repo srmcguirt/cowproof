@@ -142,6 +142,11 @@ pub struct PortHeldOut {
     /// How many held-out cases were captured and replayed.
     #[serde(default)]
     pub cases: usize,
+    /// `sha256` of the captured held-out fixtures as the verifier read them into memory once,
+    /// right after the capture's process group was gone (see [`fixture_set_hash`] for the
+    /// form): the set that was replayed and judged. Empty unless the cases were replayed.
+    #[serde(default)]
+    pub fixture_hash: String,
     /// The replay of the held-out cases, per surface, trimmed as above.
     #[serde(default)]
     pub surfaces: BTreeMap<String, SurfaceSummary>,
@@ -153,6 +158,7 @@ impl PortHeldOut {
             state: "none".into(),
             reason: None,
             cases: 0,
+            fixture_hash: String::new(),
             surfaces: BTreeMap::new(),
         }
     }
@@ -190,38 +196,89 @@ impl PortOutcome {
 /// are the regular files only; a symlink is not followed and does not count. A missing
 /// directory is an error.
 pub fn fixture_set_hash(dir: &Path) -> std::io::Result<(String, usize)> {
-    fn collect(root: &Path, dir: &Path, out: &mut Vec<(String, PathBuf)>) -> std::io::Result<()> {
-        let mut entries: Vec<_> = fs::read_dir(dir)?.collect::<Result<_, _>>()?;
-        entries.sort_by_key(|e| e.file_name());
-        for entry in entries {
-            let path = entry.path();
-            let kind = entry.file_type()?;
-            if kind.is_dir() {
-                collect(root, &path, out)?;
-            } else if kind.is_file() {
-                let rel = path
-                    .strip_prefix(root)
-                    .unwrap_or(&path)
-                    .to_string_lossy()
-                    .replace('\\', "/");
-                out.push((rel, path));
+    let set = FixtureSet::read(dir)?;
+    Ok((set.hash(), set.files.len()))
+}
+
+/// A fixtures directory read into memory at once: every regular file under it, as its path
+/// relative to the directory and its bytes, in path order. What is judged is this copy, never
+/// the directory again, so a file written after the read (by a process that outlived the
+/// capture) is not what is judged or hashed.
+struct FixtureSet {
+    files: Vec<(String, Vec<u8>)>,
+}
+
+impl FixtureSet {
+    /// Read every regular file under `dir` (no symlink followed). A missing directory is an
+    /// error.
+    fn read(dir: &Path) -> std::io::Result<Self> {
+        fn collect(
+            root: &Path,
+            dir: &Path,
+            out: &mut Vec<(String, Vec<u8>)>,
+        ) -> std::io::Result<()> {
+            let mut entries: Vec<_> = fs::read_dir(dir)?.collect::<Result<_, _>>()?;
+            entries.sort_by_key(|e| e.file_name());
+            for entry in entries {
+                let path = entry.path();
+                let kind = entry.file_type()?;
+                if kind.is_dir() {
+                    collect(root, &path, out)?;
+                } else if kind.is_file() {
+                    let rel = path
+                        .strip_prefix(root)
+                        .unwrap_or(&path)
+                        .to_string_lossy()
+                        .replace('\\', "/");
+                    out.push((rel, fs::read(&path)?));
+                }
             }
+            Ok(())
+        }
+        let mut files = Vec::new();
+        collect(dir, dir, &mut files)?;
+        files.sort();
+        Ok(Self { files })
+    }
+
+    /// The hash [`fixture_set_hash`] returns, over the bytes held here.
+    fn hash(&self) -> String {
+        let mut hasher = Sha256::new();
+        for (rel, bytes) in &self.files {
+            // Lengths first, so no path and content can run into each other.
+            hasher.update((rel.len() as u64).to_le_bytes());
+            hasher.update(rel.as_bytes());
+            hasher.update((bytes.len() as u64).to_le_bytes());
+            hasher.update(bytes);
+        }
+        format!("{:x}", hasher.finalize())
+    }
+
+    /// The `*.json` files that parse, as `read_fixture_files` returns them for a directory.
+    fn json(&self) -> Vec<(String, Value)> {
+        self.files
+            .iter()
+            .filter(|(rel, _)| rel.ends_with(".json"))
+            .filter_map(|(rel, bytes)| {
+                let value = serde_json::from_str(std::str::from_utf8(bytes).ok()?).ok()?;
+                Some((rel.clone(), value))
+            })
+            .collect()
+    }
+
+    /// Write the set to `dir` (created; any earlier content removed), file by file.
+    fn write_to(&self, dir: &Path) -> std::io::Result<()> {
+        let _ = fs::remove_dir_all(dir);
+        fs::create_dir_all(dir)?;
+        for (rel, bytes) in &self.files {
+            let path = dir.join(rel);
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::write(path, bytes)?;
         }
         Ok(())
     }
-    let mut files = Vec::new();
-    collect(dir, dir, &mut files)?;
-    files.sort();
-    let mut hasher = Sha256::new();
-    for (rel, path) in &files {
-        let bytes = fs::read(path)?;
-        // Lengths first, so no path and content can run into each other.
-        hasher.update((rel.len() as u64).to_le_bytes());
-        hasher.update(rel.as_bytes());
-        hasher.update((bytes.len() as u64).to_le_bytes());
-        hasher.update(&bytes);
-    }
-    Ok((format!("{:x}", hasher.finalize()), files.len()))
 }
 
 /// `word` as one shell word, single-quoted.
@@ -363,8 +420,13 @@ fn read_report(ran: &Ran) -> Replayed {
 /// The tools whose fixtures the directory holds: a tool is the directory name one level below
 /// the fixtures directory, and it has fixtures when that directory holds a `.json` file.
 fn tools_with_fixtures(dir: &Path) -> Vec<String> {
-    read_fixture_files(dir)
-        .into_iter()
+    tools_from(&read_fixture_files(dir))
+}
+
+/// [`tools_with_fixtures`] over fixtures already read.
+fn tools_from(files: &[(String, Value)]) -> Vec<String> {
+    files
+        .iter()
         .filter_map(|(rel, _)| rel.split_once('/').map(|(tool, _)| tool.to_string()))
         .collect::<std::collections::BTreeSet<_>>()
         .into_iter()
@@ -374,8 +436,13 @@ fn tools_with_fixtures(dir: &Path) -> Vec<String> {
 /// The `(tool, id)` of every fixture file the directory holds: the names a replay reports its
 /// outcomes under (it reads them from the files, not from the directory names).
 fn fixture_cases(dir: &Path) -> BTreeSet<(String, String)> {
-    read_fixture_files(dir)
-        .into_iter()
+    cases_from(&read_fixture_files(dir))
+}
+
+/// [`fixture_cases`] over fixtures already read.
+fn cases_from(files: &[(String, Value)]) -> BTreeSet<(String, String)> {
+    files
+        .iter()
         .filter_map(|(_, value)| {
             let tool = value.get("tool")?.as_str()?.to_string();
             let id = value.get("id")?.as_str()?.to_string();
@@ -798,6 +865,7 @@ async fn held_out(run: &PortRun<'_>) -> Result<PortHeldOut, VerifyError> {
             state: "skipped".into(),
             reason: Some(with_runtime_note(reason, run)),
             cases: 0,
+            fixture_hash: String::new(),
             surfaces: BTreeMap::new(),
         });
     }
@@ -821,9 +889,39 @@ async fn held_out(run: &PortRun<'_>) -> Result<PortHeldOut, VerifyError> {
             sh_quote(&fixtures.to_string_lossy()),
         )
     };
-    let outcome = run
+    let replay = Replay {
+        runner: run.runner,
+        tree: run.tree,
+        pk_exe: run.pk_exe,
+        config: out_dir.join("pk.toml"),
+        spec: run.spec,
+        timeout: run.timeout,
+    };
+    capture_and_judge(&replay, &capture, &fixtures, &out_dir).await
+}
+
+/// Run the held-out `capture` (which writes the captured fixtures to `fixtures`), then replay
+/// and judge them.
+///
+/// The capture runs in its own process group and the runner returns only once the group is
+/// gone, so nothing it started in the group can write afterwards. The fixtures are then read
+/// into memory at once ([`FixtureSet`]): their names, bytes and hash. From that point nothing
+/// judged comes from the capture's directory again. The replay is handed a fresh copy written
+/// from the memory set (`heldout-judged`, a name the capture never saw), the coverage check
+/// (`cases_from`, `tools_from`) and the case count read the memory set, and the recorded hash
+/// is the memory set's. A process that escaped the group (`setsid`) and rewrites a fixture in
+/// the capture's directory later changes nothing that is judged or recorded. If it also
+/// reaches the copy the replay reads and leaves it changed, the hash taken after the replay
+/// differs and the held-out cases fail.
+async fn capture_and_judge(
+    replay: &Replay<'_>,
+    capture: &str,
+    fixtures: &Path,
+    out_dir: &Path,
+) -> Result<PortHeldOut, VerifyError> {
+    let outcome = replay
         .runner
-        .run(run.tree, &capture, run.timeout)
+        .run(replay.tree, capture, replay.timeout)
         .await
         .map_err(|e: InfraError| infra(format!("held-out capture: {e}")))?;
     if outcome.exit_status != 0 {
@@ -834,33 +932,42 @@ async fn held_out(run: &PortRun<'_>) -> Result<PortHeldOut, VerifyError> {
         )));
     }
 
+    // Read once; everything below uses this copy.
+    let set = FixtureSet::read(fixtures).map_err(|e| {
+        infra(format!(
+            "the captured held-out fixtures cannot be read: {e}"
+        ))
+    })?;
+    let hash = set.hash();
+    let files = set.json();
+    let judged = out_dir.join("heldout-judged");
+    set.write_to(&judged)
+        .map_err(|e| infra(format!("the held-out fixtures copy: {e}")))?;
+
     let report_path = out_dir.join("heldout-replay.json");
-    let replay = Replay {
-        runner: run.runner,
-        tree: run.tree,
-        pk_exe: run.pk_exe,
-        config: out_dir.join("pk.toml"),
-        spec: run.spec,
-        timeout: run.timeout,
-    };
-    let ran = replay.run(&fixtures, &report_path).await?;
+    let ran = replay.run(&judged, &report_path).await?;
     let mut replayed = read_report(&ran);
-    let held_tools = tools_with_fixtures(&fixtures);
     // The held-out cases may cover fewer tools than the packet names; each tool they do cover
     // must be ported, and the replay's own report says which are not.
     judge(
         "held-out ",
         &mut replayed,
         &[],
-        &held_tools,
-        &fixture_cases(&fixtures),
+        &tools_from(&files),
+        &cases_from(&files),
     );
-    let cases_count = fixture_set_hash(&fixtures).map(|(_, n)| n).unwrap_or(0);
+    // A check that can only fail: the copy the replay read must still be the set judged.
+    if fixture_set_hash(&judged).map(|(h, _)| h).ok().as_deref() != Some(hash.as_str()) {
+        replayed.failures.push(
+            "held-out: the fixtures the replay read changed while it ran or after it".to_string(),
+        );
+    }
     let failed = !replayed.failures.is_empty();
     Ok(PortHeldOut {
         state: if failed { "failed" } else { "passed" }.into(),
         reason: failed.then(|| replayed.failures.join("; ")),
-        cases: cases_count,
+        cases: set.files.len(),
+        fixture_hash: hash,
         surfaces: summaries(&replayed.reports),
     })
 }
@@ -1204,6 +1311,100 @@ mod tests {
             fs::read_to_string(&report).unwrap(),
             "{\"genuine\":true}",
             "the report on disk changed after the replay ended"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_process_the_capture_leaves_behind_cannot_change_the_held_out_fixtures_judged() {
+        let dir = tempfile::TempDir::new_in("/var/tmp").unwrap();
+        let root = dir.path();
+        let fixtures = root.join("captured");
+        let out_dir = root.join("out");
+        fs::create_dir_all(&out_dir).unwrap();
+        let go = root.join("replay-started");
+        let mark = root.join("forged");
+        let ready = root.join("escaped");
+        let original = r#"{"tool":"t","id":"1","input":{},"expected":{"v":"original"}}"#;
+        let forged = r#"{"tool":"t","id":"forged","input":{},"expected":{"v":"forged"}}"#;
+        // The hash of the original set, taken from a directory of its own.
+        let reference = root.join("reference");
+        write(&reference, "t/1.json", original);
+        let (want_hash, want_count) = fixture_set_hash(&reference).unwrap();
+        // The report the replay prints: `t/1` passes on both surfaces.
+        let genuine = replayed(vec![outcome("t", "1", Status::Pass)]);
+        let report_json = root.join("report.json");
+        fs::write(
+            &report_json,
+            serde_json::to_string(&genuine.reports).unwrap(),
+        )
+        .unwrap();
+        // The capture writes the fixture, then starts a process in a session of its own (so
+        // the group end does not reach it; the capture waits until the process is out of the
+        // group before it exits) that waits for the replay to start and then
+        // rewrites the fixture in the capture's directory, with a different id. The replay
+        // starts only after the verifier has read the set, so the rewrite is always later; the
+        // replay waits for the rewrite to land before it prints its report.
+        let escaped = format!(
+            "i=0; while [ ! -e '{go}' ] && [ $i -lt 200 ]; do sleep 0.05; i=$((i+1)); done; \
+             printf '%s' '{forged}' > '{f}/t/1.json'; : > '{mark}'",
+            go = go.display(),
+            f = fixtures.display(),
+            mark = mark.display(),
+        );
+        let pk = fake_pk(
+            root,
+            &format!(
+                "case \"$*\" in\n\
+                 *'port capture'*)\n\
+                   mkdir -p '{f}/t'; printf '%s' '{original}' > '{f}/t/1.json'\n\
+                   perl -e 'use POSIX qw(setsid); setsid(); open(F, \">\", $ARGV[1]); close(F); exec \"sh\", \"-c\", $ARGV[0]' '{escaped}' '{ready}' >/dev/null 2>&1 &\n\
+                   i=0; while [ ! -e '{ready}' ] && [ $i -lt 200 ]; do sleep 0.05; i=$((i+1)); done\n\
+                   exit 0;;\n\
+                 *'port replay'*)\n\
+                   : > '{go}'\n\
+                   i=0; while [ ! -e '{mark}' ] && [ $i -lt 200 ]; do sleep 0.05; i=$((i+1)); done\n\
+                   cat '{report}'; exit 0;;\n\
+                 esac\nexit 9",
+                f = fixtures.display(),
+                escaped = escaped.replace('\'', "'\\''"),
+                go = go.display(),
+                mark = mark.display(),
+                ready = ready.display(),
+                report = report_json.display(),
+            ),
+        );
+        let runner = crate::runner::ProcessRunner::new();
+        let spec = spec();
+        let replay = Replay {
+            runner: &runner,
+            tree: root,
+            pk_exe: &pk,
+            config: root.join("pk.toml"),
+            spec: &spec,
+            timeout: Duration::from_secs(60),
+        };
+        let capture = format!("'{}' pk port capture", pk.display());
+        let held = capture_and_judge(&replay, &capture, &fixtures, &out_dir)
+            .await
+            .unwrap();
+        // The process ran and rewrote the capture's directory ...
+        assert!(
+            mark.exists(),
+            "the leftover process never rewrote the fixture"
+        );
+        assert_eq!(
+            fs::read_to_string(fixtures.join("t/1.json")).unwrap(),
+            forged
+        );
+        // ... and none of it was judged or recorded.
+        assert_eq!(held.state, "passed", "{:?}", held.reason);
+        assert_eq!(held.reason, None);
+        assert_eq!(held.cases, want_count);
+        assert_eq!(held.fixture_hash, want_hash);
+        assert_ne!(held.fixture_hash, fixture_set_hash(&fixtures).unwrap().0);
+        assert_eq!(
+            fs::read_to_string(out_dir.join("heldout-judged/t/1.json")).unwrap(),
+            original
         );
     }
 
