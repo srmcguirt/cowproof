@@ -707,6 +707,56 @@ fn a_cache_hit_is_checked_against_the_current_bases_checksums() {
     assert_eq!(c.dependency_cache_key, a.dependency_cache_key);
 }
 
+/// A hit on an entry that lost a gem is not a hit. The gem has no checksum anywhere, so the
+/// hash comparison cannot be what catches it: the entry must hold every gem the plan lists.
+#[test]
+fn a_cache_hit_on_an_entry_missing_a_gem_is_infrastructure_and_nothing_is_fetched() {
+    if !sandbox_available() {
+        return;
+    }
+    let cache = var_tmp("cp-gem-cache-");
+    let (_ok_dir, gem_ok) = fake_tool("gem", FAKE_GEM_OK);
+    let (_no_dir, gem_must_not_run) = fake_tool("gem", FAKE_GEM_MUST_NOT_RUN);
+    let (_bundle_dir, bundle) = fake_tool("bundle", FAKE_BUNDLE_OK);
+    let held = var_tmp("cp-gem-held-");
+
+    // The first lane fetches the entry (`bundler_project` has no CHECKSUMS section).
+    let first = new_lane(&bundler_project(), cache.path(), &gem_ok, &bundle);
+    run_with(&first, &heldout(held.path(), NEEDS_GEMS), 0);
+    let a = capsule(&first);
+    assert_eq!(a.dependency_fetch_outcome.as_deref(), Some("fetched"));
+    let gem_file = entry(cache.path(), &a).join("bundler/cache/fake-gem-1.0.0.gem");
+    assert!(gem_file.is_file(), "the entry holds the gem before");
+    fs::remove_file(&gem_file).unwrap();
+
+    // The second lane has the same key. The entry is complete as a directory, but it lost the
+    // gem: infrastructure naming the gem, and the fake `gem` is not run.
+    let second = new_lane(&bundler_project(), cache.path(), &gem_must_not_run, &bundle);
+    let out = second.run(&[]);
+    assert_eq!(out.status.code(), Some(4), "{}", text(&out));
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(
+        stdout.contains("dependency fetch failed: ")
+            && stdout.contains("the cache entry does not hold fake-gem-1.0.0.gem")
+            && stdout.contains("fake-gem (1.0.0)"),
+        "{}",
+        text(&out)
+    );
+    assert!(
+        !stdout.contains("the fake gem was called"),
+        "the fake gem ran: {}",
+        text(&out)
+    );
+    assert_eq!(second.verdict()["verdict"], "infrastructure");
+    let b = capsule(&second);
+    assert_eq!(b.dependency_fetch_outcome.as_deref(), Some("failed"));
+    assert_eq!(b.dependency_cache_key, a.dependency_cache_key);
+    assert!(
+        !gem_file.exists(),
+        "nothing was fetched back into the entry"
+    );
+}
+
 #[test]
 fn a_base_gem_the_lane_moves_to_another_remote_is_not_fetched_naming_both_remotes() {
     if !sandbox_available() {
