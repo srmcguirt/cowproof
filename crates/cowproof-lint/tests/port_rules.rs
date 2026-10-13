@@ -1,4 +1,4 @@
-//! The nine lint rules of `kind: port` packets (portkit-integration.md, section 6.4): for
+//! The ten lint rules of `kind: port` packets (portkit-integration.md, section 6.4): for
 //! each, a packet that passes and one that fails, on a real directory of files.
 
 use cowproof_lint::{Finding, LintOptions, Severity, lint_packet, lint_packet_with};
@@ -261,6 +261,11 @@ fn port_fixtures_not_owned() {
     );
 
     // One finding per tool the owns glob does not reach.
+    put(
+        dir.path(),
+        "ports/wc/fixtures/line_count/001.json",
+        r#"{"tool":"line_count","id":"001","input":{},"expected":{}}"#,
+    );
     let two = header(|h| {
         h["port"]["tools"] = json!(["word_count", "line_count"]);
         h["owns"] = json!([
@@ -358,6 +363,11 @@ fn port_tool_unregistered() {
     assert!(errors(&findings)[0].contains("not covered by owns"));
 
     // The header's own text does not count as the packet text naming the tool.
+    put(
+        dir.path(),
+        "ports/wc/fixtures/only_in_header/001.json",
+        r#"{"tool":"only_in_header","id":"001","input":{},"expected":{}}"#,
+    );
     let only_header = header(|h| h["port"]["tools"] = json!(["only_in_header"]));
     let findings = lint(dir.path(), &only_header, BODY);
     assert_eq!(rules(&findings), ["port-tool-unregistered"], "{findings:?}");
@@ -415,6 +425,7 @@ fn port_accepted_unruled() {
     );
     let options = LintOptions {
         escalations: Some(&log),
+        ..Default::default()
     };
     let findings = lint_packet_with(&text, root, &[], &options);
     assert_eq!(rules(&findings), Vec::<&str>::new(), "{findings:?}");
@@ -424,6 +435,7 @@ fn port_accepted_unruled() {
         let log = escalation_log(root, answer);
         let options = LintOptions {
             escalations: Some(&log),
+            ..Default::default()
         };
         let findings = lint_packet_with(&text, root, &[], &options);
         assert_eq!(
@@ -436,6 +448,7 @@ fn port_accepted_unruled() {
     let missing = root.join("no-such-log.jsonl");
     let options = LintOptions {
         escalations: Some(&missing),
+        ..Default::default()
     };
     let findings = lint_packet_with(&text, root, &[], &options);
     assert_eq!(rules(&findings), ["port-accepted-unruled"], "{findings:?}");
@@ -672,4 +685,163 @@ fn a_process_capture_with_substituted_roots_is_not_flagged_but_a_raw_path_beside
         "{}",
         findings[0].message
     );
+}
+
+/// A held-out file in its own directory, outside the repository, whose port cases name `tools`.
+fn held_out_file(tools: &[&str]) -> (TempDir, std::path::PathBuf) {
+    let dir = tempfile::Builder::new()
+        .prefix("cp-lint-held-")
+        .tempdir_in("/var/tmp")
+        .unwrap();
+    let cases: Vec<String> = tools
+        .iter()
+        .map(|t| format!("{{\"tool\":\"{t}\",\"input\":{{}}}}"))
+        .collect();
+    put(
+        dir.path(),
+        "heldout.cases.jsonl",
+        &format!("# the director's cases\n\n{}\n", cases.join("\n")),
+    );
+    let toml = dir.path().join("lane.toml");
+    fs::write(&toml, "[port]\ncases = \"heldout.cases.jsonl\"\n").unwrap();
+    (dir, toml)
+}
+
+fn findings_of<'a>(findings: &'a [Finding], rule: &str) -> Vec<&'a Finding> {
+    findings.iter().filter(|f| f.rule == rule).collect()
+}
+
+#[test]
+fn port_no_base_fixtures_is_an_error_on_an_empty_base() {
+    let dir = repo();
+    let root = dir.path();
+    // The clean base holds a fixture for the tool: nothing to report.
+    assert_eq!(
+        rules(&lint(root, &header(|_| {}), BODY)),
+        Vec::<&str>::new()
+    );
+
+    // A fixtures directory with no file for the tool (an empty directory, a file in the
+    // wrong place, a non-JSON file) is an empty base.
+    fs::remove_file(root.join("ports/wc/fixtures/word_count/001.json")).unwrap();
+    for stray in [
+        "ports/wc/fixtures/README.md",
+        "ports/wc/fixtures/word_count/notes.txt",
+    ] {
+        put(root, stray, "x");
+    }
+    put(root, "ports/wc/fixtures/other_tool/001.json", "{}");
+    let findings = lint(root, &header(|_| {}), BODY);
+    assert_eq!(rules(&findings), ["port-no-base-fixtures"], "{findings:?}");
+    assert_eq!(findings[0].severity, Severity::Error);
+    let text = errors(&findings).join("\n");
+    assert!(text.contains("word_count"), "{text}");
+    assert!(
+        text.contains("record the fixtures in the base first"),
+        "{text}"
+    );
+
+    // A missing fixtures directory is the same.
+    fs::remove_dir_all(root.join("ports/wc/fixtures")).unwrap();
+    let findings = lint(root, &header(|_| {}), BODY);
+    assert_eq!(findings_of(&findings, "port-no-base-fixtures").len(), 1);
+
+    // Only the tool without fixtures is named, when the packet has two.
+    put(root, "ports/wc/fixtures/word_count/001.json", "{}");
+    let two = header(|h| h["port"]["tools"] = json!(["word_count", "line_count"]));
+    let body = format!("{BODY}\nAlso `line_count`.\n");
+    let findings = lint(root, &two, &body);
+    let found = findings_of(&findings, "port-no-base-fixtures");
+    assert_eq!(found.len(), 1, "{findings:?}");
+    assert!(found[0].message.contains("line_count") && !found[0].message.contains("word_count"));
+}
+
+#[test]
+fn port_no_base_fixtures_is_a_warning_only_when_the_held_out_cases_name_the_tool() {
+    let dir = repo();
+    let root = dir.path();
+    fs::remove_file(root.join("ports/wc/fixtures/word_count/001.json")).unwrap();
+    // A fixtures directory with a file in it still exists for the `owns` rule.
+    put(root, "ports/wc/fixtures/README.md", "fixtures\n");
+    let run = |toml: &Path| {
+        let options = LintOptions {
+            held_out: Some(toml),
+            ..Default::default()
+        };
+        lint_packet_with(&packet(&header(|_| {}), BODY), root, &[], &options)
+    };
+
+    // The held-out cases (one JSONL line per case, blank lines and comments skipped) name it.
+    let (_keep, toml) = held_out_file(&["word_count"]);
+    let findings = run(&toml);
+    let found = findings_of(&findings, "port-no-base-fixtures");
+    assert_eq!(found.len(), 1, "{findings:?}");
+    assert_eq!(found[0].severity, Severity::Warn);
+    assert_eq!(errors(&findings), Vec::<String>::new());
+
+    // They name another tool: still an error.
+    let (_keep2, other) = held_out_file(&["line_count"]);
+    let found = run(&other);
+    assert_eq!(found[0].rule, "port-no-base-fixtures");
+    assert_eq!(found[0].severity, Severity::Error);
+
+    // A held-out file with no port cases: an error.
+    let bare = tempfile::Builder::new().tempdir_in("/var/tmp").unwrap();
+    let toml = bare.path().join("lane.toml");
+    fs::write(&toml, "[[check]]\nid = \"x\"\ncommand = \"true\"\n").unwrap();
+    let found = run(&toml);
+    assert_eq!(found[0].severity, Severity::Error);
+
+    // A held-out file that cannot be read: an error that says so.
+    let found = run(&bare.path().join("missing.toml"));
+    assert_eq!(found[0].severity, Severity::Error);
+    assert!(
+        found[0].message.contains("could not be read"),
+        "{}",
+        found[0].message
+    );
+
+    // No held-out file at all: an error.
+    let found = lint(root, &header(|_| {}), BODY);
+    assert_eq!(
+        findings_of(&found, "port-no-base-fixtures")[0].severity,
+        Severity::Error
+    );
+}
+
+#[test]
+fn port_no_base_fixtures_reads_the_base_commit_not_the_working_tree() {
+    let dir = repo();
+    let root = dir.path();
+    let git = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .current_dir(root)
+            .args(["-c", "user.name=t", "-c", "user.email=t@localhost"])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+    };
+    git(&["init", "-q"]);
+    // The base commit has no fixture; the working tree does.
+    fs::rename(
+        root.join("ports/wc/fixtures"),
+        root.join("ports/fixtures-held-back"),
+    )
+    .unwrap();
+    git(&["add", "-A"]);
+    git(&["commit", "-q", "-m", "base"]);
+    fs::rename(
+        root.join("ports/fixtures-held-back"),
+        root.join("ports/wc/fixtures"),
+    )
+    .unwrap();
+    let findings = lint(root, &header(|_| {}), BODY);
+    assert_eq!(rules(&findings), ["port-no-base-fixtures"], "{findings:?}");
+
+    // Committed, it is in the base.
+    git(&["add", "-A"]);
+    git(&["commit", "-q", "-m", "fixtures"]);
+    let findings = lint(root, &header(|_| {}), BODY);
+    assert_eq!(rules(&findings), Vec::<&str>::new(), "{findings:?}");
 }

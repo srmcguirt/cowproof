@@ -43,10 +43,13 @@ pub mod replay;
 pub mod report;
 
 pub use capture::{capture, error_envelope, CaptureOptions, CaptureReport};
-pub use fixture::{load_cases, load_fixtures, AcceptedDifference, Case, Fixture, Normalized};
+pub use fixture::{
+    host_platform, id_platform, load_cases, load_fixtures, tagged_id, AcceptedDifference, Case,
+    Fixture, Normalized, PLATFORMS,
+};
 pub use replay::{
-    error_envelope_of, replay, replay_fixtures, CaseOutcome, ReplayOptions, ReplayReport, Status,
-    Surface,
+    error_envelope_of, replay, replay_fixtures, CaseOutcome, PlatformGap, ReplayOptions,
+    ReplayReport, SkippedFixture, Status, Surface,
 };
 pub use report::render;
 

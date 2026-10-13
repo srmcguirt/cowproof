@@ -185,6 +185,9 @@ pub struct ExecConfig {
     pub timeout: Duration,
     /// Keep work directories (for looking at what a run did).
     pub keep_work: bool,
+    /// Tag each captured fixture with the host's platform (see
+    /// [`CaptureOptions::tag_platform`](crate::capture::CaptureOptions::tag_platform)).
+    pub tag_platform: bool,
 }
 
 impl ExecConfig {
@@ -203,6 +206,7 @@ impl ExecConfig {
             work_parent: default_work_parent(),
             timeout: Duration::from_secs(60),
             keep_work: false,
+            tag_platform: false,
         }
     }
 
@@ -683,6 +687,11 @@ pub async fn capture_process(
 ) -> Result<CaptureReport> {
     cfg.validate().map_err(Error::other)?;
     let cases = load_cases(cases_path)?;
+    let platform = if cfg.tag_platform {
+        Some(crate::fixture::host_platform_tag().map_err(Error::other)?)
+    } else {
+        None
+    };
     prove_network_denied(cfg).await?;
 
     let mut report = CaptureReport {
@@ -694,6 +703,20 @@ pub async fn capture_process(
             .id
             .clone()
             .unwrap_or_else(|| format!("{:03}", index + 1));
+        let id = match crate::capture::fixture_id(id, platform) {
+            Ok(id) => id,
+            Err((id, reason)) => {
+                report.failures.push(CaptureFailure {
+                    tool: case.tool.clone(),
+                    id,
+                    reason,
+                });
+                if fail_fast {
+                    break;
+                }
+                continue;
+            }
+        };
         match capture_case(case, cfg, repeat.max(1)).await {
             Ok(expected) => {
                 let fixture = Fixture {
@@ -712,6 +735,7 @@ pub async fn capture_process(
                     env: case.env.clone(),
                     expect_error: case.expect_error,
                     normalized: normalized_for(&cfg.path_roots),
+                    platform: platform.map(str::to_string),
                 };
                 let path = fixture.write(out_root)?;
                 report.captured.push(CapturedCase {

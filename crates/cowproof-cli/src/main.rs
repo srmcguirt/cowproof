@@ -388,6 +388,11 @@ struct LintArgs {
     /// packet's accepted differences must then cite a ruling a director's answer in it carries
     #[arg(long, value_name = "FILE")]
     escalations: Option<PathBuf>,
+    /// The lane's held-out checks file (as for `cowproof run --heldout`; the director store is
+    /// read when this is not given): a `kind: port` packet whose tool has no fixture in the base
+    /// is a warning, not an error, when the held-out port cases name that tool
+    #[arg(long, value_name = "FILE")]
+    heldout: Option<PathBuf>,
     #[arg(required = true)]
     packets: Vec<PathBuf>,
 }
@@ -655,8 +660,10 @@ fn lint_command(args: LintArgs) -> Result<()> {
         let text = fs::read_to_string(&path)
             .with_context(|| format!("reading packet {}", path.display()))?;
         let plans = load_plans(&repo, &[])?;
+        let held_out = run::heldout_for_lint(args.heldout.as_deref(), &repo, &text);
         let options = LintOptions {
             escalations: args.escalations.as_deref(),
+            held_out: held_out.as_deref(),
         };
         let findings = lint_packet_with(&text, &repo, &plans, &options);
         print_findings(&path, &findings);

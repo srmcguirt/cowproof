@@ -286,6 +286,12 @@ pub enum PortCommand {
         /// does not depend on the capturing shell.
         #[arg(long)]
         clear_env: bool,
+
+        /// Write this host's platform (`linux` or `macos`) into each fixture and append
+        /// `@<platform>` to its id, so the fixtures of both platforms share one directory and
+        /// a replay runs only the untagged ones and its own platform's.
+        #[arg(long)]
+        tag_platform: bool,
     },
 
     /// Capture a script (or any executable) as a whole process, in a sandbox with the network denied.
@@ -419,6 +425,11 @@ pub struct ExecArgs {
     /// How many times to run each case, in separate roots; a case whose runs differ is refused.
     #[arg(long, value_name = "N", default_value_t = 2)]
     pub repeat: usize,
+
+    /// Write this host's platform (`linux` or `macos`) into each fixture and append
+    /// `@<platform>` to its id (see `pk port capture --tag-platform`).
+    #[arg(long)]
+    pub tag_platform: bool,
 
     #[command(flatten)]
     pub harness: HarnessArgs,

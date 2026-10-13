@@ -16,7 +16,7 @@ use tracing::{debug, info};
 
 use portkit_core::{Error, Result};
 
-use crate::fixture::{load_cases, Case, Fixture};
+use crate::fixture::{host_platform_tag, id_platform, load_cases, tagged_id, Case, Fixture};
 
 /// How to invoke the reference implementation.
 #[derive(Debug, Clone)]
@@ -37,6 +37,10 @@ pub struct CaptureOptions {
     /// `env` or the case sets one) and what `env` and the case set (G2). Without it a fixture
     /// can depend on the capturing shell's `HOME`, `TZ`, locale or a stray `PORTKIT_NOW`.
     pub clear_env: bool,
+    /// Write the host's platform into each fixture and append `@<platform>` to its id, so the
+    /// fixtures of one case from two platforms coexist in one directory and a replay runs only
+    /// the ones for its own platform. Off by default: an untagged fixture applies everywhere.
+    pub tag_platform: bool,
 }
 
 impl CaptureOptions {
@@ -47,6 +51,7 @@ impl CaptureOptions {
             cwd: None,
             env: Vec::new(),
             clear_env: false,
+            tag_platform: false,
         }
     }
 
@@ -65,6 +70,12 @@ impl CaptureOptions {
     /// Start from an empty environment (see [`clear_env`](Self::clear_env)).
     pub fn with_clear_env(mut self, clear: bool) -> Self {
         self.clear_env = clear;
+        self
+    }
+
+    /// Tag every fixture with the host's platform (see [`tag_platform`](Self::tag_platform)).
+    pub fn with_tag_platform(mut self, tag: bool) -> Self {
+        self.tag_platform = tag;
         self
     }
 }
@@ -118,6 +129,11 @@ pub async fn capture(
     opts: &CaptureOptions,
 ) -> Result<CaptureReport> {
     let cases = load_cases(cases_path)?;
+    let platform = if opts.tag_platform {
+        Some(host_platform_tag().map_err(Error::other)?)
+    } else {
+        None
+    };
     info!(cases = cases.len(), command = %opts.command, "capturing reference behaviour");
 
     let mut report = CaptureReport {
@@ -130,6 +146,20 @@ pub async fn capture(
             .id
             .clone()
             .unwrap_or_else(|| format!("{:03}", index + 1));
+        let id = match fixture_id(id, platform) {
+            Ok(id) => id,
+            Err((id, reason)) => {
+                report.failures.push(CaptureFailure {
+                    tool: case.tool.clone(),
+                    id,
+                    reason,
+                });
+                if opts.fail_fast {
+                    break;
+                }
+                continue;
+            }
+        };
 
         match run_case(case, opts).await {
             Ok(expected) => {
@@ -147,6 +177,7 @@ pub async fn capture(
                     env: case.env.clone(),
                     expect_error: case.expect_error,
                     normalized: None,
+                    platform: platform.map(str::to_string),
                 };
                 let path = fixture.write(out_root)?;
                 debug!(tool = %case.tool, %id, path = %path.display(), "captured");
@@ -170,6 +201,28 @@ pub async fn capture(
     }
 
     Ok(report)
+}
+
+/// The id a captured case is written under: tagged for `platform` when the capture tags, else
+/// as it is. An untagged capture refuses an id that already ends with a platform tag, because
+/// the fixture would then be read back as an error (or, worse, as tagged without a tag). On a
+/// refusal the id comes back with the reason.
+pub(crate) fn fixture_id(
+    id: String,
+    platform: Option<&str>,
+) -> std::result::Result<String, (String, String)> {
+    match platform {
+        Some(platform) => tagged_id(&id, platform).map_err(|reason| (id, reason)),
+        None => match id_platform(&id) {
+            Some(tag) => {
+                let reason = format!(
+                    "the case id ends with @{tag}; capture with --tag-platform (which tags for this host only) or rename the case"
+                );
+                Err((id, reason))
+            }
+            None => Ok(id),
+        },
+    }
 }
 
 async fn run_case(case: &Case, opts: &CaptureOptions) -> Result<Value> {
@@ -430,6 +483,87 @@ mod tests {
         assert_eq!(
             fixture(&base.join("out3"), "t", "ok").expected,
             json!({"error": "nope"})
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    fn other_platform() -> &'static str {
+        crate::fixture::PLATFORMS
+            .iter()
+            .copied()
+            .find(|p| *p != crate::fixture::host_platform())
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn tag_platform_writes_the_field_and_the_id_suffix() {
+        let base = dir("tag");
+        let host = crate::fixture::host_platform();
+        let path = cases(
+            &base,
+            &[
+                json!({"tool": "t", "input": {"n": 1}}),
+                json!({"tool": "t", "id": "named", "input": {"n": 2}}),
+                json!({"tool": "t", "id": format!("done@{host}"), "input": {"n": 3}}),
+            ],
+        );
+        let out = base.join("out");
+        let opts = CaptureOptions::new("echo '{\"ok\": true}'").with_tag_platform(true);
+        let report = capture(&path, &out, &opts).await.unwrap();
+        assert!(report.is_success(), "{:?}", report.failures);
+        let ids: Vec<&str> = report.captured.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            [
+                format!("001@{host}"),
+                format!("named@{host}"),
+                format!("done@{host}")
+            ]
+        );
+        for id in ids {
+            let fixture = fixture(&out, "t", id);
+            assert_eq!(fixture.platform.as_deref(), Some(host));
+            assert_eq!(fixture.id, id);
+            // The file holds the field as plain JSON, and the fixture reads back (it validates).
+            let raw = std::fs::read_to_string(out.join("t").join(format!("{id}.json"))).unwrap();
+            assert!(raw.contains(&format!("\"platform\": \"{host}\"")), "{raw}");
+        }
+
+        // A case already tagged for the other platform cannot be captured on this one.
+        let other = other_platform();
+        let path = cases(
+            &base,
+            &[json!({"tool": "t", "id": format!("x@{other}"), "input": {}})],
+        );
+        let report = capture(&path, &base.join("out2"), &opts).await.unwrap();
+        assert_eq!(report.captured.len(), 0);
+        assert!(
+            report.failures[0].reason.contains(other),
+            "{:?}",
+            report.failures
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[tokio::test]
+    async fn an_untagged_capture_writes_no_platform_and_refuses_a_tagged_looking_id() {
+        let base = dir("untagged");
+        let path = cases(&base, &[json!({"tool": "t", "id": "plain", "input": {}})]);
+        let out = base.join("out");
+        let opts = CaptureOptions::new("echo '{\"ok\": true}'");
+        let report = capture(&path, &out, &opts).await.unwrap();
+        assert!(report.is_success());
+        assert_eq!(fixture(&out, "t", "plain").platform, None);
+        let raw = std::fs::read_to_string(out.join("t/plain.json")).unwrap();
+        assert!(!raw.contains("platform"), "{raw}");
+
+        let path = cases(&base, &[json!({"tool": "t", "id": "x@linux", "input": {}})]);
+        let report = capture(&path, &base.join("out2"), &opts).await.unwrap();
+        assert_eq!(report.captured.len(), 0);
+        assert!(
+            report.failures[0].reason.contains("--tag-platform"),
+            "{:?}",
+            report.failures
         );
         let _ = std::fs::remove_dir_all(&base);
     }

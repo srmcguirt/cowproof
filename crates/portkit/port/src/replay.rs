@@ -10,7 +10,7 @@ use tracing::debug;
 use portkit_core::{diff, DiffOptions, Difference, Error, Registry, Result};
 use portkit_mcp::{McpServer, ServerInfo};
 
-use crate::fixture::{load_fixtures, Fixture};
+use crate::fixture::{host_platform, load_fixtures, Fixture};
 
 /// Which code path a fixture is replayed through.
 ///
@@ -85,6 +85,36 @@ pub enum Status {
     NotPorted,
 }
 
+/// A fixture a replay did not run because it is tagged for another platform.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkippedFixture {
+    pub tool: String,
+    pub id: String,
+    /// The platform the fixture is tagged for.
+    pub platform: String,
+}
+
+/// A tool whose fixtures were all tagged for other platforms: nothing of it was replayed here,
+/// so the port was never proved on this platform.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlatformGap {
+    pub tool: String,
+    /// The platforms its fixtures cover (all other than this host's).
+    pub platforms: Vec<String>,
+}
+
+impl fmt::Display for PlatformGap {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "tool {:?} has no fixture for {} (its fixtures cover {}), so it was never proved on this platform",
+            self.tool,
+            host_platform(),
+            self.platforms.join(", ")
+        )
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReplayReport {
     pub outcomes: Vec<CaseOutcome>,
@@ -94,10 +124,16 @@ pub struct ReplayReport {
     pub failed: usize,
     pub errored: usize,
     pub not_ported: usize,
+    /// Fixtures tagged for another platform: not replayed, and never counted as passed.
+    #[serde(default)]
+    pub other_platform: usize,
+    /// Which fixtures those were.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub other_platform_cases: Vec<SkippedFixture>,
 }
 
 impl ReplayReport {
-    fn from_outcomes(outcomes: Vec<CaseOutcome>) -> Self {
+    fn from_outcomes(outcomes: Vec<CaseOutcome>, skipped: Vec<SkippedFixture>) -> Self {
         let count = |s: Status| outcomes.iter().filter(|o| o.status == s).count();
         Self {
             passed: count(Status::Pass),
@@ -105,8 +141,36 @@ impl ReplayReport {
             failed: count(Status::Fail),
             errored: count(Status::Error),
             not_ported: count(Status::NotPorted),
+            other_platform: skipped.len(),
+            other_platform_cases: skipped,
             outcomes,
         }
+    }
+
+    /// The tools that have fixtures tagged for other platforms and none replayed on this one.
+    pub fn platform_gaps(&self) -> Vec<PlatformGap> {
+        let mut gaps: Vec<PlatformGap> = Vec::new();
+        for skipped in &self.other_platform_cases {
+            if self.outcomes.iter().any(|o| o.tool == skipped.tool) {
+                continue;
+            }
+            match gaps.iter_mut().find(|g| g.tool == skipped.tool) {
+                Some(gap) => {
+                    if !gap.platforms.contains(&skipped.platform) {
+                        gap.platforms.push(skipped.platform.clone());
+                    }
+                }
+                None => gaps.push(PlatformGap {
+                    tool: skipped.tool.clone(),
+                    platforms: vec![skipped.platform.clone()],
+                }),
+            }
+        }
+        gaps.sort_by(|a, b| a.tool.cmp(&b.tool));
+        for gap in &mut gaps {
+            gap.platforms.sort();
+        }
+        gaps
     }
 
     pub fn total(&self) -> usize {
@@ -116,9 +180,13 @@ impl ReplayReport {
     /// Whether every replayed case matched.
     ///
     /// Unported tools count as failure: a port is not done while a fixture has
-    /// no implementation to answer it.
+    /// no implementation to answer it. So does a tool whose fixtures are all for other
+    /// platforms: a port must never prove on a platform it was never captured on.
     pub fn is_success(&self) -> bool {
-        self.failed == 0 && self.errored == 0 && self.not_ported == 0
+        self.failed == 0
+            && self.errored == 0
+            && self.not_ported == 0
+            && self.platform_gaps().is_empty()
     }
 
     /// Per-tool `(tool, passed, total)`, in stable order, for progress reporting.
@@ -163,17 +231,29 @@ pub async fn replay_fixtures(
     // the MCP surface look slower than it is.
     let server = McpServer::new(registry.clone(), ServerInfo::default());
 
+    let host = host_platform();
     let mut outcomes = Vec::new();
+    let mut skipped = Vec::new();
     for fixture in fixtures {
         if let Some(only) = &opts.only_tool {
             if &fixture.tool != only {
                 continue;
             }
         }
+        // A fixture tagged for another platform says what the reference did there; it is not
+        // a claim about this one, so it is not run and not counted as passed.
+        if !fixture.applies_on(host) {
+            skipped.push(SkippedFixture {
+                tool: fixture.tool.clone(),
+                id: fixture.id.clone(),
+                platform: fixture.platform.clone().unwrap_or_default(),
+            });
+            continue;
+        }
         outcomes.push(replay_one(fixture, registry, &server, opts).await);
     }
 
-    Ok(ReplayReport::from_outcomes(outcomes))
+    Ok(ReplayReport::from_outcomes(outcomes, skipped))
 }
 
 async fn replay_one(
@@ -389,6 +469,7 @@ mod tests {
             env: Default::default(),
             expect_error: false,
             normalized: None,
+            platform: None,
         }
     }
 
@@ -463,6 +544,7 @@ mod tests {
             env: Default::default(),
             expect_error,
             normalized: None,
+            platform: None,
         }
     }
 
@@ -670,5 +752,169 @@ mod tests {
         known.expected = json!({"stable": 1, "quirk": "rust-behaviour"});
         known.normalized = crate::process::normalized_for(&["$ROOT".to_string()]);
         assert!(run(known).await.is_success());
+    }
+
+    // ---- platform-tagged fixtures ----
+
+    /// The platform that is not the one running.
+    fn other_platform() -> &'static str {
+        crate::fixture::PLATFORMS
+            .iter()
+            .copied()
+            .find(|p| *p != host_platform())
+            .unwrap()
+    }
+
+    /// A fixture `Drifts` passes, written under `<id>` and tagged for `platform` (the id gets
+    /// the suffix).
+    fn passing(tool: &str, id: &str, platform: Option<&str>) -> Fixture {
+        let mut f = fixture(vec![]);
+        f.tool = tool.into();
+        f.expected = json!({"stable": 1, "quirk": "rust-behaviour"});
+        match platform {
+            Some(p) => {
+                f.id = format!("{id}@{p}");
+                f.platform = Some(p.into());
+            }
+            None => f.id = id.into(),
+        }
+        f
+    }
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let dir = std::path::Path::new("/var/tmp")
+            .join(format!("pk-replay-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[tokio::test]
+    async fn a_mixed_directory_replays_the_untagged_and_its_own_platform_only() {
+        let dir = scratch("mixed");
+        let (host, other) = (host_platform(), other_platform());
+        // One case in three versions: untagged, for this host, and for the other platform.
+        for f in [
+            passing("drifts", "a", None),
+            passing("drifts", "a", Some(host)),
+            // The other platform's fixture would fail here (its expectation is wrong), so a
+            // replay that ran it would show.
+            Fixture {
+                expected: json!({"stable": 99}),
+                ..passing("drifts", "a", Some(other))
+            },
+        ] {
+            f.write(&dir).unwrap();
+        }
+        let registry = Registry::new().with(Drifts);
+        for surface in [Surface::Direct, Surface::Mcp] {
+            let opts = ReplayOptions {
+                surface,
+                ..Default::default()
+            };
+            let report = replay(&dir, &registry, &opts).await.unwrap();
+            let ran: Vec<&str> = report.outcomes.iter().map(|o| o.id.as_str()).collect();
+            assert_eq!(ran, ["a", &format!("a@{host}")], "{surface}");
+            assert_eq!(report.passed, 2, "{surface}");
+            assert_eq!(report.failed, 0, "{surface}");
+            assert_eq!(report.other_platform, 1, "{surface}");
+            assert_eq!(
+                report.other_platform_cases,
+                [SkippedFixture {
+                    tool: "drifts".into(),
+                    id: format!("a@{other}"),
+                    platform: other.into()
+                }]
+            );
+            // Never counted as passed, nor in the total or the per-tool figures.
+            assert_eq!(report.total(), 2);
+            assert_eq!(report.by_tool(), [("drifts".to_string(), 2, 2)]);
+            assert!(report.platform_gaps().is_empty());
+            assert!(report.is_success(), "{surface}");
+            let text = crate::render(&report);
+            assert!(text.contains("2 passed"), "{text}");
+            assert!(text.contains("1 for other platforms"), "{text}");
+            // The count is in the JSON report a verifier reads.
+            let json = serde_json::to_value(&report).unwrap();
+            assert_eq!(json["other_platform"], 1);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_tool_with_only_other_platform_fixtures_fails_naming_the_tool_and_platforms() {
+        let dir = scratch("gap");
+        let (host, other) = (host_platform(), other_platform());
+        passing("drifts", "a", Some(host)).write(&dir).unwrap();
+        // `elsewhere` is not registered: a skipped fixture is never looked up.
+        passing("elsewhere", "a", Some(other)).write(&dir).unwrap();
+        passing("elsewhere", "b", Some(other)).write(&dir).unwrap();
+        let registry = Registry::new().with(Drifts);
+        let report = replay(&dir, &registry, &ReplayOptions::default())
+            .await
+            .unwrap();
+        // Nothing of it errored or was reported not ported: it was not replayed at all.
+        assert_eq!(
+            (report.passed, report.errored, report.not_ported),
+            (1, 0, 0)
+        );
+        assert_eq!(report.other_platform, 2);
+        let gaps = report.platform_gaps();
+        assert_eq!(gaps.len(), 1);
+        assert_eq!(gaps[0].tool, "elsewhere");
+        assert_eq!(gaps[0].platforms, [other]);
+        assert!(!report.is_success());
+        let text = crate::render(&report);
+        assert!(
+            text.contains("\"elsewhere\"") && text.contains(other),
+            "{text}"
+        );
+        assert!(text.contains(&format!("no fixture for {host}")), "{text}");
+
+        // Only the other platform's fixtures for the one tool: the replay is empty and fails.
+        let only = scratch("gap-only");
+        passing("drifts", "a", Some(other)).write(&only).unwrap();
+        let report = replay(&only, &registry, &ReplayOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(report.total(), 0);
+        assert_eq!(report.other_platform, 1);
+        assert!(!report.is_success());
+        assert_eq!(report.platform_gaps()[0].tool, "drifts");
+
+        // `--tool` leaves another tool's gap out of the report.
+        let opts = ReplayOptions {
+            only_tool: Some("drifts".into()),
+            ..Default::default()
+        };
+        let report = replay(&dir, &registry, &opts).await.unwrap();
+        assert_eq!(report.other_platform, 0);
+        assert!(report.is_success());
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&only);
+    }
+
+    #[tokio::test]
+    async fn untagged_fixtures_replay_exactly_as_before_on_any_platform() {
+        let dir = scratch("old");
+        passing("drifts", "a", None).write(&dir).unwrap();
+        passing("drifts", "b", None).write(&dir).unwrap();
+        let raw = std::fs::read_to_string(dir.join("drifts/a.json")).unwrap();
+        assert!(!raw.contains("platform"), "{raw}");
+        let registry = Registry::new().with(Drifts);
+        let report = replay(&dir, &registry, &ReplayOptions::default())
+            .await
+            .unwrap();
+        assert_eq!((report.passed, report.other_platform), (2, 0));
+        assert!(report.is_success());
+        // A report without the new fields (one made before them) still reads.
+        let old = json!({
+            "outcomes": [], "passed": 0, "accepted": 0, "failed": 0, "errored": 0,
+            "not_ported": 0,
+        });
+        let old: ReplayReport = serde_json::from_value(old).unwrap();
+        assert_eq!(old.other_platform, 0);
+        assert!(old.other_platform_cases.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

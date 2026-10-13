@@ -800,7 +800,9 @@ implementation of an existing capability is a flaw.
 The parity harness records the reference's behavior before any port is written. The
 director records the fixtures first, with `cowproof pk port capture` against the original
 command (`--cmd FILL-REFERENCE-COMMAND --cases FILL-FIXTURES-DIR/cases.jsonl --out
-FILL-FIXTURES-DIR/fixtures`), then sets the `port.reference` and the held-out cases. The
+FILL-FIXTURES-DIR/fixtures`) and commits them in the base (lint refuses a port packet whose
+base holds no fixture for a tool: `port-no-base-fixtures`), then sets the `port.reference` and
+the held-out cases. The
 builder does not write fixtures by hand, does not change a recorded `input` or `expected`
 (the proof refuses it), never edits `epsilon`, and adds an `accepted` difference only after a
 director's ruling, citing it as `ruling:<id>` in the reason.

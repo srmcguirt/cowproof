@@ -1,6 +1,6 @@
 //! The lint rules of `kind: port` packets (portkit-integration.md, section 6.4).
 //!
-//! Nine rules, none of which runs anything: they read the header, the packet text and the
+//! Ten rules, none of which runs anything: they read the header, the packet text and the
 //! files a port names. `port-nondeterministic-output` is a heuristic and only warns.
 //!
 //! | Rule | Level | Fires when |
@@ -13,6 +13,7 @@
 //! | `port-accepted-unruled` | error | a fixture's `accepted` entry has a reason that cites no `ruling:<id>`, or an id the lane's escalation log does not carry |
 //! | `port-epsilon-loosened` | error | the packet or a fixture raises epsilon above the project default |
 //! | `port-wrap-roots-mismatch` | error | the repository's `.portkit/plugins.toml` registers a `pk port wrap` entry for a tool of the packet whose `--path-root` flags are not `port.parity.path_roots` (a missing manifest, or no wrap entry for the tool, is not an error) |
+//! | `port-no-base-fixtures` | error (warn when the held-out port cases name the tool) | the base commit's fixtures directory (`HEAD`; the working tree when there is no commit) holds no `<port.fixtures>/<tool>/*.json` for a tool of `port.tools`: record the fixtures in the base first |
 //! | `port-nondeterministic-output` | warn | a fixture's expected output has a time, a temp or home path, or a host name that no `ignore_paths`, `accepted` or `path_roots` entry covers |
 
 use crate::{
@@ -26,6 +27,7 @@ use cowproof_core::port::{
 use cowproof_core::{Header, PortSpec, glob_matches};
 use regex::Regex;
 use serde_json::Value;
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Component, Path};
 
@@ -42,6 +44,11 @@ pub struct LintOptions<'a> {
     /// cited ruling id to be carried by a director's answer in it; without it the rule checks
     /// only that every reason cites a ruling.
     pub escalations: Option<&'a Path>,
+    /// The lane's held-out checks file (the director's, outside the repository). Its
+    /// `[port] cases` JSONL names the tools the director's held-out port cases cover; with it,
+    /// `port-no-base-fixtures` is a warning, not an error, for a tool those cases name (see
+    /// [`held_out_tools`]).
+    pub held_out: Option<&'a Path>,
 }
 
 /// The port rules for `header`, when it is a port packet.
@@ -61,6 +68,7 @@ pub(crate) fn lint_port(
     reference_not_allowed(header, port, packet_text, findings);
     tool_unregistered(header, port, packet_text, findings);
     accepted_unruled(port, repo_root, options, findings);
+    no_base_fixtures(port, repo_root, options, findings);
     epsilon_loosened(port, repo_root, findings);
     wrap_roots_mismatch(port, repo_root, findings);
     nondeterministic_output(port, repo_root, findings);
@@ -463,6 +471,107 @@ fn describe_unruled(entry: &AcceptedEntry, why: &Unruled) -> String {
         "fixture {} accepts a difference at {:?} but its reason {what}",
         entry.file, entry.path
     )
+}
+
+/// The tools that have a fixture file in the fixtures directory `dir` of the base: a tool is the
+/// directory one level below `dir`, and it has a fixture when that directory (or one below it)
+/// holds a `.json` file; the verifier's `tools_with_fixtures` reads the directory the same way.
+/// The base is `HEAD` when the repository has a commit (a fixture only in the working tree is not
+/// in the lane's base), else the working tree.
+fn base_fixture_tools(repo_root: &Path, dir: &str) -> BTreeSet<String> {
+    let dir = dir.trim_end_matches('/');
+    let mut tools = BTreeSet::new();
+    if has_head(repo_root) {
+        let listing = std::process::Command::new("git")
+            .current_dir(repo_root)
+            .args(["ls-tree", "-r", "--name-only", "-z", "HEAD", "--", dir])
+            .output();
+        if let Ok(out) = listing
+            && out.status.success()
+        {
+            let prefix = format!("{dir}/");
+            for path in String::from_utf8_lossy(&out.stdout).split('\0') {
+                if let Some(rel) = path.strip_prefix(&prefix)
+                    && rel.ends_with(".json")
+                    && let Some((tool, _)) = rel.split_once('/')
+                {
+                    tools.insert(tool.to_string());
+                }
+            }
+            return tools;
+        }
+    }
+    for (rel, _) in read_fixture_files(&repo_root.join(dir)) {
+        if let Some((tool, _)) = rel.split_once('/') {
+            tools.insert(tool.to_string());
+        }
+    }
+    tools
+}
+
+/// The tools the director's held-out port cases name: the `tool` of each line of the JSONL file
+/// the held-out file's `[port] cases` points at (blank lines and `#` comments skipped, as
+/// `portkit_port::load_cases` does). `Err` says why the file could not be read.
+pub fn held_out_tools(held_out: &Path) -> Result<BTreeSet<String>, String> {
+    let file = cowproof_core::heldout::load(held_out).map_err(|e| format!("{e:#}"))?;
+    let Some(cases) = file.port_cases_path(held_out) else {
+        return Ok(BTreeSet::new());
+    };
+    let text = fs::read_to_string(&cases).map_err(|e| format!("{}: {e}", cases.display()))?;
+    let mut tools = BTreeSet::new();
+    for line in text.lines().map(str::trim) {
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let case: Value =
+            serde_json::from_str(line).map_err(|e| format!("{}: {e}", cases.display()))?;
+        if let Some(tool) = case.get("tool").and_then(Value::as_str) {
+            tools.insert(tool.to_string());
+        }
+    }
+    Ok(tools)
+}
+
+fn no_base_fixtures(
+    port: &PortSpec,
+    repo_root: &Path,
+    options: &LintOptions,
+    findings: &mut Vec<Finding>,
+) {
+    let have = base_fixture_tools(repo_root, &port.fixtures);
+    let missing: Vec<&String> = port.tools.iter().filter(|t| !have.contains(*t)).collect();
+    if missing.is_empty() {
+        return;
+    }
+    let (held_out, unreadable) = match options.held_out.map(held_out_tools) {
+        None => (BTreeSet::new(), None),
+        Some(Ok(tools)) => (tools, None),
+        Some(Err(why)) => (BTreeSet::new(), Some(why)),
+    };
+    let dir = port.fixtures.trim_end_matches('/');
+    for tool in missing {
+        if held_out.contains(tool) {
+            findings.push(warn(
+                "port-no-base-fixtures",
+                None,
+                format!(
+                    "the base commit holds no fixture for tool {tool:?} ({dir}/{tool}/<id>.json); the held-out port cases name it, so only they check the port against the reference. Record the fixtures in the base first for a contract the lane can see"
+                ),
+            ));
+        } else {
+            let note = unreadable
+                .as_ref()
+                .map(|why| format!(" (the held-out file could not be read: {why})"))
+                .unwrap_or_default();
+            findings.push(error(
+                "port-no-base-fixtures",
+                None,
+                format!(
+                    "the base commit holds no fixture for tool {tool:?} ({dir}/{tool}/<id>.json) and no held-out port case names it{note}; record the fixtures in the base first, so the proof can hold the port to them (the lane may add fixtures, but a base fixture is the one the proof keeps as it was)"
+                ),
+            ));
+        }
+    }
 }
 
 fn epsilon_loosened(port: &PortSpec, repo_root: &Path, findings: &mut Vec<Finding>) {

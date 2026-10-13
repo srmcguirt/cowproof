@@ -1789,6 +1789,8 @@ struct Drive<'a> {
     cwd: &'a Path,
     repo: &'a Path,
     plans: &'a [cowproof_plan::Plan],
+    /// The lane's held-out checks file, for the lint of a redirect packet.
+    heldout: Option<&'a Path>,
     /// The checks `run_check` accepts and runs; a delivered redirect replaces them.
     declared: &'a DeclaredChecks,
 }
@@ -1934,7 +1936,7 @@ impl Drive<'_> {
                 header.id, self.lane_id
             ));
         }
-        let errors: Vec<String> = lint_for_run(&text, self.repo, self.plans)
+        let errors: Vec<String> = lint_for_run(&text, self.repo, self.plans, self.heldout)
             .iter()
             .filter(|f| f.severity == cowproof_lint::Severity::Error)
             .map(|f| one_line(&f.to_string()))
@@ -2331,8 +2333,13 @@ fn lint_for_run(
     packet_text: &str,
     repo: &Path,
     plans: &[cowproof_plan::Plan],
+    held_out: Option<&Path>,
 ) -> Vec<cowproof_lint::Finding> {
-    cowproof_lint::lint_packet(packet_text, repo, plans)
+    let options = cowproof_lint::LintOptions {
+        held_out,
+        ..Default::default()
+    };
+    cowproof_lint::lint_packet_with(packet_text, repo, plans, &options)
         .into_iter()
         .filter(|f| f.kind != cowproof_lint::FindingKind::ProfileUnmet)
         .collect()
@@ -3211,7 +3218,11 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
         .canonicalize()
         .with_context(|| format!("opening repository {}", repo.display()))?;
     let plans = cowproof_plan::load_plans(&repo, &[])?;
-    let findings = lint_for_run(&packet_text, &repo, &plans);
+    // The held-out file, when there is one, tells the lint which tools the director's held-out
+    // port cases cover (`port-no-base-fixtures`). Any trouble with it is reported by the
+    // resolution below, before a lane exists; here it only means "none".
+    let lint_heldout = heldout_for_lint(args.heldout.as_deref(), &repo, &packet_text);
+    let findings = lint_for_run(&packet_text, &repo, &plans, lint_heldout.as_deref());
     for finding in &findings {
         eprintln!("{finding}");
     }
@@ -3979,6 +3990,7 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
         cwd: &cwd,
         repo: &repo,
         plans: &plans,
+        heldout: heldout.as_deref(),
         declared: &declared,
     };
 
@@ -4677,6 +4689,20 @@ fn resolve_heldout(
         );
     }
     Ok(Some(path))
+}
+
+/// The lane's held-out checks file for the lint, which must not fail: the explicit path or the
+/// director store (see [`resolve_heldout`]), or `None` when there is none, `HOME` is not set, the
+/// packet has no readable id or the file does not resolve. `resolve_heldout` reports the real
+/// problem later, before a lane exists.
+pub(crate) fn heldout_for_lint(
+    explicit: Option<&Path>,
+    repo: &Path,
+    packet_text: &str,
+) -> Option<PathBuf> {
+    let home = PathBuf::from(std::env::var_os("HOME")?);
+    let id = parse_header(packet_text).ok()?.id;
+    resolve_heldout(explicit, repo, &home, &id).ok().flatten()
 }
 
 /// Port cases in the held-out file need a `kind: port` packet with a reference command to

@@ -348,7 +348,9 @@ fn draft_writes_a_marked_packet_per_candidate_that_lints_with_only_the_fill_erro
                 "owns-parent-missing",
                 "owns-parent-missing",
                 "owns-unmatched",
-                "port-cases-missing"
+                "port-cases-missing",
+                // The tool is still the placeholder, and the base holds no fixture for it.
+                "port-no-base-fixtures"
             ],
             "{}",
             text(&linted)
@@ -383,7 +385,13 @@ fn a_draft_with_its_placeholders_filled_lints_clean() {
         .replace("FILL-REFERENCE-COMMAND", "cargo test");
     fs::write(&path, filled).unwrap();
     fs::create_dir_all(repo.join("crates").join("pk-cargo-test").join("src")).unwrap();
-    fs::create_dir_all(repo.join("tests/ports/cargo-test/fixtures")).unwrap();
+    // The director records the fixtures first: the base holds one for the tool.
+    fs::create_dir_all(repo.join("tests/ports/cargo-test/fixtures/cargo_test")).unwrap();
+    fs::write(
+        repo.join("tests/ports/cargo-test/fixtures/cargo_test/001.json"),
+        "{\"tool\":\"cargo_test\",\"id\":\"001\",\"input\":{},\"expected\":{}}\n",
+    )
+    .unwrap();
     fs::write(
         repo.join("tests/ports/cargo-test/cases.jsonl"),
         "{\"tool\":\"cargo_test\",\"input\":{}}\n",

@@ -668,3 +668,194 @@ fn the_readme_example_header_is_a_valid_port_header() {
     assert_eq!(port.parity.epsilon, Some(0.0));
     assert_eq!(port.reference.unwrap().runtime.as_deref(), Some("node>=22"));
 }
+
+// ---- platform-tagged fixtures and an empty base ----
+
+/// The two platform names fixtures are tagged with, this host's first.
+fn platforms() -> (&'static str, &'static str) {
+    let host = portkit_port::host_platform();
+    let other = if host == "linux" { "macos" } else { "linux" };
+    (host, other)
+}
+
+/// Shell that writes `ports/upper/fixtures/<tool>/<name>.json` with `doc` as its content.
+fn write_fixture(tool: &str, name: &str, doc: &Value) -> String {
+    format!(
+        "mkdir -p ports/upper/fixtures/{tool}\ncat > 'ports/upper/fixtures/{tool}/{name}.json' <<'JSON'\n{}\nJSON\n",
+        serde_json::to_string_pretty(doc).unwrap()
+    )
+}
+
+#[test]
+fn fixtures_tagged_for_another_platform_are_counted_and_not_replayed() {
+    if workspace::skipped("fixtures_tagged_for_another_platform_are_counted_and_not_replayed") {
+        return;
+    }
+    if !sandbox_available() {
+        return;
+    }
+    let (host, other) = platforms();
+    // A case in three versions: the committed untagged ones, one for this host (right) and one
+    // for the other platform whose expectation is WRONG, so a replay that ran it would fail.
+    let mut more = write_fixture(
+        "upper",
+        &format!("hello@{host}"),
+        &json!({"tool": "upper", "id": format!("hello@{host}"), "platform": host,
+                "input": {"text": "hello"}, "expected": {"result": "HELLO"}}),
+    );
+    more += &write_fixture(
+        "upper",
+        &format!("hello@{other}"),
+        &json!({"tool": "upper", "id": format!("hello@{other}"), "platform": other,
+                "input": {"text": "hello"}, "expected": {"result": "NOT WHAT THE PORT SAYS"}}),
+    );
+    let lane = lane(&builder(
+        &TEXT_RS.replace("{SHOUT}", "!"),
+        &["upper", "shout"],
+        &more,
+    ));
+    let out = run(&lane);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    assert_eq!(lane.verdict()["verdict"], "proved");
+
+    // The gate says so, and the other platform's fixture is in no pass count.
+    let gates = gates(&lane);
+    let port = gate(&gates, "port_replay");
+    assert_eq!(port["passed"], true, "{port}");
+    assert!(
+        port["evidence"]
+            .to_string()
+            .contains("1 fixture(s) tagged for other platforms were not replayed"),
+        "{port}"
+    );
+    let capsule = Capsule::read(&lane.capsule_dir()).unwrap();
+    let result = capsule.port.unwrap().result.unwrap();
+    assert!(result.success, "{:?}", result.failures);
+    assert_eq!(result.fixture_count, 5);
+    for surface in ["direct", "mcp"] {
+        let s = &result.surfaces[surface];
+        assert_eq!(
+            (s.passed, s.failed, s.other_platform),
+            (4, 0, 1),
+            "{surface}"
+        );
+    }
+}
+
+#[test]
+fn retagging_a_base_fixture_for_another_platform_cannot_skip_it() {
+    if workspace::skipped("retagging_a_base_fixture_for_another_platform_cannot_skip_it") {
+        return;
+    }
+    if !sandbox_available() {
+        return;
+    }
+    let (host, other) = platforms();
+    // The builder rewrites the only `shout` fixture as one for the other platform. Replayed on
+    // this host, `shout` then has nothing: it was never proved here.
+    let rewritten = write_fixture(
+        "shout",
+        "hi",
+        &json!({"tool": "shout", "id": format!("hi@{other}"), "platform": other,
+                "input": {"text": "hi there"}, "expected": {"result": "HI THERE!"}}),
+    );
+    let lane = lane(&builder(
+        &TEXT_RS.replace("{SHOUT}", "!"),
+        &["upper", "shout"],
+        &rewritten,
+    ));
+    let out = run(&lane);
+    assert_eq!(out.status.code(), Some(2), "{}", text(&out));
+    let verdict = lane.verdict();
+    assert_eq!(verdict["verdict"], "refuted", "{verdict}");
+    assert!(
+        verdict["failedGates"].to_string().contains("port_replay"),
+        "{verdict}"
+    );
+    let gates = gates(&lane);
+    let evidence = gate(&gates, "port_replay")["evidence"].to_string();
+    assert!(
+        evidence.contains(&format!(
+            "tool \\\"shout\\\" has no fixture for {host} (its fixtures cover {other}), so it was never proved on this platform"
+        )),
+        "{evidence}"
+    );
+    // The change to the base fixture is named too.
+    assert!(
+        evidence.contains("changed its \\\"platform\\\""),
+        "{evidence}"
+    );
+}
+
+/// The project with the `shout` fixtures removed: a base that records none for that tool.
+fn empty_base_lane(body: &str) -> Lane {
+    let project = var_tmp("cp-port-empty-base-");
+    copy_tree(&fixture().join("project"), project.path());
+    fs::remove_dir_all(project.path().join("ports/upper/fixtures/shout")).unwrap();
+    Lane::from_project(body, project.path(), &|id| packet(id, &|t| t))
+}
+
+#[test]
+fn preflight_refuses_a_port_packet_whose_base_has_no_fixtures_for_a_tool() {
+    if workspace::skipped("preflight_refuses_a_port_packet_whose_base_has_no_fixtures_for_a_tool") {
+        return;
+    }
+    let lane = empty_base_lane("true");
+    // Without held-out cases that name the tool, `lint` and `run` both refuse.
+    let lint = lane
+        .cowproof_cmd()
+        .args(["lint", "--repo"])
+        .arg(&lane.repo)
+        .arg(&lane.packet)
+        .output()
+        .unwrap();
+    assert!(!lint.status.success(), "{}", text(&lint));
+    let stderr = String::from_utf8_lossy(&lint.stderr).to_string();
+    assert!(stderr.contains("error [port-no-base-fixtures]"), "{stderr}");
+    assert!(stderr.contains("\"shout\""), "{stderr}");
+    assert!(
+        stderr.contains("record the fixtures in the base first"),
+        "{stderr}"
+    );
+
+    let out = lane.run(&[]);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(stderr.contains("error [port-no-base-fixtures]"), "{stderr}");
+    assert!(stderr.contains("packet lint found errors"), "{stderr}");
+    assert!(
+        !lane.lane_dir().exists(),
+        "a refused run starts no lane: {}",
+        lane.lane_dir().display()
+    );
+}
+
+#[test]
+fn held_out_cases_that_name_the_tool_make_the_empty_base_a_warning() {
+    if workspace::skipped("held_out_cases_that_name_the_tool_make_the_empty_base_a_warning") {
+        return;
+    }
+    let lane = empty_base_lane("true");
+    // The committed held-out cases name `shout` (and `upper`), so `lint --heldout` only warns.
+    let heldout = heldout();
+    let lint = lane
+        .cowproof_cmd()
+        .args(["lint", "--repo"])
+        .arg(&lane.repo)
+        .arg("--heldout")
+        .arg(&heldout)
+        .arg(&lane.packet)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&lint.stderr).to_string();
+    assert!(lint.status.success(), "{}", text(&lint));
+    assert!(stderr.contains("warn [port-no-base-fixtures]"), "{stderr}");
+    assert!(!stderr.contains("error ["), "{stderr}");
+
+    // `cowproof run` reads the same file: it is not refused at lint. (It may be refused later
+    // for the sandbox, or refuted for the missing fixtures; it is not exit 1 from the lint.)
+    let out = run(&lane);
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(stderr.contains("warn [port-no-base-fixtures]"), "{stderr}");
+    assert!(!stderr.contains("packet lint found errors"), "{stderr}");
+}

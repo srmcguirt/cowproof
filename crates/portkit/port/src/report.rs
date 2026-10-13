@@ -54,6 +54,10 @@ pub fn render(report: &ReplayReport) -> String {
         }
     }
 
+    for gap in report.platform_gaps() {
+        let _ = writeln!(out, "  {:<28}  FAIL  {gap}", gap.tool);
+    }
+
     let _ = write!(
         out,
         "\n  {} passed, {} failed, {} errored, {} not ported",
@@ -61,6 +65,13 @@ pub fn render(report: &ReplayReport) -> String {
     );
     if report.accepted > 0 {
         let _ = write!(out, ", {} with accepted differences", report.accepted);
+    }
+    if report.other_platform > 0 {
+        let _ = write!(
+            out,
+            ", {} for other platforms (not replayed, not counted as passed)",
+            report.other_platform
+        );
     }
     let _ = writeln!(out, " ({} total)", report.total());
 

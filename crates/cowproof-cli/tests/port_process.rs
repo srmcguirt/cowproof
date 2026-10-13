@@ -979,6 +979,138 @@ fn pk_port_capture_sets_the_directory_and_environment_and_records_a_must_reject_
     );
 }
 
+// ---- platform-tagged fixtures ----------------------------------------------------------------
+
+fn host_and_other() -> (&'static str, &'static str) {
+    let host = std::env::consts::OS;
+    (host, if host == "linux" { "macos" } else { "linux" })
+}
+
+#[test]
+fn tag_platform_on_capture_and_exec_writes_the_field_and_the_id_suffix() {
+    let (host, _) = host_and_other();
+    // The function path.
+    let project = Project::new();
+    project.write(
+        "cases.jsonl",
+        &json!({"tool": "t", "id": "one", "input": {}}).to_string(),
+    );
+    let out = project.pk(&[
+        "port",
+        "capture",
+        "--cmd",
+        "echo '{\"ok\": true}'",
+        "--cases",
+        "cases.jsonl",
+        "--out",
+        "fixtures",
+        "--tag-platform",
+    ]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains(&format!("t/one@{host}")),
+        "{}",
+        text(&out)
+    );
+    let fixture = project.fixture("t", &format!("one@{host}"));
+    assert_eq!(fixture["platform"], host);
+    assert_eq!(fixture["id"], format!("one@{host}"));
+
+    // The process path (needs the sandbox the harness runs in).
+    if !sandbox_available() {
+        return;
+    }
+    let project = Project::new();
+    project.write("reference/greet.sh", GREET_SH);
+    let out = project.exec(
+        r#"sh "$PORTKIT_SRC/reference/greet.sh""#,
+        GREET_CASES,
+        &[ROOTS.as_slice(), &["--tag-platform"]].concat(),
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    let basic = project.fixture("greet", &format!("basic@{host}"));
+    assert_eq!(basic["platform"], host);
+    assert_eq!(basic["id"], format!("basic@{host}"));
+}
+
+#[test]
+fn replay_runs_the_untagged_and_own_platform_fixtures_and_counts_the_rest() {
+    let (host, other) = host_and_other();
+    let project = Project::new();
+    let doc = |id: &str, platform: Option<&str>, expected: &str| {
+        let mut d = json!({"tool": "ghost", "id": id, "input": {}, "expected": expected});
+        if let Some(p) = platform {
+            d["platform"] = json!(p);
+        }
+        d.to_string()
+    };
+    // `ghost` is registered nowhere: a fixture that is replayed is `not_ported`, so the
+    // statuses show exactly which fixtures ran.
+    project.write("fixtures/ghost/a.json", &doc("a", None, "x"));
+    project.write(
+        &format!("fixtures/ghost/a@{host}.json"),
+        &doc(&format!("a@{host}"), Some(host), "x"),
+    );
+    project.write(
+        &format!("fixtures/ghost/a@{other}.json"),
+        &doc(&format!("a@{other}"), Some(other), "x"),
+    );
+    let (code, report) = project.replay();
+    assert_eq!(code, Some(1));
+    for surface in ["direct", "mcp"] {
+        let ran: Vec<&str> = report[surface]["outcomes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|o| o["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ran, ["a", &format!("a@{host}")], "{surface}");
+        assert_eq!(report[surface]["not_ported"], 2, "{surface}");
+        assert_eq!(report[surface]["other_platform"], 1, "{surface}");
+        assert_eq!(
+            report[surface]["other_platform_cases"][0],
+            json!({"tool": "ghost", "id": format!("a@{other}"), "platform": other})
+        );
+    }
+
+    // Only the other platform's fixtures: nothing replayed, and the exit is a failure.
+    let project = Project::new();
+    project.write(
+        &format!("fixtures/ghost/a@{other}.json"),
+        &doc(&format!("a@{other}"), Some(other), "x"),
+    );
+    let (code, report) = project.replay();
+    assert_eq!(code, Some(1));
+    assert_eq!(report["direct"]["outcomes"], json!([]));
+    assert_eq!(report["direct"]["other_platform"], 1);
+
+    // A bad tag is an error at load, not a silent skip: the replay prints no report.
+    let project = Project::new();
+    project.write(
+        "fixtures/ghost/a.json",
+        &doc("a@windows", Some("windows"), "x"),
+    );
+    project.write(
+        "pk.toml",
+        "[parity]\nepsilon = 0.0\nepsilon_rel = 0.0\nignore_paths = []\nunordered_arrays = false\n",
+    );
+    let out = project.pk(&[
+        "--config",
+        "pk.toml",
+        "port",
+        "replay",
+        "--fixtures",
+        "fixtures",
+        "--json",
+    ]);
+    assert_ne!(out.status.code(), Some(0), "{}", text(&out));
+    assert!(
+        text(&out).contains("not one of linux, macos"),
+        "{}",
+        text(&out)
+    );
+}
+
 // ---- the committed example and a whole `cowproof run` --------------------------------------
 
 fn example() -> PathBuf {

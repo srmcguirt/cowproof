@@ -151,8 +151,21 @@ pub fn record_verify_results(
     if let Some(port) = port {
         let result = &port.result;
         let evidence = if result.success {
+            let other = result
+                .surfaces
+                .values()
+                .map(|s| s.other_platform)
+                .max()
+                .unwrap_or(0);
+            let skipped = if other > 0 {
+                format!(
+                    "; {other} fixture(s) tagged for other platforms were not replayed and are not counted as passed"
+                )
+            } else {
+                String::new()
+            };
             vec![format!(
-                "replayed {} fixture file(s) on the direct and mcp surfaces; fixture set sha256 {}",
+                "replayed {} fixture file(s) on the direct and mcp surfaces; fixture set sha256 {}{skipped}",
                 result.fixture_count, result.fixture_hash
             )]
         } else {

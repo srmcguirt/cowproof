@@ -11,9 +11,15 @@
 //! passes only when the command exited 0, both surfaces replayed, every surface's
 //! `ReplayReport::is_success()` holds, `not_ported` is 0 for every surface and every tool in
 //! `port.tools` has fixtures that were replayed, and every outcome the report holds is for a
-//! fixture on disk. The report is read the moment the replay's process group is gone. Two checks the replay cannot make for itself
+//! fixture on disk that applies on this platform. A fixture may be tagged for a platform
+//! (`"platform": "linux"` or `"macos"`, its id ending `@<platform>`): the replay runs the
+//! untagged ones and the verifier's own platform's, counts the rest as `other_platform` (never
+//! as passed), and the judge checks that count and the outcomes against the files. A tool whose
+//! fixtures are all for other platforms fails the gate, naming the tool and the platforms: a
+//! port is never proved on a platform it was not captured on. The report is read the moment the
+//! replay's process group is gone. Two checks the replay cannot make for itself
 //! come with it: a fixture of the base must still say what it said (`tool`, `id`, `input`,
-//! `expected`), because the builder may write the fixtures directory and a changed expectation
+//! `expected`, `platform`), because the builder may write the fixtures directory and a changed expectation
 //! is the easiest way to make a port pass; and an `accepted` difference the lane added must
 //! cite a ruling a director's answer carries (`port-accepted-unruled`, at proof time).
 //!
@@ -125,6 +131,10 @@ pub struct SurfaceSummary {
     pub failed: usize,
     pub errored: usize,
     pub not_ported: usize,
+    /// Fixtures tagged for another platform: not replayed, never counted as passed. Omitted
+    /// from capsules made before the platform tag.
+    #[serde(default)]
+    pub other_platform: usize,
     /// Failing and accepted outcomes, at most [`MAX_OUTCOMES`], values shortened.
     pub outcomes: Vec<CaseOutcome>,
     /// Failing and accepted outcomes left out of `outcomes` for the limit.
@@ -433,22 +443,37 @@ fn tools_from(files: &[(String, Value)]) -> Vec<String> {
         .collect()
 }
 
-/// The `(tool, id)` of every fixture file the directory holds: the names a replay reports its
-/// outcomes under (it reads them from the files, not from the directory names).
-fn fixture_cases(dir: &Path) -> BTreeSet<(String, String)> {
+/// The fixtures the directory holds, as the names a replay reports its outcomes under (it
+/// reads them from the files, not from the directory names): `(tool, id)`, with the platform
+/// the fixture is tagged for (`None`: it applies on every platform).
+type FixtureCases = BTreeMap<(String, String), Option<String>>;
+
+fn fixture_cases(dir: &Path) -> FixtureCases {
     cases_from(&read_fixture_files(dir))
 }
 
 /// [`fixture_cases`] over fixtures already read.
-fn cases_from(files: &[(String, Value)]) -> BTreeSet<(String, String)> {
+fn cases_from(files: &[(String, Value)]) -> FixtureCases {
     files
         .iter()
         .filter_map(|(_, value)| {
             let tool = value.get("tool")?.as_str()?.to_string();
             let id = value.get("id")?.as_str()?.to_string();
-            Some((tool, id))
+            let platform = value
+                .get("platform")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            Some(((tool, id), platform))
         })
         .collect()
+}
+
+/// Whether a fixture tagged `platform` is replayed on this host (the verifier's platform, which
+/// is where the replay runs).
+fn runs_here(platform: &Option<String>) -> bool {
+    platform
+        .as_deref()
+        .is_none_or(|p| p == portkit_port::host_platform())
 }
 
 /// Judge a replay: its failures in words, naming surface, tool and fixture.
@@ -457,7 +482,7 @@ fn judge(
     replayed: &mut Replayed,
     tools: &[String],
     on_disk: &[String],
-    cases: &BTreeSet<(String, String)>,
+    cases: &FixtureCases,
 ) {
     for surface in ["direct", "mcp"] {
         if !replayed.reports.contains_key(surface) {
@@ -480,14 +505,32 @@ fn judge(
         }
         let before = replayed.failures.len();
         // A report is the replay's own account; coverage it claims for a case that has no
-        // fixture in the directory is invented, whatever its status.
+        // fixture in the directory is invented, whatever its status. So is coverage for a
+        // fixture tagged for another platform: it is not replayed here, and an outcome for it
+        // says the replay ran what it must not have.
         for outcome in &report.outcomes {
-            if !cases.contains(&(outcome.tool.clone(), outcome.id.clone())) {
-                replayed.failures.push(format!(
+            match cases.get(&(outcome.tool.clone(), outcome.id.clone())) {
+                None => replayed.failures.push(format!(
                     "{label}{surface} {}/{}: the report has an outcome for a case with no fixture on disk",
                     outcome.tool, outcome.id
-                ));
+                )),
+                Some(platform) if !runs_here(platform) => replayed.failures.push(format!(
+                    "{label}{surface} {}/{}: the report has an outcome for a fixture tagged for {}, which this platform ({}) does not replay",
+                    outcome.tool,
+                    outcome.id,
+                    platform.as_deref().unwrap_or_default(),
+                    portkit_port::host_platform()
+                )),
+                Some(_) => {}
             }
+        }
+        // The fixtures of other platforms are counted, from the files, never as passed.
+        let other_on_disk = cases.values().filter(|p| !runs_here(p)).count();
+        if report.other_platform != other_on_disk {
+            replayed.failures.push(format!(
+                "{label}{surface}: the report counts {} fixture(s) for other platforms, the fixtures directory holds {other_on_disk}",
+                report.other_platform
+            ));
         }
         for outcome in &report.outcomes {
             let what = match outcome.status {
@@ -538,6 +581,29 @@ fn judge(
             ));
         }
     }
+    // A port must never prove on a platform it was never captured on: a tool whose fixtures are
+    // all tagged for other platforms has nothing to replay here. Read from the files, not from
+    // the report.
+    let mut covered: BTreeMap<&str, (bool, BTreeSet<&str>)> = BTreeMap::new();
+    for ((tool, _), platform) in cases {
+        let entry = covered.entry(tool.as_str()).or_default();
+        match platform.as_deref() {
+            Some(_) if runs_here(platform) => entry.0 = true,
+            Some(p) => {
+                entry.1.insert(p);
+            }
+            None => entry.0 = true,
+        }
+    }
+    for (tool, (here, elsewhere)) in covered {
+        if !here && !elsewhere.is_empty() {
+            replayed.failures.push(format!(
+                "{label}tool {tool:?} has no fixture for {} (its fixtures cover {}), so it was never proved on this platform",
+                portkit_port::host_platform(),
+                elsewhere.into_iter().collect::<Vec<_>>().join(", ")
+            ));
+        }
+    }
 }
 
 fn shorten(value: &Value) -> Value {
@@ -576,6 +642,7 @@ fn summarize(report: &ReplayReport) -> SurfaceSummary {
         failed: report.failed,
         errored: report.errored,
         not_ported: report.not_ported,
+        other_platform: report.other_platform,
         outcomes,
         omitted,
     }
@@ -626,7 +693,8 @@ fn fixture_findings(
         match now_map.get(path.as_str()) {
             None => findings.push(format!("fixture {path} of the base was deleted")),
             Some(after) => {
-                for key in ["tool", "id", "input", "expected"] {
+                // `platform` too: retagging a base fixture for another platform would skip it.
+                for key in ["tool", "id", "input", "expected", "platform"] {
                     if before.get(key) != after.get(key) {
                         findings.push(format!(
                             "fixture {path}: the lane changed its {key:?}; only a director recaptures a fixture"
@@ -1083,11 +1151,36 @@ mod tests {
         .unwrap()
     }
 
-    fn cases(pairs: &[(&str, &str)]) -> BTreeSet<(String, String)> {
+    /// A report that also counts `n` fixtures for other platforms.
+    fn replayed_with_other(outcomes: Vec<CaseOutcome>, n: usize) -> Replayed {
+        let mut r = replayed(outcomes);
+        for report in r.reports.values_mut() {
+            report.other_platform = n;
+        }
+        r
+    }
+
+    fn cases(pairs: &[(&str, &str)]) -> FixtureCases {
         pairs
             .iter()
-            .map(|(t, i)| (t.to_string(), i.to_string()))
+            .map(|(t, i)| ((t.to_string(), i.to_string()), None))
             .collect()
+    }
+
+    /// The platform that is not the one running.
+    fn other_platform() -> &'static str {
+        ["linux", "macos"]
+            .into_iter()
+            .find(|p| *p != portkit_port::host_platform())
+            .unwrap()
+    }
+
+    /// `cases` plus fixtures tagged `(tool, id, platform)`.
+    fn with_tagged(mut base: FixtureCases, tagged: &[(&str, &str, &str)]) -> FixtureCases {
+        for (t, i, p) in tagged {
+            base.insert((t.to_string(), i.to_string()), Some(p.to_string()));
+        }
+        base
     }
 
     fn replayed(outcomes: Vec<CaseOutcome>) -> Replayed {
@@ -1474,6 +1567,179 @@ mod tests {
             "{text}"
         );
         assert!(!text.contains("t/1"), "{text}");
+    }
+
+    #[test]
+    fn fixtures_for_other_platforms_are_counted_and_never_judged_as_passes() {
+        let other = other_platform();
+        let host = portkit_port::host_platform();
+        let on_disk = with_tagged(
+            cases(&[("t", "1")]),
+            &[
+                ("t", &format!("1@{host}"), host),
+                ("t", &format!("1@{other}"), other),
+            ],
+        );
+        // The replay ran the untagged and this platform's, and counted the other's.
+        let mut ok = replayed_with_other(
+            vec![
+                outcome("t", "1", Status::Pass),
+                outcome("t", &format!("1@{host}"), Status::Pass),
+            ],
+            1,
+        );
+        judge(
+            "",
+            &mut ok,
+            &["t".to_string()],
+            &["t".to_string()],
+            &on_disk,
+        );
+        assert_eq!(ok.failures, Vec::<String>::new());
+
+        // An outcome for the other platform's fixture: the replay ran what it must not have.
+        let mut ran = replayed_with_other(
+            vec![
+                outcome("t", "1", Status::Pass),
+                outcome("t", &format!("1@{host}"), Status::Pass),
+                outcome("t", &format!("1@{other}"), Status::Pass),
+            ],
+            0,
+        );
+        judge(
+            "",
+            &mut ran,
+            &["t".to_string()],
+            &["t".to_string()],
+            &on_disk,
+        );
+        let text = ran.failures.join("\n");
+        assert!(
+            text.contains(&format!(
+                "direct t/1@{other}: the report has an outcome for a fixture tagged for {other}"
+            )),
+            "{text}"
+        );
+        assert!(text.contains(&format!("mcp t/1@{other}")), "{text}");
+
+        // A report that does not count them, or counts too many, disagrees with the files.
+        for wrong in [0, 2] {
+            let mut miscounted = replayed_with_other(
+                vec![
+                    outcome("t", "1", Status::Pass),
+                    outcome("t", &format!("1@{host}"), Status::Pass),
+                ],
+                wrong,
+            );
+            judge(
+                "",
+                &mut miscounted,
+                &["t".to_string()],
+                &["t".to_string()],
+                &on_disk,
+            );
+            let text = miscounted.failures.join("\n");
+            assert!(
+                text.contains(&format!(
+                    "direct: the report counts {wrong} fixture(s) for other platforms, the fixtures directory holds 1"
+                )),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_tool_with_only_other_platform_fixtures_fails_by_name_and_held_out_follows() {
+        let other = other_platform();
+        let host = portkit_port::host_platform();
+        // Tool `t` has fixtures only for the other platform; `u` is fine.
+        let on_disk = with_tagged(cases(&[("u", "1")]), &[("t", &format!("1@{other}"), other)]);
+        for label in ["", "held-out "] {
+            let mut r = replayed_with_other(vec![outcome("u", "1", Status::Pass)], 1);
+            judge(
+                label,
+                &mut r,
+                &["t".to_string(), "u".to_string()],
+                &["t".to_string(), "u".to_string()],
+                &on_disk,
+            );
+            let text = r.failures.join("\n");
+            assert!(
+                text.contains(&format!(
+                    "{label}tool \"t\" has no fixture for {host} (its fixtures cover {other}), so it was never proved on this platform"
+                )),
+                "{text}"
+            );
+            assert!(!text.contains("tool \"u\""), "{text}");
+        }
+        // The same without the tool being named by the packet (a held-out tool list is empty).
+        let mut r = replayed_with_other(vec![outcome("u", "1", Status::Pass)], 1);
+        judge(
+            "held-out ",
+            &mut r,
+            &[],
+            &["t".to_string(), "u".to_string()],
+            &on_disk,
+        );
+        assert!(
+            r.failures
+                .join("\n")
+                .contains("held-out tool \"t\" has no fixture for"),
+            "{:?}",
+            r.failures
+        );
+    }
+
+    #[test]
+    fn retagging_a_base_fixture_is_a_change_of_the_base() {
+        let other = other_platform();
+        let base = vec![(
+            "t/1.json".to_string(),
+            serde_json::json!({"tool":"t","id":"1","input":{},"expected":{}}),
+        )];
+        let log = RulingLog::from_answers(vec![]);
+        let mut retagged = base.clone();
+        retagged[0].1["platform"] = serde_json::json!(other);
+        let found = fixture_findings(&base, &retagged, &log).join("\n");
+        assert!(found.contains("changed its \"platform\""), "{found}");
+        // A new fixture for the other platform is an addition, not a change.
+        let mut added = base.clone();
+        added.push((
+            format!("t/2@{other}.json"),
+            serde_json::json!({"tool":"t","id":format!("2@{other}"),"platform":other,"input":{},"expected":{}}),
+        ));
+        assert_eq!(fixture_findings(&base, &added, &log), Vec::<String>::new());
+    }
+
+    #[test]
+    fn the_surface_summary_keeps_the_other_platform_count() {
+        let mut r = report(vec![outcome("t", "1", Status::Pass)]);
+        r.other_platform = 3;
+        assert_eq!(summarize(&r).other_platform, 3);
+        // A capsule made before the field reads as 0.
+        let old: SurfaceSummary = serde_json::from_value(serde_json::json!({
+            "passed": 1, "accepted": 0, "failed": 0, "errored": 0, "not_ported": 0,
+            "outcomes": [], "omitted": 0,
+        }))
+        .unwrap();
+        assert_eq!(old.other_platform, 0);
+    }
+
+    #[test]
+    fn the_fixture_cases_read_the_platform_tag() {
+        let dir = tempfile::TempDir::new_in("/var/tmp").unwrap();
+        write(dir.path(), "a/1.json", r#"{"tool":"a","id":"1"}"#);
+        write(
+            dir.path(),
+            "a/1@linux.json",
+            r#"{"tool":"a","id":"1@linux","platform":"linux"}"#,
+        );
+        let found = fixture_cases(dir.path());
+        assert_eq!(found[&("a".to_string(), "1".to_string())], None);
+        assert_eq!(
+            found[&("a".to_string(), "1@linux".to_string())].as_deref(),
+            Some("linux")
+        );
     }
 
     #[test]

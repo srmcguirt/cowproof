@@ -193,8 +193,11 @@ pub async fn port(registry: &Registry, config: &Config, command: PortCommand) ->
             cwd,
             env,
             clear_env,
+            tag_platform,
         } => {
-            let mut opts = CaptureOptions::new(cmd).with_clear_env(clear_env);
+            let mut opts = CaptureOptions::new(cmd)
+                .with_clear_env(clear_env)
+                .with_tag_platform(tag_platform);
             opts.fail_fast = fail_fast;
             opts.cwd = cwd;
             for pair in &env {
@@ -516,7 +519,8 @@ fn harness_config(command: String, args: &crate::HarnessArgs) -> Result<ExecConf
 }
 
 async fn port_exec(args: crate::ExecArgs) -> Result<ExitCode> {
-    let cfg = harness_config(args.cmd.clone(), &args.harness)?;
+    let mut cfg = harness_config(args.cmd.clone(), &args.harness)?;
+    cfg.tag_platform = args.tag_platform;
     let report = capture_process(&args.cases, &args.out, &cfg, args.repeat, args.fail_fast).await?;
     for case in &report.captured {
         println!("  captured  {}/{}", case.tool, case.id);
