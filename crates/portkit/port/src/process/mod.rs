@@ -72,6 +72,40 @@ pub fn check_normalized(n: &Normalized) -> Result<(), String> {
     Ok(())
 }
 
+/// `roots` sorted and without repeats: the form two sets of roots are compared in.
+pub fn canonical_roots(roots: &[String]) -> Vec<String> {
+    let mut roots = roots.to_vec();
+    roots.sort();
+    roots.dedup();
+    roots
+}
+
+/// Check that the roots a port's wrap substitutes (`wrapped`) are the roots the fixture was
+/// captured with (`n`, its `normalized`; none recorded means none declared). The two are
+/// compared as sets. A port that substitutes other roots than its fixtures did answers in
+/// another vocabulary: a root it leaves out is a path the fixture records as a token, a root
+/// it adds hides a difference the declared roots would show.
+pub fn check_roots(wrapped: &[String], n: Option<&Normalized>) -> Result<(), String> {
+    let recorded = canonical_roots(n.map(|n| n.roots.as_slice()).unwrap_or_default());
+    let wrapped = canonical_roots(wrapped);
+    if recorded == wrapped {
+        return Ok(());
+    }
+    let show = |roots: &[String]| {
+        if roots.is_empty() {
+            "none".to_string()
+        } else {
+            roots.join(", ")
+        }
+    };
+    Err(format!(
+        "the port's wrap substitutes the roots [{}] but the fixture was captured with [{}]; \
+         `pk port wrap --path-root` must declare the same roots as `pk port exec` did (port.parity.path_roots)",
+        show(&wrapped),
+        show(&recorded)
+    ))
+}
+
 /// The declaration a fixture records for `roots`; `None` when no root is declared (nothing is
 /// substituted, and the fixture says nothing).
 pub fn normalized_for(roots: &[String]) -> Option<Normalized> {

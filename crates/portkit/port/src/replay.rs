@@ -210,6 +210,20 @@ async fn replay_one(
         }
     }
 
+    // A process wrapper says which roots it substitutes; they must be the ones the fixture was
+    // captured with, or the two sides speak different vocabularies.
+    if let Some(wrapped) = registry
+        .get(&fixture.tool)
+        .and_then(|tool| tool.spec().path_roots)
+    {
+        if let Err(why) = crate::process::check_roots(&wrapped, fixture.normalized.as_ref()) {
+            return CaseOutcome {
+                error: Some(why),
+                ..base(Status::Error)
+            };
+        }
+    }
+
     let actual = match opts.surface {
         Surface::Direct => registry.call(&fixture.tool, fixture.input.clone()).await,
         Surface::Mcp => call_via_mcp(server, fixture).await,
@@ -553,6 +567,87 @@ mod tests {
         );
         let signalled = Error::tool_failed("t", "exited with signal: 9 (SIGKILL): ");
         assert_eq!(error_envelope_of(&signalled)["error"]["exit"], Value::Null);
+    }
+
+    /// A process wrapper: it answers the fixture's `expected` and declares the roots it
+    /// substitutes in its spec, as `pk port wrap --portkit-spec` does.
+    struct Wrapped(Vec<String>);
+
+    #[async_trait]
+    impl Tool for Wrapped {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec::new("drifts", "A wrapped port.", json!({"type": "object"}))
+                .with_path_roots(self.0.clone())
+        }
+        async fn call(&self, _input: Value) -> CoreResult<Value> {
+            Ok(json!({"stable": 1, "quirk": "python-behaviour"}))
+        }
+    }
+
+    fn roots(roots: &[&str]) -> Vec<String> {
+        roots.iter().map(|r| r.to_string()).collect()
+    }
+
+    fn captured_with(declared: &[&str]) -> Fixture {
+        let mut f = fixture(vec![]);
+        f.normalized = crate::process::normalized_for(&roots(declared));
+        f
+    }
+
+    #[tokio::test]
+    async fn a_wrap_with_other_roots_than_the_fixture_was_captured_with_fails_naming_both() {
+        for surface in [Surface::Direct, Surface::Mcp] {
+            // Matching roots (in any order, repeats aside) pass.
+            for wrapped in [
+                roots(&["$HOME", "$ROOT", "$TMP"]),
+                roots(&["$TMP", "$ROOT", "$HOME", "$ROOT"]),
+            ] {
+                let f = captured_with(&["$ROOT", "$HOME", "$TMP"]);
+                let report = run_with(Wrapped(wrapped), f, surface).await;
+                assert!(report.is_success(), "{surface}: {}", crate::render(&report));
+            }
+            // A root the wrap leaves out, a root it adds, and none against some are mismatches.
+            for (wrapped, captured) in [
+                (roots(&["$ROOT"]), &["$HOME", "$ROOT"][..]),
+                (roots(&["$ROOT", "$SRC"]), &["$ROOT"][..]),
+                (roots(&[]), &["$ROOT"][..]),
+                (roots(&["$ROOT"]), &[][..]),
+            ] {
+                let report =
+                    run_with(Wrapped(wrapped.clone()), captured_with(captured), surface).await;
+                assert_eq!(report.errored, 1, "{surface}: {wrapped:?} vs {captured:?}");
+                assert!(!report.is_success());
+                let why = report.outcomes[0].error.clone().unwrap();
+                // Both sides are named, the wrap's first.
+                let wrapped_text = if wrapped.is_empty() {
+                    "none".to_string()
+                } else {
+                    wrapped.join(", ")
+                };
+                let captured_text = if captured.is_empty() {
+                    "none".to_string()
+                } else {
+                    captured.join(", ")
+                };
+                assert!(
+                    why.contains(&format!("substitutes the roots [{wrapped_text}]"))
+                        && why.contains(&format!("captured with [{captured_text}]")),
+                    "{why}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_tool_that_declares_no_roots_is_not_compared() {
+        // `Drifts` is no process wrapper: its spec says nothing about roots.
+        let f = captured_with(&["$ROOT"]);
+        let report = run(f).await;
+        assert_eq!(report.errored, 0);
+        assert_eq!(
+            report.failed, 1,
+            "it fails on its own difference, not on roots"
+        );
     }
 
     #[tokio::test]

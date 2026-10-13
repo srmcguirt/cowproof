@@ -22,7 +22,9 @@
 //! `LANG=C.UTF-8`, `LC_ALL=C.UTF-8`, `PYTHONHASHSEED=0`, `NODE_OPTIONS=`, `PORTKIT_SRC`, then
 //! the capture's `--env`, the case's `env` and the input's `env`, later winning. A capture runs
 //! each case more than once in separate roots and refuses a case whose runs differ after the
-//! declared path substitution, naming the first field that differs.
+//! declared path substitution, naming the first field that differs. `date` and `mktemp` are
+//! pinned by shims (the clock from `PORTKIT_NOW`, temporary names from a counter); `$RANDOM` and
+//! process ids are not, and a case that prints one is refused by that comparison.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -41,7 +43,10 @@ use tokio::process::Command;
 
 use portkit_core::{diff, DiffOptions, Error, Result};
 
-use super::{envelope, normalized_for, shim, PathNormaliser, ProcessInput, Root, ROOT_TOKENS};
+use super::{
+    canonical_roots, envelope, normalized_for, shim, PathNormaliser, ProcessInput, Root,
+    ROOT_TOKENS,
+};
 use crate::capture::{CaptureFailure, CaptureReport, CapturedCase};
 use crate::fixture::{load_cases, Fixture};
 
@@ -792,12 +797,15 @@ pub async fn serve_request(cfg: &ExecConfig, request: &str) -> Result<Value> {
     Ok(run_once(cfg, &input, &BTreeMap::new()).await?.envelope)
 }
 
-/// The tool spec `pk port wrap --portkit-spec` prints.
-pub fn wrap_spec(tool: &str) -> Value {
+/// The tool spec `pk port wrap --portkit-spec` prints. `path_roots` is what the wrap
+/// substitutes (`--path-root`); the spec carries it so a replay can compare it with the roots
+/// the fixtures were captured with.
+pub fn wrap_spec(tool: &str, path_roots: &[String]) -> Value {
     json!({
         "name": tool,
         "description": format!("Runs the port of `{tool}` in the process harness and answers its envelope (exit, stdout, stderr, files_after, deleted, calls)."),
         "input_schema": {"type": "object"},
+        "path_roots": canonical_roots(path_roots),
     })
 }
 

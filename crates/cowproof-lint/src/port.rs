@@ -1,6 +1,6 @@
 //! The lint rules of `kind: port` packets (portkit-integration.md, section 6.4).
 //!
-//! Eight rules, none of which runs anything: they read the header, the packet text and the
+//! Nine rules, none of which runs anything: they read the header, the packet text and the
 //! files a port names. `port-nondeterministic-output` is a heuristic and only warns.
 //!
 //! | Rule | Level | Fires when |
@@ -12,6 +12,7 @@
 //! | `port-tool-unregistered` | error | a tool in `port.tools` is not named in the packet text, or the text names no owned plugin manifest to register it in |
 //! | `port-accepted-unruled` | error | a fixture's `accepted` entry has a reason that cites no `ruling:<id>`, or an id the lane's escalation log does not carry |
 //! | `port-epsilon-loosened` | error | the packet or a fixture raises epsilon above the project default |
+//! | `port-wrap-roots-mismatch` | error | the repository's `.portkit/plugins.toml` registers a `pk port wrap` entry for a tool of the packet whose `--path-root` flags are not `port.parity.path_roots` (a missing manifest, or no wrap entry for the tool, is not an error) |
 //! | `port-nondeterministic-output` | warn | a fixture's expected output has a time, a temp or home path, or a host name that no `ignore_paths`, `accepted` or `path_roots` entry covers |
 
 use crate::{
@@ -61,6 +62,7 @@ pub(crate) fn lint_port(
     tool_unregistered(header, port, packet_text, findings);
     accepted_unruled(port, repo_root, options, findings);
     epsilon_loosened(port, repo_root, findings);
+    wrap_roots_mismatch(port, repo_root, findings);
     nondeterministic_output(port, repo_root, findings);
 }
 
@@ -504,6 +506,117 @@ fn epsilon_loosened(port: &PortSpec, repo_root: &Path, findings: &mut Vec<Findin
                 None,
                 format!(
                     "fixture {file} sets epsilon {epsilon}, above the project default {default}"
+                ),
+            ));
+        }
+    }
+}
+
+/// The repository's project plugin manifest (`portkit-plugin`'s `PROJECT_PATH`).
+const PLUGIN_MANIFEST: &str = ".portkit/plugins.toml";
+
+/// The `--tool` and the `--path-root` flags of a `pk port wrap` plugin entry, from its
+/// arguments: `None` when the arguments are not a wrap (`port` then `wrap`, anywhere in the
+/// list, so `["pk", "port", "wrap", ..]` and `["port", "wrap", ..]` both are).
+fn wrap_flags(args: &[String]) -> Option<(Option<String>, Vec<String>)> {
+    let at = args
+        .windows(2)
+        .position(|pair| pair[0] == "port" && pair[1] == "wrap")?;
+    let mut tool = None;
+    let mut roots = Vec::new();
+    let mut words = args[at + 2..].iter();
+    while let Some(word) = words.next() {
+        if let Some(value) = word.strip_prefix("--tool=") {
+            tool = Some(value.to_string());
+        } else if let Some(value) = word.strip_prefix("--path-root=") {
+            roots.push(value.to_string());
+        } else if word == "--tool" {
+            tool = words.next().cloned();
+        } else if word == "--path-root" {
+            roots.extend(words.next().cloned());
+        }
+    }
+    Some((tool, roots))
+}
+
+/// The roots as a sorted list without repeats: two lists are the same roots when these are equal.
+fn sorted(roots: &[String]) -> Vec<String> {
+    let mut roots = roots.to_vec();
+    roots.sort();
+    roots.dedup();
+    roots
+}
+
+fn wrap_roots_mismatch(port: &PortSpec, repo_root: &Path, findings: &mut Vec<Finding>) {
+    let path = repo_root.join(PLUGIN_MANIFEST);
+    let text = match fs::read_to_string(&path) {
+        Ok(text) => text,
+        // No manifest yet: the builder writes it. Nothing to compare.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+        Err(e) => {
+            findings.push(error(
+                "port-wrap-roots-mismatch",
+                None,
+                format!("{PLUGIN_MANIFEST} cannot be read: {e}"),
+            ));
+            return;
+        }
+    };
+    let manifest: toml::Table = match text.parse() {
+        Ok(manifest) => manifest,
+        Err(e) => {
+            findings.push(error(
+                "port-wrap-roots-mismatch",
+                None,
+                format!("{PLUGIN_MANIFEST} is not valid TOML: {e}"),
+            ));
+            return;
+        }
+    };
+    let declared = sorted(&port.parity.path_roots);
+    let entries = manifest
+        .get("plugin")
+        .and_then(toml::Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    for entry in entries.iter().filter_map(toml::Value::as_table) {
+        let args: Vec<String> = entry
+            .get("args")
+            .and_then(toml::Value::as_array)
+            .map(|args| {
+                args.iter()
+                    .filter_map(|a| a.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let Some((wrapped_tool, roots)) = wrap_flags(&args) else {
+            continue;
+        };
+        // The tool the registry knows it as: the manifest's `name` wins over `--tool`.
+        let name = entry
+            .get("name")
+            .and_then(toml::Value::as_str)
+            .map(str::to_string)
+            .or(wrapped_tool);
+        let Some(name) = name.filter(|name| port.tools.contains(name)) else {
+            continue;
+        };
+        let flags = sorted(&roots);
+        if flags != declared {
+            let show = |roots: &[String]| {
+                if roots.is_empty() {
+                    "none".to_string()
+                } else {
+                    roots.join(", ")
+                }
+            };
+            findings.push(error(
+                "port-wrap-roots-mismatch",
+                None,
+                format!(
+                    "{PLUGIN_MANIFEST}: the `pk port wrap` entry for tool {name:?} has --path-root [{}] but port.parity.path_roots is [{}]; the fixtures are captured with the packet's roots and a replay fails a wrap that substitutes others",
+                    show(&flags),
+                    show(&declared)
                 ),
             ));
         }

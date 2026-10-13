@@ -1,4 +1,4 @@
-//! The eight lint rules of `kind: port` packets (portkit-integration.md, section 6.4): for
+//! The nine lint rules of `kind: port` packets (portkit-integration.md, section 6.4): for
 //! each, a packet that passes and one that fails, on a real directory of files.
 
 use cowproof_lint::{Finding, LintOptions, Severity, lint_packet, lint_packet_with};
@@ -471,6 +471,108 @@ fn port_epsilon_loosened() {
     let findings = lint(root, &beyond, BODY);
     assert_eq!(rules(&findings), ["port-epsilon-loosened"], "{findings:?}");
     assert!(errors(&findings)[0].contains("project default 0.001"));
+}
+
+/// A `.portkit/plugins.toml` with one `pk port wrap` entry, `args` after `port wrap`.
+fn wrap_manifest(args: &str) -> String {
+    format!(
+        "[[plugin]]\ncommand = \"/usr/bin/cowproof\"\nargs = [\"pk\", \"port\", \"wrap\", {args}]\n"
+    )
+}
+
+fn with_roots(roots: &[&str]) -> Value {
+    header(|h| h["port"]["parity"] = json!({"path_roots": roots}))
+}
+
+#[test]
+fn port_wrap_roots_mismatch() {
+    let dir = repo();
+    let root = dir.path();
+    let manifest = |args: &str| put(root, ".portkit/plugins.toml", &wrap_manifest(args));
+
+    // The flags name the packet's roots, in another order: nothing to report.
+    manifest(
+        r#""--tool", "word_count", "--exe", "target/wc", "--path-root", "$HOME", "--path-root", "$ROOT""#,
+    );
+    let declared = with_roots(&["$ROOT", "$HOME"]);
+    assert_eq!(rules(&lint(root, &declared, BODY)), Vec::<&str>::new());
+    // The `=` spelling of both flags reads the same.
+    manifest(r#""--tool=word_count", "--path-root=$ROOT", "--path-root=$HOME""#);
+    assert_eq!(rules(&lint(root, &declared, BODY)), Vec::<&str>::new());
+    // A packet with no roots and a wrap with none.
+    manifest(r#""--tool", "word_count", "--exe", "target/wc""#);
+    assert_eq!(
+        rules(&lint(root, &header(|_| {}), BODY)),
+        Vec::<&str>::new()
+    );
+
+    // A root the manifest leaves out: reported, with the rule and both lists.
+    manifest(r#""--tool", "word_count", "--path-root", "$ROOT""#);
+    let findings = lint(root, &with_roots(&["$ROOT", "$HOME", "$TMP"]), BODY);
+    assert_eq!(
+        rules(&findings),
+        ["port-wrap-roots-mismatch"],
+        "{findings:?}"
+    );
+    let text = errors(&findings).join("\n");
+    assert!(
+        text.contains("port-wrap-roots-mismatch")
+            && text.contains("--path-root [$ROOT]")
+            && text.contains("path_roots is [$HOME, $ROOT, $TMP]")
+            && text.contains(".portkit/plugins.toml"),
+        "{text}"
+    );
+    // A root it adds, and roots against none.
+    let findings = lint(root, &with_roots(&["$HOME"]), BODY);
+    assert_eq!(rules(&findings), ["port-wrap-roots-mismatch"]);
+    let findings = lint(root, &header(|_| {}), BODY);
+    assert_eq!(rules(&findings), ["port-wrap-roots-mismatch"]);
+    assert!(
+        errors(&findings)
+            .join("\n")
+            .contains("path_roots is [none]")
+    );
+
+    // The name the manifest gives the plugin is the tool, whatever `--tool` says.
+    put(
+        root,
+        ".portkit/plugins.toml",
+        &format!(
+            "{}name = \"word_count\"\n",
+            wrap_manifest(r#""--tool", "other", "--path-root", "$ROOT""#)
+        ),
+    );
+    assert_eq!(
+        rules(&lint(root, &with_roots(&["$HOME"]), BODY)),
+        ["port-wrap-roots-mismatch"]
+    );
+    // An entry for another tool, and a plugin that is not a wrap, are not this packet's.
+    manifest(r#""--tool", "other", "--path-root", "$ROOT""#);
+    assert_eq!(
+        rules(&lint(root, &with_roots(&["$HOME"]), BODY)),
+        Vec::<&str>::new()
+    );
+    put(
+        root,
+        ".portkit/plugins.toml",
+        "[[plugin]]\ncommand = \"/usr/bin/tool\"\nargs = [\"--tool\", \"word_count\", \"--path-root\", \"$ROOT\"]\n",
+    );
+    assert_eq!(
+        rules(&lint(root, &with_roots(&["$HOME"]), BODY)),
+        Vec::<&str>::new()
+    );
+
+    // No manifest at all is not an error; one that is not TOML is.
+    fs::remove_file(root.join(".portkit/plugins.toml")).unwrap();
+    assert_eq!(
+        rules(&lint(root, &with_roots(&["$HOME"]), BODY)),
+        Vec::<&str>::new()
+    );
+    put(root, ".portkit/plugins.toml", "[[plugin\n");
+    assert_eq!(
+        rules(&lint(root, &with_roots(&["$HOME"]), BODY)),
+        ["port-wrap-roots-mismatch"]
+    );
 }
 
 #[test]

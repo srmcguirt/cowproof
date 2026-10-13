@@ -540,6 +540,7 @@ async fn port_wrap(args: crate::WrapArgs) -> Result<ExitCode> {
     if args.portkit_spec {
         portkit_port::process::exec::print_json(&portkit_port::process::exec::wrap_spec(
             &args.tool,
+            &args.harness.path_root,
         ))?;
         return Ok(ExitCode::SUCCESS);
     }

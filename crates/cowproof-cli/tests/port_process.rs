@@ -410,6 +410,153 @@ fn the_clock_is_pinned_through_a_date_shim_or_the_capture_refuses() {
     assert!(!project.path().join("fixtures/when/unpinned.json").exists());
 }
 
+/// A reference that makes temporary files and a directory and prints their names and modes.
+/// The `ls` modes are cut to ten characters (Linux adds a `.` or `+` after them).
+const TEMPS_SH: &str = r#"#!/bin/sh
+set -eu
+a=$(mktemp)
+b=$(mktemp)
+d=$(mktemp -d)
+t=$(mktemp "$TMPDIR/job.XXXXXX")
+echo "$a"
+echo "$b"
+echo "$d"
+echo "$t"
+ls -ld "$a" "$d" | cut -c1-10
+"#;
+
+/// A port of [`TEMPS_SH`]: it calls `mktemp` as the script does (the same shim answers it).
+const TEMPS_RS: &str = r#"use std::os::unix::fs::PermissionsExt;
+use std::process::Command;
+
+fn mktemp(args: &[&str]) -> String {
+    let out = Command::new("mktemp").args(args).output().expect("mktemp");
+    assert!(out.status.success());
+    String::from_utf8_lossy(&out.stdout).trim_end().to_string()
+}
+
+fn ls_mode(path: &str) -> String {
+    let meta = std::fs::metadata(path).unwrap();
+    let mut text = String::from(if meta.is_dir() { "d" } else { "-" });
+    let mode = meta.permissions().mode();
+    for (bit, c) in [(0o400, 'r'), (0o200, 'w'), (0o100, 'x'), (0o040, 'r'), (0o020, 'w'), (0o010, 'x'), (0o004, 'r'), (0o002, 'w'), (0o001, 'x')] {
+        text.push(if mode & bit != 0 { c } else { '-' });
+    }
+    text
+}
+
+fn main() {
+    let a = mktemp(&[]);
+    let b = mktemp(&[]);
+    let d = mktemp(&["-d"]);
+    let template = format!("{}/job.XXXXXX", std::env::var("TMPDIR").unwrap());
+    let t = mktemp(&[&template]);
+    println!("{a}\n{b}\n{d}\n{t}");
+    println!("{}\n{}", ls_mode(&a), ls_mode(&d));
+}
+"#;
+
+#[test]
+fn mktemp_is_shimmed_with_numbered_names_so_a_script_that_prints_them_is_captured_and_replays() {
+    if !sandbox_available() {
+        return;
+    }
+    let project = Project::new();
+    project.write("ref/temps.sh", TEMPS_SH);
+    let cases = json!({"tool": "temps", "id": "four", "input": {}}).to_string();
+    // Before the shim the names were random and the run-twice comparison refused this; now the
+    // names are numbered in the order of the calls and the root is substituted.
+    let out = project.exec(r#"sh "$PORTKIT_SRC/ref/temps.sh""#, &cases, &ROOTS);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    let expected = project.fixture("temps", "four")["expected"].clone();
+    assert_eq!(
+        expected["stdout"],
+        "$TMP/tmp.0001\n$TMP/tmp.0002\n$TMP/tmp.0003\n$TMP/job.000004\n-rw-------\ndrwx------\n"
+    );
+    // The files are in the root's tmp/, mode 0600, and the directory is empty (mode 0700 in
+    // the ls line above).
+    let files = &expected["files_after"];
+    assert_eq!(files["tmp/tmp.0001"]["mode"], 0o600, "{files}");
+    assert_eq!(files["tmp/job.000004"]["mode"], 0o600, "{files}");
+    assert_eq!(files["tmp/tmp.0003"], json!({"dir": true}), "{files}");
+    // Not recorded as calls: only a scripted program is.
+    assert_eq!(expected["calls"], json!([]));
+
+    // A port that makes the same calls replays it on both surfaces, deterministically.
+    project.port("temps", TEMPS_RS, "temps");
+    for _ in 0..2 {
+        let (code, report) = project.replay();
+        assert_eq!(code, Some(0), "{report}");
+        for surface in ["direct", "mcp"] {
+            assert_eq!(report[surface]["passed"], 1, "{surface}: {report}");
+        }
+    }
+    // One that makes one call fewer names the others differently and is refuted.
+    let short = TEMPS_RS.replace("let b = mktemp(&[]);", "let b = a.clone();");
+    project.port("temps", &short, "temps");
+    let (code, report) = project.replay();
+    assert_eq!(code, Some(1), "{report}");
+    assert!(
+        diff_paths(&report, "direct", "four").contains(&"/stdout".to_string()),
+        "{report}"
+    );
+}
+
+#[test]
+fn mktemp_shim_refuses_an_option_it_does_not_implement_and_concurrent_calls_get_two_names() {
+    if !sandbox_available() {
+        return;
+    }
+    let project = Project::new();
+    project.write(
+        "ref/odd.sh",
+        "#!/bin/sh\nmktemp -u 2>&1\necho \"exit=$?\"\n",
+    );
+    let cases = json!({"tool": "odd", "id": "dry", "input": {}}).to_string();
+    let out = project.exec(r#"sh "$PORTKIT_SRC/ref/odd.sh""#, &cases, &ROOTS);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    let stdout = project.fixture("odd", "dry")["expected"]["stdout"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        stdout.contains("`-u` is not supported") && stdout.ends_with("exit=2\n"),
+        "{stdout}"
+    );
+    // Nothing was made for the refused call.
+    assert_eq!(
+        project.fixture("odd", "dry")["expected"]["files_after"],
+        json!({})
+    );
+
+    // Two background jobs call it at once: two different files, whichever got which.
+    project.write(
+        "ref/both.sh",
+        "#!/bin/sh\nmktemp > /dev/null &\nmktemp > /dev/null &\nwait\nls \"$TMPDIR\"\n",
+    );
+    let cases = json!({"tool": "both", "id": "two", "input": {}}).to_string();
+    let out = project.exec(r#"sh "$PORTKIT_SRC/ref/both.sh""#, &cases, &ROOTS);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    assert_eq!(
+        project.fixture("both", "two")["expected"]["stdout"],
+        "tmp.0001\ntmp.0002\n"
+    );
+}
+
+#[test]
+fn a_process_id_stays_unpinned_and_the_capture_refuses_a_script_that_prints_one() {
+    if !sandbox_available() {
+        return;
+    }
+    let project = Project::new();
+    project.write("ref/pid.sh", "#!/bin/sh\necho \"pid=$$\"\n");
+    let cases = json!({"tool": "pid", "id": "one", "input": {}}).to_string();
+    let out = project.exec(r#"sh "$PORTKIT_SRC/ref/pid.sh""#, &cases, &ROOTS);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+    assert!(text(&out).contains("not deterministic"), "{}", text(&out));
+    assert!(!project.path().join("fixtures/pid/one.json").exists());
+}
+
 #[test]
 fn a_capture_that_would_record_a_flaky_fixture_is_refused_loudly() {
     if !sandbox_available() {
@@ -678,35 +825,66 @@ fn a_fixture_whose_transform_this_build_does_not_know_is_an_error_not_a_pass() {
 }
 
 #[test]
-fn a_port_that_leaves_the_declared_roots_out_is_refuted_on_the_path() {
+fn a_wrap_that_declares_other_roots_than_the_fixtures_were_captured_with_fails_naming_both() {
     if !sandbox_available() {
         return;
     }
     let project = greet_project();
     project.port("greet", &RIGHT.source(), "greet");
-    // The same plugin without `--path-root`: it prints the run's real directory.
+    // The roots that match pass (`a_right_port_passes_...` covers every surface); the same
+    // plugin without `--path-root` would print the run's real directory, and one with an
+    // extra root would hide a difference, so both are failures before any output is compared.
     let manifest = project.path().join(".portkit/plugins.toml");
-    let text = fs::read_to_string(&manifest).unwrap();
-    let bare = text
+    let original = fs::read_to_string(&manifest).unwrap();
+    let error_of = |report: &Value, surface: &str, id: &str| {
+        report[surface]["outcomes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|o| o["id"] == id)
+            .unwrap()["error"]
+            .to_string()
+    };
+
+    let bare = original
         .replace(", \"--path-root\", \"$ROOT\"", "")
         .replace(", \"--path-root\", \"$HOME\"", "")
         .replace(", \"--path-root\", \"$TMP\"", "");
-    assert_ne!(bare, text);
+    assert_ne!(bare, original);
     fs::write(&manifest, bare).unwrap();
     let (code, report) = project.replay();
     assert_eq!(code, Some(1), "{report}");
-    assert!(diff_paths(&report, "direct", "basic").contains(&"/stdout".to_string()));
-    let actual = report["direct"]["outcomes"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|o| o["id"] == "basic")
-        .unwrap()["differences"][0]["actual"]
-        .to_string();
-    assert!(
-        actual.contains("greeting.txt") && !actual.contains("$ROOT"),
-        "{actual}"
+    for surface in ["direct", "mcp"] {
+        for id in ["basic", "loose", "missing"] {
+            assert_eq!(status_of(&report, surface, id), "error", "{surface}/{id}");
+            let error = error_of(&report, surface, id);
+            assert!(
+                error.contains("substitutes the roots [none]")
+                    && error.contains("captured with [$HOME, $ROOT, $TMP]"),
+                "{error}"
+            );
+        }
+    }
+
+    let extra = original.replace(
+        ", \"--work-dir\"",
+        ", \"--path-root\", \"$SRC\", \"--work-dir\"",
     );
+    assert_ne!(extra, original);
+    fs::write(&manifest, extra).unwrap();
+    let (code, report) = project.replay();
+    assert_eq!(code, Some(1), "{report}");
+    let error = error_of(&report, "direct", "basic");
+    assert!(
+        error.contains("substitutes the roots [$HOME, $ROOT, $SRC, $TMP]")
+            && error.contains("captured with [$HOME, $ROOT, $TMP]"),
+        "{error}"
+    );
+
+    // The roots as captured are accepted again.
+    fs::write(&manifest, original).unwrap();
+    let (code, report) = project.replay();
+    assert_eq!(code, Some(0), "{report}");
 }
 
 #[test]
@@ -717,6 +895,24 @@ fn pk_port_wrap_describes_itself_as_a_plugin() {
     let spec: Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(spec["name"], "greet");
     assert_eq!(spec["input_schema"], json!({"type": "object"}));
+    // No `--path-root`: the wrap says it substitutes none.
+    assert_eq!(spec["path_roots"], json!([]));
+    // With them: sorted, once each.
+    let out = project.pk(&[
+        "port",
+        "wrap",
+        "--tool",
+        "greet",
+        "--portkit-spec",
+        "--path-root",
+        "$TMP",
+        "--path-root",
+        "$ROOT",
+        "--path-root",
+        "$TMP",
+    ]);
+    let spec: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(spec["path_roots"], json!(["$ROOT", "$TMP"]));
     // Asked to run with no port named, it says what it needs.
     let out = project.pk(&["port", "wrap", "--tool", "greet"]);
     assert_eq!(out.status.code(), Some(1), "{}", text(&out));
@@ -940,6 +1136,44 @@ fn a_process_port_packet_with_a_shell_reference_is_proved() {
         result.held_out.reason
     );
     assert_eq!(result.held_out.cases, 2);
+}
+
+#[test]
+fn a_port_whose_wrap_declares_other_roots_than_the_packet_is_refuted_by_the_replay_gate() {
+    if workspace::skipped(
+        "a_port_whose_wrap_declares_other_roots_than_the_packet_is_refuted_by_the_replay_gate",
+    ) {
+        return;
+    }
+    if !sandbox_available() {
+        return;
+    }
+    // The packet declares `$ROOT`, `$HOME` and `$TMP`, and the fixtures and held-out cases
+    // are captured with them; the builder's wrap names `$ROOT` alone.
+    let body = builder_body(&RIGHT.source()).replace(
+        ", \"--path-root\", \"$HOME\", \"--path-root\", \"$TMP\"",
+        "",
+    );
+    assert!(!body.contains("$HOME"), "{body}");
+    let lane = Lane::from_project(&body, &example().join("project"), &packet);
+    let heldout = example().join("heldout/heldout.toml");
+    let out = lane.run(&[Path::new("--heldout"), &heldout]);
+    assert_eq!(out.status.code(), Some(2), "{}", text(&out));
+    let verdict = lane.verdict();
+    assert_eq!(verdict["verdict"], "refuted", "{verdict}");
+    assert!(
+        verdict["failedGates"].to_string().contains("port_replay"),
+        "{verdict}"
+    );
+    let capsule = cowproof_prove::Capsule::read(&lane.capsule_dir()).unwrap();
+    let result = capsule.port.unwrap().result.unwrap();
+    assert!(!result.success);
+    let failures = result.failures.join("\n");
+    assert!(
+        failures.contains("substitutes the roots [$ROOT]")
+            && failures.contains("captured with [$HOME, $ROOT, $TMP]"),
+        "{failures}"
+    );
 }
 
 #[test]

@@ -27,6 +27,12 @@ pub struct ToolSpec {
     /// this rather than trusting callers to ask for less.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub budget: Option<crate::budget::Budget>,
+    /// The path roots (`$ROOT`, `$HOME`, `$TMP`, `$SRC`) a process wrapper (`pk port wrap`)
+    /// substitutes in the envelope it answers, sorted, once each; empty when it substitutes
+    /// none. `None` for any other tool, which says nothing. A replay compares it with the
+    /// roots a fixture was captured with.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path_roots: Option<Vec<String>>,
 }
 
 impl ToolSpec {
@@ -41,7 +47,14 @@ impl ToolSpec {
             input_schema,
             output_schema: None,
             budget: None,
+            path_roots: None,
         }
+    }
+
+    /// Declare the path roots this tool substitutes (see [`ToolSpec::path_roots`]).
+    pub fn with_path_roots(mut self, roots: Vec<String>) -> Self {
+        self.path_roots = Some(roots);
+        self
     }
 
     pub fn with_output_schema(mut self, schema: Value) -> Self {
