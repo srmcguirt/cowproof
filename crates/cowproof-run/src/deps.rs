@@ -100,12 +100,13 @@ use crate::bridge::bridge_port;
 use crate::bundler::{self, Fetch, GEM_LOCKFILES, GemLock, Host};
 use crate::cache::{self, Alive};
 use crate::fetch_proxy::{self, BASE_GEM_LOCKFILE, FetchAllowlist, FetchProxy, Resolver};
+use crate::js_lock;
 use crate::{
-    BUNDLER_CACHE, BUNDLER_ENTRY_DIR, LOCKFILES, LaneLayout, MAX_DEPENDENCY_INPUT_TEXT, NPM_CACHE,
-    NPM_ENTRY_DIR, NPM_LOCKFILES, NPM_MANIFEST, NPM_MODULES, NetworkMode, PNPM_LOCKFILE,
-    REGISTRY_CONFIGS, SandboxPolicy, YARN_LOCKFILE, dependency_cache_key,
-    oversize_dependency_input, read_dependency_input, read_dependency_text, render_macos_profile,
-    sandbox_command,
+    BUNDLER_CACHE, BUNDLER_ENTRY_DIR, COREPACK_ENV, LOCKFILES, LaneLayout,
+    MAX_DEPENDENCY_INPUT_TEXT, NPM_CACHE, NPM_ENTRY_DIR, NPM_LOCKFILES, NPM_MANIFEST, NPM_MODULES,
+    NetworkMode, PNPM_LOCKFILE, REGISTRY_CONFIGS, SandboxPolicy, YARN_LOCKFILE,
+    dependency_cache_key, oversize_dependency_input, read_dependency_input, read_dependency_text,
+    render_macos_profile, sandbox_command,
 };
 use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
@@ -505,10 +506,16 @@ pub fn js_plan(tree: &Path) -> JsPlan {
         return JsPlan::Fetch(JsTool::Npm);
     }
     if pnpm {
-        return JsPlan::Fetch(JsTool::Pnpm);
+        return match local_path_note(tree, PNPM_LOCKFILE, js_lock::pnpm_local_path) {
+            Some(note) => JsPlan::NotFetched(note),
+            None => JsPlan::Fetch(JsTool::Pnpm),
+        };
     }
     if !yarn {
         return JsPlan::Nothing;
+    }
+    if let Some(note) = local_path_note(tree, YARN_LOCKFILE, js_lock::yarn_local_path) {
+        return JsPlan::NotFetched(note);
     }
     let lock = read_dependency_text(&tree.join(YARN_LOCKFILE)).unwrap_or_default();
     let rc = read_config(tree, ".yarnrc.yml").ok().flatten();
@@ -523,6 +530,32 @@ pub fn js_plan(tree: &Path) -> JsPlan {
                 .to_string(),
         )
     }
+}
+
+/// The longest part of a lockfile entry the capsule line quotes.
+const LOCAL_ENTRY_LISTED: usize = 200;
+
+/// The capsule line when the JavaScript lockfile `name` of `tree` holds an entry `scan`
+/// refuses (a local path with an absolute path or a `..` component, or a Berry `exec:`): it is
+/// lane-written, and a fetch with registry network must not copy or link host files into the
+/// cache entry or run a script. The entry is quoted with every control character escaped.
+/// A lockfile that cannot be read as text is refused the same way.
+fn local_path_note(tree: &Path, name: &str, scan: fn(&str) -> Option<String>) -> Option<String> {
+    let text = match read_dependency_text(&tree.join(name)) {
+        Ok(text) => text,
+        Err(e) => {
+            return Some(format!(
+                "{name}: not read ({e}), so node_modules is not fetched and is not available to the verifier"
+            ));
+        }
+    };
+    scan(&text).map(|entry| {
+        let entry: String = entry.chars().take(LOCAL_ENTRY_LISTED).collect();
+        format!(
+            "{name}: the entry `{}` names a local path outside the tree (an absolute path or a `..` component) or code to run at fetch time (`exec:`), so node_modules is not fetched and is not available to the verifier",
+            cowproof_core::one_line(&entry)
+        )
+    })
 }
 
 /// The capsule line for a lockfile or manifest over [`crate::MAX_DEPENDENCY_INPUT_BYTES`].
@@ -1188,6 +1221,16 @@ fn prefetch_in(
                 ));
             }
         }
+        let pinned = read_dependency_input(&tree.join(NPM_MANIFEST))
+            .ok()
+            .and_then(|bytes| strip_package_manager(&bytes).ok())
+            .map_or(0, |(_, n)| n);
+        if pinned > 0 {
+            notes.push(format!(
+                "{}: {pinned} packageManager setting(s) of {NPM_MANIFEST} were removed from the copy the fetch got (a corepack shim never picks or downloads a tool for it)",
+                tool.name()
+            ));
+        }
     }
     if needs.bundler
         && let Ok(Some((file, lock))) = gem_lock(&tree)
@@ -1357,6 +1400,31 @@ fn install(fresh: &Path, dir: &Path, needs: Needs) -> Result<FetchOutcome> {
     }
 }
 
+/// `package.json` (`bytes`) without the field that names the package manager to run:
+/// `packageManager`, and `devEngines.packageManager`, which corepack reads too. It is
+/// lane-written, and with corepack enabled the host's `yarn`, `pnpm` or `npm` shim downloads
+/// the release it names and runs it. Returns the bytes for the fetch's copy and the number of
+/// fields removed; the original bytes when there was none (the file is not rewritten). An error
+/// when `bytes` is not a JSON document.
+pub fn strip_package_manager(bytes: &[u8]) -> Result<(Vec<u8>, usize)> {
+    let json = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes);
+    let mut doc: serde_json::Value =
+        serde_json::from_slice(json).context("package.json is not valid JSON")?;
+    let mut removed = 0;
+    if let Some(map) = doc.as_object_mut() {
+        removed += usize::from(map.remove("packageManager").is_some());
+        if let Some(dev) = map.get_mut("devEngines").and_then(|d| d.as_object_mut()) {
+            removed += usize::from(dev.remove("packageManager").is_some());
+        }
+    }
+    if removed == 0 {
+        return Ok((bytes.to_vec(), 0));
+    }
+    let mut out = serde_json::to_vec_pretty(&doc).context("writing package.json")?;
+    out.push(b'\n');
+    Ok((out, removed))
+}
+
 /// A configuration file of the base (`.npmrc`, `.yarnrc`, `.yarnrc.yml`) as text (`None` when
 /// it is absent, a directory or a symlink).
 fn read_config(tree: &Path, name: &str) -> Result<Option<String>> {
@@ -1523,7 +1591,12 @@ fn fetch_js(
             tool.name()
         );
     }
-    copy_bounded(&manifest, &project.join(NPM_MANIFEST))
+    // The copy has no `packageManager`: a corepack shim must not pick, or download, a tool.
+    let (manifest_text, _) = read_dependency_input(&manifest)
+        .map_err(|e| anyhow::anyhow!("{e}"))
+        .and_then(|bytes| strip_package_manager(&bytes))
+        .with_context(|| format!("copying {NPM_MANIFEST}"))?;
+    fs::write(project.join(NPM_MANIFEST), manifest_text)
         .with_context(|| format!("copying {NPM_MANIFEST}"))?;
     for name in tool.lockfiles() {
         let from = tree.join(name);
@@ -1555,6 +1628,9 @@ fn fetch_js(
         ("npm_config_ignore_scripts", "true".to_string()),
         ("npm_config_update_notifier", "false".to_string()),
     ];
+    // A corepack shim of the host never downloads a release and never insists on the one a
+    // lane-written `packageManager` names.
+    env.extend(COREPACK_ENV.iter().map(|(k, v)| (*k, (*v).to_string())));
     match tool {
         JsTool::Npm => {
             env.push(("npm_config_cache", cache_text));
@@ -2705,6 +2781,92 @@ mod tests {
             plan(&[("package-lock.json", "{}"), ("npm-shrinkwrap.json", "{}")]),
             JsPlan::Fetch(JsTool::Npm)
         );
+    }
+
+    #[test]
+    fn a_lockfile_entry_with_a_host_path_or_code_is_not_fetched_and_the_note_names_it() {
+        let plan = |files: &[(&str, &str)]| {
+            let tmp = TempDir::new().unwrap();
+            for (name, text) in files {
+                fs::write(tmp.path().join(name), text).unwrap();
+            }
+            js_plan(tmp.path())
+        };
+        let not_fetched = |plan: JsPlan| match plan {
+            JsPlan::NotFetched(note) => note,
+            other => panic!("{other:?}"),
+        };
+        let rc = (".yarnrc.yml", "nodeLinker: node-modules\n");
+        // Each lockfile names its own file and the first offending entry.
+        let note = not_fetched(plan(&[(
+            "yarn.lock",
+            "# yarn lockfile v1\nfoo@^1:\n  resolved \"https://r/foo.tgz\"\nbar@^1:\n  resolved \"file:/etc/passwd\"\n",
+        )]));
+        assert!(note.starts_with("yarn.lock: "), "{note}");
+        assert!(note.contains("`resolved \"file:/etc/passwd\"`"), "{note}");
+        assert!(!note.contains("foo.tgz"), "{note}");
+        let berry = "__metadata:\n  version: 8\n\n\"a@npm:^1\":\n  resolution: \"a@exec:./gen.js#./gen.js::hash=x\"\n";
+        let note = not_fetched(plan(&[("yarn.lock", berry), rc]));
+        assert!(note.contains("a@exec:./gen.js"), "{note}");
+        let note = not_fetched(plan(&[(
+            "pnpm-lock.yaml",
+            "packages:\n  foo@1.0.0:\n    resolution: {directory: ../x, type: directory}\n",
+        )]));
+        assert!(note.starts_with("pnpm-lock.yaml: "), "{note}");
+        assert!(note.contains("directory: ../x"), "{note}");
+        // Control characters of the entry are escaped: the note is one line.
+        let note = not_fetched(plan(&[(
+            "pnpm-lock.yaml",
+            "importers:\n  .:\n    dependencies:\n      foo: link:/\u{1b}[2J\u{9b}x\r\n",
+        )]));
+        assert!(note.contains("link:/\\u{1b}[2J\\u{9b}x"), "{note}");
+        assert!(!note.chars().any(char::is_control), "{note:?}");
+        // Relative paths inside the tree (workspace packages) are fetched; a relative Berry
+        // `exec:` is not, because it runs code.
+        let relative = "__metadata:\n  version: 8\n\n\"a@portal:packages/a::locator=app%40workspace%3A.\":\n  resolution: \"a@portal:packages/a::locator=app%40workspace%3A.\"\n\"b@link:./packages/b::locator=app%40workspace%3A.\":\n  resolution: \"b@link:./packages/b::locator=app%40workspace%3A.\"\n";
+        assert_eq!(
+            plan(&[("yarn.lock", relative), rc]),
+            JsPlan::Fetch(JsTool::YarnBerry)
+        );
+        assert_eq!(
+            plan(&[(
+                "pnpm-lock.yaml",
+                "importers:\n  .:\n    dependencies:\n      a:\n        specifier: link:packages/a\n        version: link:packages/a\n"
+            )]),
+            JsPlan::Fetch(JsTool::Pnpm)
+        );
+        let relative_exec = "__metadata:\n  version: 8\n\n\"a@exec:./gen.js\":\n  version: 1.0.0\n";
+        let note = not_fetched(plan(&[("yarn.lock", relative_exec), rc]));
+        assert!(note.contains("exec:./gen.js"), "{note}");
+        // The unreadable and the not-UTF-8 are refused too.
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("pnpm-lock.yaml"), [0xff, 0xfe]).unwrap();
+        let note = not_fetched(js_plan(tmp.path()));
+        assert!(note.starts_with("pnpm-lock.yaml: not read"), "{note}");
+    }
+
+    #[test]
+    fn the_package_manager_fields_of_a_manifest_are_removed_and_counted() {
+        let (out, n) = strip_package_manager(
+            br#"{"name":"app","packageManager":"yarn@1.0.0+sha1.abc","devEngines":{"packageManager":{"name":"pnpm"},"node":"20"},"dependencies":{"a":"1"}}"#,
+        )
+        .unwrap();
+        assert_eq!(n, 2);
+        let doc: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert!(doc.get("packageManager").is_none(), "{doc}");
+        assert!(doc["devEngines"].get("packageManager").is_none(), "{doc}");
+        assert_eq!(doc["devEngines"]["node"], "20");
+        assert_eq!(doc["dependencies"]["a"], "1");
+        assert_eq!(doc["name"], "app");
+        // A byte order mark does not hide it, and an escaped spelling is the same key.
+        let (out, n) =
+            strip_package_manager(b"\xEF\xBB\xBF{\"package\\u004danager\":\"npm@9\"}").unwrap();
+        assert_eq!((n, out.starts_with(b"{")), (1, true));
+        // Without the field the bytes are kept as they are; a non-document is an error.
+        let plain = b"{ \"name\" : \"app\" }\n";
+        assert_eq!(strip_package_manager(plain).unwrap(), (plain.to_vec(), 0));
+        assert!(strip_package_manager(b"not json").is_err());
+        assert_eq!(strip_package_manager(b"[]").unwrap().1, 0);
     }
 
     #[test]

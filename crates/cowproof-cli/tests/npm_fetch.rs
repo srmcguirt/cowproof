@@ -1215,3 +1215,284 @@ fn yarn_may_reach_yarns_registry_and_pnpm_may_not() {
     );
     assert_eq!(other.accepted.load(Ordering::SeqCst), 0);
 }
+
+// ---- corepack and local paths (lane/js-fetch-local-paths-corepack) ----
+
+/// A manifest whose `packageManager` names a release a corepack shim would download.
+const PINNED_MANIFEST: &str = "{\"name\":\"app\",\"version\":\"1.0.0\",\"packageManager\":\"yarn@1.22.19+sha256.deadbeef\",\"devEngines\":{\"packageManager\":{\"name\":\"pnpm\",\"version\":\"8.0.0\"}},\"dependencies\":{\"fake-pkg\":\"1.0.0\"}}\n";
+
+/// The three settings that keep a corepack shim from downloading or insisting on a release.
+const COREPACK_VERIFIER_SETTINGS: &str = "test \"$COREPACK_ENABLE_NETWORK\" = 0 \
+     && test \"$COREPACK_ENABLE_STRICT\" = 0 \
+     && test \"$COREPACK_ENABLE_AUTO_PIN\" = 0";
+
+#[test]
+fn the_fetch_copy_of_package_json_has_no_package_manager_and_corepack_never_downloads() {
+    if !sandbox_available() {
+        return;
+    }
+    // (fake tool body, hook variable, tool name, lockfile)
+    let cases = [
+        (
+            FAKE_NPM_OK.to_string(),
+            "COWPROOF_NPM",
+            "npm",
+            npm_project().remove(1),
+        ),
+        (
+            fake_js_ok("YARN_CACHE_FOLDER"),
+            "COWPROOF_YARN",
+            "yarn",
+            ("yarn.lock", YARN_V1_LOCK),
+        ),
+        (
+            fake_js_ok("npm_config_store_dir"),
+            "COWPROOF_PNPM",
+            "pnpm",
+            ("pnpm-lock.yaml", "lockfileVersion: '9.0'\n"),
+        ),
+    ];
+    for (body, hook, name, lockfile) in cases {
+        let cache = var_tmp("cp-corepack-cache-");
+        let (_dir, tool) = fake_tool(name, &body);
+        let lane = new_lane_for(
+            &[("package.json", PINNED_MANIFEST), lockfile],
+            cache.path(),
+            hook,
+            &tool,
+        );
+        let held = var_tmp("cp-corepack-held-");
+        let check = format!("{NEEDS_MODULES} && {COREPACK_VERIFIER_SETTINGS}");
+        let out = run_with(&lane, &heldout(held.path(), &check), 0);
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains(&format!("{}: proved", lane.id)),
+            "{name}: {}",
+            text(&out)
+        );
+        let c = capsule(&lane);
+        assert_eq!(c.dependency_fetch_outcome.as_deref(), Some("fetched"));
+        let recorded = entry(cache.path(), &c).join("npm/cache");
+
+        // The tool saw a manifest without either field, and everything else of it.
+        let seen = fs::read_to_string(recorded.join("package_json.txt")).unwrap();
+        assert!(!seen.contains("packageManager"), "{name}: {seen}");
+        let doc: serde_json::Value = serde_json::from_str(&seen).unwrap();
+        assert_eq!(doc["name"], "app", "{name}");
+        assert_eq!(doc["dependencies"]["fake-pkg"], "1.0.0", "{name}");
+        // ... and corepack could neither download nor insist on a release.
+        let env = fs::read_to_string(recorded.join("env.txt")).unwrap();
+        for want in [
+            "COREPACK_ENABLE_NETWORK=0",
+            "COREPACK_ENABLE_STRICT=0",
+            "COREPACK_ENABLE_AUTO_PIN=0",
+        ] {
+            assert!(env.lines().any(|l| l == want), "{name}: {want} in\n{env}");
+        }
+        // The capsule counts the removal; the lane's own tree keeps its field.
+        assert!(
+            c.dependency_fetch_notes
+                .iter()
+                .any(|n| n.starts_with(&format!(
+                    "{name}: 2 packageManager setting(s) of package.json were removed"
+                ))),
+            "{name}: {:?}",
+            c.dependency_fetch_notes
+        );
+    }
+}
+
+/// A Berry lock whose entries are `entries` (each `"descriptor"` and its resolution).
+fn berry_lock(entries: &[&str]) -> String {
+    let mut lock = String::from("__metadata:\n  version: 8\n");
+    for e in entries {
+        lock.push_str(&format!(
+            "\n\"a@npm:^1\":\n  version: 1.0.0\n  resolution: \"{e}\"\n  linkType: hard\n"
+        ));
+    }
+    lock
+}
+
+/// A lane over `files` whose fetch must not run: the fake tool refuses, and the capsule says
+/// `not_fetched` with a note that starts `<lockfile>: ` and holds `entry`.
+fn assert_local_path_refused(
+    files: &[(&str, &str)],
+    hook: &str,
+    tool_name: &str,
+    lockfile: &str,
+    entry: &str,
+) -> Vec<String> {
+    let cache = var_tmp("cp-local-cache-");
+    let (_dir, tool) = fake_tool(tool_name, FAKE_JS_MUST_NOT_RUN);
+    let lane = new_lane_for(files, cache.path(), hook, &tool);
+    let out = lane.run(&[]);
+    assert_eq!(out.status.code(), Some(0), "{entry}: {}", text(&out));
+    let c = capsule(&lane);
+    assert_eq!(
+        c.dependency_fetch_outcome.as_deref(),
+        Some("not_fetched"),
+        "{entry}: {:?}",
+        c.dependency_fetch_notes
+    );
+    assert!(c.dependency_cache_key.is_none(), "{entry}");
+    assert!(c.dependency_ecosystems.is_empty(), "{entry}");
+    assert!(
+        c.dependency_fetch_notes
+            .iter()
+            .any(|n| n.starts_with(&format!("{lockfile}: ")) && n.contains(entry)),
+        "{entry}: {:?}",
+        c.dependency_fetch_notes
+    );
+    c.dependency_fetch_notes
+}
+
+#[test]
+fn a_yarn_lockfile_entry_with_a_host_path_or_code_is_not_fetched_naming_the_entry() {
+    if !sandbox_available() {
+        return;
+    }
+    let rc = (".yarnrc.yml", "nodeLinker: node-modules\n");
+    // Classic: file: and link: with an absolute path or a `..` component.
+    for entry in [
+        "resolved \"file:/etc/passwd\"",
+        "resolved \"file:../outside\"",
+        "resolved \"link:/home/u/dir\"",
+        "resolved \"link:./a/../../b\"",
+    ] {
+        let lock = format!("# yarn lockfile v1\n\nfoo@^1.0.0:\n  version \"1.0.0\"\n  {entry}\n");
+        assert_local_path_refused(
+            &[manifest(), ("yarn.lock", &lock)],
+            "COWPROOF_YARN",
+            "yarn",
+            "yarn.lock",
+            entry,
+        );
+    }
+    // Berry: portal, link, file, exec and a patch whose path leaves the tree.
+    for resolution in [
+        "a@portal:/abs::locator=app%40workspace%3A.",
+        "a@link:../x::locator=app%40workspace%3A.",
+        "a@file:/x.tgz#/x.tgz::hash=abc",
+        "a@exec:./gen.js#./gen.js::hash=abc",
+        "a@patch:a@npm%3A1.0.0#../x.patch::version=1.0.0&hash=abc",
+        "a@patch:a@npm%3A1.0.0#/etc/x.patch::version=1.0.0&hash=abc",
+        "a@patch:a@portal%3A/abs#./x.patch::version=1.0.0&hash=abc",
+    ] {
+        let lock = berry_lock(&[resolution]);
+        assert_local_path_refused(
+            &[manifest(), ("yarn.lock", &lock), rc],
+            "COWPROOF_YARN",
+            "yarn",
+            "yarn.lock",
+            resolution,
+        );
+    }
+}
+
+#[test]
+fn a_pnpm_lockfile_entry_with_a_host_path_is_not_fetched_naming_the_entry() {
+    if !sandbox_available() {
+        return;
+    }
+    for (body, entry) in [
+        (
+            "packages:\n  foo@file:../x:\n    resolution: {directory: ../x, type: directory}\n",
+            "foo@file:../x:",
+        ),
+        (
+            "packages:\n  foo@1.0.0:\n    resolution: {directory: /abs, type: directory}\n",
+            "resolution: {directory: /abs, type: directory}",
+        ),
+        (
+            "importers:\n  .:\n    dependencies:\n      foo:\n        specifier: link:../foo\n        version: link:../foo\n",
+            "specifier: link:../foo",
+        ),
+        (
+            "importers:\n  .:\n    dependencies:\n      foo:\n        specifier: ^1.0.0\n        version: file:/abs/foo\n",
+            "version: file:/abs/foo",
+        ),
+        (
+            "packages:\n  foo@1.0.0:\n    resolution: {integrity: sha512-x, tarball: file:../x.tgz}\n",
+            "tarball: file:../x.tgz",
+        ),
+    ] {
+        let lock = format!("lockfileVersion: '9.0'\n\n{body}");
+        assert_local_path_refused(
+            &[manifest(), ("pnpm-lock.yaml", &lock)],
+            "COWPROOF_PNPM",
+            "pnpm",
+            "pnpm-lock.yaml",
+            entry,
+        );
+    }
+}
+
+#[test]
+fn the_note_for_a_host_path_entry_escapes_its_control_characters() {
+    if !sandbox_available() {
+        return;
+    }
+    let lock = "lockfileVersion: '9.0'\n\nimporters:\n  .:\n    dependencies:\n      foo:\n        specifier: x\n        version: link:/\u{1b}[2J\u{9b}0c\n";
+    let notes = assert_local_path_refused(
+        &[manifest(), ("pnpm-lock.yaml", lock)],
+        "COWPROOF_PNPM",
+        "pnpm",
+        "pnpm-lock.yaml",
+        "version: link:/\\u{1b}[2J\\u{9b}0c",
+    );
+    assert!(
+        notes.iter().all(|n| !n.chars().any(char::is_control)),
+        "{notes:?}"
+    );
+}
+
+#[test]
+fn relative_workspace_paths_in_a_lockfile_are_fetched_and_a_relative_exec_is_not() {
+    if !sandbox_available() {
+        return;
+    }
+    // pnpm: link: and file: paths inside the tree.
+    let cache = var_tmp("cp-local-cache-");
+    let (_dir, pnpm) = fake_tool("pnpm", &fake_js_ok("npm_config_store_dir"));
+    let lock = "lockfileVersion: '9.0'\n\nimporters:\n  .:\n    dependencies:\n      a:\n        specifier: link:packages/a\n        version: link:packages/a\n      b:\n        specifier: file:./vendor/b\n        version: file:vendor/b\n\npackages:\n  b@file:vendor/b:\n    resolution: {directory: vendor/b, type: directory}\n";
+    let lane = new_lane_for(
+        &[manifest(), ("pnpm-lock.yaml", lock)],
+        cache.path(),
+        "COWPROOF_PNPM",
+        &pnpm,
+    );
+    let held = var_tmp("cp-local-held-");
+    run_with(&lane, &heldout(held.path(), NEEDS_MODULES), 0);
+    let c = capsule(&lane);
+    assert_eq!(c.dependency_fetch_outcome.as_deref(), Some("fetched"));
+    assert_eq!(c.dependency_ecosystems, vec!["pnpm".to_string()]);
+
+    // Berry: portal: and link: paths inside the tree.
+    let cache = var_tmp("cp-local-cache-");
+    let (_dir, yarn) = fake_tool("yarn", &fake_js_ok("YARN_CACHE_FOLDER"));
+    let lock = berry_lock(&[
+        "a@portal:packages/a::locator=app%40workspace%3A.",
+        "a@link:./packages/b::locator=app%40workspace%3A.",
+    ]);
+    let rc = (".yarnrc.yml", "nodeLinker: node-modules\n");
+    let lane = new_lane_for(
+        &[manifest(), ("yarn.lock", &lock), rc],
+        cache.path(),
+        "COWPROOF_YARN",
+        &yarn,
+    );
+    let held = var_tmp("cp-local-held-");
+    run_with(&lane, &heldout(held.path(), NEEDS_MODULES), 0);
+    let c = capsule(&lane);
+    assert_eq!(c.dependency_fetch_outcome.as_deref(), Some("fetched"));
+    assert_eq!(c.dependency_ecosystems, vec!["yarn".to_string()]);
+
+    // A Berry exec: with a path inside the tree still runs a script at fetch time.
+    let lock = berry_lock(&["a@exec:./scripts/gen.js#./scripts/gen.js::hash=abc"]);
+    assert_local_path_refused(
+        &[manifest(), ("yarn.lock", &lock), rc],
+        "COWPROOF_YARN",
+        "yarn",
+        "yarn.lock",
+        "a@exec:./scripts/gen.js",
+    );
+}

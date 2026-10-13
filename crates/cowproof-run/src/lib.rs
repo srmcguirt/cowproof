@@ -20,6 +20,7 @@ pub mod deps;
 pub mod director;
 pub mod fetch_proxy;
 pub mod hostload;
+mod js_lock;
 pub mod lane;
 pub mod models;
 pub mod opencode;
@@ -407,7 +408,7 @@ impl SandboxPolicy {
                         .push((name.to_string(), cache.to_string_lossy().into_owned()));
                 }
             }
-            for (k, v) in NPM_VERIFIER_ENV {
+            for (k, v) in NPM_VERIFIER_ENV.into_iter().chain(COREPACK_ENV) {
                 self.env_set.push((k.to_string(), v.to_string()));
             }
         }
@@ -558,6 +559,17 @@ const NPM_VERIFIER_ENV: [(&str, &str); 7] = [
     ("YARN_ENABLE_SCRIPTS", "false"),
     ("YARN_ENABLE_NETWORK", "false"),
     ("YARN_ENABLE_TELEMETRY", "false"),
+];
+
+/// Corepack's settings for the Node tools, in the dependency fetch and in the verifier: a
+/// corepack shim for `yarn`, `pnpm` or `npm` never downloads a release (`NETWORK`), never
+/// insists on the version a lane-written `packageManager` field names (`STRICT`) and never
+/// writes that field into `package.json` (`AUTO_PIN`). The fetch also drops the field from the
+/// `package.json` it copies ([`deps::strip_package_manager`]).
+pub(crate) const COREPACK_ENV: [(&str, &str); 3] = [
+    ("COREPACK_ENABLE_NETWORK", "0"),
+    ("COREPACK_ENABLE_STRICT", "0"),
+    ("COREPACK_ENABLE_AUTO_PIN", "0"),
 ];
 
 /// The settings that point each tool at the entry's `cache` directory: npm's cache, yarn's
@@ -3343,6 +3355,9 @@ mod tests {
             ("npm_config_store_dir", cache.to_string_lossy().into_owned()),
             ("YARN_ENABLE_SCRIPTS", "false".to_string()),
             ("YARN_ENABLE_NETWORK", "false".to_string()),
+            ("COREPACK_ENABLE_NETWORK", "0".to_string()),
+            ("COREPACK_ENABLE_STRICT", "0".to_string()),
+            ("COREPACK_ENABLE_AUTO_PIN", "0".to_string()),
         ] {
             assert!(
                 policy

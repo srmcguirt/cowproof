@@ -344,7 +344,7 @@ pub fn var_tmp(prefix: &str) -> TempDir {
 /// A FAKE `npm` that succeeds. It records what it was given into the npm cache directory
 /// the fetch names (`$npm_config_cache`, a directory of the cache entry being made, the only
 /// place the fetch sandbox lets it write besides its scratch directory): `argv.txt` (one
-/// argument per line), `env.txt` (its sorted environment), `npmrc.txt` (the `.npmrc` it was
+/// argument per line), `env.txt` (its sorted environment), `package_json.txt` (the `package.json` it was given), `npmrc.txt` (the `.npmrc` it was
 /// given, if any) and `cwd.txt`. It installs `node_modules/fake-pkg/index.js` into its working
 /// directory, as `npm ci` installs into the project.
 #[allow(dead_code)] // `tests/npm_fetch.rs` and `tests/deps.rs` use it; the other test crates do not
@@ -352,6 +352,7 @@ pub const FAKE_NPM_OK: &str = r#"#!/bin/sh
 printf '%s\n' "$@" > "$npm_config_cache/argv.txt"
 env | sort > "$npm_config_cache/env.txt"
 pwd > "$npm_config_cache/cwd.txt"
+if [ -f package.json ]; then cat package.json > "$npm_config_cache/package_json.txt"; fi
 if [ -f .npmrc ]; then cat .npmrc > "$npm_config_cache/npmrc.txt"; fi
 mkdir -p node_modules/fake-pkg
 printf 'module.exports = 42;\n' > node_modules/fake-pkg/index.js
@@ -376,7 +377,7 @@ exit 1
 
 /// A FAKE `yarn` or `pnpm` that succeeds, as [`FAKE_NPM_OK`] is for npm. It records into
 /// the tool's own cache directory, named by `cache_var` (`YARN_CACHE_FOLDER` for yarn,
-/// `npm_config_store_dir` for pnpm): `argv.txt`, `env.txt`, `cwd.txt`, and the configuration
+/// `npm_config_store_dir` for pnpm): `argv.txt`, `env.txt`, `cwd.txt`, `package_json.txt`, and the configuration
 /// files it was given (`npmrc.txt`, `yarnrc.txt`, `yarnrc_yml.txt`). It installs
 /// `node_modules/fake-pkg/index.js` into its working directory.
 #[allow(dead_code)] // `tests/npm_fetch.rs` uses it; the other test crates do not
@@ -387,6 +388,7 @@ dir="${cache_var}"
 printf '%s\n' "$@" > "$dir/argv.txt"
 env | sort > "$dir/env.txt"
 pwd > "$dir/cwd.txt"
+if [ -f package.json ]; then cat package.json > "$dir/package_json.txt"; fi
 if [ -f .npmrc ]; then cat .npmrc > "$dir/npmrc.txt"; fi
 if [ -f .yarnrc ]; then cat .yarnrc > "$dir/yarnrc.txt"; fi
 if [ -f .yarnrc.yml ]; then cat .yarnrc.yml > "$dir/yarnrc_yml.txt"; fi
