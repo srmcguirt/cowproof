@@ -962,6 +962,12 @@ mod tests {
         drop(ok);
         assert_eq!(running.stop(), ["evil.example:443"]);
         assert!(!socket.exists(), "the socket is removed on stop");
+        // The fake counts a connection when its accept task runs, on another thread, which
+        // can come after the proxy has already answered 200: wait for it, briefly.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while count.load(Ordering::SeqCst) < 1 && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         assert_eq!(count.load(Ordering::SeqCst), 1);
         drop(done_tx);
         keep.join().unwrap();
