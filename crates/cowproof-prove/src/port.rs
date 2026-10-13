@@ -477,12 +477,23 @@ fn runs_here(platform: &Option<String>) -> bool {
 }
 
 /// Judge a replay: its failures in words, naming surface, tool and fixture.
+///
+/// `cases` is every fixture on disk; `base` is the subset the director vouches for (the
+/// fixtures of the base commit; for the held-out set, the set itself). Only `base` counts as
+/// platform coverage: a fixture the lane added is replayed and judged like any other, but it
+/// cannot stand in for a base fixture captured on another platform. `held_out_tools` are the
+/// tools the director's held-out cases cover (captured live on this platform, so they are
+/// coverage too). A tool with no base fixture at all is not judged here (the
+/// `port-no-base-fixtures` lint and the held-out rule handle it). `tools` limits the coverage
+/// check to the packet's tools; an empty list checks every tool of `base`.
 fn judge(
     label: &str,
     replayed: &mut Replayed,
     tools: &[String],
     on_disk: &[String],
     cases: &FixtureCases,
+    base: &FixtureCases,
+    held_out_tools: &[String],
 ) {
     for surface in ["direct", "mcp"] {
         if !replayed.reports.contains_key(surface) {
@@ -581,12 +592,26 @@ fn judge(
             ));
         }
     }
-    // A port must never prove on a platform it was never captured on: a tool whose fixtures are
-    // all tagged for other platforms has nothing to replay here. Read from the files, not from
-    // the report.
+    // A port must never prove on a platform it was never captured on: a tool whose base
+    // fixtures are all tagged for other platforms has nothing reference-captured to replay
+    // here. Read from the base's files, not from the report, and not from fixtures the lane
+    // added: those would let one untagged fixture of the lane's own hide the gap. The
+    // director's held-out cases, captured here, do count.
     let mut covered: BTreeMap<&str, (bool, BTreeSet<&str>)> = BTreeMap::new();
-    for ((tool, _), platform) in cases {
-        let entry = covered.entry(tool.as_str()).or_default();
+    for (key, base_platform) in base {
+        let entry = covered.entry(key.0.as_str()).or_default();
+        // A base fixture covers this platform only as it stands on disk now: one the lane
+        // retagged for another platform no longer runs here, and one it deleted never does
+        // (both are also findings of `fixture_findings`).
+        let Some(platform) = cases.get(key) else {
+            if let Some(p) = base_platform
+                .as_deref()
+                .filter(|_| !runs_here(base_platform))
+            {
+                entry.1.insert(p);
+            }
+            continue;
+        };
         match platform.as_deref() {
             Some(_) if runs_here(platform) => entry.0 = true,
             Some(p) => {
@@ -596,7 +621,9 @@ fn judge(
         }
     }
     for (tool, (here, elsewhere)) in covered {
-        if !here && !elsewhere.is_empty() {
+        let in_scope = tools.is_empty() || tools.iter().any(|t| t == tool);
+        let held = held_out_tools.iter().any(|t| t == tool);
+        if in_scope && !held && !here && !elsewhere.is_empty() {
             replayed.failures.push(format!(
                 "{label}tool {tool:?} has no fixture for {} (its fixtures cover {}), so it was never proved on this platform",
                 portkit_port::host_platform(),
@@ -859,24 +886,11 @@ pub(crate) async fn run_port(run: PortRun<'_>) -> Result<PortOutcome, VerifyErro
     let ran = replay.run(&fixtures_dir, &report_path).await?;
     let mut visible = read_report(&ran);
     let on_disk = tools_with_fixtures(&fixtures_dir);
-    judge(
-        "",
-        &mut visible,
-        &spec.tools,
-        &on_disk,
-        &fixture_cases(&fixtures_dir),
-    );
-    failures.append(&mut visible.failures);
 
-    // Base fixtures kept as they were, and accepted differences ruled.
+    // The base's fixtures, and the director's held-out cases: the only coverage a platform
+    // gap can be made up from (a fixture the lane added is judged but never covers).
     let base = base_fixtures(tree, &spec.fixtures).await?;
-    let now = read_fixture_files(&fixtures_dir);
-    let log = RulingLog::read(&capsule_dir.join("escalations.jsonl"))
-        .map_err(|e| infra(format!("escalations.jsonl: {e:#}")))?;
-    failures.extend(fixture_findings(&base, &now, &log));
-
-    // The director's held-out cases.
-    let held_out = held_out(&PortRun {
+    let (held_out, held_out_tools) = held_out(&PortRun {
         capsule_dir,
         capsule,
         spec,
@@ -889,6 +903,23 @@ pub(crate) async fn run_port(run: PortRun<'_>) -> Result<PortOutcome, VerifyErro
         runtime_dirs,
     })
     .await?;
+    judge(
+        "",
+        &mut visible,
+        &spec.tools,
+        &on_disk,
+        &fixture_cases(&fixtures_dir),
+        &cases_from(&base),
+        &held_out_tools,
+    );
+    failures.append(&mut visible.failures);
+
+    // Base fixtures kept as they were, and accepted differences ruled.
+    let now = read_fixture_files(&fixtures_dir);
+    let log = RulingLog::read(&capsule_dir.join("escalations.jsonl"))
+        .map_err(|e| infra(format!("escalations.jsonl: {e:#}")))?;
+    failures.extend(fixture_findings(&base, &now, &log));
+
     if held_out.state == "failed" {
         failures.push(format!(
             "held-out port cases failed: {}",
@@ -911,9 +942,11 @@ pub(crate) async fn run_port(run: PortRun<'_>) -> Result<PortOutcome, VerifyErro
     Ok(PortOutcome { result })
 }
 
-async fn held_out(run: &PortRun<'_>) -> Result<PortHeldOut, VerifyError> {
+/// The director's held-out cases, replayed, and the tools they covered when they passed (the
+/// tools they cover count as platform coverage: they are captured live on this platform).
+async fn held_out(run: &PortRun<'_>) -> Result<(PortHeldOut, Vec<String>), VerifyError> {
     if run.heldout.port.is_none() {
-        return Ok(PortHeldOut::none());
+        return Ok((PortHeldOut::none(), Vec::new()));
     }
     let Some(reference) = run
         .spec
@@ -929,13 +962,16 @@ async fn held_out(run: &PortRun<'_>) -> Result<PortHeldOut, VerifyError> {
     if let Some(runtime) = &reference.runtime
         && let Err(reason) = runtime_met(run.runner, run.tree, runtime, run.timeout).await?
     {
-        return Ok(PortHeldOut {
-            state: "skipped".into(),
-            reason: Some(with_runtime_note(reason, run)),
-            cases: 0,
-            fixture_hash: String::new(),
-            surfaces: BTreeMap::new(),
-        });
+        return Ok((
+            PortHeldOut {
+                state: "skipped".into(),
+                reason: Some(with_runtime_note(reason, run)),
+                cases: 0,
+                fixture_hash: String::new(),
+                surfaces: BTreeMap::new(),
+            },
+            Vec::new(),
+        ));
     }
 
     // Capture the held-out cases against the reference, inside the sandbox.
@@ -969,7 +1005,7 @@ async fn held_out(run: &PortRun<'_>) -> Result<PortHeldOut, VerifyError> {
 }
 
 /// Run the held-out `capture` (which writes the captured fixtures to `fixtures`), then replay
-/// and judge them.
+/// and judge them. The second value is the tools the passing cases covered.
 ///
 /// The capture runs in its own process group and the runner returns only once the group is
 /// gone, so nothing it started in the group can write afterwards. The fixtures are then read
@@ -986,7 +1022,7 @@ async fn capture_and_judge(
     capture: &str,
     fixtures: &Path,
     out_dir: &Path,
-) -> Result<PortHeldOut, VerifyError> {
+) -> Result<(PortHeldOut, Vec<String>), VerifyError> {
     let outcome = replay
         .runner
         .run(replay.tree, capture, replay.timeout)
@@ -1023,6 +1059,8 @@ async fn capture_and_judge(
         &[],
         &tools_from(&files),
         &cases_from(&files),
+        &cases_from(&files),
+        &[],
     );
     // A check that can only fail: the copy the replay read must still be the set judged.
     if fixture_set_hash(&judged).map(|(h, _)| h).ok().as_deref() != Some(hash.as_str()) {
@@ -1031,13 +1069,21 @@ async fn capture_and_judge(
         );
     }
     let failed = !replayed.failures.is_empty();
-    Ok(PortHeldOut {
-        state: if failed { "failed" } else { "passed" }.into(),
-        reason: failed.then(|| replayed.failures.join("; ")),
-        cases: set.files.len(),
-        fixture_hash: hash,
-        surfaces: summaries(&replayed.reports),
-    })
+    let covered = if failed {
+        Vec::new()
+    } else {
+        tools_from(&files)
+    };
+    Ok((
+        PortHeldOut {
+            state: if failed { "failed" } else { "passed" }.into(),
+            reason: failed.then(|| replayed.failures.join("; ")),
+            cases: set.files.len(),
+            fixture_hash: hash,
+            surfaces: summaries(&replayed.reports),
+        },
+        covered,
+    ))
 }
 
 #[cfg(test)]
@@ -1183,6 +1229,18 @@ mod tests {
         base
     }
 
+    /// `judge` where the fixtures on disk are all the base's, and the held-out cases cover
+    /// nothing: the form most tests need.
+    fn judge_self(
+        label: &str,
+        replayed: &mut Replayed,
+        tools: &[String],
+        on_disk: &[String],
+        cases: &FixtureCases,
+    ) {
+        judge(label, replayed, tools, on_disk, cases, cases, &[]);
+    }
+
     fn replayed(outcomes: Vec<CaseOutcome>) -> Replayed {
         let r = report(outcomes);
         Replayed {
@@ -1197,7 +1255,7 @@ mod tests {
             outcome("t", "1", Status::Pass),
             outcome("t", "2", Status::Accepted),
         ]);
-        judge(
+        judge_self(
             "",
             &mut r,
             &["t".to_string()],
@@ -1213,7 +1271,7 @@ mod tests {
             outcome("t", "1", Status::Pass),
             outcome("gone", "1", Status::NotPorted),
         ]);
-        judge(
+        judge_self(
             "",
             &mut r,
             &["t".to_string()],
@@ -1229,7 +1287,7 @@ mod tests {
     #[test]
     fn a_tool_without_fixtures_is_not_proved_and_a_forged_count_is_caught() {
         let mut r = replayed(vec![outcome("t", "1", Status::Pass)]);
-        judge(
+        judge_self(
             "",
             &mut r,
             &["t".to_string(), "silent".to_string()],
@@ -1248,7 +1306,7 @@ mod tests {
             report.failed = 0;
             report.passed = 1;
         }
-        judge(
+        judge_self(
             "",
             &mut forged,
             &["t".to_string()],
@@ -1264,7 +1322,7 @@ mod tests {
     fn a_missing_surface_fails() {
         let mut r = replayed(vec![outcome("t", "1", Status::Pass)]);
         r.reports.remove("mcp");
-        judge(
+        judge_self(
             "",
             &mut r,
             &["t".to_string()],
@@ -1477,7 +1535,7 @@ mod tests {
             timeout: Duration::from_secs(60),
         };
         let capture = format!("'{}' pk port capture", pk.display());
-        let held = capture_and_judge(&replay, &capture, &fixtures, &out_dir)
+        let (held, held_tools) = capture_and_judge(&replay, &capture, &fixtures, &out_dir)
             .await
             .unwrap();
         // The process ran and rewrote the capture's directory ...
@@ -1495,6 +1553,7 @@ mod tests {
         assert_eq!(held.cases, want_count);
         assert_eq!(held.fixture_hash, want_hash);
         assert_ne!(held.fixture_hash, fixture_set_hash(&fixtures).unwrap().0);
+        assert_eq!(held_tools, vec!["t".to_string()]);
         assert_eq!(
             fs::read_to_string(out_dir.join("heldout-judged/t/1.json")).unwrap(),
             original
@@ -1528,7 +1587,7 @@ mod tests {
         );
         let mut replayed = read_report(&ran);
         assert_eq!(replayed.failures, Vec::<String>::new());
-        judge(
+        judge_self(
             "",
             &mut replayed,
             &["t".to_string()],
@@ -1552,7 +1611,7 @@ mod tests {
             outcome("t", "1", Status::Pass),
             outcome("t", "9", Status::Accepted),
         ]);
-        judge(
+        judge_self(
             "held-out ",
             &mut r,
             &[],
@@ -1588,7 +1647,7 @@ mod tests {
             ],
             1,
         );
-        judge(
+        judge_self(
             "",
             &mut ok,
             &["t".to_string()],
@@ -1606,7 +1665,7 @@ mod tests {
             ],
             0,
         );
-        judge(
+        judge_self(
             "",
             &mut ran,
             &["t".to_string()],
@@ -1631,7 +1690,7 @@ mod tests {
                 ],
                 wrong,
             );
-            judge(
+            judge_self(
                 "",
                 &mut miscounted,
                 &["t".to_string()],
@@ -1656,7 +1715,7 @@ mod tests {
         let on_disk = with_tagged(cases(&[("u", "1")]), &[("t", &format!("1@{other}"), other)]);
         for label in ["", "held-out "] {
             let mut r = replayed_with_other(vec![outcome("u", "1", Status::Pass)], 1);
-            judge(
+            judge_self(
                 label,
                 &mut r,
                 &["t".to_string(), "u".to_string()],
@@ -1674,7 +1733,7 @@ mod tests {
         }
         // The same without the tool being named by the packet (a held-out tool list is empty).
         let mut r = replayed_with_other(vec![outcome("u", "1", Status::Pass)], 1);
-        judge(
+        judge_self(
             "held-out ",
             &mut r,
             &[],

@@ -1,5 +1,6 @@
 //! Replay captured fixtures against the Rust port and report the differences.
 
+use std::collections::BTreeSet;
 use std::fmt;
 use std::path::Path;
 
@@ -148,10 +149,36 @@ impl ReplayReport {
     }
 
     /// The tools that have fixtures tagged for other platforms and none replayed on this one.
+    ///
+    /// Every fixture counts, whoever wrote it: this is what `pk port replay` and
+    /// [`is_success`](Self::is_success) use, and it keeps today's behaviour. A caller that
+    /// knows which fixtures a director vouches for (the verifier's base fixtures) asks
+    /// [`platform_gaps_among`](Self::platform_gaps_among) instead.
     pub fn platform_gaps(&self) -> Vec<PlatformGap> {
+        self.platform_gaps_among(None)
+    }
+
+    /// [`platform_gaps`](Self::platform_gaps), counting only the fixtures in `vouched` (their
+    /// `(tool, id)`) when the set is given: a fixture outside it, such as one a lane added, is
+    /// still replayed and judged elsewhere, but it neither makes a gap nor closes one. A tool
+    /// none of whose fixtures are vouched for is not judged here. `None` counts every fixture.
+    pub fn platform_gaps_among(
+        &self,
+        vouched: Option<&BTreeSet<(String, String)>>,
+    ) -> Vec<PlatformGap> {
+        let counts = |tool: &str, id: &str| {
+            vouched.is_none_or(|set| set.contains(&(tool.to_string(), id.to_string())))
+        };
         let mut gaps: Vec<PlatformGap> = Vec::new();
         for skipped in &self.other_platform_cases {
-            if self.outcomes.iter().any(|o| o.tool == skipped.tool) {
+            if !counts(&skipped.tool, &skipped.id) {
+                continue;
+            }
+            if self
+                .outcomes
+                .iter()
+                .any(|o| o.tool == skipped.tool && counts(&o.tool, &o.id))
+            {
                 continue;
             }
             match gaps.iter_mut().find(|g| g.tool == skipped.tool) {
@@ -892,6 +919,44 @@ mod tests {
         assert!(report.is_success());
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&only);
+    }
+
+    #[tokio::test]
+    async fn a_fixture_the_director_does_not_vouch_for_cannot_close_a_platform_gap() {
+        let dir = scratch("vouched");
+        let (host, other) = (host_platform(), other_platform());
+        // The base's fixture is for the other platform; the lane added an untagged one.
+        passing("drifts", "base", Some(other)).write(&dir).unwrap();
+        passing("drifts", "lane-own", None).write(&dir).unwrap();
+        let registry = Registry::new().with(Drifts);
+        let report = replay(&dir, &registry, &ReplayOptions::default())
+            .await
+            .unwrap();
+        let vouch = |ids: &[&str]| -> BTreeSet<(String, String)> {
+            ids.iter()
+                .map(|id| ("drifts".to_string(), id.to_string()))
+                .collect()
+        };
+        // Without a set: today's behaviour, the lane's fixture closes the gap.
+        assert!(report.platform_gaps().is_empty());
+        assert!(report.is_success());
+        assert!(report.platform_gaps_among(None).is_empty());
+        // With the base's fixture vouched for, the gap shows.
+        let base = vouch(&[&format!("base@{other}")]);
+        let gaps = report.platform_gaps_among(Some(&base));
+        assert_eq!(gaps.len(), 1, "{gaps:?}");
+        assert_eq!(gaps[0].tool, "drifts");
+        assert_eq!(gaps[0].platforms, [other]);
+        assert!(gaps[0]
+            .to_string()
+            .contains(&format!("no fixture for {host}")));
+        // Vouching for the lane's fixture too closes it, as does vouching for nothing of the tool.
+        let both = vouch(&[&format!("base@{other}"), "lane-own"]);
+        assert!(report.platform_gaps_among(Some(&both)).is_empty());
+        assert!(report
+            .platform_gaps_among(Some(&BTreeSet::new()))
+            .is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
