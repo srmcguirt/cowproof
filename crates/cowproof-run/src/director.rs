@@ -1063,7 +1063,14 @@ mod tests {
             assert!(std::time::Instant::now() < deadline, "no summary: {said:?}");
             std::thread::sleep(std::time::Duration::from_millis(20));
         };
-        assert!(line.contains("request line 4"), "{line}");
+        // The client waited 400 ms before writing; the clock can read a hair under that.
+        let waited: u64 = line
+            .split("request line ")
+            .nth(1)
+            .and_then(|rest| rest.split(" ms").next())
+            .and_then(|ms| ms.trim().parse().ok())
+            .unwrap_or_else(|| panic!("no request line time: {line}"));
+        assert!(waited >= 350, "request line {waited} ms: {line}");
         assert!(line.contains("queue lock "), "{line}");
         assert!(line.contains("recording the note "), "{line}");
         assert!(line.contains("reply "), "{line}");
