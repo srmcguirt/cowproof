@@ -446,6 +446,63 @@ pub fn fake_npm(body: &str) -> (TempDir, PathBuf) {
     fake_tool("npm", body)
 }
 
+/// A held-out file in `dir` with one check, `held`, that runs only in the verifier.
+#[allow(dead_code)] // the dependency-fetch tests use it; the other test crates do not
+pub fn heldout(dir: &Path, command: &str) -> PathBuf {
+    let path = dir.join("h.toml");
+    fs::write(
+        &path,
+        format!("[[check]]\nid = \"held\"\ncommand = {command:?}\n"),
+    )
+    .unwrap();
+    path
+}
+
+/// `cowproof run` of `lane` with the held-out file `heldout`, asserting its exit code.
+#[allow(dead_code)] // the dependency-fetch tests use it; the other test crates do not
+pub fn run_with(lane: &Lane, heldout: &Path, code: i32) -> Output {
+    let out = lane.run(&[Path::new("--heldout"), heldout]);
+    assert_eq!(
+        out.status.code(),
+        Some(code),
+        "cowproof run:\n{}",
+        text(&out)
+    );
+    out
+}
+
+/// The sealed capsule of `lane`.
+#[allow(dead_code)] // the dependency-fetch tests use it; the other test crates do not
+pub fn capsule(lane: &Lane) -> cowproof_prove::Capsule {
+    cowproof_prove::Capsule::read(&lane.capsule_dir()).unwrap()
+}
+
+/// The dependency cache entry a capsule names, under the cache root `cache`.
+#[allow(dead_code)] // the dependency-fetch tests use it; the other test crates do not
+pub fn entry(cache: &Path, capsule: &cowproof_prove::Capsule) -> PathBuf {
+    cache
+        .join("deps")
+        .join(capsule.dependency_cache_key.as_ref().unwrap())
+}
+
+/// Every regular file under `dir`, links not followed.
+#[allow(dead_code)] // the dependency-fetch tests use it; the other test crates do not
+pub fn files_under(dir: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let mut pending = vec![dir.to_path_buf()];
+    while let Some(d) = pending.pop() {
+        for e in fs::read_dir(&d).unwrap().flatten() {
+            let kind = e.file_type().unwrap();
+            if kind.is_dir() {
+                pending.push(e.path());
+            } else if kind.is_file() {
+                found.push(e.path());
+            }
+        }
+    }
+    found
+}
+
 pub fn git(repo: &Path, args: &[&str]) {
     let out = output(
         Command::new("git")

@@ -3,10 +3,12 @@ use async_trait::async_trait;
 use cowproof_run::runtime_dirs::RuntimeDir;
 use cowproof_run::tools::CheckEnd;
 use cowproof_run::{LaneLayout, RustupEnv, SandboxPolicy, render_macos_profile, sandbox_command};
+use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::os::unix::process::ExitStatusExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Mutex;
 use std::time::Duration;
 use tempfile::NamedTempFile;
 use thiserror::Error;
@@ -684,7 +686,22 @@ pub struct SandboxedRunner {
     /// The runtime directories the director granted (`--runtime-dir`): read-only in every
     /// check's sandbox, their executables on its `PATH`.
     runtime_dirs: Vec<RuntimeDir>,
+    /// The `bundle` that installs a Bundler entry's gems ([`SandboxedRunner::with_bundle_exe`]);
+    /// `None` runs the `bundle` on the checks' `PATH`.
+    bundle_exe: Option<PathBuf>,
+    /// The result of the one `bundle install --local` per tree, run before that tree's first
+    /// check when the dependency cache has a Bundler part: `None` is success, `Some` the
+    /// failure (the step and its first error line).
+    setup: Mutex<HashMap<PathBuf, Option<String>>>,
 }
+
+/// The step that makes a Bundler entry's gems available: run once per tree in the verifier's
+/// sandbox, before the first check. `--no-cache` keeps Bundler from writing into the entry's
+/// read-only `vendor/cache`.
+pub const BUNDLER_STEP: &str = "bundle install --local";
+
+/// Longest the Bundler step may take (native extensions compile in it).
+pub const BUNDLER_STEP_TIMEOUT: Duration = Duration::from_secs(20 * 60);
 
 impl SandboxedRunner {
     /// Create a new SandboxedRunner. Construct it when verification starts: it looks
@@ -711,6 +728,8 @@ impl SandboxedRunner {
             port_base: None,
             executables: Vec::new(),
             groups: None,
+            bundle_exe: None,
+            setup: Mutex::new(HashMap::new()),
         }
     }
 
@@ -729,6 +748,35 @@ impl SandboxedRunner {
     pub fn with_dependency_cache(mut self, deps_dir: PathBuf) -> Self {
         self.deps_cache = Some(deps_dir);
         self
+    }
+
+    /// The `bundle` to install a Bundler entry's gems with: an absolute path is granted
+    /// read-only and run by that path, with its directory on the `PATH` (so the `ruby` beside it
+    /// is found); `None` runs the `bundle` on the checks' `PATH`. Only a tree whose dependency
+    /// cache has a Bundler part runs it.
+    pub fn with_bundle_exe(mut self, exe: Option<PathBuf>) -> Self {
+        self.bundle_exe = exe.filter(|e| e.is_absolute());
+        self
+    }
+
+    /// The Bundler step's failures so far, one line each (the step and its first error line):
+    /// empty when it was not needed or succeeded. A caller that has run the checks reads this
+    /// to end the lane, since every check of such a tree fails with the same text.
+    pub fn setup_failures(&self) -> Vec<String> {
+        let map = self.setup.lock().unwrap_or_else(|e| e.into_inner());
+        let mut all: Vec<String> = map.values().flatten().cloned().collect();
+        all.sort();
+        all.dedup();
+        all
+    }
+
+    /// Whether the Bundler step ran (and ended well or not) for at least one tree.
+    pub fn setup_ran(&self) -> bool {
+        !self
+            .setup
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty()
     }
 
     /// Grant the director's runtime directories (`--runtime-dir`, already checked by
@@ -767,39 +815,27 @@ impl SandboxedRunner {
     }
 }
 
-#[async_trait]
-impl CheckRunner for SandboxedRunner {
-    async fn run(
+impl SandboxedRunner {
+    /// Run `argv` in `tree` under `policy` with `path` as the `PATH`: the one place a sandboxed
+    /// command is built and started, for a check and for the Bundler step alike.
+    async fn run_sandboxed(
         &self,
+        policy: &SandboxPolicy,
         tree: &Path,
-        command: &str,
+        path: String,
+        argv: Vec<String>,
+        label: &str,
         timeout: Duration,
     ) -> Result<CheckOutcome, InfraError> {
-        let path = self.path()?;
-        // The rebuilt tree is the verifier's clone: it is the one writable tree, so
-        // the policy is built around it, not around the lane's own clone.
-        let mut lane = self.lane.clone();
-        lane.clone = tree.to_path_buf();
-        let mut policy =
-            SandboxPolicy::verifier(&lane, &self.cache_dir).with_runtime_dirs(&self.runtime_dirs);
-        if let Some(deps) = &self.deps_cache {
-            policy = policy.with_dependency_cache(deps);
-            // The entry's npm install appears at `<tree>/node_modules` before every check
-            // (a read-only mount behind a link), so each check starts from the trusted one.
-            cowproof_run::link_npm_modules(deps, tree)
-                .map_err(|e| InfraError::SpawnError(format!("node_modules link failed: {e:#}")))?;
-        }
-        policy.executables.extend(self.executables.iter().cloned());
-
         // On macOS, write the profile to a temp file outside the clone. It lives until
-        // the check has finished.
+        // the command has finished.
         let profile_file = NamedTempFile::new()
             .map_err(|e| InfraError::SpawnError(format!("cannot create sandbox profile: {e}")))?;
         let profile_path = profile_file.path().to_path_buf();
 
         // Render the Seatbelt profile (macOS) or bubblewrap args (Linux).
         if self.platform == "darwin" {
-            let profile_text = render_macos_profile(&policy).map_err(|e| {
+            let profile_text = render_macos_profile(policy).map_err(|e| {
                 InfraError::SpawnError(format!("sandbox profile render failed: {e}"))
             })?;
             std::fs::write(&profile_path, profile_text).map_err(|e| {
@@ -807,13 +843,9 @@ impl CheckRunner for SandboxedRunner {
             })?;
         }
 
-        let (sandbox_bin, sandbox_args) = sandbox_command(
-            &policy,
-            &profile_path,
-            &["sh".to_string(), "-c".to_string(), command.to_string()],
-            &self.platform,
-        )
-        .map_err(|e| InfraError::SpawnError(format!("sandbox_command failed: {e}")))?;
+        let (sandbox_bin, sandbox_args) =
+            sandbox_command(policy, &profile_path, &argv, &self.platform)
+                .map_err(|e| InfraError::SpawnError(format!("sandbox_command failed: {e}")))?;
 
         // No credentials (D6): the check starts from an empty environment holding only
         // the explicit PATH and what the policy sets (the verifier's CARGO_HOME), never
@@ -829,7 +861,142 @@ impl CheckRunner for SandboxedRunner {
             .current_dir(tree)
             .env_clear()
             .envs(env);
-        run_with_timeout(cmd, command, timeout, self.groups.as_deref()).await
+        run_with_timeout(cmd, label, timeout, self.groups.as_deref()).await
+    }
+
+    /// `bundle install --local --no-cache` in `tree`, once per tree (the result is kept):
+    /// `None` when it succeeded, else the failure's one line. The command runs the lane's
+    /// `Gemfile` and compiles native extensions, under the trust of the lane's own tests.
+    async fn bundler_setup(
+        &self,
+        policy: &SandboxPolicy,
+        tree: &Path,
+        path: &str,
+    ) -> Result<Option<String>, InfraError> {
+        if let Some(done) = self
+            .setup
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(tree)
+        {
+            return Ok(done.clone());
+        }
+        let program = match &self.bundle_exe {
+            Some(exe) => exe.to_string_lossy().into_owned(),
+            None => "bundle".to_string(),
+        };
+        let argv = vec![
+            program,
+            "install".to_string(),
+            "--local".to_string(),
+            "--no-cache".to_string(),
+        ];
+        let ran = self
+            .run_sandboxed(
+                policy,
+                tree,
+                path.to_string(),
+                argv,
+                BUNDLER_STEP,
+                BUNDLER_STEP_TIMEOUT,
+            )
+            .await;
+        let failure = match ran {
+            Ok(o) if o.exit_status == 0 && matches!(o.end, CheckEnd::Exited { code: 0 }) => None,
+            Ok(o) => {
+                let how = match o.end {
+                    CheckEnd::Exited { code } => format!("exit {code}"),
+                    CheckEnd::Signaled { signal } => format!("signal {signal}"),
+                    CheckEnd::NotRun => "not run".to_string(),
+                    CheckEnd::TimedOut => "timed out".to_string(),
+                };
+                Some(format!(
+                    "`{BUNDLER_STEP}` failed ({how}): {}",
+                    cowproof_run::deps::bundle_failure(o.output.as_bytes())
+                ))
+            }
+            Err(InfraError::Timeout(_)) => Some(format!(
+                "`{BUNDLER_STEP}` timed out after {}s",
+                BUNDLER_STEP_TIMEOUT.as_secs()
+            )),
+            Err(e) => return Err(e),
+        };
+        self.setup
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(tree.to_path_buf(), failure.clone());
+        Ok(failure)
+    }
+}
+
+#[async_trait]
+impl CheckRunner for SandboxedRunner {
+    async fn run(
+        &self,
+        tree: &Path,
+        command: &str,
+        timeout: Duration,
+    ) -> Result<CheckOutcome, InfraError> {
+        let mut path = self.path()?;
+        // The rebuilt tree is the verifier's clone: it is the one writable tree, so
+        // the policy is built around it, not around the lane's own clone.
+        let mut lane = self.lane.clone();
+        lane.clone = tree.to_path_buf();
+        let mut policy =
+            SandboxPolicy::verifier(&lane, &self.cache_dir).with_runtime_dirs(&self.runtime_dirs);
+        let mut bundler = false;
+        if let Some(deps) = &self.deps_cache {
+            policy = policy.with_dependency_cache(deps);
+            // The entry's npm install appears at `<tree>/node_modules` before every check
+            // (a read-only mount behind a link), so each check starts from the trusted one.
+            cowproof_run::link_npm_modules(deps, tree)
+                .map_err(|e| InfraError::SpawnError(format!("node_modules link failed: {e:#}")))?;
+            // The same for the Bundler part: its `.gem` files appear at `<tree>/vendor/cache`
+            // and Bundler's settings are fixed (frozen, offline, its own scratch install path).
+            if deps
+                .join(cowproof_run::BUNDLER_ENTRY_DIR)
+                .join(cowproof_run::BUNDLER_CACHE)
+                .is_dir()
+            {
+                bundler = true;
+                let scratch = self.cache_dir.join("bundler");
+                for dir in cowproof_run::BUNDLER_SCRATCH_DIRS {
+                    std::fs::create_dir_all(scratch.join(dir)).map_err(|e| {
+                        InfraError::SpawnError(format!("cannot create the Bundler scratch: {e}"))
+                    })?;
+                }
+                policy = policy.with_bundler(deps, &scratch);
+                cowproof_run::link_vendor_cache(deps, tree).map_err(|e| {
+                    InfraError::SpawnError(format!("vendor/cache link failed: {e:#}"))
+                })?;
+                if let Some(exe) = &self.bundle_exe {
+                    policy.executables.push(exe.clone());
+                    path = cowproof_run::deps::path_with_tool_dir(&path, Some(exe));
+                }
+            }
+        }
+        policy.executables.extend(self.executables.iter().cloned());
+
+        // The gems are installed from the entry before the tree's first check; a step that
+        // fails fails every check with its text, and the caller reads `setup_failures`.
+        if bundler && let Some(failure) = self.bundler_setup(&policy, tree, &path).await? {
+            return Ok(CheckOutcome {
+                exit_status: 1,
+                output: format!("bundler setup failed: {failure}\n"),
+                attempts: 1,
+                end: CheckEnd::Exited { code: 1 },
+            });
+        }
+
+        self.run_sandboxed(
+            &policy,
+            tree,
+            path,
+            vec!["sh".to_string(), "-c".to_string(), command.to_string()],
+            command,
+            timeout,
+        )
+        .await
     }
 }
 

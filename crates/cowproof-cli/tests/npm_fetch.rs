@@ -16,16 +16,16 @@ mod common;
 
 use common::{
     FAKE_JS_MUST_NOT_RUN, FAKE_NPM_FAILS, FAKE_NPM_MUST_NOT_RUN, FAKE_NPM_OK, FAKE_PNPM_FAILS,
-    FAKE_YARN_FAILS, Lane, fake_js_ok, fake_npm, fake_tool, output, run_checks, sandbox_available,
-    text, var_tmp,
+    FAKE_YARN_FAILS, Lane, capsule, entry, fake_js_ok, fake_npm, fake_tool, files_under, heldout,
+    output, run_checks, run_with, sandbox_available, text, var_tmp,
 };
 use cowproof_prove::Capsule;
 use serde_json::json;
 use std::fs;
 use std::io::Write;
 use std::net::{SocketAddr, TcpListener};
-use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::path::Path;
+use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -61,55 +61,6 @@ fn new_lane_for(files: &[(&str, &str)], cache: &Path, hook: &str, tool: &Path) -
     lane.set_env("COWPROOF_FETCH_NETWORK", "none");
     lane.set_env(hook, tool);
     lane
-}
-
-/// A held-out file with one check, `held`, that runs only in the verifier.
-fn heldout(dir: &Path, command: &str) -> PathBuf {
-    let path = dir.join("h.toml");
-    fs::write(
-        &path,
-        format!("[[check]]\nid = \"held\"\ncommand = {command:?}\n"),
-    )
-    .unwrap();
-    path
-}
-
-fn run_with(lane: &Lane, heldout: &Path, code: i32) -> Output {
-    let out = lane.run(&[Path::new("--heldout"), heldout]);
-    assert_eq!(
-        out.status.code(),
-        Some(code),
-        "cowproof run:\n{}",
-        text(&out)
-    );
-    out
-}
-
-fn capsule(lane: &Lane) -> Capsule {
-    Capsule::read(&lane.capsule_dir()).unwrap()
-}
-
-fn entry(cache: &Path, capsule: &Capsule) -> PathBuf {
-    cache
-        .join("deps")
-        .join(capsule.dependency_cache_key.as_ref().unwrap())
-}
-
-/// Every regular file under `dir`, links not followed.
-fn files_under(dir: &Path) -> Vec<PathBuf> {
-    let mut found = Vec::new();
-    let mut pending = vec![dir.to_path_buf()];
-    while let Some(d) = pending.pop() {
-        for e in fs::read_dir(&d).unwrap().flatten() {
-            let kind = e.file_type().unwrap();
-            if kind.is_dir() {
-                pending.push(e.path());
-            } else if kind.is_file() {
-                found.push(e.path());
-            }
-        }
-    }
-    found
 }
 
 /// The check that proves the verifier has the install.

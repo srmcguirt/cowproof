@@ -42,7 +42,7 @@
 //! * **Upkeep**: every hit and install takes a lease and touches a use marker in the entry,
 //!   and `cowproof cache prune` removes the unused (see [`crate::cache`]); a fetch also
 //!   clears the stale work directories of interrupted runs.
-//! * **What is covered**: Cargo, npm, yarn and pnpm.
+//! * **What is covered**: Cargo, npm, yarn, pnpm and Bundler.
 //!   * A tree with a `Cargo.lock` gets `<entry>/cargo/{registry,git}`.
 //!   * A tree with a `package-lock.json` or `npm-shrinkwrap.json` at its root gets
 //!     `<entry>/npm/node_modules` and `<entry>/npm/cache`. The fetch runs
@@ -63,10 +63,32 @@
 //!     base's `.yarnrc.yml` and `.yarnrc` are stripped of credentials, certificate keys and
 //!     code-in-the-tree settings ([`strip_yarnrc_yml`], [`strip_yarnrc`]) like the `.npmrc`.
 //!     Exactly one tool's lockfile is expected: two are `NotFetched`, naming both.
+//!   * A `Gemfile.lock` (or `gems.locked`) is read in Rust ([`crate::bundler`]), because a
+//!     `Gemfile` is Ruby code: the fetch never runs `bundle` and never evaluates a `Gemfile`.
+//!     Each locked gem becomes one sandboxed `gem fetch NAME --version V --platform P
+//!     --clear-sources --source <remote>` (one script, one sandbox, one proxy), and the `.gem`
+//!     files land in `<entry>/bundler/cache`. Only `ruby` and the host's platform variants are
+//!     downloaded (CPU and OS; see [`crate::bundler`]). A `sha256` in the `CHECKSUMS` section
+//!     is compared with each download (a mismatch is an error naming the gem) and a gem
+//!     `gem fetch` did not produce is an error. `GIT`, `PATH` and `PLUGIN SOURCE` sections, a
+//!     lockfile that does not parse, a remote that is not https with no checksum, and a tree
+//!     that already has a `vendor/cache` are [`FetchOutcome::NotFetched`], naming the cause.
+//!     The `remote:` URLs lose any `user:pass@` (`drop_url_credentials`) and the count is a
+//!     note; the base's `.bundle/config` and `.gemrc` are never read or passed (the gem
+//!     runs in an empty `HOME`, `GEM_HOME` and `GEM_SPEC_CACHE`). The allowlist is
+//!     `rubygems.org`, `index.rubygems.org`, the https hosts of the BASE lockfile's `remote:`
+//!     lines ([`RegistryConfigSnapshot`] keeps that lockfile apart for the purpose) and
+//!     `[proof] fetch_hosts`; the real service's redirect hosts were not tested live. The
+//!     verifier gets the entry's `.gem` files read-only as `vendor/cache` and runs
+//!     `bundle install --local --no-cache` once before the first check
+//!     (`cowproof_prove::runner::SandboxedRunner`), with `BUNDLE_FROZEN`, `BUNDLE_PATH` (its
+//!     own scratch), `BUNDLE_DISABLE_SHARED_GEMS` and `BUNDLE_IGNORE_CONFIG` set. The builder
+//!     gets nothing, as for npm. `gem` is `$COWPROOF_GEM` and `bundle` `$COWPROOF_BUNDLE`, or
+//!     the first on `PATH`.
 //!   * Nothing else is fetched. A tree whose only dependency file is a `package.json` with no
-//!     lockfile, a `Gemfile.lock`, two tools' lockfiles or a Berry Plug'n'Play `yarn.lock` has
-//!     no entry; the outcome is [`FetchOutcome::NotFetched`] and says why in
-//!     [`Prefetch::notes`], and is never "fetched". Bundler is in the backlog.
+//!     lockfile, two tools' lockfiles or a Berry Plug'n'Play `yarn.lock` has no entry; the
+//!     outcome is [`FetchOutcome::NotFetched`] and says why in [`Prefetch::notes`], and is
+//!     never "fetched".
 //!   * `npm`, `yarn` and `pnpm` are found by `COWPROOF_NPM`, `COWPROOF_YARN` and
 //!     `COWPROOF_PNPM` (an absolute path, the test hook the way `CARGO` is for cargo) or the
 //!     first one on the director's `PATH`; its directory is put on the fetch's `PATH` so its
@@ -74,14 +96,16 @@
 //!     from the sandbox.
 
 use crate::bridge::bridge_port;
+use crate::bundler::{self, Download, GEM_LOCKFILES, GemLock, Host};
 use crate::cache::{self, Alive};
-use crate::fetch_proxy::{self, FetchAllowlist, FetchProxy, Resolver};
+use crate::fetch_proxy::{self, BASE_GEM_LOCKFILE, FetchAllowlist, FetchProxy, Resolver};
 use crate::{
-    LaneLayout, NPM_CACHE, NPM_ENTRY_DIR, NPM_LOCKFILES, NPM_MANIFEST, NPM_MODULES, NetworkMode,
-    PNPM_LOCKFILE, REGISTRY_CONFIGS, SandboxPolicy, YARN_LOCKFILE, dependency_cache_key,
-    render_macos_profile, sandbox_command,
+    BUNDLER_CACHE, BUNDLER_ENTRY_DIR, LaneLayout, NPM_CACHE, NPM_ENTRY_DIR, NPM_LOCKFILES,
+    NPM_MANIFEST, NPM_MODULES, NetworkMode, PNPM_LOCKFILE, REGISTRY_CONFIGS, SandboxPolicy,
+    YARN_LOCKFILE, dependency_cache_key, render_macos_profile, sandbox_command,
 };
 use anyhow::{Context, Result, bail};
+use sha2::{Digest, Sha256};
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -112,7 +136,16 @@ pub const YARN_ENV: &str = "COWPROOF_YARN";
 /// The environment variable that names the `pnpm` to fetch with, as [`NPM_ENV`] does for npm.
 pub const PNPM_ENV: &str = "COWPROOF_PNPM";
 
-/// How long one `cargo fetch`, `npm ci`, `yarn install` or `pnpm install` may take.
+/// The environment variable that names the `gem` to fetch Bundler's gems with, as [`NPM_ENV`]
+/// does for npm. Tests point it at a fake.
+pub const GEM_ENV: &str = "COWPROOF_GEM";
+
+/// The environment variable that names the `bundle` the VERIFIER installs with
+/// (`bundle install --local`), as [`NPM_ENV`] does for npm. The fetch never runs `bundle`.
+pub const BUNDLE_ENV: &str = "COWPROOF_BUNDLE";
+
+/// How long one `cargo fetch`, `npm ci`, `yarn install`, `pnpm install` or the `gem fetch`
+/// run of a whole lockfile may take.
 pub const FETCH_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
 /// The cache root: `$COWPROOF_CACHE_ROOT` when set and non-empty, else `~/.cache/cowproof`.
@@ -213,7 +246,7 @@ pub enum FetchOutcome {
     Fetched,
     /// The tree has dependency files this runner does not fetch (a `package.json` with no
     /// JavaScript lockfile, lockfiles of two tools, a Yarn Plug'n'Play tree, a Bundler
-    /// lockfile) and nothing it does: no entry, and
+    /// lockfile with a `GIT` section) and nothing it does: no entry, and
     /// [`Prefetch::notes`] says what was left out. Never reported as fetched.
     NotFetched,
     /// The fetch could not run or failed; the reason is for the director.
@@ -240,7 +273,7 @@ pub struct Prefetch {
     pub outcome: FetchOutcome,
     /// `<cache root>/deps/<key>`: valid when the outcome is not `Failed`.
     pub dir: PathBuf,
-    /// The ecosystems the entry holds (`cargo`, `npm`, `yarn` or `pnpm`) when the outcome is a hit or a fetch,
+    /// The ecosystems the entry holds (`cargo`, `npm`, `yarn`, `pnpm` or `bundler`) when the outcome is a hit or a fetch,
     /// else empty: what the capsule records as fetched.
     pub ecosystems: Vec<&'static str>,
     /// What was left out or changed, one line each: dependency files that are not fetched,
@@ -266,6 +299,11 @@ pub struct FetchTools {
     pub yarn: Option<PathBuf>,
     /// The `pnpm` to run, found and granted the same way.
     pub pnpm: Option<PathBuf>,
+    /// The `gem` to run for a Bundler tree, found and granted the same way.
+    pub gem: Option<PathBuf>,
+    /// The `bundle` the verifier runs, found at fetch time only to be named in the notes; the
+    /// fetch itself never runs it.
+    pub bundle: Option<PathBuf>,
 }
 
 impl FetchTools {
@@ -492,12 +530,14 @@ pub struct Needs {
     pub cargo: bool,
     /// The Node tool that installs the tree's one JavaScript lockfile ([`js_plan`]).
     pub js: Option<JsTool>,
+    /// The tree has a Bundler lockfile whose gems are downloaded ([`gem_plan`]).
+    pub bundler: bool,
 }
 
 impl Needs {
-    /// What `tree` (the rebuilt tree) asks for: a `Cargo.lock`, and one JavaScript lockfile
+    /// What `tree` (the rebuilt tree) asks for: a `Cargo.lock`, one JavaScript lockfile
     /// that is a regular file (a symlink in the tree could point anywhere) and that a tool
-    /// installs.
+    /// installs, and a Bundler lockfile whose gems are downloaded.
     pub fn of(tree: &Path) -> Self {
         Self {
             cargo: tree.join("Cargo.lock").is_file(),
@@ -505,11 +545,12 @@ impl Needs {
                 JsPlan::Fetch(tool) => Some(tool),
                 _ => None,
             },
+            bundler: matches!(gem_plan(tree, &Host::current()), GemPlan::Fetch(..)),
         }
     }
 
     fn any(self) -> bool {
-        self.cargo || self.js.is_some()
+        self.cargo || self.js.is_some() || self.bundler
     }
 
     fn ecosystems(self) -> Vec<&'static str> {
@@ -519,6 +560,9 @@ impl Needs {
         }
         if let Some(tool) = self.js {
             names.push(tool.name());
+        }
+        if self.bundler {
+            names.push("bundler");
         }
         names
     }
@@ -542,10 +586,74 @@ pub fn unfetched_notes(tree: &Path) -> Vec<String> {
         )),
         _ => {}
     }
-    if has("Gemfile.lock") {
-        notes.push("Gemfile.lock: Bundler is not fetched".to_string());
+    if let GemPlan::NotFetched(note) = gem_plan(tree, &Host::current()) {
+        notes.push(note);
     }
     notes
+}
+
+/// What a tree's Bundler lockfile asks for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GemPlan {
+    /// No Bundler lockfile.
+    Nothing,
+    /// The lockfile (its file name) and the gems to download.
+    Fetch(&'static str, Vec<Download>),
+    /// A lockfile whose gems are not downloaded: the line for [`Prefetch::notes`].
+    NotFetched(String),
+}
+
+/// The Bundler lockfile of `tree` (the rebuilt tree) as a regular file, read and parsed:
+/// `Gemfile.lock` or `gems.locked`. `Ok(None)` when there is none; `Err` is the note for a
+/// tree that has two, or one that does not parse. A symlink is not a lockfile: it could point
+/// anywhere.
+fn gem_lock(tree: &Path) -> std::result::Result<Option<(&'static str, GemLock)>, String> {
+    let present: Vec<&'static str> = GEM_LOCKFILES
+        .iter()
+        .copied()
+        .filter(|name| is_regular(&tree.join(name)))
+        .collect();
+    match present.as_slice() {
+        [] => Ok(None),
+        [name] => {
+            let text = fs::read_to_string(tree.join(name))
+                .map_err(|e| format!("{name}: cannot be read as text ({e}), so gems are not available to the verifier"))?;
+            bundler::parse(&text)
+                .map(|lock| Some((*name, lock)))
+                .map_err(|e| {
+                    format!(
+                        "{name}: does not parse as a Bundler lockfile ({e}), so gems are not available to the verifier"
+                    )
+                })
+        }
+        _ => Err(format!(
+            "{}: more than one Bundler lockfile, so none is guessed and gems are not available to the verifier",
+            present.join(", ")
+        )),
+    }
+}
+
+/// What the Bundler lockfile of `tree` asks for, for `host`: see [`bundler::plan`] for what
+/// is not fetched. A tree that already has a `vendor/cache` (a directory, a file or a link)
+/// is not fetched either: the verifier puts the entry's gems there, and would replace it.
+pub fn gem_plan(tree: &Path, host: &Host) -> GemPlan {
+    let (file, lock) = match gem_lock(tree) {
+        Ok(Some(found)) => found,
+        Ok(None) => return GemPlan::Nothing,
+        Err(note) => return GemPlan::NotFetched(note),
+    };
+    match bundler::plan(file, &lock, host) {
+        bundler::Plan::NotFetched(note) => GemPlan::NotFetched(note),
+        bundler::Plan::Fetch(_)
+            if fs::symlink_metadata(tree.join(crate::BUNDLER_VENDOR_CACHE)).is_ok() =>
+        {
+            GemPlan::NotFetched(format!(
+                "{file}: the tree already has a {}, which the verifier would have to replace, so gems are not fetched",
+                crate::BUNDLER_VENDOR_CACHE
+            ))
+        }
+        bundler::Plan::Fetch(downloads) => GemPlan::Fetch(file, downloads),
+    }
 }
 
 /// `.npmrc` with every credential removed, and how many lines had one. A line is dropped when
@@ -606,7 +714,7 @@ pub fn strip_npmrc_auth(text: &str) -> (String, usize) {
 }
 
 /// `value` without the `user:pass@` of a URL in it, or `None` when it has none.
-fn drop_url_credentials(value: &str) -> Option<String> {
+pub(crate) fn drop_url_credentials(value: &str) -> Option<String> {
     let (scheme, rest) = value.split_once("://")?;
     let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
     let (_userinfo, host) = rest[..authority_end].rsplit_once('@')?;
@@ -784,7 +892,13 @@ pub fn strip_yarnrc(text: &str) -> YarnrcStripped {
 /// [`restore`](Self::restore) it afterwards: whatever the patch did to those files, the
 /// key and the fetch see the base's (D14).
 #[derive(Debug)]
-pub struct RegistryConfigSnapshot(Vec<(&'static str, Option<Vec<u8>>)>);
+pub struct RegistryConfigSnapshot {
+    files: Vec<(&'static str, Option<Vec<u8>>)>,
+    /// The base's Bundler lockfile (`Gemfile.lock`, else `gems.locked`), kept for the fetch's
+    /// allowlist and NOT restored over the tree's own: the lane may change its lockfile (add
+    /// a gem), but a `remote:` it adds is no host the fetch may reach.
+    gem_lock: Option<Vec<u8>>,
+}
 
 impl RegistryConfigSnapshot {
     /// Read every registry configuration file of `tree` (`None` for an absent one).
@@ -806,14 +920,41 @@ impl RegistryConfigSnapshot {
             };
             files.push((*name, content));
         }
-        Ok(Self(files))
+        let mut gem_lock = None;
+        for name in GEM_LOCKFILES {
+            let path = tree.join(name);
+            if is_regular(&path) {
+                gem_lock =
+                    Some(fs::read(&path).with_context(|| format!("reading {}", path.display()))?);
+                break;
+            }
+        }
+        Ok(Self { files, gem_lock })
     }
 
     /// Put the snapshot back: rewrite the files that existed, remove the ones that did
     /// not. A patch can have replaced a parent directory or the file with a symlink; the
     /// symlink is removed itself and never followed.
+    ///
+    /// The base's Bundler lockfile is written to [`BASE_GEM_LOCKFILE`] (replacing whatever a
+    /// patch put there, a symlink included, without following it) for
+    /// [`FetchAllowlist::bundler_from_tree`]; the tree's own lockfile is left as the patch
+    /// made it.
     pub fn restore(&self, tree: &Path) -> Result<()> {
-        for (name, content) in &self.0 {
+        let base = tree.join(BASE_GEM_LOCKFILE);
+        if let Some(dir) = base.parent() {
+            match fs::symlink_metadata(dir) {
+                Ok(m) if m.is_dir() => fs::remove_dir_all(dir),
+                Ok(_) => fs::remove_file(dir),
+                Err(_) => Ok(()),
+            }
+            .with_context(|| format!("clearing {}", dir.display()))?;
+            if let Some(content) = &self.gem_lock {
+                fs::create_dir_all(dir)?;
+                fs::write(&base, content).with_context(|| format!("writing {}", base.display()))?;
+            }
+        }
+        for (name, content) in &self.files {
             let path = tree.join(name);
             if let Some(parent) = path.parent()
                 && parent != tree
@@ -929,6 +1070,21 @@ fn prefetch_in(
             }
         }
     }
+    if needs.bundler
+        && let Ok(Some((file, lock))) = gem_lock(&tree)
+    {
+        let with_credentials = lock
+            .sources
+            .iter()
+            .flat_map(|s| s.remotes.iter())
+            .filter(|r| bundler::has_credentials(r))
+            .count();
+        if with_credentials > 0 {
+            notes.push(format!(
+                "bundler: {with_credentials} remote URL(s) of {file} carried credentials; they were not used (the fetch never receives a token)"
+            ));
+        }
+    }
     let done = |outcome: FetchOutcome| {
         let ecosystems = match outcome {
             FetchOutcome::Hit | FetchOutcome::Fetched => needs.ecosystems(),
@@ -975,6 +1131,9 @@ fn prefetch_in(
         if let Some(tool) = needs.js {
             fetch_js(tool, work, &tree, &fresh, lane, config)?;
         }
+        if needs.bundler {
+            fetch_bundler(work, &tree, &fresh, lane, config)?;
+        }
         Ok(())
     })();
     let outcome = match fetched {
@@ -1013,7 +1172,8 @@ fn entry_state(dir: &Path, needs: Needs) -> EntryState {
         Err(_) => EntryState::Absent,
         Ok(_)
             if (!needs.cargo || dir.join("cargo/registry").is_dir())
-                && (needs.js.is_none() || dir.join(NPM_ENTRY_DIR).join(NPM_MODULES).is_dir()) =>
+                && (needs.js.is_none() || dir.join(NPM_ENTRY_DIR).join(NPM_MODULES).is_dir())
+                && (!needs.bundler || dir.join(BUNDLER_ENTRY_DIR).join(BUNDLER_CACHE).is_dir()) =>
         {
             EntryState::Complete
         }
@@ -1226,18 +1386,7 @@ fn fetch_js(
         _ => tool.program().to_string(),
     };
     // The tool is a script that finds `node` on `PATH`: its own directory comes along.
-    let mut path = tools.path.clone();
-    if let Some(dir) = found.and_then(Path::parent).and_then(Path::to_str)
-        && Path::new(dir).is_absolute()
-        && !dir.contains(':')
-        && !path.split(':').any(|e| e == dir)
-    {
-        path = if path.is_empty() {
-            dir.to_string()
-        } else {
-            format!("{path}:{dir}")
-        };
-    }
+    let path = path_with_tool_dir(&tools.path, found);
     let cache_text = cache.to_string_lossy().into_owned();
     let mut env: Vec<(&str, String)> = vec![
         (
@@ -1317,6 +1466,168 @@ fn fetch_js(
     }
 }
 
+/// `text` as one shell word in single quotes.
+fn sh_quote(text: &str) -> String {
+    format!("'{}'", text.replace('\'', "'\\''"))
+}
+
+/// The script that downloads every locked gem: one `gem fetch NAME --version V --platform P
+/// --clear-sources --source <remote>` per gem, the `gem` executable being `$1`, stopping at
+/// the first that fails. The names, versions and platforms were checked by the lockfile reader
+/// and every word is quoted. No remote carries a credential: they are cleaned here, not
+/// trusted to have been.
+fn gem_fetch_script(downloads: &[Download]) -> String {
+    let mut script = String::from(
+        "#!/bin/sh\n# written by cowproof: one `gem fetch` per locked gem; $1 is the gem executable\n",
+    );
+    for d in downloads {
+        let spec = &d.spec;
+        let mut line = format!(
+            "\"$1\" fetch {} --version {} --platform {} --clear-sources",
+            sh_quote(&spec.name),
+            sh_quote(&spec.version),
+            sh_quote(spec.platform.as_deref().unwrap_or("ruby")),
+        );
+        for remote in &d.remotes {
+            line.push_str(&format!(
+                " --source {}",
+                sh_quote(&bundler::drop_credentials(remote))
+            ));
+        }
+        line.push_str(&format!(
+            " || {{ echo {} >&2; exit 1; }}\n",
+            sh_quote(&format!("cowproof: gem fetch {} failed", spec.label()))
+        ));
+        script.push_str(&line);
+    }
+    script.push_str("exit 0\n");
+    script
+}
+
+/// The lowercase hex sha256 of the file at `path`.
+fn sha256_hex(path: &Path) -> Result<String> {
+    let mut hasher = Sha256::new();
+    let mut file = fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    std::io::copy(&mut file, &mut hasher).with_context(|| format!("reading {}", path.display()))?;
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// Every gem the Bundler lockfile of `tree` names (for the host: `ruby` and the host's
+/// platforms) downloaded as a `.gem` file into `<fresh>/bundler/cache`, by the sandboxed
+/// `gem fetch` of the same fetch sandbox, proxy and process group as the other ecosystems.
+/// No `Gemfile` is read and no `bundle` is run: the work directory holds only the script, and
+/// the gem runs with a throwaway `HOME`, `GEM_HOME` and `GEM_SPEC_CACHE` and `--clear-sources`,
+/// so no `.gemrc`, `.bundle/config` or credential is in reach.
+///
+/// Afterwards every gem must be there (a missing one is an error naming it) and, when the
+/// lockfile's `CHECKSUMS` gives a sha256 for it, must match (a mismatch is an error naming it).
+fn fetch_bundler(
+    work: &Path,
+    tree: &Path,
+    fresh: &Path,
+    lane: &LaneLayout,
+    config: &FetchConfig,
+) -> Result<()> {
+    let tools = config.tools;
+    let GemPlan::Fetch(file, downloads) = gem_plan(tree, &Host::current()) else {
+        bail!("the tree has no Bundler lockfile to fetch");
+    };
+    let (_, lock) = gem_lock(tree)
+        .map_err(|e| anyhow::anyhow!("{e}"))?
+        .context("the Bundler lockfile is gone")?;
+    let cache = fresh.join(BUNDLER_ENTRY_DIR).join(BUNDLER_CACHE);
+    let home = work.join("home");
+    let scripts = work.join("gem-fetch");
+    fs::create_dir_all(&cache).context("creating the gem cache directory")?;
+    fs::create_dir_all(&home)?;
+    fs::create_dir_all(&scripts)?;
+    let script = scripts.join("fetch.sh");
+    fs::write(&script, gem_fetch_script(&downloads)).context("writing the gem fetch script")?;
+
+    let found = tools.gem.as_deref();
+    let gem_program = match found {
+        Some(g) if g.is_absolute() => g.to_string_lossy().into_owned(),
+        _ => "gem".to_string(),
+    };
+    let gem_home = home.join("gem-home");
+    let env: Vec<(String, String)> = vec![
+        (
+            "GEM_HOME".to_string(),
+            gem_home.to_string_lossy().into_owned(),
+        ),
+        (
+            "GEM_PATH".to_string(),
+            gem_home.to_string_lossy().into_owned(),
+        ),
+        (
+            "GEM_SPEC_CACHE".to_string(),
+            home.join("gem-spec-cache").to_string_lossy().into_owned(),
+        ),
+    ];
+    run_fetch(
+        work,
+        lane,
+        fresh,
+        config,
+        Job {
+            label: "gem fetch",
+            program: "/bin/sh".to_string(),
+            args: vec![script.to_string_lossy().into_owned(), gem_program],
+            exe: found.filter(|g| g.is_absolute() && g.is_file()),
+            cwd: &cache,
+            path: path_with_tool_dir(&tools.path, found),
+            home: &home,
+            rw: Vec::new(),
+            ro: vec![scripts.clone()],
+            env,
+            proxy_env: &["http_proxy", "HTTP_PROXY", "https_proxy", "HTTPS_PROXY"],
+            allowlist: FetchAllowlist::bundler_from_tree,
+            tree,
+            describe: gem_failure,
+        },
+    )?;
+
+    for d in &downloads {
+        let name = d.spec.file_name();
+        let path = cache.join(&name);
+        if !is_regular(&path) {
+            bail!(
+                "gem fetch did not produce {name} for {} (from {file})",
+                d.spec.label()
+            );
+        }
+        if let Some(want) = lock.checksum(&d.spec) {
+            let got = sha256_hex(&path)?;
+            if got != want {
+                bail!(
+                    "checksum mismatch for {}: {file} lists sha256 {want}, the download is {got}",
+                    d.spec.label()
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `path` with the directory of `tool` appended (when it is an absolute directory not already
+/// on it): a tool that is a script finds the interpreter beside it (`node` for npm, `ruby` for
+/// `gem`).
+pub fn path_with_tool_dir(path: &str, tool: Option<&Path>) -> String {
+    let mut path = path.to_string();
+    if let Some(dir) = tool.and_then(Path::parent).and_then(Path::to_str)
+        && Path::new(dir).is_absolute()
+        && !dir.contains(':')
+        && !path.split(':').any(|e| e == dir)
+    {
+        path = if path.is_empty() {
+            dir.to_string()
+        } else {
+            format!("{path}:{dir}")
+        };
+    }
+    path
+}
+
 /// The first line of `output` that starts (after any leading symbols, such as Berry's `➤`)
 /// with one of `prefixes`, in any case, else its first line, cut to a sensible length.
 fn first_error_line(output: &[u8], prefixes: &[&str]) -> String {
@@ -1344,6 +1655,29 @@ fn npm_failure(output: &[u8]) -> String {
 /// and `YN0035` lines.
 fn yarn_failure(output: &[u8]) -> String {
     first_error_line(output, &["error", "yn0001", "yn0028", "yn0035"])
+}
+
+/// The first error line of `gem fetch`: its `ERROR:` line, or the line the fetch script adds
+/// after it naming the gem.
+fn gem_failure(output: &[u8]) -> String {
+    first_error_line(output, &["error", "cowproof:"])
+}
+
+/// The first error line of `bundle install`: Bundler's own `Could not ...` and `An error
+/// occurred ...` lines, a `Gem::Ext::BuildError`, or an `ERROR`/`Bundler::` line; else the first
+/// line. Public: the verifier names the install step with it.
+pub fn bundle_failure(output: &[u8]) -> String {
+    first_error_line(
+        output,
+        &[
+            "could not",
+            "an error occurred",
+            "gem::ext",
+            "bundler::",
+            "error",
+            "fatal",
+        ],
+    )
 }
 
 /// The first error line of pnpm: its `ERR_PNPM_*` code line, or an `ERROR` line.
@@ -1521,6 +1855,7 @@ mod tests {
     const CARGO: Needs = Needs {
         cargo: true,
         js: None,
+        bundler: false,
     };
 
     /// A fetch configuration for a test that never reaches the command: running one is a
@@ -1798,6 +2133,8 @@ mod tests {
             npm: None,
             yarn: None,
             pnpm: None,
+            gem: None,
+            bundle: None,
         }
     }
 
@@ -1847,7 +2184,11 @@ mod tests {
             ),
             (
                 &["Gemfile.lock"][..],
-                "Gemfile.lock: Bundler is not fetched",
+                "Gemfile.lock: does not parse as a Bundler lockfile",
+            ),
+            (
+                &["Gemfile.lock", "gems.locked"][..],
+                "Gemfile.lock, gems.locked: more than one Bundler lockfile",
             ),
         ] {
             let tmp = TempDir::new().unwrap();
@@ -1912,10 +2253,12 @@ mod tests {
         let both = Needs {
             cargo: true,
             js: Some(JsTool::Npm),
+            bundler: false,
         };
         let npm = Needs {
             cargo: false,
             js: Some(JsTool::Pnpm),
+            bundler: false,
         };
         let old = tmp.path().join("old");
         complete_entry(&old);
@@ -2231,6 +2574,8 @@ mod tests {
             npm: None,
             yarn: None,
             pnpm: None,
+            gem: None,
+            bundle: None,
         };
         let build = |tree: &Path| -> Result<()> {
             fs::write(tree.join("Cargo.lock"), "# lock\n")?;
@@ -2286,6 +2631,8 @@ mod tests {
             npm: None,
             yarn: None,
             pnpm: None,
+            gem: None,
+            bundle: None,
         };
         let got = prefetch(|_| Ok(()), &root, &lane, &config(&tools, &|_| false)).unwrap();
         assert!(got.is_none(), "the fetch itself ran");
@@ -2315,6 +2662,8 @@ mod tests {
             npm: None,
             yarn: None,
             pnpm: None,
+            gem: None,
+            bundle: None,
         };
         prefetch(|_| Ok(()), &root, &lane, &config(&tools, &|_| true)).unwrap();
         assert_eq!(
@@ -2347,6 +2696,8 @@ mod tests {
             npm: None,
             yarn: None,
             pnpm: None,
+            gem: None,
+            bundle: None,
         };
         let got = prefetch(
             |_| Ok(()),
@@ -2358,5 +2709,302 @@ mod tests {
         assert!(got.is_none());
         assert!(!work.join(format!("{dead}-1")).exists());
         assert!(work.join(format!("{live}-1/tree")).is_dir());
+    }
+
+    const GEM_LOCK: &str = "GEM\n  remote: https://rubygems.org/\n  specs:\n    rake (13.0.6)\n\nPLATFORMS\n  ruby\n\nDEPENDENCIES\n  rake\n";
+
+    fn plan_of(files: &[(&str, &str)]) -> GemPlan {
+        let tmp = TempDir::new().unwrap();
+        for (name, text) in files {
+            let path = tmp.path().join(name);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, text).unwrap();
+        }
+        gem_plan(tmp.path(), &Host::of("x86_64", "linux"))
+    }
+
+    #[test]
+    fn the_bundler_lockfile_of_a_tree_is_one_regular_file_that_parses() {
+        assert_eq!(plan_of(&[("Gemfile", "source 'x'")]), GemPlan::Nothing);
+        for name in ["Gemfile.lock", "gems.locked"] {
+            match plan_of(&[(name, GEM_LOCK)]) {
+                GemPlan::Fetch(file, list) => {
+                    assert_eq!(file, name);
+                    assert_eq!(list.len(), 1);
+                    assert_eq!(list[0].spec.file_name(), "rake-13.0.6.gem");
+                }
+                other => panic!("{name}: {other:?}"),
+            }
+        }
+        // Two lockfiles: none is picked.
+        match plan_of(&[("Gemfile.lock", GEM_LOCK), ("gems.locked", GEM_LOCK)]) {
+            GemPlan::NotFetched(note) => assert!(
+                note.starts_with("Gemfile.lock, gems.locked: more than one Bundler lockfile"),
+                "{note}"
+            ),
+            other => panic!("{other:?}"),
+        }
+        // A file that is not a lockfile is named, with the line.
+        match plan_of(&[("Gemfile.lock", "<<<<<<< HEAD\nGEM\n")]) {
+            GemPlan::NotFetched(note) => assert!(
+                note.starts_with("Gemfile.lock: does not parse as a Bundler lockfile (line 1"),
+                "{note}"
+            ),
+            other => panic!("{other:?}"),
+        }
+        // A GIT section is named, not ignored.
+        let git = format!(
+            "GIT\n  remote: https://git.example/x.git\n  revision: abc\n  specs:\n    x (1.0)\n\n{GEM_LOCK}"
+        );
+        match plan_of(&[("Gemfile.lock", &git)]) {
+            GemPlan::NotFetched(note) => assert!(note.contains("a GIT section"), "{note}"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_symlinked_bundler_lockfile_is_not_a_lockfile() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("real"), GEM_LOCK).unwrap();
+        std::os::unix::fs::symlink(tmp.path().join("real"), tmp.path().join("Gemfile.lock"))
+            .unwrap();
+        assert_eq!(
+            gem_plan(tmp.path(), &Host::of("x86_64", "linux")),
+            GemPlan::Nothing
+        );
+        assert!(!Needs::of(tmp.path()).bundler);
+    }
+
+    #[test]
+    fn a_tree_that_already_has_a_vendor_cache_is_not_fetched_and_says_so() {
+        for make in [0, 1, 2] {
+            let tmp = TempDir::new().unwrap();
+            fs::write(tmp.path().join("Gemfile.lock"), GEM_LOCK).unwrap();
+            fs::create_dir(tmp.path().join("vendor")).unwrap();
+            match make {
+                0 => fs::create_dir(tmp.path().join("vendor/cache")).unwrap(),
+                1 => fs::write(tmp.path().join("vendor/cache"), "x").unwrap(),
+                _ => std::os::unix::fs::symlink("/", tmp.path().join("vendor/cache")).unwrap(),
+            }
+            match gem_plan(tmp.path(), &Host::of("x86_64", "linux")) {
+                GemPlan::NotFetched(note) => assert!(
+                    note.contains("already has a vendor/cache"),
+                    "{make}: {note}"
+                ),
+                other => panic!("{make}: {other:?}"),
+            }
+            assert!(!Needs::of(tmp.path()).bundler);
+            assert_eq!(unfetched_notes(tmp.path()).len(), 1);
+        }
+    }
+
+    #[test]
+    fn a_bundler_tree_is_fetched_beside_the_other_ecosystems_and_named_bundler() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("Gemfile.lock"), GEM_LOCK).unwrap();
+        fs::write(tmp.path().join("Cargo.lock"), "# lock\n").unwrap();
+        let needs = Needs::of(tmp.path());
+        assert!(needs.cargo && needs.bundler && needs.js.is_none());
+        assert_eq!(needs.ecosystems(), ["cargo", "bundler"]);
+        assert!(unfetched_notes(tmp.path()).is_empty());
+        // The entry is complete only with its gem cache.
+        let entry = tmp.path().join("entry");
+        complete_entry(&entry);
+        assert_eq!(entry_state(&entry, needs), EntryState::Incomplete);
+        fs::create_dir_all(entry.join("bundler/cache")).unwrap();
+        assert_eq!(entry_state(&entry, needs), EntryState::Complete);
+    }
+
+    #[test]
+    fn the_bundler_key_follows_the_lockfile_and_gems_locked_is_a_lockfile() {
+        let key = |files: &[(&str, &str)]| {
+            let tmp = TempDir::new().unwrap();
+            for (name, text) in files {
+                fs::write(tmp.path().join(name), text).unwrap();
+            }
+            dependency_cache_key(tmp.path(), "t").unwrap()
+        };
+        let base = key(&[("Gemfile.lock", GEM_LOCK)]);
+        assert_ne!(
+            base,
+            key(&[("Gemfile.lock", &GEM_LOCK.replace("13.0.6", "13.0.7"))])
+        );
+        assert_ne!(base, key(&[("gems.locked", GEM_LOCK)]));
+        assert_ne!(base, key(&[]));
+        // `.bundle/config` and `.gemrc` are never read, so they are not part of the key.
+        assert_eq!(base, key(&[("Gemfile.lock", GEM_LOCK), (".gemrc", "x")]));
+    }
+
+    #[test]
+    fn the_fetch_script_has_one_quoted_gem_fetch_per_gem_with_clear_sources_and_no_credential() {
+        let lock = bundler::parse(
+            "GEM\n  remote: https://user:SECRET@gems.example/\n  specs:\n    rake (13.0.6)\n    nokogiri (1.15.0-x86_64-linux)\n\nPLATFORMS\n  ruby\n",
+        )
+        .unwrap();
+        let bundler::Plan::Fetch(list) =
+            bundler::plan("Gemfile.lock", &lock, &Host::of("x86_64", "linux"))
+        else {
+            panic!("expected a fetch plan");
+        };
+        let script = gem_fetch_script(&list);
+        assert!(
+            !script.contains("SECRET") && !script.contains("user:"),
+            "{script}"
+        );
+        let lines: Vec<&str> = script.lines().filter(|l| l.starts_with("\"$1\"")).collect();
+        assert_eq!(lines.len(), 2, "{script}");
+        assert!(
+            lines[0].starts_with(
+                "\"$1\" fetch 'nokogiri' --version '1.15.0' --platform 'x86_64-linux' --clear-sources --source 'https://gems.example/' || {"
+            ),
+            "{}",
+            lines[0]
+        );
+        assert!(
+            lines[1].starts_with(
+                "\"$1\" fetch 'rake' --version '13.0.6' --platform 'ruby' --clear-sources --source 'https://gems.example/' || {"
+            ),
+            "{}",
+            lines[1]
+        );
+        assert!(script.ends_with("exit 0\n"));
+        assert_eq!(sh_quote("it's"), "'it'\\''s'");
+    }
+
+    #[test]
+    fn the_snapshot_keeps_the_bases_gem_lockfile_for_the_allowlist_and_leaves_the_lanes_own() {
+        let tmp = TempDir::new().unwrap();
+        let t = tmp.path();
+        fs::write(
+            t.join("Gemfile.lock"),
+            "GEM\n  remote: https://gems.base.example/\n  specs:\n    rake (13.0.6)\n\nPLATFORMS\n  ruby\n",
+        )
+        .unwrap();
+        let snapshot = RegistryConfigSnapshot::take(t).unwrap();
+        // The patch repoints the remote, adds a gem, and plants the base file as a symlink.
+        fs::write(
+            t.join("Gemfile.lock"),
+            "GEM\n  remote: https://evil.example/\n  specs:\n    rake (13.0.6)\n    extra (1.0)\n\nPLATFORMS\n  ruby\n",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink("/etc", t.join(".cowproof-base")).unwrap();
+        snapshot.restore(t).unwrap();
+        assert!(
+            fs::read_to_string(t.join("Gemfile.lock"))
+                .unwrap()
+                .contains("extra (1.0)"),
+            "the lane's own lockfile stays"
+        );
+        assert!(
+            fs::symlink_metadata(t.join(".cowproof-base"))
+                .unwrap()
+                .is_dir()
+        );
+        let allow = FetchAllowlist::bundler_from_tree(t).unwrap();
+        assert!(allow.allows("rubygems.org", 443), "{:?}", allow.hosts());
+        assert!(allow.allows("index.rubygems.org", 443));
+        assert!(
+            allow.allows("gems.base.example", 443),
+            "{:?}",
+            allow.hosts()
+        );
+        assert!(!allow.allows("evil.example", 443), "{:?}", allow.hosts());
+        assert!(!allow.allows("rubygems.org", 80));
+        // No cargo or npm host is reachable from a gem fetch.
+        assert!(!allow.allows("registry.npmjs.org", 443));
+        assert!(!allow.allows("crates.io", 443));
+
+        // A base with no lockfile: the lane's new one adds nothing, and a stale file is cleared.
+        let bare = TempDir::new().unwrap();
+        let snapshot = RegistryConfigSnapshot::take(bare.path()).unwrap();
+        fs::create_dir_all(bare.path().join(".cowproof-base")).unwrap();
+        fs::write(
+            bare.path().join(".cowproof-base/gem.lock"),
+            GEM_LOCK.replace("rubygems.org", "evil.example"),
+        )
+        .unwrap();
+        snapshot.restore(bare.path()).unwrap();
+        assert!(!bare.path().join(".cowproof-base").exists());
+        assert_eq!(
+            FetchAllowlist::bundler_from_tree(bare.path()).unwrap(),
+            FetchAllowlist::rubygems_defaults()
+        );
+    }
+
+    #[test]
+    fn a_gem_lockfile_named_gems_locked_is_the_bases_when_there_is_no_gemfile_lock() {
+        let tmp = TempDir::new().unwrap();
+        let t = tmp.path();
+        fs::write(
+            t.join("gems.locked"),
+            "GEM\n  remote: https://gems.base.example/\n  specs:\n\nPLATFORMS\n  ruby\n",
+        )
+        .unwrap();
+        let snapshot = RegistryConfigSnapshot::take(t).unwrap();
+        snapshot.restore(t).unwrap();
+        assert!(
+            FetchAllowlist::bundler_from_tree(t)
+                .unwrap()
+                .allows("gems.base.example", 443)
+        );
+    }
+
+    #[test]
+    fn gem_and_bundle_failures_are_named_by_their_first_error_line() {
+        assert_eq!(
+            gem_failure(b"WARNING: x\nERROR:  Could not find a valid gem 'rake' (= 13.0.6) in any repository\ncowproof: gem fetch rake (13.0.6) failed\n"),
+            "ERROR:  Could not find a valid gem 'rake' (= 13.0.6) in any repository"
+        );
+        assert_eq!(gem_failure(b""), "no output");
+        assert_eq!(
+            bundle_failure(
+                b"Resolving dependencies...\nCould not find gem 'x' in locally installed gems.\n"
+            ),
+            "Could not find gem 'x' in locally installed gems."
+        );
+        assert_eq!(
+            bundle_failure(b"Installing y 1.0 with native extensions\nAn error occurred while installing y (1.0), and Bundler cannot continue.\n"),
+            "An error occurred while installing y (1.0), and Bundler cannot continue."
+        );
+    }
+
+    #[test]
+    fn a_downloads_hash_is_its_lowercase_hex_sha256() {
+        let tmp = TempDir::new().unwrap();
+        let f = tmp.path().join("g.gem");
+        fs::write(&f, "abc").unwrap();
+        assert_eq!(
+            sha256_hex(&f).unwrap(),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    #[test]
+    fn the_gem_and_bundle_tools_are_found_like_the_other_package_tools() {
+        let tmp = TempDir::new().unwrap();
+        let bin = tmp.path().join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        for name in ["gem", "bundle"] {
+            fs::write(bin.join(name), "#!/bin/sh\n").unwrap();
+        }
+        let path = std::env::join_paths([Path::new("rel"), bin.as_path()]).unwrap();
+        assert_eq!(
+            resolve_tool("gem", None, Some(&path)),
+            Some(bin.join("gem"))
+        );
+        let hook = tmp.path().join("hook-bundle");
+        fs::write(&hook, "x").unwrap();
+        assert_eq!(
+            resolve_tool("bundle", Some(hook.as_os_str()), Some(&path)),
+            Some(hook)
+        );
+        assert_eq!(
+            path_with_tool_dir("/usr/bin:/bin", Some(&bin.join("gem"))),
+            format!("/usr/bin:/bin:{}", bin.display())
+        );
+        assert_eq!(
+            path_with_tool_dir("/usr/bin", Some(Path::new("relative/gem"))),
+            "/usr/bin"
+        );
     }
 }

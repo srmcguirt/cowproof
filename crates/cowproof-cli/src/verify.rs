@@ -43,8 +43,9 @@ is named); 4 infrastructure (the capsule was refused as tampered, unsandboxed or
 or the replay could not run, or the dependency fetch the checks need failed; never a \
 refutation).
 
-Dependencies: a capsule whose tree has a Cargo.lock, and one of package-lock.json, \
-npm-shrinkwrap.json, yarn.lock or pnpm-lock.yaml, names a dependency cache key. The cache is <cache root>/deps/<key>, the \
+Dependencies: a capsule whose tree has a Cargo.lock, one of package-lock.json, \
+npm-shrinkwrap.json, yarn.lock or pnpm-lock.yaml, or a Gemfile.lock (or gems.locked), names a \
+dependency cache key. The cache is <cache root>/deps/<key>, the \
 cache root being ~/.cache/cowproof or $COWPROOF_CACHE_ROOT; verify fetches it (cargo fetch \
 --locked, npm ci --ignore-scripts, yarn install --frozen-lockfile --ignore-scripts (classic) or \
 --immutable --mode=skip-build (Berry, node-modules linker only), or pnpm install --frozen-lockfile \
@@ -52,7 +53,10 @@ cache root being ~/.cache/cowproof or $COWPROOF_CACHE_ROOT; verify fetches it (c
 first on PATH; the network is $COWPROOF_FETCH_NETWORK: `registry` by default, a proxy that tunnels only \
 to the base's registry hosts and the base cowproof.toml's [proof] fetch_hosts; `open` for full \
 outbound network; or `none`) when it is absent, and mounts it read-only for the checks \
-(node_modules appears in the tree, read-only).")]
+(node_modules appears in the tree, read-only). A Gemfile.lock is fetched as `.gem` files by `gem \
+fetch` (no Gemfile is evaluated and `bundle` is not run; the tool is $COWPROOF_GEM or the first on \
+PATH), which appear as vendor/cache, read-only, and the verifier runs `bundle install --local` \
+once ($COWPROOF_BUNDLE or the first on PATH) before the first check.")]
 pub struct VerifyArgs {
     /// The capsule directory (`control/capsule` of a lane)
     capsule_dir: PathBuf,
@@ -104,9 +108,23 @@ pub(crate) fn verifier_runner(
             .with_runtime_dirs(runtime.to_vec());
     if let Some(deps) = deps {
         link_dependency_cache(deps, &cache.join(".cargo"))?;
-        runner = runner.with_dependency_cache(deps.to_path_buf());
+        // The `bundle` of a Bundler entry's install step: `$COWPROOF_BUNDLE` or the first on
+        // `PATH`. Only a tree whose entry has a Bundler part runs it.
+        runner = runner
+            .with_dependency_cache(deps.to_path_buf())
+            .with_bundle_exe(find_tool("bundle", deps::BUNDLE_ENV));
     }
     Ok(runner)
+}
+
+/// The absolute `name` executable the hook variable `hook` names, else the first `name` on the
+/// director's `PATH` ([`deps::resolve_tool`]).
+fn find_tool(name: &str, hook: &str) -> Option<PathBuf> {
+    deps::resolve_tool(
+        name,
+        std::env::var_os(hook).as_deref(),
+        std::env::var_os("PATH").as_deref(),
+    )
 }
 
 /// The runtime directories the director grants (`--runtime-dir` flags, then
@@ -238,15 +256,14 @@ pub(crate) async fn fetch_dependencies(
     let bridge_exe = std::env::current_exe()
         .and_then(|p| p.canonicalize())
         .context("locating the cowproof executable for the fetch's bridge")?;
-    // `$COWPROOF_NPM`, `$COWPROOF_YARN` and `$COWPROOF_PNPM` (test hooks, as `$CARGO` is for
-    // cargo) or the first `npm`, `yarn` and `pnpm` on `PATH`.
-    let path_env = std::env::var_os("PATH");
-    let find = |name: &str, hook: &str| {
-        deps::resolve_tool(name, std::env::var_os(hook).as_deref(), path_env.as_deref())
-    };
-    let npm = find("npm", deps::NPM_ENV);
-    let yarn = find("yarn", deps::YARN_ENV);
-    let pnpm = find("pnpm", deps::PNPM_ENV);
+    // `$COWPROOF_NPM`, `$COWPROOF_YARN`, `$COWPROOF_PNPM`, `$COWPROOF_GEM` and
+    // `$COWPROOF_BUNDLE` (test hooks, as `$CARGO` is for cargo) or the first `npm`, `yarn`,
+    // `pnpm`, `gem` and `bundle` on `PATH`.
+    let npm = find_tool("npm", deps::NPM_ENV);
+    let yarn = find_tool("yarn", deps::YARN_ENV);
+    let pnpm = find_tool("pnpm", deps::PNPM_ENV);
+    let gem = find_tool("gem", deps::GEM_ENV);
+    let bundle = find_tool("bundle", deps::BUNDLE_ENV);
     let root = deps::cache_root(&layout.real_home);
     let layout = layout.clone();
     let cancelled = Arc::new(AtomicBool::new(false));
@@ -258,6 +275,8 @@ pub(crate) async fn fetch_dependencies(
             npm,
             yarn,
             pnpm,
+            gem,
+            bundle,
         };
         let egress = FetchEgress {
             bridge_exe,
@@ -331,8 +350,8 @@ async fn capsule_dependencies(
     match fetch_dependencies(rebuild, layout, None).await {
         Err(e) => Err(format!("dependency fetch could not run: {e:#}")),
         Ok(None) => Err(format!(
-            "the capsule names dependency cache {key}, but the rebuilt tree has no Cargo.lock \
-             or npm lockfile"
+            "the capsule names dependency cache {key}, but the rebuilt tree has no Cargo.lock, \
+             JavaScript lockfile or Bundler lockfile to fetch"
         )),
         Ok(Some(Prefetch {
             outcome: FetchOutcome::NotFetched,
@@ -529,7 +548,15 @@ pub async fn verify_capsule(args: VerifyArgs) -> Result<i32> {
                 .iter()
                 .filter_map(|m| m.output_note())
                 .collect();
+            // A Bundler tree whose `bundle install --local` failed in the verifier fails every
+            // check with the same text: it is a divergence even when the capsule's own record
+            // was a failure too.
+            let setup_failures = runner.setup_failures();
             let code = match report.result {
+                VerifyResult::Reproduced if !setup_failures.is_empty() => {
+                    println!("diverged: the verifier's dependency setup failed");
+                    2
+                }
                 VerifyResult::Reproduced => {
                     println!("reproduced");
                     0
@@ -553,6 +580,9 @@ pub async fn verify_capsule(args: VerifyArgs) -> Result<i32> {
                     2
                 }
             };
+            for why in &setup_failures {
+                println!("setup: {why}");
+            }
             for note in notes {
                 println!("note: {note}");
             }

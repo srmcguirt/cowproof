@@ -4494,6 +4494,10 @@ struct Evidence {
     no_checks_declared: bool,
     /// Held-out checks that failed on the verifier's rebuilt tree.
     heldout_failed: Vec<String>,
+    /// A step that makes the dependencies available to the verifier's checks failed (the
+    /// Bundler tree's `bundle install --local`): the step and its first error line. The lane's
+    /// own gems did not install, so it is refuted, not an infrastructure failure.
+    setup_failed: Vec<String>,
     /// What the proof wants the director to see that is neither a failure nor a pass, for
     /// instance `held-out: skipped (...)` on a port packet. Printed after the verdict line.
     notes: Vec<String>,
@@ -4536,6 +4540,9 @@ fn judge(e: &Evidence, unsandboxed: bool) -> Verdict {
     }
     for id in &e.heldout_failed {
         reasons.push(format!("held-out check {id:?} failed on the rebuilt tree"));
+    }
+    for why in &e.setup_failed {
+        reasons.push(format!("the verifier's dependency setup failed: {why}"));
     }
     for g in &e.failed_gates {
         if g.evidence.is_empty() {
@@ -5060,6 +5067,23 @@ async fn replay_and_gate(
     };
     match verify(&capsule_dir, input.repo, &verify_dir, &runner, options).await {
         Ok(report) => {
+            // A Bundler tree's `bundle install --local` ran in the verifier before its first
+            // check. It is recorded as a dependency note (the capsule's `dependency_fetch_notes`,
+            // sealed again below), and a failure of it ends the lane: every check failed for
+            // want of the gems, and the reason names the step.
+            let setup_failures = runner.setup_failures();
+            if runner.setup_ran() {
+                capsule
+                    .dependency_fetch_notes
+                    .push(match setup_failures.first() {
+                        None => format!(
+                            "bundler: `{}` ran in the verifier before the checks and succeeded",
+                            cowproof_prove::runner::BUNDLER_STEP
+                        ),
+                        Some(why) => format!("bundler: the verifier's step failed: {why}"),
+                    });
+            }
+            evidence.setup_failed.extend(setup_failures);
             // The verifier's own run of each check goes into the sealed `checks/<id>.json`
             // beside the builder's, and the capsule is sealed again over it. Where the output
             // is not byte-identical to the builder's, a note says so; it is never a failure.

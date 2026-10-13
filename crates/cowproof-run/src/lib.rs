@@ -12,6 +12,7 @@
 //! any caller edits to the policy, and only the resolved path is emitted.
 
 pub mod bridge;
+pub mod bundler;
 pub mod cache;
 pub mod claude;
 pub mod codex;
@@ -412,6 +413,35 @@ impl SandboxPolicy {
         self
     }
 
+    /// The Bundler part of the entry, when it has one (`bundler/cache`): the `.gem` files become
+    /// a READ-ONLY grant (the caller links them into the tree as `vendor/cache`,
+    /// [`link_vendor_cache`]), and Bundler is told to stay frozen, to install into `scratch`
+    /// (a writable directory of the verifier's own: `scratch/install`), and to read no
+    /// configuration: `BUNDLE_FROZEN`, `BUNDLE_PATH`, `BUNDLE_DISABLE_SHARED_GEMS` and
+    /// `BUNDLE_IGNORE_CONFIG`, with `BUNDLE_APP_CONFIG` and `BUNDLE_USER_HOME` at empty
+    /// directories of `scratch` so a tree's `.bundle/config` cannot redirect either. `HOME`
+    /// is `scratch/home`: the real home is hidden, and Ruby tools write caches there.
+    pub fn with_bundler(mut self, deps_dir: &Path, scratch: &Path) -> Self {
+        let cache = deps_dir.join(BUNDLER_ENTRY_DIR).join(BUNDLER_CACHE);
+        if !cache.is_dir() {
+            return self;
+        }
+        self.ro_paths.push(cache);
+        let text = |p: PathBuf| p.to_string_lossy().into_owned();
+        for (k, v) in [
+            ("BUNDLE_FROZEN", "true".to_string()),
+            ("BUNDLE_PATH", text(scratch.join("install"))),
+            ("BUNDLE_DISABLE_SHARED_GEMS", "true".to_string()),
+            ("BUNDLE_IGNORE_CONFIG", "true".to_string()),
+            ("BUNDLE_APP_CONFIG", text(scratch.join("app-config"))),
+            ("BUNDLE_USER_HOME", text(scratch.join("user-home"))),
+            ("HOME", text(scratch.join("home"))),
+        ] {
+            self.env_set.push((k.to_string(), v));
+        }
+        self
+    }
+
     /// Run check: read-write to clone and scratch (and the lane's own cargo
     /// home); no network, except the lane's runner socket (a check run through
     /// `run_check` may itself call the builder tools).
@@ -537,6 +567,20 @@ const NPM_CACHE_ENV: [&str; 3] = [
     "npm_config_store_dir",
 ];
 
+/// The directory of a cache entry that holds the Bundler part: `<entry>/bundler/cache`, the
+/// `.gem` files `gem fetch` left (the layout `bundle install --local` reads from
+/// `vendor/cache`).
+pub const BUNDLER_ENTRY_DIR: &str = "bundler";
+pub const BUNDLER_CACHE: &str = "cache";
+
+/// Where the Bundler part appears in the verifier's tree.
+pub const BUNDLER_VENDOR_CACHE: &str = "vendor/cache";
+
+/// The settings a tree's Bundler configuration cannot change in the verifier, and the
+/// directories under the verifier's scratch they point at (see
+/// [`SandboxPolicy::with_bundler`]). The runner makes the directories before its first check.
+pub const BUNDLER_SCRATCH_DIRS: [&str; 4] = ["install", "app-config", "user-home", "home"];
+
 /// Link the cache's `registry` (and `git`, when present) into `cargo_home`, the
 /// verifier's private `CARGO_HOME`. The links point at the cache, which
 /// [`SandboxPolicy::with_dependency_cache`] grants read-only; the rest of
@@ -585,6 +629,41 @@ pub fn link_npm_modules(deps_dir: &Path, tree: &Path) -> Result<()> {
     .with_context(|| format!("clearing {}", link.display()))?;
     std::os::unix::fs::symlink(&target, &link)
         .with_context(|| format!("linking node_modules into {}", tree.display()))
+}
+
+/// Put the cache entry's `bundler/cache` at `<tree>/vendor/cache`, the verifier's rebuilt tree,
+/// as a symlink to the entry, the way [`link_npm_modules`] links `node_modules`.
+/// [`SandboxPolicy::with_bundler`] grants the target read-only, so a check reads the gems and
+/// cannot write into the entry. Nothing is done when the entry has no Bundler part. Whatever
+/// stood at `vendor/cache` is replaced without following a symlink, and a `vendor` that is a
+/// symlink or a file is replaced by a directory first, so nothing is ever written through a
+/// link the tree made. Called before every check.
+pub fn link_vendor_cache(deps_dir: &Path, tree: &Path) -> Result<()> {
+    let target = deps_dir.join(BUNDLER_ENTRY_DIR).join(BUNDLER_CACHE);
+    if !target.is_dir() {
+        return Ok(());
+    }
+    let vendor = tree.join("vendor");
+    if !std::fs::symlink_metadata(&vendor).is_ok_and(|m| m.is_dir()) {
+        match std::fs::symlink_metadata(&vendor) {
+            Ok(_) => std::fs::remove_file(&vendor),
+            Err(_) => Ok(()),
+        }
+        .with_context(|| format!("clearing {}", vendor.display()))?;
+        std::fs::create_dir(&vendor).with_context(|| format!("creating {}", vendor.display()))?;
+    }
+    let link = tree.join(BUNDLER_VENDOR_CACHE);
+    if std::fs::read_link(&link).is_ok_and(|current| current == target) {
+        return Ok(());
+    }
+    match std::fs::symlink_metadata(&link) {
+        Ok(m) if m.is_dir() => std::fs::remove_dir_all(&link),
+        Ok(_) => std::fs::remove_file(&link),
+        Err(_) => Ok(()),
+    }
+    .with_context(|| format!("clearing {}", link.display()))?;
+    std::os::unix::fs::symlink(&target, &link)
+        .with_context(|| format!("linking vendor/cache into {}", tree.display()))
 }
 
 /// The temp directory a sandboxed process gets: a directory of the lane's own
@@ -662,6 +741,7 @@ const LOCKFILES: &[&str] = &[
     "yarn.lock",
     "pnpm-lock.yaml",
     "Gemfile.lock",
+    "gems.locked",
 ];
 
 /// Registry and source configuration, relative to the tree root (D14). The cache key
@@ -3247,6 +3327,120 @@ mod tests {
         link_npm_modules(&cargo_only, &bare).unwrap();
         assert!(bare.join("node_modules").is_dir());
         assert!(std::fs::read_link(bare.join("node_modules")).is_err());
+    }
+
+    fn gem_cache(root: &Path) -> PathBuf {
+        let deps = root.join("deps");
+        std::fs::create_dir_all(deps.join("bundler/cache")).unwrap();
+        std::fs::write(deps.join("bundler/cache/fake-1.0.gem"), "gem").unwrap();
+        deps
+    }
+
+    #[test]
+    fn the_bundler_part_is_mounted_read_only_with_bundler_frozen_and_ignoring_config() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let deps = gem_cache(tmp.path());
+        let lane = test_lane();
+        let scratch = Path::new("/nonexistent-cp/scratch/bundler");
+        let policy = SandboxPolicy::verifier(&lane, Path::new("/nonexistent-cp/cache"))
+            .with_dependency_cache(&deps)
+            .with_bundler(&deps, scratch);
+        let cache = deps.join("bundler/cache");
+        assert!(policy.ro_paths.contains(&cache), "{:?}", policy.ro_paths);
+        assert!(!policy.rw_paths.contains(&cache));
+        let env = |k: &str| {
+            policy
+                .env_set
+                .iter()
+                .find(|(key, _)| key == k)
+                .map(|(_, v)| v.clone())
+        };
+        assert_eq!(env("BUNDLE_FROZEN").as_deref(), Some("true"));
+        assert_eq!(env("BUNDLE_DISABLE_SHARED_GEMS").as_deref(), Some("true"));
+        assert_eq!(env("BUNDLE_IGNORE_CONFIG").as_deref(), Some("true"));
+        assert_eq!(
+            env("BUNDLE_PATH").as_deref(),
+            Some("/nonexistent-cp/scratch/bundler/install")
+        );
+        for k in ["BUNDLE_APP_CONFIG", "BUNDLE_USER_HOME", "HOME"] {
+            assert!(
+                env(k).is_some_and(|v| v.starts_with("/nonexistent-cp/scratch/bundler/")),
+                "{k}"
+            );
+        }
+        // The renderers keep it read-only: bubblewrap binds it `--ro-bind`, and the macOS profile
+        // denies writes to it after the read-write grants.
+        let real = cache.canonicalize().unwrap();
+        let c = real.to_str().unwrap();
+        let args = render_bwrap_args(&policy_without_deny(policy.clone()), &[]).unwrap();
+        assert!(
+            args.windows(3)
+                .any(|w| w[0] == "--ro-bind" && w[1] == c && w[2] == c),
+            "{args:?}"
+        );
+        assert!(!args.windows(3).any(|w| w[0] == "--bind" && w[1] == c));
+        let profile = render_macos_profile(&policy).unwrap();
+        let quoted = format!("(subpath {})", sbpl(&real).unwrap());
+        assert!(
+            profile.contains(&format!("(deny file-write* {quoted})")),
+            "{profile}"
+        );
+
+        // An entry with no Bundler part changes nothing and sets no Bundler variable.
+        let cargo_only = fetched_cache(&tmp.path().join("c"), false);
+        let policy = SandboxPolicy::verifier(&lane, Path::new("/nonexistent-cp/cache"))
+            .with_bundler(&cargo_only, scratch);
+        assert!(!policy.env_set.iter().any(|(k, _)| k.starts_with("BUNDLE_")));
+    }
+
+    #[test]
+    fn linking_vendor_cache_replaces_what_stood_there_and_never_writes_through_a_link() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let deps = gem_cache(tmp.path());
+        let target = deps.join("bundler/cache");
+        let tree = tmp.path().join("tree");
+        // A directory a patch committed is replaced, not merged.
+        std::fs::create_dir_all(tree.join("vendor/cache/planted")).unwrap();
+        link_vendor_cache(&deps, &tree).unwrap();
+        assert_eq!(
+            std::fs::read_link(tree.join("vendor/cache")).unwrap(),
+            target
+        );
+        assert!(tree.join("vendor/cache/fake-1.0.gem").is_file());
+        assert!(!target.join("planted").exists());
+        // Idempotent.
+        link_vendor_cache(&deps, &tree).unwrap();
+        // A `vendor` that is a link out of the tree is replaced by a directory: nothing is
+        // created in, or removed from, the place it pointed at.
+        let elsewhere = tmp.path().join("elsewhere");
+        std::fs::create_dir_all(elsewhere.join("cache")).unwrap();
+        std::fs::write(elsewhere.join("cache/keep"), "x").unwrap();
+        std::fs::remove_dir_all(tree.join("vendor")).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, tree.join("vendor")).unwrap();
+        link_vendor_cache(&deps, &tree).unwrap();
+        assert!(
+            std::fs::symlink_metadata(tree.join("vendor"))
+                .unwrap()
+                .is_dir()
+        );
+        assert_eq!(
+            std::fs::read_link(tree.join("vendor/cache")).unwrap(),
+            target
+        );
+        assert!(elsewhere.join("cache/keep").is_file());
+        assert!(!elsewhere.join("cache").is_symlink());
+        // A `vendor` that is a file is replaced too.
+        std::fs::remove_dir_all(tree.join("vendor")).unwrap();
+        std::fs::write(tree.join("vendor"), "file").unwrap();
+        link_vendor_cache(&deps, &tree).unwrap();
+        assert!(tree.join("vendor/cache/fake-1.0.gem").is_file());
+        // No Bundler part: the tree is left as it is.
+        let cargo_only = fetched_cache(&tmp.path().join("c"), false);
+        let bare = tmp.path().join("bare");
+        std::fs::create_dir_all(bare.join("vendor/cache")).unwrap();
+        link_vendor_cache(&cargo_only, &bare).unwrap();
+        assert!(bare.join("vendor/cache").is_dir());
+        assert!(std::fs::read_link(bare.join("vendor/cache")).is_err());
     }
 
     // The macOS profile denies file writes everywhere and grants them back.

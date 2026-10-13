@@ -52,6 +52,11 @@ pub const DEFAULT_NPM_HOSTS: [&str; 1] = ["registry.npmjs.org"];
 /// the public npm registry (a lockfile written by npm tooling resolves there).
 pub const DEFAULT_YARN_HOSTS: [&str; 2] = ["registry.yarnpkg.com", "registry.npmjs.org"];
 
+/// The hosts a Bundler fetch may reach with no configuration: the public RubyGems server and
+/// its index. The real service may send a download to a CDN host that was not tested live;
+/// name such a host in `[proof] fetch_hosts`.
+pub const DEFAULT_RUBYGEMS_HOSTS: [&str; 2] = ["rubygems.org", "index.rubygems.org"];
+
 /// The one port a tunnel may be opened to.
 pub const TUNNEL_PORT: u16 = 443;
 
@@ -59,6 +64,12 @@ pub const TUNNEL_PORT: u16 = 443;
 /// the base is rebuilt and before `lane.patch` is applied (see
 /// [`crate::deps::RegistryConfigSnapshot`]), never from the patched tree.
 pub const POLICY_FILE: &str = "cowproof.toml";
+
+/// Where `RegistryConfigSnapshot::restore` leaves the BASE's Bundler lockfile (whichever of
+/// `Gemfile.lock` and `gems.locked` the base had) in the rebuilt tree the fetch works from, so
+/// the allowlist can read the base's `remote:` lines while the tree's own lockfile is the
+/// lane's. Nothing but the fetch reads it, and it is not an input of the cache key.
+pub const BASE_GEM_LOCKFILE: &str = ".cowproof-base/gem.lock";
 
 /// Most tunnels open at once. The 65th is refused, so a fetch cannot exhaust the runner's
 /// file descriptors.
@@ -103,6 +114,43 @@ impl FetchAllowlist {
                 .map(|h| (*h).to_string())
                 .collect(),
         }
+    }
+
+    /// The defaults of a Bundler fetch alone: the public RubyGems hosts.
+    pub fn rubygems_defaults() -> Self {
+        Self {
+            hosts: DEFAULT_RUBYGEMS_HOSTS
+                .iter()
+                .map(|h| (*h).to_string())
+                .collect(),
+        }
+    }
+
+    /// The allowlist of a Bundler fetch of the tree `tree`, which must be the BASE: the
+    /// RubyGems hosts, then the https hosts of the `remote:` lines of the BASE's lockfile
+    /// (read from [`BASE_GEM_LOCKFILE`], which `RegistryConfigSnapshot::restore` leaves in
+    /// the tree; absent when the base had no lockfile), then `[proof] fetch_hosts`. The
+    /// lane's own lockfile is never read here: a patch that points a `remote:` at another
+    /// host adds nothing, and the fetch of that host is refused. A base lockfile that does
+    /// not parse adds no host (the gems then come from the defaults or fail).
+    pub fn bundler_from_tree(tree: &Path) -> Result<Self> {
+        let mut list = Self::rubygems_defaults();
+        if let Some(text) = read_regular(&tree.join(BASE_GEM_LOCKFILE))?
+            && let Ok(lock) = crate::bundler::parse(&text)
+        {
+            list = list.with_hosts(
+                lock.sources
+                    .iter()
+                    .flat_map(|s| s.remotes.iter())
+                    .filter_map(|r| https_host(r)),
+            )?;
+        }
+        if let Some(text) = read_regular(&tree.join(POLICY_FILE))? {
+            list = list.with_hosts(
+                fetch_hosts(&text).with_context(|| format!("reading {POLICY_FILE}"))?,
+            )?;
+        }
+        Ok(list)
     }
 
     /// The allowlist of an npm fetch of the tree `tree`, which must be the BASE: the
