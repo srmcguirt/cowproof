@@ -1,10 +1,10 @@
-use crate::capsule::{Capsule, CapsuleError, CheckResult, HELDOUT_FILE};
+use crate::capsule::{Capsule, CapsuleError, CheckResult, HELDOUT_FILE, VerifierRun};
 use crate::port::{PortOutcome, PortRun, run_port};
 use crate::runner::{CheckRunner, acquire_slot};
 use cowproof_core::get_slot_dir;
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use thiserror::Error;
 use tokio::process::Command;
 
@@ -71,6 +71,37 @@ pub struct CheckMatch {
     pub matched_capsule: bool,
     pub capsule_exit_status: i32,
     pub actual_exit_status: i32,
+    /// This replay's own run of the check (the last attempt, for a flaky check). `cowproof run`
+    /// writes it into the capsule beside the builder's record; `cowproof verify` writes nothing.
+    pub run: VerifierRun,
+    /// The builder's recorded output hash, when the capsule has one (empty for a capsule from
+    /// before runs were recorded).
+    pub builder_output_sha256: String,
+}
+
+impl CheckMatch {
+    /// A note, never a failure: this replay's output is not byte-identical to the builder's.
+    /// `None` when the hashes agree or the capsule recorded no builder hash to compare with.
+    /// Outputs legitimately differ between runs (a timestamp, a path, a test order), and only
+    /// pass or fail decides the verdict.
+    pub fn output_note(&self) -> Option<String> {
+        if self.builder_output_sha256.is_empty()
+            || self.builder_output_sha256 == self.run.output_sha256
+        {
+            return None;
+        }
+        Some(format!(
+            "check {:?}: the verifier's output is not byte-identical to the builder's (builder \
+             sha256 {}, verifier sha256 {}); only pass or fail was compared",
+            self.check_id,
+            short_hash(&self.builder_output_sha256),
+            short_hash(&self.run.output_sha256),
+        ))
+    }
+}
+
+fn short_hash(hash: &str) -> &str {
+    hash.get(..12).unwrap_or(hash)
 }
 
 /// A held-out check run on the rebuilt tree. It has no recorded result to match: it
@@ -127,7 +158,9 @@ const FLAKY_ATTEMPTS: u32 = 3;
 /// 5. Run each recorded check's command through the `CheckRunner`. The checks are the
 ///    sealed `checks/<id>.json` files named in `capsule.json`; a file the seal does not
 ///    list is refused by `Capsule::read` before this point, never run.
-/// 6. Compare pass or fail per check id; durations and output hashes are never compared.
+/// 6. Compare pass or fail per check id; durations and output hashes are never compared. Each
+///    check's own run (exit, duration, output hash and length) comes back in its `CheckMatch`,
+///    and `CheckMatch::output_note` says when its output differs from the builder's.
 /// 7. Run the held-out checks in `packets/heldout.toml` (when the capsule has one) on the
 ///    same tree, after the recorded checks. They have no recorded result: one that fails
 ///    refutes the lane (`HeldOutFailed`), naming the check. A held-out file that cannot be
@@ -209,16 +242,26 @@ pub async fn verify(
         };
 
         let mut actual_exit = -1;
+        let mut run = None;
         for _ in 0..max_attempts {
+            let started = Instant::now();
             let outcome = runner
                 .run(&tree, &check.command, opts.default_timeout)
                 .await
                 .map_err(|e| infra(format!("check {check_id}: {e}")))?;
+            run = Some(VerifierRun {
+                exit_status: outcome.exit_status,
+                end: outcome.end,
+                duration_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                output_sha256: Capsule::hash_bytes(outcome.output.as_bytes()),
+                output_len: outcome.output.len() as u64,
+            });
             actual_exit = outcome.exit_status;
             if actual_exit == 0 {
                 break;
             }
         }
+        let run = run.ok_or_else(|| infra(format!("check {check_id}: no attempt was made")))?;
 
         let matched = (check.exit_status == 0) == (actual_exit == 0);
         if !matched {
@@ -231,6 +274,8 @@ pub async fn verify(
             matched_capsule: matched,
             capsule_exit_status: check.exit_status,
             actual_exit_status: actual_exit,
+            run,
+            builder_output_sha256: check.output_sha256.clone(),
         });
     }
 
@@ -536,6 +581,48 @@ fn validate_launch_path(tree: &Path, rel: &str) -> Result<PathBuf, VerifyError> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cowproof_run::tools::CheckEnd;
+
+    fn matched(builder: &str, verifier: &str) -> CheckMatch {
+        CheckMatch {
+            check_id: "unit".to_string(),
+            passed: true,
+            matched_capsule: true,
+            capsule_exit_status: 0,
+            actual_exit_status: 0,
+            run: VerifierRun {
+                exit_status: 0,
+                end: CheckEnd::Exited { code: 0 },
+                duration_ms: 5,
+                output_sha256: verifier.to_string(),
+                output_len: 1,
+            },
+            builder_output_sha256: builder.to_string(),
+        }
+    }
+
+    #[test]
+    fn the_output_note_names_a_check_whose_hashes_differ() {
+        let note = matched(&"a".repeat(64), &"b".repeat(64))
+            .output_note()
+            .expect("different hashes are noted");
+        assert!(note.contains("\"unit\""), "{note}");
+        assert!(note.contains("not byte-identical"), "{note}");
+        assert!(
+            note.contains(&"a".repeat(12)) && note.contains(&"b".repeat(12)),
+            "{note}"
+        );
+    }
+
+    #[test]
+    fn there_is_no_output_note_for_equal_hashes_or_a_builder_without_one() {
+        assert_eq!(
+            matched(&"a".repeat(64), &"a".repeat(64)).output_note(),
+            None
+        );
+        // A capsule from before runs were recorded has an empty builder hash: nothing to compare.
+        assert_eq!(matched("", &"b".repeat(64)).output_note(), None);
+    }
 
     #[test]
     fn a_launch_removed_symlink_is_unlinked_and_its_target_is_left_alone() {

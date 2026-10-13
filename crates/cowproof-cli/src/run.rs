@@ -4897,6 +4897,17 @@ async fn replay_and_gate(
     };
     match verify(&capsule_dir, input.repo, &verify_dir, &runner, options).await {
         Ok(report) => {
+            // The verifier's own run of each check goes into the sealed `checks/<id>.json`
+            // beside the builder's, and the capsule is sealed again over it. Where the output
+            // is not byte-identical to the builder's, a note says so; it is never a failure.
+            if let Err(e) = record_verifier_runs(&capsule_dir, &mut capsule, &report) {
+                evidence
+                    .infrastructure
+                    .push(format!("recording the verifier's runs failed: {e:#}"));
+            }
+            evidence
+                .notes
+                .extend(report.checks.iter().filter_map(|m| m.output_note()));
             if let Err(e) = record_verify_results(
                 &capsule_dir,
                 &mut capsule,
@@ -4966,6 +4977,7 @@ fn check_result(
             output_sha256: run.output_sha256.clone(),
             output_len: Some(run.output_len),
             end: Some(run.end),
+            verifier: None,
         },
         None => CheckResult {
             command: check.command.clone(),
@@ -4975,8 +4987,36 @@ fn check_result(
             output_sha256: String::new(),
             output_len: None,
             end: None,
+            verifier: None,
         },
     }
+}
+
+/// Write the verifier's own run of each check into that check's `checks/<id>.json`, as its
+/// `verifier` object, and seal the capsule again over the new bytes. The builder's fields are
+/// read and written back unchanged. The file is one `verify` already accepted, so it is one the
+/// seal listed; a check the replay did not run keeps the record it had.
+fn record_verifier_runs(
+    capsule_dir: &Path,
+    capsule: &mut Capsule,
+    report: &cowproof_prove::VerifyReport,
+) -> Result<()> {
+    for m in &report.checks {
+        let path = capsule_dir
+            .join("checks")
+            .join(format!("{}.json", m.check_id));
+        let text = fs::read_to_string(&path)
+            .with_context(|| format!("reading checks/{}.json", m.check_id))?;
+        let mut record: CheckResult = serde_json::from_str(&text)
+            .with_context(|| format!("parsing checks/{}.json", m.check_id))?;
+        record.verifier = Some(m.run.clone());
+        fs::write(&path, serde_json::to_vec_pretty(&record)?)
+            .with_context(|| format!("writing checks/{}.json", m.check_id))?;
+    }
+    capsule
+        .write(capsule_dir)
+        .context("sealing the capsule again")?;
+    Ok(())
 }
 
 /// Put what `verify` found into the sealed files: `gates.json` gets each held-out check's pass

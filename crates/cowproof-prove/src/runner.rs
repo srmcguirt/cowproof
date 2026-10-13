@@ -1,7 +1,9 @@
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
+use cowproof_run::tools::CheckEnd;
 use cowproof_run::{LaneLayout, RustupEnv, SandboxPolicy, render_macos_profile, sandbox_command};
 use std::ffi::OsStr;
+use std::os::unix::process::ExitStatusExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
@@ -34,6 +36,9 @@ pub struct CheckOutcome {
     pub exit_status: i32,
     pub output: String,
     pub attempts: u32,
+    /// How the command ended: with an exit code, or by a signal (`exit_status` is then -1). A
+    /// timeout is not an outcome here; it is `InfraError::Timeout`.
+    pub end: CheckEnd,
 }
 
 /// Trait for executing checks.
@@ -395,10 +400,16 @@ async fn run_with_timeout(
         GroupEnd::Exited(status) => {
             let mut output = String::from_utf8_lossy(&ran.stdout).to_string();
             output.push_str(&String::from_utf8_lossy(&ran.stderr));
+            let end = match (status.code(), status.signal()) {
+                (Some(code), _) => CheckEnd::Exited { code },
+                (None, Some(signal)) => CheckEnd::Signaled { signal },
+                (None, None) => CheckEnd::NotRun,
+            };
             Ok(CheckOutcome {
                 exit_status: status.code().unwrap_or(-1),
                 output,
                 attempts: 1,
+                end,
             })
         }
         GroupEnd::TimedOut => Err(InfraError::Timeout(format!(

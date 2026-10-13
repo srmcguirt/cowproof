@@ -529,7 +529,16 @@ fn verify_on_another_cache_root_fetches_what_the_capsule_names_and_reproduces() 
     };
     let out = verify("none");
     assert_eq!(out.status.code(), Some(0), "{}", text(&out));
-    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "reproduced");
+    // A cargo build prints paths and timings that differ in the rebuilt tree, so the result
+    // line may be followed by the note that the output is not byte-identical (never a failure).
+    let said = String::from_utf8_lossy(&out.stdout).to_string();
+    assert_eq!(said.lines().next(), Some("reproduced"), "{said}");
+    assert!(
+        said.lines()
+            .skip(1)
+            .all(|l| l.starts_with("note: check \"build\"")),
+        "{said}"
+    );
     assert!(
         cache_entry(other_cache.path(), &key)
             .join("cargo/registry")

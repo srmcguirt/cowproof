@@ -277,6 +277,7 @@ fn write_capsule(dir: &Path, spec: &CapsuleSpec) {
             output_sha256: "ignored".to_string(),
             output_len: None,
             end: None,
+            verifier: None,
         };
         std::fs::write(
             dir.join(format!("checks/{id}.json")),
@@ -361,6 +362,7 @@ impl CheckRunner for ScriptedRunner {
             exit_status: status,
             output: String::new(),
             attempts: 1,
+            end: crate::capsule::CheckEnd::Exited { code: status },
         })
     }
 }
@@ -1476,6 +1478,7 @@ impl CheckRunner for SlowRunner {
             exit_status: 0,
             output: String::new(),
             attempts: 1,
+            end: crate::capsule::CheckEnd::Exited { code: 0 },
         })
     }
 }
@@ -2129,6 +2132,7 @@ async fn an_unsealed_check_file_is_refused_and_never_run() {
         output_sha256: "ignored".to_string(),
         output_len: None,
         end: None,
+        verifier: None,
     };
     std::fs::write(
         capsule_dir.path().join("checks/injected.json"),
@@ -2294,6 +2298,7 @@ fn load_checks_takes_its_ids_from_file_hashes_not_the_directory() {
             output_sha256: "ignored".to_string(),
             output_len: None,
             end: None,
+            verifier: None,
         })
         .unwrap()
     };

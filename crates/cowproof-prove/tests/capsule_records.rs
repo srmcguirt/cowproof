@@ -35,6 +35,7 @@ fn recorded() -> CheckResult {
         output_sha256: Capsule::hash_bytes(b"test result: ok\n"),
         output_len: Some(16),
         end: Some(CheckEnd::Exited { code: 0 }),
+        verifier: None,
     }
 }
 

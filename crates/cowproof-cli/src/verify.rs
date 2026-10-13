@@ -432,7 +432,14 @@ pub async fn verify_capsule(args: VerifyArgs) -> Result<i32> {
             if let Some(note) = report.port.as_ref().and_then(|p| p.skipped_note()) {
                 println!("{note}");
             }
-            match report.result {
+            // Printed after the result line, whatever it is: a note, never a failure. Only pass
+            // or fail is compared with the builder's record.
+            let notes: Vec<String> = report
+                .checks
+                .iter()
+                .filter_map(|m| m.output_note())
+                .collect();
+            let code = match report.result {
                 VerifyResult::Reproduced => {
                     println!("reproduced");
                     0
@@ -455,7 +462,11 @@ pub async fn verify_capsule(args: VerifyArgs) -> Result<i32> {
                     }
                     2
                 }
+            };
+            for note in notes {
+                println!("note: {note}");
             }
+            code
         }
         Err(VerifyError::Capsule(e)) => {
             eprintln!("refused: the capsule was tampered with or is damaged: {e}");

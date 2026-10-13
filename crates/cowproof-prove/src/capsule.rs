@@ -158,6 +158,31 @@ pub struct CheckResult {
     /// How the recorded run ended: exited with a code, signalled, timed out, or never started.
     #[serde(default)]
     pub end: Option<CheckEnd>,
+    /// The verifier's own run of this check (`cowproof run` records it after the replay and
+    /// seals the capsule again). Absent from a capsule the replay has not been recorded in:
+    /// every capsule from before this field, and a lane whose proof did not reach the replay.
+    /// It is never compared: `cowproof verify` compares pass or fail against the fields above.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verifier: Option<VerifierRun>,
+}
+
+/// The verifier's own run of one check, the values `cowproof run`'s replay measured and the
+/// capsule keeps beside the builder's. The same fields as the builder's record, minus `attempts`
+/// (the verifier's retries of a flaky check are not counted: this is the last attempt's run).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VerifierRun {
+    /// The command's exit code, or -1 when it had none (it was ended by a signal).
+    pub exit_status: i32,
+    /// How the command ended. A timeout never appears: the verifier treats it as infrastructure.
+    pub end: CheckEnd,
+    /// Wall-clock time of the run in milliseconds, from just before the sandboxed command was
+    /// started to just after its output was collected. The slot wait is not in it.
+    pub duration_ms: u64,
+    /// SHA-256 (hex) of the run's stdout then stderr, the same bytes the builder's
+    /// `output_sha256` covers. The output itself is never kept.
+    pub output_sha256: String,
+    /// Length in bytes of that output.
+    pub output_len: u64,
 }
 
 /// One entry of `packets/versions.json`: a version of the packet the lane ran under.

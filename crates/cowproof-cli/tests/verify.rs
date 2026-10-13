@@ -588,7 +588,8 @@ fn a_check_that_failed_then_passed_records_two_attempts_a_duration_and_the_passi
             "end",
             "exit_status",
             "output_len",
-            "output_sha256"
+            "output_sha256",
+            "verifier"
         ]
     );
     // No remote holds the test repository's base commit.
@@ -716,4 +717,185 @@ fn a_capsule_whose_check_records_predate_the_run_fields_still_reproduces() {
     let out = replay(&lane);
     assert_eq!(out.status.code(), Some(0), "{}", text(&out));
     assert_eq!(stdout(&out).trim(), "reproduced");
+}
+
+// ---- The verifier's own run of each check ----------------------------------
+
+/// A lane with two checks: `stable` prints the same bytes every time, `rand` prints sixteen
+/// random bytes in hex, so the verifier's output can never be the builder's.
+fn verifier_lane() -> Lane {
+    Lane::new(
+        &run_checks(&["stable", "rand"]),
+        json!([
+            {"id": "stable", "command": "echo same"},
+            {"id": "rand", "command": "od -An -N16 -tx1 /dev/urandom"},
+        ]),
+    )
+}
+
+/// Seal `capsule.json` again after a test changed a file listed in it, as the writer would.
+fn reseal(capsule: &Path, file: &str, bytes: &[u8]) {
+    fs::write(capsule.join(file), bytes).unwrap();
+    let path = capsule.join("capsule.json");
+    let mut json: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    json["file_hashes"][file] = json!(Capsule::hash_bytes(bytes));
+    let raw = serde_json::to_vec_pretty(&json).unwrap();
+    fs::write(&path, &raw).unwrap();
+    fs::write(capsule.join("capsule.sha256"), Capsule::hash_bytes(&raw)).unwrap();
+}
+
+#[test]
+fn the_capsule_records_the_verifiers_own_run_beside_the_builders_and_notes_a_different_output() {
+    if !sandbox_available() {
+        return;
+    }
+    let lane = verifier_lane();
+    let run = run_expecting(&lane, &[], 0);
+    // A note is not a failure: the lane is proved.
+    assert_eq!(lane.verdict()["verdict"], "proved");
+
+    // `stable`: both runs print `same\n`. The verifier's record has its own exit, end, a
+    // duration over zero and the hash and length of its own output.
+    let stable = check_record(&lane, "stable");
+    let verifier = &stable["verifier"];
+    assert_eq!(verifier["exit_status"], 0, "{stable}");
+    assert_eq!(
+        verifier["end"],
+        json!({"kind": "exited", "code": 0}),
+        "{stable}"
+    );
+    assert!(verifier["duration_ms"].as_u64().unwrap() > 0, "{stable}");
+    assert_eq!(verifier["output_sha256"], sha256_hex(b"same\n"), "{stable}");
+    assert_eq!(verifier["output_len"], 5, "{stable}");
+    // The builder's fields are as they were.
+    assert_eq!(stable["output_sha256"], sha256_hex(b"same\n"), "{stable}");
+    assert_eq!(stable["attempts"], 1, "{stable}");
+    assert_eq!(
+        stable["end"],
+        json!({"kind": "exited", "code": 0}),
+        "{stable}"
+    );
+
+    // `rand`: two different outputs, both recorded, neither the other's.
+    let rand = check_record(&lane, "rand");
+    let (builder_hash, verifier_hash) = (
+        rand["output_sha256"].as_str().unwrap(),
+        rand["verifier"]["output_sha256"].as_str().unwrap(),
+    );
+    assert_eq!(builder_hash.len(), 64, "{rand}");
+    assert_eq!(verifier_hash.len(), 64, "{rand}");
+    assert_ne!(builder_hash, verifier_hash, "{rand}");
+    assert!(
+        rand["verifier"]["output_len"].as_u64().unwrap() > 0,
+        "{rand}"
+    );
+    assert!(
+        rand["verifier"]["duration_ms"].as_u64().unwrap() > 0,
+        "{rand}"
+    );
+
+    // The record is sealed: the capsule reads, and `cowproof run` named the note for `rand`
+    // only, after its verdict line.
+    Capsule::read(&lane.capsule_dir()).expect("the capsule is sealed over the verifier's record");
+    let said = stdout(&run);
+    assert!(
+        said.contains("check \"rand\": the verifier's output is not byte-identical"),
+        "{said}"
+    );
+    assert!(!said.contains("check \"stable\""), "{said}");
+
+    // `cowproof verify` is a third run: it compares pass or fail with the builder's record,
+    // reproduces, and prints the same note for `rand` and none for `stable`.
+    let out = replay(&lane);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    let said = stdout(&out);
+    assert!(said.starts_with("reproduced\n"), "{said}");
+    assert!(
+        said.contains("note: check \"rand\": the verifier's output is not byte-identical"),
+        "{said}"
+    );
+    assert!(!said.contains("\"stable\""), "{said}");
+}
+
+#[test]
+fn a_lane_whose_outputs_agree_prints_no_note() {
+    if !sandbox_available() {
+        return;
+    }
+    let lane = Lane::new(
+        &run_checks(&["stable"]),
+        json!([{"id": "stable", "command": "echo same"}]),
+    );
+    let run = run_expecting(&lane, &[], 0);
+    assert!(!stdout(&run).contains("byte-identical"), "{}", stdout(&run));
+    let out = replay(&lane);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    assert_eq!(stdout(&out).trim(), "reproduced");
+}
+
+#[test]
+fn editing_the_verifiers_record_fails_verify() {
+    if !sandbox_available() {
+        return;
+    }
+    let lane = verifier_lane();
+    run_expecting(&lane, &[], 0);
+    let path = lane.capsule_dir().join("checks/stable.json");
+    let original = fs::read(&path).unwrap();
+    for (field, value) in [
+        ("duration_ms", json!(1)),
+        ("output_len", json!(99)),
+        ("output_sha256", json!(sha256_hex(b"something else"))),
+        ("exit_status", json!(1)),
+    ] {
+        let mut record: Value = serde_json::from_slice(&original).unwrap();
+        record["verifier"][field] = value;
+        fs::write(&path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+        let out = replay(&lane);
+        assert_eq!(out.status.code(), Some(4), "{field}: {}", text(&out));
+        let err = String::from_utf8_lossy(&out.stderr).to_string();
+        assert!(
+            err.contains("tampered") && err.contains("checks/stable.json"),
+            "{field}: {err}"
+        );
+    }
+    // Removing the record is an edit too.
+    let mut record: Value = serde_json::from_slice(&original).unwrap();
+    record.as_object_mut().unwrap().remove("verifier");
+    fs::write(&path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+    let out = replay(&lane);
+    assert_eq!(out.status.code(), Some(4), "{}", text(&out));
+    fs::write(&path, &original).unwrap();
+    let out = replay(&lane);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+}
+
+/// A capsule sealed before the verifier's runs were recorded has no `verifier` object in its
+/// check files. It reads and reproduces; the builder's hash is still there, so the third run of
+/// `cowproof verify` still notes the check whose output differs.
+#[test]
+fn a_capsule_without_the_verifiers_record_still_reproduces() {
+    if !sandbox_available() {
+        return;
+    }
+    let lane = verifier_lane();
+    run_expecting(&lane, &[], 0);
+    let capsule = lane.capsule_dir();
+    for id in ["stable", "rand"] {
+        let mut record = check_record(&lane, id);
+        assert!(record.as_object_mut().unwrap().remove("verifier").is_some());
+        reseal(
+            &capsule,
+            &format!("checks/{id}.json"),
+            &serde_json::to_vec_pretty(&record).unwrap(),
+        );
+    }
+    assert!(check_record(&lane, "stable").get("verifier").is_none());
+    Capsule::read(&capsule).expect("a capsule without the verifier's record reads");
+    let out = replay(&lane);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    let said = stdout(&out);
+    assert!(said.starts_with("reproduced\n"), "{said}");
+    assert!(said.contains("note: check \"rand\""), "{said}");
+    assert!(!said.contains("\"stable\""), "{said}");
 }

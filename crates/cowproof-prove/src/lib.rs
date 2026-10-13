@@ -18,7 +18,9 @@ mod port_exec;
 pub mod runner;
 pub mod verify;
 
-pub use capsule::{Capsule, CapsuleError, HELDOUT_FILE, SEAL_FILE, ToolTotals, TraceTotals};
+pub use capsule::{
+    Capsule, CapsuleError, HELDOUT_FILE, SEAL_FILE, ToolTotals, TraceTotals, VerifierRun,
+};
 pub use flaws::{FlawFinding, FlawRule, GENERIC_PACK, LoadedPacks, PatchDelta, RuleFile};
 pub use gates::{GatePacket, GateReport, GateResult, record_verify_results, run_gates};
 pub use port::{
