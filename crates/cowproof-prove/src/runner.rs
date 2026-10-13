@@ -336,6 +336,19 @@ pub fn run_probe_blocking(
     cmd: std::process::Command,
     timeout: Duration,
 ) -> Result<GroupOutput, GroupError> {
+    run_in_group_blocking(cmd, timeout, Duration::ZERO, None)
+}
+
+/// [`run_in_group`] for a caller that is not async, listing the group in `set` while it
+/// lives. It drives the command on a current-thread runtime of its own, on a scoped thread,
+/// so it is safe to call from inside another tokio runtime (a `spawn_blocking` task, the
+/// dependency fetch), which `block_on` on the calling thread would not be.
+pub fn run_in_group_blocking(
+    cmd: std::process::Command,
+    timeout: Duration,
+    term_grace: Duration,
+    set: Option<&GroupSet>,
+) -> Result<GroupOutput, GroupError> {
     std::thread::scope(|scope| {
         scope
             .spawn(move || {
@@ -343,7 +356,7 @@ pub fn run_probe_blocking(
                     .enable_all()
                     .build()
                     .map_err(GroupError::Spawn)?;
-                runtime.block_on(run_probe(Command::from(cmd), timeout))
+                runtime.block_on(run_in_group(Command::from(cmd), timeout, term_grace, set))
             })
             .join()
             .unwrap_or_else(|_| {

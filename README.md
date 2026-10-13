@@ -444,6 +444,8 @@ Tests: `crates/cowproof-cli/tests/port_process.rs`, on `fixtures/port-process/` 
 
 Before verify runs, `cowproof run` and `cowproof verify` fetch a lane's Cargo dependencies into a cache that the verifier mounts read-only: `~/.cache/cowproof/deps/<key>/`, or `$COWPROOF_CACHE_ROOT/deps/<key>/`. Nothing else removes an entry, so prune it.
 
+The fetch's network is `COWPROOF_FETCH_NETWORK`: `registry` (the default), `open` (full outbound network, an explicit opt-in) or `none`. In `registry` mode `cargo fetch --locked` runs in a sandbox with no network of its own and reaches a small CONNECT proxy that `cowproof` runs outside it. The proxy tunnels only to port 443 of an allowlist built from the base commit: `index.crates.io`, `static.crates.io` and `crates.io`, the https hosts of the registries and git sources in the base's `.cargo/config.toml`, and the base `cowproof.toml`'s `[proof] fetch_hosts = ["git.example"]` for the hosts of git dependencies you allow. A patch never adds to it. A fetch that needs any other host fails as infrastructure (exit 4) and the message names the host. A signal during the fetch ends it with the run.
+
 ```
 cowproof cache                 # same as `cache ls`: root, entry count, total size, oldest last use
 cowproof cache ls

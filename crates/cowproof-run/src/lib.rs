@@ -17,6 +17,7 @@ pub mod claude;
 pub mod codex;
 pub mod deps;
 pub mod director;
+pub mod fetch_proxy;
 pub mod lane;
 pub mod models;
 pub mod opencode;
@@ -48,7 +49,10 @@ pub enum NetworkMode {
     /// its own empty network namespace (`--unshare-net`) and the port is only
     /// the bridge's address in it.
     Proxy { port: u16, socket: PathBuf },
-    /// Registry-only access through the proxy.
+    /// Registry-only access, for the dependency fetch: rendered exactly like `Proxy` (one
+    /// Unix socket, reached through the in-sandbox bridge), but the socket is served by the
+    /// fetch's CONNECT proxy ([`fetch_proxy`]), which tunnels only to `host:443` of the
+    /// base's allowlist.
     RegistryReadOnly { port: u16, socket: PathBuf },
     /// Unrestricted network (legacy: current runner until egress proxy lands).
     /// Documented as legacy; used ONLY by existing CLI runner with explicit opt-in.
@@ -394,8 +398,8 @@ impl SandboxPolicy {
         }
     }
 
-    /// Dependency fetch: write to cache_dir; read-only registry access.
-    /// network: must be passed by caller
+    /// Dependency fetch: write to cache_dir. `network` is the caller's choice: `None`,
+    /// `RegistryReadOnly` (the default fetch) or `Unrestricted` (explicit opt-in).
     pub fn dependency_fetch(lane: &LaneLayout, cache_dir: &Path, network: NetworkMode) -> Self {
         Self {
             rw_paths: vec![cache_dir.to_path_buf()],

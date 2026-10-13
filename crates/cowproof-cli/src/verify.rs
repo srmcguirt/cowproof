@@ -12,20 +12,27 @@ use cowproof_core::{PORT_CLASS, class_limit_at_commit, get_slot_dir, port_base_f
 use cowproof_prove::{
     Capsule, VerifyError,
     runner::{
-        SandboxedRunner, SlotGuard, acquire_slot_notifying, host_platform, verifier_toolchain,
+        GroupEnd, GroupSet, SandboxedRunner, SlotGuard, acquire_slot_notifying, host_platform,
+        run_in_group_blocking, verifier_toolchain,
     },
     verify::{VerifyOptions, VerifyResult, remove_launch_paths, verify},
 };
 use cowproof_run::{
     LaneLayout,
-    deps::{self, FETCH_TIMEOUT, FetchNetwork, FetchOutcome, FetchTools, Prefetch},
+    deps::{
+        self, FETCH_RESOLVE_ENV, FETCH_TIMEOUT, FetchConfig, FetchEgress, FetchEnd, FetchNetwork,
+        FetchOutcome, FetchTools, Prefetch,
+    },
+    fetch_proxy::Resolver,
     lane_tmp, link_dependency_cache,
 };
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[derive(Parser)]
 #[command(after_help = "\
@@ -37,8 +44,10 @@ refutation).
 
 Dependencies: a capsule whose tree has a Cargo.lock names a dependency cache key. The cache \
 is <cache root>/deps/<key>, the cache root being ~/.cache/cowproof or $COWPROOF_CACHE_ROOT; \
-verify fetches it (cargo fetch --locked, in a sandbox; the network is $COWPROOF_FETCH_NETWORK, \
-`open` by default or `none`) when it is absent, and mounts it read-only for the checks.")]
+verify fetches it (cargo fetch --locked, in a sandbox; the network is $COWPROOF_FETCH_NETWORK: \
+`registry` by default, a proxy that tunnels only to the base's registry hosts and the base \
+cowproof.toml's [proof] fetch_hosts; `open` for full outbound network; or `none`) when it is \
+absent, and mounts it read-only for the checks.")]
 pub struct VerifyArgs {
     /// The capsule directory (`control/capsule` of a lane)
     capsule_dir: PathBuf,
@@ -169,27 +178,80 @@ fn apply(tree: &Path, patch: &[u8]) -> Result<()> {
 /// Fetch (or find in the cache) the dependencies of the tree `rebuild` describes, before
 /// verify runs (D6, D11, D14). `Ok(None)`: nothing to fetch. The fetch is blocking work,
 /// so it runs off the async threads.
+///
+/// `groups` is the run's [`GroupSet`] (`cowproof run`; `cowproof verify` has none): the
+/// `cargo fetch` command is its own process group, listed there while it runs, so a signal
+/// that ends the run's groups ends the fetch with them. A fetch that has not started its
+/// command when this future is dropped (the signal came during the rebuild) never starts it.
 pub(crate) async fn fetch_dependencies(
     rebuild: Rebuild,
     layout: &LaneLayout,
+    groups: Option<Arc<GroupSet>>,
 ) -> Result<Option<Prefetch>> {
     let network = FetchNetwork::from_env()?;
+    let resolver = match std::env::var(FETCH_RESOLVE_ENV) {
+        Ok(spec) => {
+            Resolver::parse(&spec).with_context(|| format!("reading {FETCH_RESOLVE_ENV}"))?
+        }
+        Err(_) => Resolver::system(),
+    };
     let (path, cargo) = verifier_toolchain(&layout.real_home).map_err(|e| anyhow!("{e}"))?;
+    // The executable that runs `net-bridge` inside the registry-only fetch sandbox, resolved
+    // as the proof does for the port replay.
+    let bridge_exe = std::env::current_exe()
+        .and_then(|p| p.canonicalize())
+        .context("locating the cowproof executable for the fetch's bridge")?;
     let root = deps::cache_root(&layout.real_home);
     let layout = layout.clone();
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let _cancel = CancelOnDrop(cancelled.clone());
     tokio::task::spawn_blocking(move || {
+        let tools = FetchTools { path, cargo };
+        let egress = FetchEgress {
+            bridge_exe,
+            resolver,
+        };
+        let exec = |command: Command, timeout: Duration| -> Result<FetchEnd> {
+            if cancelled.load(Ordering::SeqCst) {
+                bail!("the run was interrupted before the fetch command started");
+            }
+            let ran = run_in_group_blocking(command, timeout, Duration::ZERO, groups.as_deref())
+                .map_err(|e| anyhow!("{e}"))?;
+            Ok(match ran.end {
+                GroupEnd::Exited(status) => {
+                    let mut output = ran.stdout;
+                    output.extend_from_slice(&ran.stderr);
+                    FetchEnd::Exited { status, output }
+                }
+                GroupEnd::TimedOut => FetchEnd::TimedOut,
+            })
+        };
         deps::prefetch(
             |tree| rebuild.build(tree),
             &root,
             &layout,
-            network,
-            &FetchTools { path, cargo },
-            FETCH_TIMEOUT,
-            &crate::cache::alive,
+            &FetchConfig {
+                network,
+                tools: &tools,
+                timeout: FETCH_TIMEOUT,
+                alive: &crate::cache::alive,
+                exec: &exec,
+                egress: Some(&egress),
+            },
         )
     })
     .await
     .context("the dependency fetch task died")?
+}
+
+/// Sets a flag when dropped: the future that holds it was dropped (the run was signalled), or
+/// finished, and the blocking fetch must not start a command after that.
+struct CancelOnDrop(Arc<AtomicBool>);
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
 }
 
 /// The dependency cache a capsule's checks need, for `cowproof verify`: the capsule's
@@ -214,7 +276,7 @@ async fn capsule_dependencies(
         launch_removed: capsule.launch_removed.clone(),
         lane_patch: read("lane.patch").unwrap_or_default(),
     };
-    match fetch_dependencies(rebuild, layout).await {
+    match fetch_dependencies(rebuild, layout, None).await {
         Err(e) => Err(format!("dependency fetch could not run: {e:#}")),
         Ok(None) => Err(format!(
             "the capsule names dependency cache {key}, but the rebuilt tree has no Cargo.lock"

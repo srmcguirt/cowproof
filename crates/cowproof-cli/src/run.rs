@@ -4792,7 +4792,7 @@ async fn replay_and_gate(
         lane_patch: lane_patch.clone(),
     };
     let mut deps_dir = None;
-    match fetch_dependencies(rebuild, layout).await {
+    match fetch_dependencies(rebuild, layout, Some(input.groups.clone())).await {
         Ok(None) => {}
         Ok(Some(fetch)) => {
             capsule.dependency_cache_key = Some(fetch.key.clone());

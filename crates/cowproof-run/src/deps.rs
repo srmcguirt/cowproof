@@ -15,13 +15,27 @@
 //! * **The fetch sandbox** ([`SandboxPolicy::dependency_fetch`]): it may write only its
 //!   own work directory (the `CARGO_HOME` it fills and a private `HOME`) and read the
 //!   rebuilt tree, the toolchain and the one `cargo` executable. It holds no key (its
-//!   environment is `PATH`, `CARGO_HOME`, `RUSTUP_HOME` and `HOME`, nothing inherited),
-//!   cannot see the lane's control directory, the other lanes or the real home, and
-//!   `cargo fetch` runs no `build.rs` and no procedural macro. Its NETWORK is the one
-//!   knob: [`FetchNetwork`], `COWPROOF_FETCH_NETWORK`. The default is `open`, full
-//!   outbound network (a registry-only egress filter does not exist yet, so the
-//!   alternatives are this or no real project ever fetches); `none` is a sandbox with no
-//!   network at all, enough for a registry that is a directory in the repository.
+//!   environment is `PATH`, `CARGO_HOME`, `RUSTUP_HOME`, `HOME` and the proxy variables
+//!   below, nothing inherited), cannot see the lane's control directory, the other lanes or
+//!   the real home, and `cargo fetch` runs no `build.rs` and no procedural macro. Its
+//!   NETWORK is the one knob: [`FetchNetwork`], `COWPROOF_FETCH_NETWORK`, read by
+//!   `FetchNetwork::from_env` (called by `fetch_dependencies` in `cowproof-cli`, which both
+//!   `cowproof run` and `cowproof verify` use).
+//!   * `registry` (the default): no network of its own. The sandbox reaches one Unix socket
+//!     through the in-sandbox bridge (`cowproof net-bridge`, as a builder does for its model
+//!     proxy), and `CARGO_HTTP_PROXY` / `HTTPS_PROXY` point `cargo` at the bridge. The
+//!     runner serves that socket with a CONNECT proxy ([`crate::fetch_proxy`]) that tunnels
+//!     only to `host:443` of an allowlist built from the base: the crates.io hosts, the https
+//!     hosts of the registries and git sources the base's cargo configuration names, and
+//!     the base `cowproof.toml`'s `[proof] fetch_hosts`. A refused host fails the fetch as
+//!     infrastructure (F-1) and is named in the message.
+//!   * `open`: full outbound network, an explicit opt-in. The sandbox still holds no key,
+//!     no control directory and no home.
+//!   * `none`: a sandbox with no network at all, enough for a registry that is a directory
+//!     in the repository (the tests use it).
+//! * **Process group**: the fetch command is its own process group, listed in the run's
+//!   `cowproof_prove::runner::GroupSet` when the caller has one (the caller's `exec`), so
+//!   a signal ends it with the run instead of leaving it to run out [`FETCH_TIMEOUT`].
 //! * **Cache root**: `~/.cache/cowproof`, or the directory named by the environment
 //!   variable `COWPROOF_CACHE_ROOT` ([`CACHE_ROOT_ENV`]). Tests set it so they never touch
 //!   the real cache.
@@ -32,7 +46,9 @@
 //!   without one has nothing to fetch and no cache entry. npm and the others are in the
 //!   backlog, not here.
 
+use crate::bridge::bridge_port;
 use crate::cache::{self, Alive};
+use crate::fetch_proxy::{self, FetchAllowlist, FetchProxy, Resolver};
 use crate::{
     LaneLayout, NetworkMode, REGISTRY_CONFIGS, SandboxPolicy, dependency_cache_key,
     render_macos_profile, sandbox_command,
@@ -40,17 +56,22 @@ use crate::{
 use anyhow::{Context, Result, bail};
 use std::ffi::OsString;
 use std::fs;
-use std::io::Read;
-use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::process::{Command, ExitStatus};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// The environment variable that overrides the cache root.
 pub const CACHE_ROOT_ENV: &str = "COWPROOF_CACHE_ROOT";
 
-/// The environment variable that picks the fetch's network: `open` (default) or `none`.
+/// The environment variable that picks the fetch's network: `registry` (default), `open`
+/// or `none`.
 pub const FETCH_NETWORK_ENV: &str = "COWPROOF_FETCH_NETWORK";
+
+/// The environment variable that fixes the address of allowed registry hosts, as
+/// `host=ip:port[,host=ip:port...]` ([`Resolver::parse`]). It only changes where an
+/// ALLOWED name connects (a registry behind a split-horizon resolver, a test's fake on
+/// `127.0.0.1`); it never admits a name the allowlist refuses.
+pub const FETCH_RESOLVE_ENV: &str = "COWPROOF_FETCH_RESOLVE";
 
 /// How long one `cargo fetch` may take.
 pub const FETCH_TIMEOUT: Duration = Duration::from_secs(15 * 60);
@@ -75,34 +96,68 @@ pub fn cache_dir(cache_root: &Path, key: &str) -> PathBuf {
 /// What network the fetch sandbox gets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FetchNetwork {
-    /// Full outbound network. The sandbox still holds no key, no control directory and
-    /// no home.
+    /// Registry-only: the sandbox reaches a CONNECT proxy, run by the runner, that tunnels
+    /// only to `host:443` of the base's allowlist ([`crate::fetch_proxy`]). The default.
+    Registry,
+    /// Full outbound network, an explicit opt-in. The sandbox still holds no key, no
+    /// control directory and no home.
     Open,
     /// No network at all.
     None,
 }
 
 impl FetchNetwork {
-    /// From `COWPROOF_FETCH_NETWORK`: unset or empty is `open`.
+    /// From `COWPROOF_FETCH_NETWORK`: unset or empty is `registry`.
     pub fn from_env() -> Result<Self> {
         Self::parse(std::env::var(FETCH_NETWORK_ENV).ok().as_deref())
     }
 
     fn parse(value: Option<&str>) -> Result<Self> {
         match value {
-            None | Some("") | Some("open") => Ok(Self::Open),
+            None | Some("") | Some("registry") => Ok(Self::Registry),
+            Some("open") => Ok(Self::Open),
             Some("none") => Ok(Self::None),
-            Some(other) => bail!("{FETCH_NETWORK_ENV} must be `open` or `none`, not {other:?}"),
+            Some(other) => {
+                bail!("{FETCH_NETWORK_ENV} must be `registry`, `open` or `none`, not {other:?}")
+            }
         }
     }
+}
 
-    /// The sandbox network mode.
-    pub fn mode(self) -> NetworkMode {
-        match self {
-            Self::Open => NetworkMode::Unrestricted,
-            Self::None => NetworkMode::None,
-        }
-    }
+/// What it takes to serve the registry-only mode.
+#[derive(Debug, Clone)]
+pub struct FetchEgress {
+    /// The `cowproof` executable that runs `net-bridge` inside the fetch sandbox. It is
+    /// granted read-only there, like a builder's.
+    pub bridge_exe: PathBuf,
+    /// Where an allowed name connects.
+    pub resolver: Resolver,
+}
+
+/// How the fetch's command ended, as the caller's runner reports it.
+#[derive(Debug)]
+pub enum FetchEnd {
+    /// The command exited; its group is gone. `output` is its stdout then stderr.
+    Exited { status: ExitStatus, output: Vec<u8> },
+    /// It did not finish within the limit and its group was ended.
+    TimedOut,
+}
+
+/// Runs the fetch's command as the leader of its own process group, listed wherever the
+/// caller keeps its groups, and ends the whole group when the command is over or the time
+/// is up. `cowproof-cli` supplies it (`cowproof_prove::runner::run_in_group_blocking` with
+/// the run's `GroupSet`); this crate cannot, because the verifier depends on it.
+pub type Exec<'a> = &'a dyn Fn(Command, Duration) -> Result<FetchEnd>;
+
+/// What one [`prefetch`] call runs with.
+pub struct FetchConfig<'a> {
+    pub network: FetchNetwork,
+    pub tools: &'a FetchTools,
+    pub timeout: Duration,
+    pub alive: Alive<'a>,
+    pub exec: Exec<'a>,
+    /// Needed by [`FetchNetwork::Registry`]; the other modes ignore it.
+    pub egress: Option<&'a FetchEgress>,
 }
 
 /// The platform part of the cache key (D14): what the fetch is for.
@@ -151,7 +206,8 @@ pub struct FetchTools {
     pub cargo: Option<PathBuf>,
 }
 
-/// The registry configuration files of a tree, as they were at one moment.
+/// The registry configuration files of a tree, and its `cowproof.toml` (whose
+/// `[proof] fetch_hosts` the fetch's allowlist reads), as they were at one moment.
 ///
 /// Take it after the base is rebuilt and before `lane.patch` is applied, and
 /// [`restore`](Self::restore) it afterwards: whatever the patch did to those files, the
@@ -163,7 +219,9 @@ impl RegistryConfigSnapshot {
     /// Read every registry configuration file of `tree` (`None` for an absent one).
     pub fn take(tree: &Path) -> Result<Self> {
         let mut files = Vec::new();
-        for name in REGISTRY_CONFIGS {
+        // The registry configuration, and the `cowproof.toml` whose `[proof] fetch_hosts`
+        // widens the fetch's allowlist: both the base's, whatever the patch did.
+        for name in REGISTRY_CONFIGS.iter().chain(&[fetch_proxy::POLICY_FILE]) {
             let path = tree.join(name);
             let content = match fs::symlink_metadata(&path) {
                 Ok(m) if m.is_file() => {
@@ -224,11 +282,9 @@ pub fn prefetch(
     rebuild: impl FnOnce(&Path) -> Result<()>,
     cache_root: &Path,
     lane: &LaneLayout,
-    network: FetchNetwork,
-    tools: &FetchTools,
-    timeout: Duration,
-    alive: Alive,
+    config: &FetchConfig,
 ) -> Result<Option<Prefetch>> {
+    let alive = config.alive;
     // Ask first, create after: a root that already holds things cowproof did not make is
     // not swept (below), though the fetch still works there.
     let owned = cache::require_owned(cache_root, &lane.real_home);
@@ -249,40 +305,19 @@ pub fn prefetch(
     let stamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
     let work = work_root.join(format!("{}-{stamp}", std::process::id()));
     fs::create_dir(&work).context("creating the dependency work directory")?;
-    let run = FetchRun {
-        lane,
-        network,
-        tools,
-        timeout,
-        alive,
-    };
-    let result = prefetch_in(&work, rebuild, cache_root, &run);
+    let result = prefetch_in(&work, rebuild, cache_root, lane, config);
     let _ = fs::remove_dir_all(&work);
     result
-}
-
-/// What one [`prefetch`] call runs with.
-struct FetchRun<'a> {
-    lane: &'a LaneLayout,
-    network: FetchNetwork,
-    tools: &'a FetchTools,
-    timeout: Duration,
-    alive: Alive<'a>,
 }
 
 fn prefetch_in(
     work: &Path,
     rebuild: impl FnOnce(&Path) -> Result<()>,
     cache_root: &Path,
-    run: &FetchRun,
+    lane: &LaneLayout,
+    config: &FetchConfig,
 ) -> Result<Option<Prefetch>> {
-    let FetchRun {
-        lane,
-        network,
-        tools,
-        timeout,
-        alive,
-    } = *run;
+    let alive = config.alive;
     let tree = work.join("tree");
     fs::create_dir(&tree)?;
     rebuild(&tree).context("rebuilding the tree to fetch dependencies for")?;
@@ -323,7 +358,7 @@ fn prefetch_in(
     }
 
     let fresh = work.join("new");
-    let outcome = match fetch_cargo(work, &tree, &fresh, lane, network, tools, timeout) {
+    let outcome = match fetch_cargo(work, &tree, &fresh, lane, config) {
         Ok(()) => match install(&fresh, &dir) {
             Ok(outcome) => match claim() {
                 Ok(()) => outcome,
@@ -382,10 +417,16 @@ fn fetch_cargo(
     tree: &Path,
     fresh: &Path,
     lane: &LaneLayout,
-    network: FetchNetwork,
-    tools: &FetchTools,
-    timeout: Duration,
+    config: &FetchConfig,
 ) -> Result<()> {
+    let FetchConfig {
+        network,
+        tools,
+        timeout,
+        exec,
+        egress,
+        ..
+    } = *config;
     let cargo_home = fresh.join("cargo");
     let home = work.join("home");
     fs::create_dir_all(&cargo_home).context("creating the fetch CARGO_HOME")?;
@@ -394,7 +435,43 @@ fn fetch_cargo(
     fs::create_dir_all(cargo_home.join("registry"))?;
     fs::create_dir_all(&home)?;
 
-    let mut policy = SandboxPolicy::dependency_fetch(lane, fresh, network.mode());
+    // The registry-only mode: serve the allowlist's proxy on a socket in the work
+    // directory before the sandbox is rendered (the policy names the socket), and stop it
+    // when the fetch is over, whatever the fetch came to.
+    let registry = match network {
+        FetchNetwork::Registry => {
+            let egress = egress.context(
+                "the registry-only fetch needs the cowproof executable that runs the bridge",
+            )?;
+            // Read from the tree, which the caller rebuilt with the BASE's cargo
+            // configuration and `cowproof.toml` (see `RegistryConfigSnapshot`), never the
+            // patch's.
+            let allow = FetchAllowlist::from_tree(tree)
+                .context("building the fetch's host allowlist from the base")?;
+            let socket = work.join("fetch.sock");
+            let port = free_bridge_port(
+                work.file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default()
+                    .as_str(),
+            )?;
+            let proxy = FetchProxy::new(allow.clone(), egress.resolver.clone())
+                .start(&socket)
+                .context("starting the registry-only fetch proxy")?;
+            Some((proxy, allow, socket, port, egress.bridge_exe.clone()))
+        }
+        _ => None,
+    };
+
+    let sandbox_network = match (&registry, network) {
+        (Some((_, _, socket, port, _)), _) => NetworkMode::RegistryReadOnly {
+            port: *port,
+            socket: socket.clone(),
+        },
+        (None, FetchNetwork::Open) => NetworkMode::Unrestricted,
+        (None, _) => NetworkMode::None,
+    };
+    let mut policy = SandboxPolicy::dependency_fetch(lane, fresh, sandbox_network);
     policy.rw_paths.push(home.clone());
     policy.ro_paths.push(tree.to_path_buf());
     if let Some(cargo) = tools
@@ -417,6 +494,27 @@ fn fetch_cargo(
         "CARGO_HOME".to_string(),
         cargo_home.to_string_lossy().into_owned(),
     )];
+    let mut argv = vec![program, "fetch".to_string(), "--locked".to_string()];
+    if let Some((_, _, socket, port, bridge_exe)) = &registry {
+        // cargo cannot speak to a Unix socket: the bridge, started inside the sandbox by the
+        // wrapper, listens on 127.0.0.1:<port> and copies bytes to the proxy's socket.
+        let url = format!("http://127.0.0.1:{port}");
+        for key in ["CARGO_HTTP_PROXY", "HTTPS_PROXY", "https_proxy"] {
+            policy.env_set.push((key.to_string(), url.clone()));
+        }
+        policy.executables.push(bridge_exe.clone());
+        let mut wrapped = vec![
+            bridge_exe.to_string_lossy().into_owned(),
+            "net-bridge".to_string(),
+            "--port".to_string(),
+            port.to_string(),
+            "--target".to_string(),
+            socket.to_string_lossy().into_owned(),
+            "--".to_string(),
+        ];
+        wrapped.append(&mut argv);
+        argv = wrapped;
+    }
     policy.apply_env(&mut env);
 
     let profile = work.join("fetch.sb");
@@ -429,76 +527,85 @@ fn fetch_cargo(
         fs::write(&profile, render_macos_profile(&policy)?)
             .context("writing the fetch sandbox profile")?;
     }
-    let argv = [program, "fetch".to_string(), "--locked".to_string()];
     let (sandbox_bin, sandbox_args) = sandbox_command(&policy, &profile, &argv, platform)?;
 
-    // Output goes to a file the runner opened, so the sandboxed process needs no grant
-    // for it and nothing can fill a pipe while this thread waits.
-    let log_path = work.join("fetch.log");
-    let log = fs::File::create(&log_path)?;
     let mut command = Command::new(sandbox_bin);
     command
         .args(sandbox_args)
         .env_clear()
         .envs(env)
-        .current_dir(tree)
-        .stdin(Stdio::null())
-        .stdout(log.try_clone()?)
-        .stderr(log)
-        .process_group(0);
-    let mut child = command
-        .spawn()
-        .context("starting the sandboxed cargo fetch")?;
-    let pgid = child.id() as i32;
-    let deadline = Instant::now() + timeout;
-    let status = loop {
-        if let Some(status) = child.try_wait()? {
-            break status;
-        }
-        if Instant::now() >= deadline {
-            kill_group(pgid);
-            let _ = child.wait();
-            bail!(
-                "cargo fetch --locked timed out after {}s",
-                timeout.as_secs()
-            );
-        }
-        std::thread::sleep(Duration::from_millis(25));
+        .current_dir(tree);
+    let ended = exec(command, timeout).context("running the sandboxed cargo fetch");
+    // Stop the proxy before judging the fetch: a host it refused is the likely reason a
+    // fetch failed, and the message names it first.
+    let refused = match registry {
+        Some((proxy, allow, ..)) => (proxy.stop(), allow.hosts().join(", ")),
+        None => (Vec::new(), String::new()),
     };
-    // The leader is gone; nothing it started may outlive the fetch.
-    kill_group(pgid);
-    if !status.success() {
-        bail!(
-            "cargo fetch --locked failed ({status}): {}",
-            tail(&log_path, 1500)
-        );
+    let named = if refused.0.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "the registry-only fetch refused a connection to {} (allowed: {}; name a git \
+             dependency's host in `[proof] fetch_hosts` of the base cowproof.toml, or set \
+             {FETCH_NETWORK_ENV}=open): ",
+            refused.0.join(", "),
+            refused.1
+        )
+    };
+    match ended? {
+        FetchEnd::TimedOut => bail!(
+            "{named}cargo fetch --locked timed out after {}s",
+            timeout.as_secs()
+        ),
+        FetchEnd::Exited { status, output } if !status.success() => bail!(
+            "{named}cargo fetch --locked failed ({status}): {}",
+            tail(&output, 1500)
+        ),
+        FetchEnd::Exited { .. } => Ok(()),
     }
-    Ok(())
 }
 
-fn kill_group(pgid: i32) {
-    // SAFETY: killpg only signals the process group this function started.
-    unsafe {
-        libc::killpg(pgid, libc::SIGKILL);
+/// A bridge port that is free on this host now, drawn from the bridge range by a hash of
+/// `seed` (a name unique to this fetch). On macOS the sandbox shares the host's loopback,
+/// so two bridges must not share a port; on Linux the sandbox has a network namespace of its
+/// own and the port is only an address in it. The first of a few draws that binds wins.
+fn free_bridge_port(seed: &str) -> Result<u16> {
+    for n in 0..16 {
+        let port = bridge_port(&format!("fetch-{seed}-{n}"));
+        if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
+            return Ok(port);
+        }
     }
+    bail!("no free bridge port for the registry-only fetch")
 }
 
 /// The last `max` bytes of a log, on one line.
-fn tail(path: &Path, max: usize) -> String {
-    let mut text = String::new();
-    if let Ok(mut f) = fs::File::open(path) {
-        let mut bytes = Vec::new();
-        let _ = f.read_to_end(&mut bytes);
-        let from = bytes.len().saturating_sub(max);
-        text = String::from_utf8_lossy(&bytes[from..]).into_owned();
-    }
-    text.split_whitespace().collect::<Vec<_>>().join(" ")
+fn tail(bytes: &[u8], max: usize) -> String {
+    let from = bytes.len().saturating_sub(max);
+    String::from_utf8_lossy(&bytes[from..])
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    /// A fetch configuration for a test that never reaches the command: running one is a
+    /// failure of the test.
+    fn config<'a>(tools: &'a FetchTools, alive: Alive<'a>) -> FetchConfig<'a> {
+        FetchConfig {
+            network: FetchNetwork::None,
+            tools,
+            timeout: Duration::from_secs(5),
+            alive,
+            exec: &|_, _| bail!("this test must not run the fetch command"),
+            egress: None,
+        }
+    }
 
     fn complete_entry(dir: &Path) {
         fs::create_dir_all(dir.join("cargo/registry")).unwrap();
@@ -526,9 +633,16 @@ mod tests {
     }
 
     #[test]
-    fn the_fetch_network_defaults_to_open_and_none_is_a_sandbox_without_network() {
-        assert_eq!(FetchNetwork::parse(None).unwrap(), FetchNetwork::Open);
-        assert_eq!(FetchNetwork::parse(Some("")).unwrap(), FetchNetwork::Open);
+    fn the_fetch_network_defaults_to_registry_and_open_and_none_are_opt_ins() {
+        assert_eq!(FetchNetwork::parse(None).unwrap(), FetchNetwork::Registry);
+        assert_eq!(
+            FetchNetwork::parse(Some("")).unwrap(),
+            FetchNetwork::Registry
+        );
+        assert_eq!(
+            FetchNetwork::parse(Some("registry")).unwrap(),
+            FetchNetwork::Registry
+        );
         assert_eq!(
             FetchNetwork::parse(Some("open")).unwrap(),
             FetchNetwork::Open
@@ -537,10 +651,15 @@ mod tests {
             FetchNetwork::parse(Some("none")).unwrap(),
             FetchNetwork::None
         );
-        assert_eq!(FetchNetwork::None.mode(), NetworkMode::None);
-        assert_eq!(FetchNetwork::Open.mode(), NetworkMode::Unrestricted);
         let e = FetchNetwork::parse(Some("proxy")).unwrap_err().to_string();
-        assert!(e.contains(FETCH_NETWORK_ENV) && e.contains("proxy"), "{e}");
+        assert!(
+            e.contains(FETCH_NETWORK_ENV)
+                && e.contains("proxy")
+                && e.contains("registry")
+                && e.contains("open")
+                && e.contains("none"),
+            "{e}"
+        );
     }
 
     #[test]
@@ -648,6 +767,50 @@ mod tests {
     }
 
     #[test]
+    fn the_allowlist_of_the_restored_tree_is_the_bases_whatever_the_patch_did() {
+        let tmp = TempDir::new().unwrap();
+        let t = tmp.path();
+        fs::write(
+            t.join("cowproof.toml"),
+            "[proof]\nfetch_hosts = [\"git.example\"]\n",
+        )
+        .unwrap();
+        let snapshot = RegistryConfigSnapshot::take(t).unwrap();
+        // The patch swaps the host for its own and adds a registry in the cargo config.
+        fs::write(
+            t.join("cowproof.toml"),
+            "[proof]\nfetch_hosts = [\"evil.example\"]\n",
+        )
+        .unwrap();
+        fs::create_dir_all(t.join(".cargo")).unwrap();
+        fs::write(
+            t.join(".cargo/config.toml"),
+            "[source.x]\nregistry = \"sparse+https://evil2.example/\"\n",
+        )
+        .unwrap();
+        snapshot.restore(t).unwrap();
+        let allow = FetchAllowlist::from_tree(t).unwrap();
+        assert!(allow.allows("git.example", 443), "{:?}", allow.hosts());
+        assert!(!allow.allows("evil.example", 443), "{:?}", allow.hosts());
+        assert!(!allow.allows("evil2.example", 443), "{:?}", allow.hosts());
+
+        // A base without the file: the patch's new one is removed.
+        let bare = TempDir::new().unwrap();
+        let snapshot = RegistryConfigSnapshot::take(bare.path()).unwrap();
+        fs::write(
+            bare.path().join("cowproof.toml"),
+            "[proof]\nfetch_hosts = [\"evil.example\"]\n",
+        )
+        .unwrap();
+        snapshot.restore(bare.path()).unwrap();
+        assert!(!bare.path().join("cowproof.toml").exists());
+        assert_eq!(
+            FetchAllowlist::from_tree(bare.path()).unwrap(),
+            FetchAllowlist::defaults()
+        );
+    }
+
+    #[test]
     fn restoring_never_follows_a_symlinked_parent_out_of_the_tree() {
         let tmp = TempDir::new().unwrap();
         let t = tmp.path().join("tree");
@@ -705,10 +868,7 @@ mod tests {
             },
             &root,
             &lane,
-            FetchNetwork::None,
-            &tools,
-            Duration::from_secs(5),
-            &|_| true,
+            &config(&tools, &|_| true),
         )
         .unwrap();
         assert!(got.is_none());
@@ -753,17 +913,9 @@ mod tests {
             dependency_cache_key(&t, &host_target()).unwrap()
         };
         complete_entry(&cache_dir(&root, &key));
-        let got = prefetch(
-            build,
-            &root,
-            &lane,
-            FetchNetwork::None,
-            &tools,
-            Duration::from_secs(5),
-            &|_| true,
-        )
-        .unwrap()
-        .unwrap();
+        let got = prefetch(build, &root, &lane, &config(&tools, &|_| true))
+            .unwrap()
+            .unwrap();
         assert_eq!(got.outcome, FetchOutcome::Hit);
         assert_eq!(got.key, key);
         assert_eq!(got.dir, cache_dir(&root, &key));
@@ -802,16 +954,7 @@ mod tests {
             path: String::new(),
             cargo: None,
         };
-        let got = prefetch(
-            |_| Ok(()),
-            &root,
-            &lane,
-            FetchNetwork::None,
-            &tools,
-            Duration::from_secs(5),
-            &|_| false,
-        )
-        .unwrap();
+        let got = prefetch(|_| Ok(()), &root, &lane, &config(&tools, &|_| false)).unwrap();
         assert!(got.is_none(), "the fetch itself ran");
         assert!(
             root.join(format!("deps-work/{dead}-1")).is_dir(),
@@ -837,16 +980,7 @@ mod tests {
             path: String::new(),
             cargo: None,
         };
-        prefetch(
-            |_| Ok(()),
-            &root,
-            &lane,
-            FetchNetwork::None,
-            &tools,
-            Duration::from_secs(5),
-            &|_| true,
-        )
-        .unwrap();
+        prefetch(|_| Ok(()), &root, &lane, &config(&tools, &|_| true)).unwrap();
         assert_eq!(
             fs::read_to_string(root.join(cache::MARKER)).unwrap(),
             cache::MARKER_BODY
@@ -879,10 +1013,7 @@ mod tests {
             |_| Ok(()),
             &root,
             &lane,
-            FetchNetwork::None,
-            &tools,
-            Duration::from_secs(5),
-            &|pid| pid == live,
+            &config(&tools, &|pid| pid == live),
         )
         .unwrap();
         assert!(got.is_none());
