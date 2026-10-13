@@ -283,6 +283,14 @@ fn lint_header_checks(header: &Header, packet_text: &str, findings: &mut Vec<Fin
                     format!("check {:?} has an empty command", check.id),
                 ));
             }
+            // A declared time limit must parse and lie between 1 second and 6 hours.
+            if let Err(why) = check.time_limit() {
+                findings.push(error(
+                    "invalid-check-timeout",
+                    None,
+                    format!("check {:?}: timeout {why}", check.id),
+                ));
+            }
             // Check for masked pipe in command
             if has_masking_pipe(&check.command) {
                 findings.push(error(
@@ -1649,6 +1657,61 @@ mod tests {
         );
         let findings = lint_packet(&text, &dir, &[]);
         assert!(has(&findings, "empty-check-command"));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn header_checks_timeout_out_of_range_or_unparseable_is_error() {
+        let dir = root();
+        for bad in [
+            r#""0s""#,
+            "0",
+            r#""420m""#,
+            "25200",
+            r#""25200s""#,
+            r#""7h""#,
+            r#""361m""#,
+            "21601",
+            r#""soon""#,
+            "1.5",
+            "-4",
+        ] {
+            let text = packet(
+                &format!(
+                    r#"{{"id":"test-to","owns":["x"],"checks":[{{"id":"slow","command":"cargo test","timeout":{bad}}}]}}"#
+                ),
+                "",
+            );
+            let findings = lint_packet(&text, &dir, &[]);
+            assert!(
+                has(&findings, "invalid-check-timeout"),
+                "timeout {bad} should trigger invalid-check-timeout: {:?}",
+                signatures(&findings)
+            );
+            assert!(
+                signatures(&findings)
+                    .iter()
+                    .any(|s| s.contains("[invalid-check-timeout]") && s.contains("\"slow\"")),
+                "the finding names the check: {:?}",
+                signatures(&findings)
+            );
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn header_checks_valid_timeouts_and_none_are_clean() {
+        let dir = root();
+        let text = packet(
+            r#"{"id":"test-to-ok","owns":["x"],"checks":[{"id":"a","command":"cargo test","timeout":"1s"},{"id":"b","command":"cargo fmt","timeout":"21600s"},{"id":"c","command":"cargo build","timeout":"360m"},{"id":"d","command":"true","timeout":90},{"id":"e","command":"true"}]}"#,
+            "",
+        );
+        let findings = lint_packet(&text, &dir, &[]);
+        assert!(
+            !has(&findings, "invalid-check-timeout"),
+            "{:?}",
+            signatures(&findings)
+        );
         fs::remove_dir_all(dir).unwrap();
     }
 

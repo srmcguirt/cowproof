@@ -6,6 +6,7 @@ use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 pub mod git_show;
 pub mod heldout;
@@ -89,6 +90,70 @@ pub struct Check {
     pub command: String,
     #[serde(default)]
     pub flaky: bool,
+    /// The check's own time limit, as written in the header: `"90s"`, `"20m"`, or an integer of
+    /// seconds. It is kept raw so a bad value parses (and `cowproof lint` names the check)
+    /// instead of failing the whole header; [`Check::time_limit`] reads it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout: Option<Value>,
+}
+
+/// The shortest time limit a check may declare.
+pub const MIN_CHECK_TIMEOUT: Duration = Duration::from_secs(1);
+/// The longest time limit a check may declare (6 hours).
+pub const MAX_CHECK_TIMEOUT: Duration = Duration::from_secs(6 * 60 * 60);
+
+/// Read a check's `timeout` value: `"<n>s"`, `"<n>m"` or an integer of seconds, from 1 second to
+/// 6 hours. The error says what was wrong, without the check's name (the caller adds it).
+pub fn parse_check_timeout(value: &Value) -> std::result::Result<Duration, String> {
+    let secs = match value {
+        Value::Number(n) => n
+            .as_u64()
+            .ok_or_else(|| format!("{n} is not a whole number of seconds"))?,
+        Value::String(text) => {
+            let (digits, unit) = match text.strip_suffix('s') {
+                Some(d) => (d, 1u64),
+                None => match text.strip_suffix('m') {
+                    Some(d) => (d, 60u64),
+                    None => {
+                        return Err(format!(
+                            "{text:?} must be \"<n>s\", \"<n>m\" or an integer of seconds"
+                        ));
+                    }
+                },
+            };
+            if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(format!(
+                    "{text:?} must be \"<n>s\", \"<n>m\" or an integer of seconds"
+                ));
+            }
+            digits
+                .parse::<u64>()
+                .ok()
+                .and_then(|n| n.checked_mul(unit))
+                .ok_or_else(|| format!("{text:?} is too large"))?
+        }
+        other => {
+            return Err(format!(
+                "{other} must be \"<n>s\", \"<n>m\" or an integer of seconds"
+            ));
+        }
+    };
+    let limit = Duration::from_secs(secs);
+    if limit < MIN_CHECK_TIMEOUT || limit > MAX_CHECK_TIMEOUT {
+        return Err(format!(
+            "{secs} s is outside the allowed range of 1 s to 6 h ({} s)",
+            MAX_CHECK_TIMEOUT.as_secs()
+        ));
+    }
+    Ok(limit)
+}
+
+impl Check {
+    /// The limit this check declares: `None` when it declares none (the default applies), an
+    /// error when the value is unparseable or out of range.
+    pub fn time_limit(&self) -> std::result::Result<Option<Duration>, String> {
+        self.timeout.as_ref().map(parse_check_timeout).transpose()
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -163,6 +228,16 @@ impl Header {
     }
     pub fn effort(&self) -> &str {
         self.effort.as_deref().unwrap_or("high")
+    }
+    /// The first check whose `timeout` is unparseable or out of range, as a message naming it.
+    /// `parse_header` accepts such a header so that `cowproof lint` can report it; the runner
+    /// refuses it before a lane exists.
+    pub fn check_limit_error(&self) -> Option<String> {
+        self.checks.iter().find_map(|c| {
+            c.time_limit()
+                .err()
+                .map(|e| format!("check {:?}: timeout {e}", c.id))
+        })
     }
 }
 
@@ -960,14 +1035,58 @@ mod tests {
                     id: "unit".into(),
                     command: "cargo test".into(),
                     flaky: false,
+                    timeout: None,
                 },
                 Check {
                     id: "fmt-all".into(),
                     command: "cargo fmt --check".into(),
                     flaky: true,
+                    timeout: None,
                 },
             ]
         );
+    }
+
+    #[test]
+    fn check_timeout_forms_and_range() {
+        use serde_json::json;
+        let ok = |v: Value| parse_check_timeout(&v);
+        assert_eq!(ok(json!("90s")).unwrap(), Duration::from_secs(90));
+        assert_eq!(ok(json!("20m")).unwrap(), Duration::from_secs(1200));
+        assert_eq!(ok(json!(45)).unwrap(), Duration::from_secs(45));
+        assert_eq!(ok(json!("1s")).unwrap(), MIN_CHECK_TIMEOUT);
+        assert_eq!(ok(json!("360m")).unwrap(), MAX_CHECK_TIMEOUT);
+        for bad in [
+            json!("0s"),
+            json!(0),
+            json!("361m"),
+            json!("7h"),
+            json!(21601),
+            json!("abc"),
+            json!("s"),
+            json!("-5s"),
+            json!("1.5s"),
+            json!(1.5),
+            json!(-3),
+            json!(true),
+            json!("18446744073709551615m"),
+        ] {
+            assert!(parse_check_timeout(&bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn header_with_a_bad_timeout_parses_and_names_the_check() {
+        let h = parse_header(
+            r#"<!-- lane {"id":"lane-t","owns":["a"],"checks":[{"id":"ok","command":"x","timeout":"5s"},{"id":"slow","command":"y","timeout":"7h"}]} -->"#,
+        )
+        .unwrap();
+        assert_eq!(
+            h.checks[0].time_limit().unwrap(),
+            Some(Duration::from_secs(5))
+        );
+        let err = h.check_limit_error().unwrap();
+        assert!(err.contains("\"slow\""), "{err}");
     }
 
     #[test]

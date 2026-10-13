@@ -264,6 +264,17 @@ struct CapsuleSpec<'a> {
 }
 
 fn write_capsule(dir: &Path, spec: &CapsuleSpec) {
+    write_capsule_with(dir, spec, &[], None);
+}
+
+/// `write_capsule`, with the time limit (milliseconds) recorded for some checks and, when
+/// given, a packet text written as the capsule's only packet version.
+fn write_capsule_with(
+    dir: &Path,
+    spec: &CapsuleSpec,
+    timeouts: &[(&str, u64)],
+    packet: Option<&str>,
+) {
     for (name, content) in spec.patches {
         std::fs::write(dir.join(name), content).unwrap();
     }
@@ -278,6 +289,7 @@ fn write_capsule(dir: &Path, spec: &CapsuleSpec) {
             output_len: None,
             end: None,
             verifier: None,
+            timeout_ms: timeouts.iter().find(|(t, _)| t == id).map(|(_, ms)| *ms),
         };
         std::fs::write(
             dir.join(format!("checks/{id}.json")),
@@ -303,6 +315,9 @@ fn write_capsule(dir: &Path, spec: &CapsuleSpec) {
         .map(|s| (*s).to_string())
         .collect();
     capsule.unsandboxed = spec.unsandboxed;
+    if let Some(packet) = packet {
+        crate::capsule::write_packet_versions(dir, &[(None, packet.to_string())]).unwrap();
+    }
     capsule.write(dir).unwrap();
 }
 
@@ -1629,6 +1644,309 @@ async fn test_check_timeout_is_infrastructure_naming_the_check_and_frees_the_slo
     );
 }
 
+/// A packet whose header declares `checks` (id, command, optional timeout JSON), as the capsule's
+/// only packet version.
+fn packet_declaring(checks: &[(&str, &str, Option<&str>)]) -> String {
+    let list: Vec<String> = checks
+        .iter()
+        .map(|(id, command, timeout)| {
+            let timeout = timeout.map_or_else(String::new, |t| format!(r#","timeout":{t}"#));
+            format!(r#"{{"id":"{id}","command":"{command}"{timeout}}}"#)
+        })
+        .collect();
+    format!(
+        "<!-- lane {{\"id\":\"lane-limits\",\"owns\":[\"src.txt\"],\"checks\":[{}]}} -->\n# Packet\n",
+        list.join(",")
+    )
+}
+
+/// A check records its own limit, and the verifier holds the replay to that limit, not to
+/// `default_timeout`: `sleep 30` recorded with 1 s ends in a timeout within a few seconds while
+/// the default would have allowed a minute. The error is infrastructure and names the check.
+#[tokio::test]
+async fn test_check_replays_under_its_recorded_limit_not_the_default() {
+    let c = chain();
+    let (capsule_dir, work) = dirs();
+    write_capsule_with(
+        capsule_dir.path(),
+        &CapsuleSpec {
+            base: &c.base,
+            patches: &[("lane.patch", &c.lane)],
+            launch_removed: &[".env"],
+            checks: &[("hangs", "sleep 30", 0)],
+            flaky: &[],
+            unsandboxed: false,
+        },
+        &[("hangs", 1000)],
+        None,
+    );
+    let mut opts = test_opts(work.path());
+    opts.default_timeout = Duration::from_secs(60);
+    let started = std::time::Instant::now();
+    let result = verify(
+        capsule_dir.path(),
+        c.repo.path(),
+        work.path(),
+        &ProcessRunner::new(),
+        opts,
+    )
+    .await;
+    match result {
+        Err(VerifyError::Infrastructure(msg)) => {
+            assert!(msg.contains("check hangs"), "{msg}");
+            assert!(msg.contains("Timeout"), "{msg}");
+        }
+        other => panic!("expected Infrastructure, got {other:?}"),
+    }
+    assert!(
+        started.elapsed() < Duration::from_secs(15),
+        "the 1 s limit held, not the 60 s default: {:?}",
+        started.elapsed()
+    );
+}
+
+/// The recorded limit wins in the other direction too: a check that needs longer than the
+/// verifier's default still passes under the limit it was recorded with.
+#[tokio::test]
+async fn test_recorded_limit_longer_than_the_default_lets_the_check_finish() {
+    let c = chain();
+    let (capsule_dir, work) = dirs();
+    write_capsule_with(
+        capsule_dir.path(),
+        &CapsuleSpec {
+            base: &c.base,
+            patches: &[("lane.patch", &c.lane)],
+            launch_removed: &[".env"],
+            checks: &[("naps", "sleep 1", 0)],
+            flaky: &[],
+            unsandboxed: false,
+        },
+        &[("naps", 30_000)],
+        None,
+    );
+    let mut opts = test_opts(work.path());
+    opts.default_timeout = Duration::from_millis(200);
+    let report = verify(
+        capsule_dir.path(),
+        c.repo.path(),
+        work.path(),
+        &ProcessRunner::new(),
+        opts,
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(report.result, VerifyResult::Reproduced),
+        "{report:?}"
+    );
+}
+
+/// A record with no limit (every capsule written before the field) is held to
+/// `default_timeout`, as before.
+#[tokio::test]
+async fn test_unset_limit_still_uses_the_default_timeout() {
+    let c = chain();
+    let (capsule_dir, work) = dirs();
+    write_capsule_with(
+        capsule_dir.path(),
+        &CapsuleSpec {
+            base: &c.base,
+            patches: &[("lane.patch", &c.lane)],
+            launch_removed: &[".env"],
+            checks: &[("hangs", "sleep 30", 0)],
+            flaky: &[],
+            unsandboxed: false,
+        },
+        &[],
+        None,
+    );
+    let mut opts = test_opts(work.path());
+    opts.default_timeout = Duration::from_secs(1);
+    let started = std::time::Instant::now();
+    let result = verify(
+        capsule_dir.path(),
+        c.repo.path(),
+        work.path(),
+        &ProcessRunner::new(),
+        opts,
+    )
+    .await;
+    assert!(
+        matches!(&result, Err(VerifyError::Infrastructure(m)) if m.contains("Timeout")),
+        "{result:?}"
+    );
+    assert!(started.elapsed() < Duration::from_secs(15));
+}
+
+/// A capsule written before `timeout_ms` existed (a check file with no such key, and no packet
+/// versions) still reads, seals and verifies.
+#[tokio::test]
+async fn test_capsule_from_before_timeout_ms_still_verifies() {
+    let c = chain();
+    let (capsule_dir, work) = dirs();
+    write_capsule(
+        capsule_dir.path(),
+        &CapsuleSpec {
+            base: &c.base,
+            patches: &[("lane.patch", &c.lane)],
+            launch_removed: &[".env"],
+            checks: &[("old", "echo old", 0)],
+            flaky: &[],
+            unsandboxed: false,
+        },
+    );
+    // Rewrite the check file in the shape the field's predecessors wrote, then seal again.
+    let mut capsule = Capsule::read(capsule_dir.path()).unwrap();
+    let old_shape = r#"{"command":"echo old","exit_status":0,"attempts":1,"duration_ms":1,"output_sha256":"ignored"}"#;
+    std::fs::write(capsule_dir.path().join("checks/old.json"), old_shape).unwrap();
+    capsule.write(capsule_dir.path()).unwrap();
+    assert!(
+        Capsule::read(capsule_dir.path()).is_ok(),
+        "the old-shape capsule is sealed and reads"
+    );
+    let raw = std::fs::read_to_string(capsule_dir.path().join("checks/old.json")).unwrap();
+    assert!(!raw.contains("timeout_ms"), "{raw}");
+
+    let runner = ScriptedRunner::new(&[("echo old", &[0])]);
+    let report = verify(
+        capsule_dir.path(),
+        c.repo.path(),
+        work.path(),
+        &runner,
+        test_opts(work.path()),
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(report.result, VerifyResult::Reproduced),
+        "{report:?}"
+    );
+}
+
+/// The header is what was proved: a capsule whose recorded limit differs from the one the
+/// packet header declares (or has none when the header declares one) is refused before any
+/// check runs.
+#[tokio::test]
+async fn test_recorded_limit_differing_from_the_header_is_refused() {
+    for (recorded, why) in [
+        (&[("unit", 3_000u64)][..], "a different limit"),
+        (&[][..], "no limit"),
+    ] {
+        let c = chain();
+        let (capsule_dir, work) = dirs();
+        write_capsule_with(
+            capsule_dir.path(),
+            &CapsuleSpec {
+                base: &c.base,
+                patches: &[("lane.patch", &c.lane)],
+                launch_removed: &[".env"],
+                checks: &[("unit", "echo unit", 0)],
+                flaky: &[],
+                unsandboxed: false,
+            },
+            recorded,
+            Some(&packet_declaring(&[("unit", "echo unit", Some(r#""2s""#))])),
+        );
+        let runner = ScriptedRunner::new(&[("echo unit", &[0])]);
+        let result = verify(
+            capsule_dir.path(),
+            c.repo.path(),
+            work.path(),
+            &runner,
+            test_opts(work.path()),
+        )
+        .await;
+        match result {
+            Err(VerifyError::CheckLimitMismatch(msg)) => {
+                assert!(msg.contains("\"unit\""), "{why}: {msg}");
+                assert!(msg.contains("2000 ms"), "{why}: {msg}");
+                assert!(
+                    msg.contains("the header is what was proved"),
+                    "{why}: {msg}"
+                );
+            }
+            other => panic!("{why}: expected CheckLimitMismatch, got {other:?}"),
+        }
+        assert_eq!(runner.call_count(), 0, "{why}: nothing ran");
+    }
+}
+
+/// A recorded limit equal to the header's reproduces; a check the header gives no limit may
+/// record the default the builder's runner used; an integer of seconds is the same as "<n>s".
+#[tokio::test]
+async fn test_recorded_limit_matching_the_header_reproduces() {
+    let c = chain();
+    let (capsule_dir, work) = dirs();
+    write_capsule_with(
+        capsule_dir.path(),
+        &CapsuleSpec {
+            base: &c.base,
+            patches: &[("lane.patch", &c.lane)],
+            launch_removed: &[".env"],
+            checks: &[("a", "echo a", 0), ("b", "echo b", 0), ("c", "echo c", 0)],
+            flaky: &[],
+            unsandboxed: false,
+        },
+        &[("a", 120_000), ("b", 1_200_000), ("c", 7_000)],
+        Some(&packet_declaring(&[
+            ("a", "echo a", Some(r#""2m""#)),
+            ("b", "echo b", None),
+            ("c", "echo c", Some("7")),
+        ])),
+    );
+    let runner = ScriptedRunner::new(&[("echo a", &[0]), ("echo b", &[0]), ("echo c", &[0])]);
+    let report = verify(
+        capsule_dir.path(),
+        c.repo.path(),
+        work.path(),
+        &runner,
+        test_opts(work.path()),
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(report.result, VerifyResult::Reproduced),
+        "{report:?}"
+    );
+}
+
+/// A recorded limit outside 1 s to 6 h is refused: a forged zero would time every check out at
+/// once, a huge one would hold the verifier for days.
+#[tokio::test]
+async fn test_recorded_limit_out_of_range_is_refused() {
+    for bad in [0u64, 999, 21_600_001] {
+        let c = chain();
+        let (capsule_dir, work) = dirs();
+        write_capsule_with(
+            capsule_dir.path(),
+            &CapsuleSpec {
+                base: &c.base,
+                patches: &[("lane.patch", &c.lane)],
+                launch_removed: &[".env"],
+                checks: &[("unit", "echo unit", 0)],
+                flaky: &[],
+                unsandboxed: false,
+            },
+            &[("unit", bad)],
+            None,
+        );
+        let runner = ScriptedRunner::new(&[("echo unit", &[0])]);
+        let result = verify(
+            capsule_dir.path(),
+            c.repo.path(),
+            work.path(),
+            &runner,
+            test_opts(work.path()),
+        )
+        .await;
+        assert!(
+            matches!(&result, Err(VerifyError::CheckLimitMismatch(m)) if m.contains("outside the allowed range")),
+            "{bad}: {result:?}"
+        );
+        assert_eq!(runner.call_count(), 0);
+    }
+}
+
 /// The slot is also released when the verifier fails before running any check.
 #[tokio::test]
 async fn test_slot_is_released_when_verification_errors() {
@@ -2135,6 +2453,7 @@ async fn an_unsealed_check_file_is_refused_and_never_run() {
         output_len: None,
         end: None,
         verifier: None,
+        timeout_ms: None,
     };
     std::fs::write(
         capsule_dir.path().join("checks/injected.json"),
@@ -2301,6 +2620,7 @@ fn load_checks_takes_its_ids_from_file_hashes_not_the_directory() {
             output_len: None,
             end: None,
             verifier: None,
+            timeout_ms: None,
         })
         .unwrap()
     };

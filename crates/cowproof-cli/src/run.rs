@@ -1803,16 +1803,29 @@ struct DeclaredChecks {
     context: Arc<CheckContext>,
 }
 
+/// The commands and own time limits of `checks`, keyed by id. A header whose limits do not parse
+/// was refused before the lane started (and a redirect's by lint), so none is dropped here.
+fn declared_commands(
+    checks: &[cowproof_core::Check],
+) -> BTreeMap<String, (String, Option<Duration>)> {
+    checks
+        .iter()
+        .map(|c| {
+            (
+                c.id.clone(),
+                (c.command.clone(), c.time_limit().ok().flatten()),
+            )
+        })
+        .collect()
+}
+
 impl DeclaredChecks {
     fn replace(&self, checks: &[cowproof_core::Check]) {
         *self
             .context
             .commands
             .write()
-            .unwrap_or_else(|e| e.into_inner()) = checks
-            .iter()
-            .map(|c| (c.id.clone(), c.command.clone()))
-            .collect();
+            .unwrap_or_else(|e| e.into_inner()) = declared_commands(checks);
         self.ids
             .replace(checks.iter().map(|c| c.id.clone()).collect());
     }
@@ -2511,7 +2524,8 @@ struct CheckContext {
     path: String,
     /// The director's runtime directories, read-only in every check's sandbox.
     runtime_dirs: Vec<RuntimeDir>,
-    commands: RwLock<BTreeMap<String, String>>,
+    /// Each declared check's command and its own time limit (`None`: `check_timeout`).
+    commands: RwLock<BTreeMap<String, (String, Option<Duration>)>>,
     /// One check at a time per lane (a builder can open several connections).
     slot: Semaphore,
     /// The first port of the lane's block (`COWPROOF_PORT_BASE`), the same one the builder gets.
@@ -2523,8 +2537,8 @@ struct CheckContext {
     /// terminal Ctrl-C does not reach it): the runner ends exactly these when the lane stops
     /// or the runner is signalled.
     groups: Arc<GroupSet>,
-    /// How long one check may run before its group is killed: `CHECK_TIMEOUT`, or the hidden
-    /// `--check-timeout-secs` (tests).
+    /// How long a check that declares no limit of its own may run before its group is killed:
+    /// `CHECK_TIMEOUT`, or the hidden `--check-timeout-secs` (tests).
     check_timeout: Duration,
 }
 
@@ -2535,22 +2549,24 @@ fn refused(output: impl Into<String>) -> CheckOutcome {
 /// Run one declared check in a fresh `SandboxPolicy::run_check` sandbox.
 /// Fails closed: if the sandbox cannot be built, nothing runs.
 async fn run_declared_check(ctx: Arc<CheckContext>, id: String) -> CheckOutcome {
-    let command = ctx
+    let declared = ctx
         .commands
         .read()
         .unwrap_or_else(|e| e.into_inner())
         .get(&id)
         .cloned();
-    let Some(command) = command else {
+    let Some((command, own_limit)) = declared else {
         return refused(format!("no command is declared for check {id:?}"));
     };
     let command = &command;
+    // The check's own limit, else the lane's default.
+    let limit = own_limit.unwrap_or(ctx.check_timeout);
     let Ok(_slot) = ctx.slot.acquire().await else {
         return refused("the check queue is closed");
     };
     if let Some(remote) = &ctx.remote {
         return remote
-            .run_check(&id, command, Some(ctx.port_base), ctx.check_timeout)
+            .run_check(&id, command, Some(ctx.port_base), limit)
             .await;
     }
     run_check_command(
@@ -2561,7 +2577,7 @@ async fn run_declared_check(ctx: Arc<CheckContext>, id: String) -> CheckOutcome 
         },
         command,
         Some(ctx.port_base),
-        ctx.check_timeout,
+        limit,
         &id,
         &ctx.groups,
     )
@@ -3244,6 +3260,9 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
     {
         bail!("the packet's maxCostUsd must be a positive number of US dollars");
     }
+    if let Some(why) = header.check_limit_error() {
+        bail!("the packet's {why}");
+    }
     let checks = &header.checks;
     if checks.is_empty() {
         eprintln!("warning: the packet declares no checks, so run_check will refuse every id");
@@ -3768,6 +3787,9 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
         .map(|host| RemoteLane::new(host, &header.id, &layout.control))
         .transpose()?;
     let tools_queue = queue.clone();
+    let check_timeout = args
+        .check_timeout_secs
+        .map_or(CHECK_TIMEOUT, Duration::from_secs);
     let table: CheckTable = checks.iter().map(|c| c.id.clone()).collect();
     let live_ids = LiveChecks::from(table);
     let check_groups = Arc::new(GroupSet::new());
@@ -3775,19 +3797,12 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
         layout: layout.clone(),
         path: runtime_dirs::prepend_to_path(&path, &runtime),
         runtime_dirs: runtime.clone(),
-        commands: RwLock::new(
-            checks
-                .iter()
-                .map(|c| (c.id.clone(), c.command.clone()))
-                .collect(),
-        ),
+        commands: RwLock::new(declared_commands(checks)),
         slot: Semaphore::new(1),
         port_base,
         remote: remote.clone(),
         groups: check_groups.clone(),
-        check_timeout: args
-            .check_timeout_secs
-            .map_or(CHECK_TIMEOUT, Duration::from_secs),
+        check_timeout,
     });
     let declared = DeclaredChecks {
         ids: live_ids.clone(),
@@ -4359,6 +4374,7 @@ pub async fn run_one(args: super::RunOneArgs) -> Result<i32> {
                 trace_totals: trace_totals.clone(),
                 host: remote.as_ref().map(|r| r.alias()),
                 runs: &runs,
+                check_timeout,
                 packet_versions: &lane_run.packet_versions,
                 runtime_dirs: &runtime,
             },
@@ -4659,6 +4675,8 @@ struct ProofInput<'a> {
     host: Option<&'a str>,
     /// What the builder's `run_check` calls came to, per check id: attempts and the last run.
     runs: &'a BTreeMap<String, CheckRunRecord>,
+    /// The limit a check with none of its own was held to (`CHECK_TIMEOUT` or the hidden flag).
+    check_timeout: Duration,
     /// Every version of the packet the lane ran under (see `LaneRun::packet_versions`).
     packet_versions: &'a [(Option<String>, String)],
     /// The runtime directories the director granted (`--runtime-dir`): read-only and on the
@@ -5051,7 +5069,12 @@ async fn replay_and_gate(
     let checks_dir = capsule_dir.join("checks");
     fs::create_dir_all(&checks_dir)?;
     for (check, passed) in ran {
-        let recorded = check_result(check, *passed, input.runs.get(&check.id));
+        let recorded = check_result(
+            check,
+            *passed,
+            input.runs.get(&check.id),
+            input.check_timeout,
+        );
         fs::write(
             checks_dir.join(format!("{}.json", check.id)),
             serde_json::to_vec_pretty(&recorded)?,
@@ -5184,7 +5207,11 @@ fn check_result(
     check: &cowproof_core::Check,
     passed: bool,
     run: Option<&CheckRunRecord>,
+    default_timeout: Duration,
 ) -> CheckResult {
+    // The limit the run was held to: the check's own, else the lane's default.
+    let limit = check.time_limit().ok().flatten().unwrap_or(default_timeout);
+    let timeout_ms = Some(u64::try_from(limit.as_millis()).unwrap_or(u64::MAX));
     match run {
         Some(run) => CheckResult {
             command: check.command.clone(),
@@ -5195,6 +5222,7 @@ fn check_result(
             output_len: Some(run.output_len),
             end: Some(run.end),
             verifier: None,
+            timeout_ms,
         },
         None => CheckResult {
             command: check.command.clone(),
@@ -5205,6 +5233,7 @@ fn check_result(
             output_len: None,
             end: None,
             verifier: None,
+            timeout_ms,
         },
     }
 }
@@ -6406,6 +6435,7 @@ body"#;
             id: "unit".into(),
             command: "cargo test".into(),
             flaky: false,
+            timeout: None,
         };
         let run = CheckRunRecord {
             attempts: 3,
@@ -6415,7 +6445,7 @@ body"#;
             output_sha256: "ab".repeat(32),
             output_len: 99,
         };
-        let real = check_result(&check, false, Some(&run));
+        let real = check_result(&check, false, Some(&run), CHECK_TIMEOUT);
         assert_eq!(
             (real.exit_status, real.attempts, real.duration_ms),
             (101, 3, 4321)
@@ -6424,12 +6454,51 @@ body"#;
         assert_eq!(real.output_len, Some(99));
         assert_eq!(real.end, Some(CheckEnd::Exited { code: 101 }));
 
-        let bare = check_result(&check, true, None);
+        let bare = check_result(&check, true, None, CHECK_TIMEOUT);
         assert_eq!(
             (bare.exit_status, bare.attempts, bare.duration_ms),
             (0, 1, 0)
         );
         assert_eq!((bare.output_len, bare.end), (None, None));
-        assert_eq!(check_result(&check, false, None).exit_status, 1);
+        assert_eq!(
+            check_result(&check, false, None, CHECK_TIMEOUT).exit_status,
+            1
+        );
+    }
+
+    /// The capsule records the limit the run was held to: the check's own when it declares one,
+    /// else the lane's default (and that on both the measured and the bare record).
+    #[test]
+    fn a_check_file_records_the_limit_the_run_was_held_to() {
+        let mut check = cowproof_core::Check {
+            id: "unit".into(),
+            command: "cargo test".into(),
+            flaky: false,
+            timeout: None,
+        };
+        let default = Duration::from_secs(90);
+        assert_eq!(
+            check_result(&check, true, None, default).timeout_ms,
+            Some(90_000),
+            "no limit of its own: the lane's default is recorded"
+        );
+        check.timeout = Some(serde_json::json!("2m"));
+        assert_eq!(
+            check_result(&check, true, None, default).timeout_ms,
+            Some(120_000)
+        );
+        check.timeout = Some(serde_json::json!(7));
+        let run = CheckRunRecord {
+            attempts: 1,
+            exit_status: 0,
+            end: CheckEnd::Exited { code: 0 },
+            duration_ms: 1,
+            output_sha256: String::new(),
+            output_len: 0,
+        };
+        assert_eq!(
+            check_result(&check, true, Some(&run), default).timeout_ms,
+            Some(7_000)
+        );
     }
 }

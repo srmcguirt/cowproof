@@ -164,6 +164,13 @@ pub struct CheckResult {
     /// It is never compared: `cowproof verify` compares pass or fail against the fields above.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verifier: Option<VerifierRun>,
+    /// The time limit, in milliseconds, the builder's run of this check was held to: the check's
+    /// own `timeout` from the packet header, else the runner's default. `cowproof verify` replays
+    /// the check under this limit, not the current default, and refuses a capsule whose limit
+    /// differs from the one the header declares. Absent from a capsule written before the field
+    /// existed, which is replayed under the verifier's default as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
 }
 
 /// The verifier's own run of one check, the values `cowproof run`'s replay measured and the

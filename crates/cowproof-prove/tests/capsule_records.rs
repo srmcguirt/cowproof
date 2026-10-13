@@ -36,6 +36,7 @@ fn recorded() -> CheckResult {
         output_len: Some(16),
         end: Some(CheckEnd::Exited { code: 0 }),
         verifier: None,
+        timeout_ms: None,
     }
 }
 

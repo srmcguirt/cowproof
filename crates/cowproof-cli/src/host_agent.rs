@@ -94,10 +94,9 @@ use self::config::{HostConfig, Loaded};
 use crate::preflight::{Check, CheckStatus, PreflightOptions, preflight};
 use crate::remote::is_bare_char;
 use crate::run::{
-    BuilderLaunch, CHECK_TERM_GRACE, CHECK_TIMEOUT, CheckEnv, INTERRUPTED_EXIT_CODE,
-    MAX_STDERR_LINE, PUMP_DRAIN, TERM_GRACE, builder_command, builder_path, capture_patch,
-    pump_stderr, redact_ready, resumable, run_check_command, sibling_pk, sleep_until_opt,
-    valid_model, write_lane_files,
+    BuilderLaunch, CHECK_TERM_GRACE, CheckEnv, INTERRUPTED_EXIT_CODE, MAX_STDERR_LINE, PUMP_DRAIN,
+    TERM_GRACE, builder_command, builder_path, capture_patch, pump_stderr, redact_ready, resumable,
+    run_check_command, sibling_pk, sleep_until_opt, valid_model, write_lane_files,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use cowproof_core::{PORT_BASE, PORT_BLOCK_SIZE, redact};
@@ -1846,10 +1845,12 @@ async fn check(lane_id: &str, check_id: &str, root: &Path) -> Result<Value> {
     if spec.command.is_empty() || spec.command.contains('\0') {
         bail!("the check command is empty or holds a NUL");
     }
-    if spec.timeout_secs == 0 || spec.timeout_secs > CHECK_TIMEOUT.as_secs() {
+    // A check may declare its own limit (up to the packet header's maximum), so the host
+    // accepts what the header allows; the runner decides which limit applies.
+    if spec.timeout_secs == 0 || spec.timeout_secs > cowproof_core::MAX_CHECK_TIMEOUT.as_secs() {
         bail!(
-            "timeout_secs must be 1 to {} (the local run_check limit)",
-            CHECK_TIMEOUT.as_secs()
+            "timeout_secs must be 1 to {} (the longest limit a check may declare)",
+            cowproof_core::MAX_CHECK_TIMEOUT.as_secs()
         );
     }
     if spec.port_base.is_some_and(|p| !valid_port_base(p)) {

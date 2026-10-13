@@ -1,7 +1,9 @@
-use crate::capsule::{Capsule, CapsuleError, CheckResult, HELDOUT_FILE, VerifierRun};
+use crate::capsule::{
+    Capsule, CapsuleError, CheckResult, HELDOUT_FILE, VerifierRun, read_packet_versions,
+};
 use crate::port::{PortOutcome, PortRun, run_port};
 use crate::runner::{CheckRunner, acquire_slot};
-use cowproof_core::get_slot_dir;
+use cowproof_core::{MAX_CHECK_TIMEOUT, MIN_CHECK_TIMEOUT, get_slot_dir, parse_header};
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -17,8 +19,9 @@ pub struct VerifyOptions {
     pub slot_class: String,
     /// The class's limit.
     pub slot_limit: usize,
-    /// Per-check time limit. A recorded check carries no limit of its own yet, so this
-    /// applies to every check.
+    /// The time limit of a check whose capsule record carries none (a capsule from before
+    /// the limit was recorded), of the held-out checks and of the port replay. A check whose
+    /// record has `timeout_ms` is replayed under that limit instead.
     pub default_timeout: Duration,
     /// The directory of a slot of `slot_class` the caller already holds and keeps holding
     /// until `verify` returns. The verifier then acquires none. `cowproof run` sets it to
@@ -66,6 +69,11 @@ pub enum VerifyError {
 
     #[error("Capsule rejected: {0}")]
     Capsule(#[from] CapsuleError),
+
+    /// A check's recorded time limit is not the one the packet header declares, or is out of
+    /// range. The header is what was proved, so the capsule is refused before anything runs.
+    #[error("Capsule refused: {0}")]
+    CheckLimitMismatch(String),
 }
 
 #[derive(Debug, Clone)]
@@ -150,8 +158,11 @@ const FLAKY_ATTEMPTS: u32 = 3;
 /// `opts.held_slot_path` names a slot the caller already holds.
 /// A capsule marked `unsandboxed` is refused (`VerifyError::UnsandboxedNotProved`) before
 /// anything is built, unless `opts.allow_unsandboxed` is set.
-/// Every check runs under `opts.default_timeout`; one that overruns is an
-/// infrastructure error naming the check, never a divergence.
+/// Every check runs under the time limit its record carries (`CheckResult::timeout_ms`), else
+/// under `opts.default_timeout`; one that overruns is an infrastructure error naming the
+/// check, never a divergence. Before anything is built, a recorded limit that differs from
+/// the one the capsule's last packet header declares for that check is refused
+/// (`VerifyError::CheckLimitMismatch`): the header is what was proved.
 ///
 /// The tree is always built the same way, into `workdir/tree` (which must not exist):
 /// 1. Clone `source_repo` and check out the capsule's base commit (its tree hash must
@@ -209,6 +220,7 @@ pub async fn verify(
     };
 
     let recorded = load_checks(capsule_dir, &capsule)?;
+    refuse_limit_mismatch(capsule_dir, &recorded)?;
 
     let tree = workdir.join("tree");
     if tree.exists() {
@@ -245,12 +257,15 @@ pub async fn verify(
             1
         };
 
+        let limit = check
+            .timeout_ms
+            .map_or(opts.default_timeout, Duration::from_millis);
         let mut actual_exit = -1;
         let mut run = None;
         for _ in 0..max_attempts {
             let started = Instant::now();
             let outcome = runner
-                .run(&tree, &check.command, opts.default_timeout)
+                .run(&tree, &check.command, limit)
                 .await
                 .map_err(|e| infra(format!("check {check_id}: {e}")))?;
             run = Some(VerifierRun {
@@ -384,6 +399,60 @@ pub(crate) fn load_checks(
         checks.insert(id.to_string(), check);
     }
     Ok(checks)
+}
+
+/// Refuse a capsule whose recorded check limits are not the ones the packet header declares.
+///
+/// A recorded `timeout_ms` must lie between the shortest and the longest limit a header may
+/// declare. For each check the last packet version (the one the lane was proved against)
+/// declares a limit for, the record must carry exactly that limit: a record with another limit
+/// or none is refused. A check with no declared limit may record whatever default the builder's
+/// runner used. A capsule with no packet versions (from before they were written), or whose
+/// last version holds no readable header, has nothing to compare and is left to the other checks.
+fn refuse_limit_mismatch(
+    capsule_dir: &Path,
+    recorded: &BTreeMap<String, CheckResult>,
+) -> Result<(), VerifyError> {
+    for (id, check) in recorded {
+        if let Some(ms) = check.timeout_ms
+            && !(MIN_CHECK_TIMEOUT.as_millis()..=MAX_CHECK_TIMEOUT.as_millis())
+                .contains(&u128::from(ms))
+        {
+            return Err(VerifyError::CheckLimitMismatch(format!(
+                "check {id:?}: the recorded time limit of {ms} ms is outside the allowed range of 1 s to 6 h"
+            )));
+        }
+    }
+    let versions = read_packet_versions(capsule_dir)?;
+    let Some((version, text)) = versions.last() else {
+        return Ok(());
+    };
+    let Ok(header) = parse_header(text) else {
+        return Ok(());
+    };
+    for declared in &header.checks {
+        let limit = declared.time_limit().map_err(|why| {
+            VerifyError::CheckLimitMismatch(format!(
+                "check {:?}: the packet header ({}) has an invalid timeout: {why}",
+                declared.id, version.file
+            ))
+        })?;
+        let (Some(limit), Some(check)) = (limit, recorded.get(&declared.id)) else {
+            continue;
+        };
+        let want = u64::try_from(limit.as_millis()).unwrap_or(u64::MAX);
+        if check.timeout_ms != Some(want) {
+            let had = check
+                .timeout_ms
+                .map_or_else(|| "none".to_string(), |ms| format!("{ms} ms"));
+            return Err(VerifyError::CheckLimitMismatch(format!(
+                "check {:?}: the capsule recorded a time limit of {had}, but the packet header \
+                 ({}) declares {want} ms; the header is what was proved",
+                declared.id, version.file
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// The held-out file the capsule carries (its checks in file order, and the `[port]` table);

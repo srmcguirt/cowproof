@@ -589,9 +589,12 @@ fn a_check_that_failed_then_passed_records_two_attempts_a_duration_and_the_passi
             "exit_status",
             "output_len",
             "output_sha256",
+            "timeout_ms",
             "verifier"
         ]
     );
+    // No limit of its own: the lane's default (20 minutes) is what the run was held to.
+    assert_eq!(record["timeout_ms"], 20 * 60 * 1000, "{record}");
     // No remote holds the test repository's base commit.
     let capsule = Capsule::read(&lane.capsule_dir()).unwrap();
     assert_eq!(capsule.base_remote, None);
@@ -607,14 +610,21 @@ fn a_check_the_runner_timed_out_is_recorded_as_timed_out() {
         &run_checks(&["slow"]),
         json!([{"id": "slow", "command": "sleep 6"}]),
     );
-    // The check overruns its 2 s limit, so the builder saw a failure; the verifier then runs
-    // the full six seconds and passes it, which is a divergence: the lane is refuted.
-    run_expecting(
+    // The check overruns its 2 s limit, so the builder saw a failure. The capsule records that
+    // limit and the verifier replays under it, so it times out too: an infrastructure end
+    // (exit 4), not a divergence, as for any verifier timeout.
+    let out = run_expecting(
         &lane,
         &[Path::new("--check-timeout-secs"), Path::new("2")],
-        2,
+        4,
+    );
+    assert!(
+        text(&out).contains("check slow") && text(&out).contains("Timeout"),
+        "{}",
+        text(&out)
     );
     let record = check_record(&lane, "slow");
+    assert_eq!(record["timeout_ms"], 2000, "{record}");
     assert_eq!(record["end"], json!({"kind": "timed_out"}), "{record}");
     assert_eq!(record["exit_status"], -1, "{record}");
     assert_eq!(record["attempts"], 1, "{record}");
@@ -625,6 +635,86 @@ fn a_check_the_runner_timed_out_is_recorded_as_timed_out() {
     assert!(record["output_len"].as_u64().unwrap() > 0, "{record}");
     assert_eq!(record["output_sha256"].as_str().unwrap().len(), 64);
     assert_eq!(lane.verdict()["failedChecks"], json!(["slow"]));
+}
+
+/// A check that declares `"timeout": "1s"` against `sleep 30` ends timed out in the builder's
+/// `run_check` within a few seconds (the lane's default is 20 minutes), the capsule records the
+/// 1 s limit, and `cowproof verify` replays under that recorded limit, not its default, so it
+/// too times out within a few seconds and says so.
+#[test]
+fn a_check_with_its_own_limit_times_out_in_run_check_and_in_the_verifier() {
+    if !sandbox_available() {
+        return;
+    }
+    let lane = Lane::new(
+        &run_checks(&["slow"]),
+        json!([{"id": "slow", "command": "sleep 30", "timeout": "1s"}]),
+    );
+    let started = std::time::Instant::now();
+    let out = lane.run(&[]);
+    let elapsed = started.elapsed();
+    let record = check_record(&lane, "slow");
+    assert_eq!(record["end"], json!({"kind": "timed_out"}), "{record}");
+    assert_eq!(record["timeout_ms"], 1000, "{record}");
+    let ms = record["duration_ms"].as_u64().unwrap();
+    assert!(
+        (1000..15_000).contains(&ms),
+        "the builder's run stopped at its own 1 s limit: {record}"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(120),
+        "the whole run, replay included, did not wait out sleep 30 twice: {elapsed:?} {}",
+        text(&out)
+    );
+
+    // A later `cowproof verify` holds the replay to the recorded 1 s too.
+    let started = std::time::Instant::now();
+    let replayed = replay(&lane);
+    assert_eq!(replayed.status.code(), Some(4), "{}", text(&replayed));
+    let err = String::from_utf8_lossy(&replayed.stderr).to_string();
+    assert!(
+        err.contains("check slow") && err.contains("Timeout"),
+        "{err}"
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(60),
+        "{:?}",
+        started.elapsed()
+    );
+}
+
+/// `cowproof verify` refuses a capsule whose recorded limit is not the one its packet header
+/// declares. The edit also has to survive the seal, so the capsule is resealed after it.
+#[test]
+fn verify_refuses_a_capsule_whose_limit_differs_from_the_header() {
+    if !sandbox_available() {
+        return;
+    }
+    let lane = Lane::new(
+        &run_checks(&["quick"]),
+        json!([{"id": "quick", "command": "true", "timeout": "30s"}]),
+    );
+    run_expecting(&lane, &[], 0);
+    assert_eq!(check_record(&lane, "quick")["timeout_ms"], 30_000);
+    assert_eq!(replay(&lane).status.code(), Some(0), "unedited reproduces");
+
+    let dir = lane.capsule_dir();
+    let mut capsule = Capsule::read(&dir).unwrap();
+    let mut record = check_record(&lane, "quick");
+    record["timeout_ms"] = json!(31_000);
+    fs::write(
+        dir.join("checks/quick.json"),
+        serde_json::to_vec_pretty(&record).unwrap(),
+    )
+    .unwrap();
+    capsule.write(&dir).unwrap();
+    let out = replay(&lane);
+    assert_eq!(out.status.code(), Some(4), "{}", text(&out));
+    let err = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(
+        err.contains("\"quick\"") && err.contains("the header is what was proved"),
+        "{err}"
+    );
 }
 
 #[test]

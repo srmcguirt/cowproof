@@ -103,6 +103,21 @@ error [profile]: mutations: profile "strict" for rung claude:haiku (the header c
 
 `run.json` records the check per segment as `profile`: `{rung, name, requires, met, missing}`, or null for a rung with no profile.
 
+## A time limit per check
+
+A check in the packet header may carry its own time limit, for the one slow suite among quick ones:
+
+```json
+"checks": [
+  {"id": "unit", "command": "cargo test --lib"},
+  {"id": "slow", "command": "cargo test --test e2e", "timeout": "45m"}
+]
+```
+
+`timeout` is `"<n>s"` or `"<n>m"` (a bare integer is seconds), from `"1s"` to `"360m"` (6 hours). A value that is unparseable or outside that range is the lint error `invalid-check-timeout`, naming the check, and `cowproof run` refuses it before a lane exists. A check with no `timeout` keeps the default, 20 minutes.
+
+The builder's `run_check` and the verifier both honour the limit; a run that reaches it ends `timed_out`, and the verifier's timeout is an infrastructure end, never a divergence. The capsule records the limit each run was held to as `timeout_ms` in `checks/<id>.json` (the default included), and `cowproof verify` replays every check under the limit recorded there, not under its own default. The header is what was proved: a recorded `timeout_ms` that differs from the limit the capsule's last packet header declares for that check (or is missing when the header declares one) is refused before anything runs, as is a recorded limit outside 1 second to 6 hours. A capsule written before the field has no `timeout_ms` and is replayed under the default as before. Codex lanes cap one MCP tool call at an hour, so a `run_check` limit above `"60m"` does not outlast that cap for a builder on a `codex` rung; the verifier is not affected.
+
 ## OpenRouter models through OpenCode
 
 A rung `openrouter:<model>` (for example `openrouter:z-ai/glm-5.3-flash`) runs the model through [OpenCode](https://opencode.ai), not Claude Code: OpenRouter's own Claude Code integration is only guaranteed to work with Anthropic models. The runner, the sandbox, the queue, the checks and the proof are the same as for a Claude lane; only the builder's launcher, its event parser and the provider the proxy forwards to differ.

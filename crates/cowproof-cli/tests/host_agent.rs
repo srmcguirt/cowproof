@@ -1889,7 +1889,10 @@ fn check_refuses_a_key_a_bad_spec_and_a_lane_that_is_not_there() {
 
     for (name, spec) in [
         ("no timeout", json!({"command": "true", "timeout_secs": 0})),
-        ("a timeout past the local limit", check_spec("true", 1201)),
+        (
+            "a timeout past the longest a check may declare",
+            check_spec("true", 21601),
+        ),
         ("an empty command", check_spec("", 60)),
         (
             "an unknown field",
