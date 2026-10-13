@@ -746,7 +746,7 @@ impl LaneLayout {
 }
 
 /// Lockfiles, at the tree root only, that determine the dependencies (D11).
-const LOCKFILES: &[&str] = &[
+pub(crate) const LOCKFILES: &[&str] = &[
     "Cargo.lock",
     "package-lock.json",
     "npm-shrinkwrap.json",
@@ -775,6 +775,10 @@ pub const REGISTRY_CONFIGS: &[&str] = &[
 /// its length, so the same bytes in a different file, or bytes moving from one file to
 /// the next, give a different key. Changing the triple, a lockfile or a registry config
 /// changes the key; creation order and directory iteration order do not.
+///
+/// Only a regular file is an input: a symbolic link is skipped (not followed, not hashed), as
+/// the planners skip it, and a file over [`MAX_DEPENDENCY_INPUT_BYTES`] is never read (its size
+/// stands for it; no planner fetches for such a file).
 pub fn dependency_cache_key(repo_tree: &Path, target_triple: &str) -> Result<String> {
     let mut hasher = Sha256::new();
     hasher.update(target_triple.len().to_le_bytes());
@@ -788,25 +792,97 @@ pub fn dependency_cache_key(repo_tree: &Path, target_triple: &str) -> Result<Str
     if NPM_LOCKFILES
         .iter()
         .chain(&[YARN_LOCKFILE, PNPM_LOCKFILE])
-        .any(|name| repo_tree.join(name).is_file())
+        .any(|name| is_regular_file(&repo_tree.join(name)))
     {
         names.push(NPM_MANIFEST);
     }
     names.sort_unstable();
     for name in names {
         let path = repo_tree.join(name);
-        if !path.is_file() {
+        // A regular file only: a symbolic link in the tree could point at any file the
+        // director can read, and every planner refuses one too (`deps::unfetched_notes` says so).
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if !meta.is_file() {
             continue;
         }
-        let contents =
-            std::fs::read(&path).with_context(|| format!("cannot read {}", path.display()))?;
         hasher.update(name.len().to_le_bytes());
         hasher.update(name.as_bytes());
+        if meta.len() > MAX_DEPENDENCY_INPUT_BYTES {
+            // Over the bound: never read. No planner fetches for such a file (each says so in
+            // the capsule), so what the key stands for does not depend on its bytes.
+            hasher.update(u64::MAX.to_le_bytes());
+            hasher.update(meta.len().to_le_bytes());
+            continue;
+        }
+        let contents = read_dependency_input(&path)
+            .with_context(|| format!("cannot read {}", path.display()))?;
         hasher.update(contents.len().to_le_bytes());
         hasher.update(&contents);
     }
 
     Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// The most bytes the director reads of any file a lane can have written that decides what is
+/// fetched: a lockfile or `package.json` (S-3, S-7). A file over it is never read; the planners
+/// say `not_fetched`, naming this bound.
+pub const MAX_DEPENDENCY_INPUT_BYTES: u64 = 8 * 1024 * 1024;
+
+/// [`MAX_DEPENDENCY_INPUT_BYTES`] for messages.
+pub const MAX_DEPENDENCY_INPUT_TEXT: &str = "8 MiB";
+
+/// Whether `path` is a regular file, a symbolic link not followed.
+pub(crate) fn is_regular_file(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|m| m.is_file())
+}
+
+/// The size of `path` when it is a regular file over [`MAX_DEPENDENCY_INPUT_BYTES`].
+pub(crate) fn oversize_dependency_input(path: &Path) -> Option<u64> {
+    std::fs::symlink_metadata(path)
+        .ok()
+        .filter(|m| m.is_file() && m.len() > MAX_DEPENDENCY_INPUT_BYTES)
+        .map(|m| m.len())
+}
+
+/// The one reader of a lane-written lockfile or manifest: the bytes of the regular file at
+/// `path` (a symbolic link is refused, never followed), and an error past
+/// [`MAX_DEPENDENCY_INPUT_BYTES`] (checked on the size and again on what was read, so a file that
+/// grows between the two is stopped too). Never more than the bound plus one byte is held.
+pub fn read_dependency_input(path: &Path) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+    let too_big = |n: u64| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("is larger than the {MAX_DEPENDENCY_INPUT_TEXT} bound ({n} bytes or more)"),
+        )
+    };
+    let meta = std::fs::symlink_metadata(path)?;
+    if !meta.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "is not a regular file (a symbolic link is not followed)",
+        ));
+    }
+    if meta.len() > MAX_DEPENDENCY_INPUT_BYTES {
+        return Err(too_big(meta.len()));
+    }
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)?
+        .take(MAX_DEPENDENCY_INPUT_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_DEPENDENCY_INPUT_BYTES {
+        return Err(too_big(bytes.len() as u64));
+    }
+    Ok(bytes)
+}
+
+/// [`read_dependency_input`] as text (invalid UTF-8 is an error).
+pub fn read_dependency_text(path: &Path) -> std::io::Result<String> {
+    String::from_utf8(read_dependency_input(path)?).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, "is not valid UTF-8 text")
+    })
 }
 
 #[cfg(test)]

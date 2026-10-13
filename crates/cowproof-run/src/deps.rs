@@ -96,13 +96,15 @@
 //!     from the sandbox.
 
 use crate::bridge::bridge_port;
-use crate::bundler::{self, Download, GEM_LOCKFILES, GemLock, Host};
+use crate::bundler::{self, Fetch, GEM_LOCKFILES, GemLock, Host};
 use crate::cache::{self, Alive};
 use crate::fetch_proxy::{self, BASE_GEM_LOCKFILE, FetchAllowlist, FetchProxy, Resolver};
 use crate::{
-    BUNDLER_CACHE, BUNDLER_ENTRY_DIR, LaneLayout, NPM_CACHE, NPM_ENTRY_DIR, NPM_LOCKFILES,
-    NPM_MANIFEST, NPM_MODULES, NetworkMode, PNPM_LOCKFILE, REGISTRY_CONFIGS, SandboxPolicy,
-    YARN_LOCKFILE, dependency_cache_key, render_macos_profile, sandbox_command,
+    BUNDLER_CACHE, BUNDLER_ENTRY_DIR, LOCKFILES, LaneLayout, MAX_DEPENDENCY_INPUT_TEXT, NPM_CACHE,
+    NPM_ENTRY_DIR, NPM_LOCKFILES, NPM_MANIFEST, NPM_MODULES, NetworkMode, PNPM_LOCKFILE,
+    REGISTRY_CONFIGS, SandboxPolicy, YARN_LOCKFILE, dependency_cache_key,
+    oversize_dependency_input, read_dependency_input, read_dependency_text, render_macos_profile,
+    sandbox_command,
 };
 use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
@@ -469,6 +471,19 @@ pub enum JsPlan {
 /// anywhere.
 pub fn js_plan(tree: &Path) -> JsPlan {
     let has = |name: &str| is_regular(&tree.join(name));
+    // A lockfile or manifest over the bound is never read (S-7): the lane wrote it.
+    let present: Vec<&str> = NPM_LOCKFILES
+        .iter()
+        .copied()
+        .chain([YARN_LOCKFILE, PNPM_LOCKFILE])
+        .filter(|n| has(n))
+        .collect();
+    let manifest = (!present.is_empty()).then_some(NPM_MANIFEST);
+    for name in present.iter().copied().chain(manifest) {
+        if oversize_dependency_input(&tree.join(name)).is_some() {
+            return JsPlan::NotFetched(oversize_note(name, "node_modules"));
+        }
+    }
     let npm = NPM_LOCKFILES.iter().any(|n| has(n));
     let yarn = has(YARN_LOCKFILE);
     let pnpm = has(PNPM_LOCKFILE);
@@ -494,7 +509,7 @@ pub fn js_plan(tree: &Path) -> JsPlan {
     if !yarn {
         return JsPlan::Nothing;
     }
-    let lock = fs::read_to_string(tree.join(YARN_LOCKFILE)).unwrap_or_default();
+    let lock = read_dependency_text(&tree.join(YARN_LOCKFILE)).unwrap_or_default();
     let rc = read_config(tree, ".yarnrc.yml").ok().flatten();
     if rc.is_none() && !lock.lines().any(|l| l.starts_with("__metadata:")) {
         return JsPlan::Fetch(JsTool::YarnClassic);
@@ -507,6 +522,13 @@ pub fn js_plan(tree: &Path) -> JsPlan {
                 .to_string(),
         )
     }
+}
+
+/// The capsule line for a lockfile or manifest over [`crate::MAX_DEPENDENCY_INPUT_BYTES`].
+fn oversize_note(name: &str, what: &str) -> String {
+    format!(
+        "{name}: larger than the {MAX_DEPENDENCY_INPUT_TEXT} bound for a file the director reads, so it is not read and {what} is not available to the verifier"
+    )
 }
 
 /// Whether a `.yarnrc.yml` sets the top-level `nodeLinker` to `node-modules`.
@@ -540,7 +562,8 @@ impl Needs {
     /// installs, and a Bundler lockfile whose gems are downloaded.
     pub fn of(tree: &Path) -> Self {
         Self {
-            cargo: tree.join("Cargo.lock").is_file(),
+            cargo: is_regular(&tree.join("Cargo.lock"))
+                && oversize_dependency_input(&tree.join("Cargo.lock")).is_none(),
             js: match js_plan(tree) {
                 JsPlan::Fetch(tool) => Some(tool),
                 _ => None,
@@ -589,6 +612,18 @@ pub fn unfetched_notes(tree: &Path) -> Vec<String> {
     if let GemPlan::NotFetched(note) = gem_plan(tree, &Host::current()) {
         notes.push(note);
     }
+    if oversize_dependency_input(&tree.join("Cargo.lock")).is_some() {
+        notes.push(oversize_note("Cargo.lock", "cargo's dependencies are"));
+    }
+    // A symbolic link where a key input should be is not read, not hashed and not fetched for
+    // (S-7): say which, so a check missing its dependencies has a reason in the capsule.
+    for name in LOCKFILES.iter().copied().chain([NPM_MANIFEST]) {
+        if fs::symlink_metadata(tree.join(name)).is_ok_and(|m| m.file_type().is_symlink()) {
+            notes.push(format!(
+                "{name}: a symbolic link, which could point anywhere, is not read or hashed, so what it names is not fetched for and is not available to the verifier"
+            ));
+        }
+    }
     notes
 }
 
@@ -598,7 +633,7 @@ pub enum GemPlan {
     /// No Bundler lockfile.
     Nothing,
     /// The lockfile (its file name) and the gems to download.
-    Fetch(&'static str, Vec<Download>),
+    Fetch(&'static str, Fetch),
     /// A lockfile whose gems are not downloaded: the line for [`Prefetch::notes`].
     NotFetched(String),
 }
@@ -616,8 +651,11 @@ fn gem_lock(tree: &Path) -> std::result::Result<Option<(&'static str, GemLock)>,
     match present.as_slice() {
         [] => Ok(None),
         [name] => {
-            let text = fs::read_to_string(tree.join(name))
-                .map_err(|e| format!("{name}: cannot be read as text ({e}), so gems are not available to the verifier"))?;
+            let text = read_dependency_text(&tree.join(name)).map_err(|e| {
+                format!(
+                    "{name}: cannot be read ({name} {e}), so gems are not available to the verifier"
+                )
+            })?;
             bundler::parse(&text)
                 .map(|lock| Some((*name, lock)))
                 .map_err(|e| {
@@ -642,7 +680,11 @@ pub fn gem_plan(tree: &Path, host: &Host) -> GemPlan {
         Ok(None) => return GemPlan::Nothing,
         Err(note) => return GemPlan::NotFetched(note),
     };
-    match bundler::plan(file, &lock, host) {
+    // The base's lockfile (left in the tree by `RegistryConfigSnapshot::restore`), when the tree
+    // has one: it decides the checksums and remotes of the gems it lists (S-9). One that is
+    // unreadable, too large or does not parse pins nothing.
+    let base = read_base_gem_lock(tree);
+    match bundler::plan_with_base(file, &lock, base.as_ref(), host) {
         bundler::Plan::NotFetched(note) => GemPlan::NotFetched(note),
         bundler::Plan::Fetch(_)
             if fs::symlink_metadata(tree.join(crate::BUNDLER_VENDOR_CACHE)).is_ok() =>
@@ -652,8 +694,15 @@ pub fn gem_plan(tree: &Path, host: &Host) -> GemPlan {
                 crate::BUNDLER_VENDOR_CACHE
             ))
         }
-        bundler::Plan::Fetch(downloads) => GemPlan::Fetch(file, downloads),
+        bundler::Plan::Fetch(fetch) => GemPlan::Fetch(file, fetch),
     }
+}
+
+/// The BASE's Bundler lockfile of `tree` ([`BASE_GEM_LOCKFILE`]), when there is one that is a
+/// regular file within the bound and parses.
+fn read_base_gem_lock(tree: &Path) -> Option<GemLock> {
+    let text = read_dependency_text(&tree.join(BASE_GEM_LOCKFILE)).ok()?;
+    bundler::parse(&text).ok()
 }
 
 /// `.npmrc` with every credential removed, and how many lines had one. A line is dropped when
@@ -664,6 +713,12 @@ pub fn gem_plan(tree: &Path, host: &Host) -> GemPlan {
 /// first line. A `registry=` URL with `user:pass@` in it keeps the URL without the
 /// credentials. The fetch gets this copy and nothing from the original, and the entry holds
 /// none of it: a registry that needs a token or a client certificate is out of reach.
+///
+/// A key is read the way npm's `ini` reads it ([`ini_key`]): `"//host/:_authToken"=T` and
+/// `'//host/:_authToken'=T` are the same line as `//host/:_authToken=T`, with any spaces around
+/// the `=`. A URL value also loses a query parameter named `token`, `auth`, `access_token` or
+/// `password` (any case, percent-escapes decoded): the line is kept without it. Each line changed
+/// counts once.
 pub fn strip_npmrc_auth(text: &str) -> (String, usize) {
     let mut out = String::new();
     let mut stripped = 0;
@@ -685,11 +740,11 @@ pub fn strip_npmrc_auth(text: &str) -> (String, usize) {
             out.push('\n');
             continue;
         }
-        let last = key
-            .trim()
+        let last = ini_key(key)
             .rsplit(':')
             .next()
             .unwrap_or("")
+            .trim()
             .to_ascii_lowercase();
         if matches!(
             last.as_str(),
@@ -699,7 +754,7 @@ pub fn strip_npmrc_auth(text: &str) -> (String, usize) {
             in_pem = value.contains("-----BEGIN") && !value.contains("-----END");
             continue;
         }
-        match drop_url_credentials(value) {
+        match drop_url_credentials(value.trim()) {
             Some(clean) => {
                 stripped += 1;
                 out.push_str(&format!("{}={clean}\n", key.trim()));
@@ -713,12 +768,91 @@ pub fn strip_npmrc_auth(text: &str) -> (String, usize) {
     (out, stripped)
 }
 
-/// `value` without the `user:pass@` of a URL in it, or `None` when it has none.
+/// A key of an `.npmrc` line as `ini` (npm's parser) reads it: trimmed, and unquoted when it is
+/// wrapped in double quotes (read as a JSON string, else the text between them) or single
+/// quotes (the text between them). `"//host/:_authToken"=T` and `'//host/:_authToken'=T` both
+/// set the token, so both are the key `//host/:_authToken`.
+fn ini_key(key: &str) -> String {
+    let key = key.trim();
+    let quoted = |q: char| key.len() >= 2 && key.starts_with(q) && key.ends_with(q);
+    if quoted('"') {
+        serde_json::from_str::<String>(key).unwrap_or_else(|_| key[1..key.len() - 1].to_string())
+    } else if quoted('\'') {
+        key[1..key.len() - 1].to_string()
+    } else {
+        key.to_string()
+    }
+}
+
+/// Names of URL query parameters that carry a credential, lower case.
+const CREDENTIAL_QUERY_PARAMS: [&str; 4] = ["token", "auth", "access_token", "password"];
+
+/// `name` with its `%XX` escapes decoded, as far as ASCII goes, in lower case.
+fn query_name(name: &str) -> String {
+    let bytes = name.as_bytes();
+    let mut out = String::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        let hex = |b: u8| (b as char).to_digit(16);
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let (Some(h), Some(l)) = (hex(bytes[i + 1]), hex(bytes[i + 2]))
+            && (h * 16 + l) < 128
+        {
+            out.push(char::from((h * 16 + l) as u8).to_ascii_lowercase());
+            i += 3;
+        } else {
+            out.push((bytes[i] as char).to_ascii_lowercase());
+            i += 1;
+        }
+    }
+    out
+}
+
+/// `tail` (a URL's path, query and fragment) without the query parameters named like a
+/// credential (`token`, `auth`, `access_token`, `password`, in any case), and whether any was.
+fn drop_query_credentials(tail: &str) -> (String, bool) {
+    let (before_fragment, fragment) = match tail.find('#') {
+        Some(i) => tail.split_at(i),
+        None => (tail, ""),
+    };
+    let Some((path, query)) = before_fragment.split_once('?') else {
+        return (tail.to_string(), false);
+    };
+    let params: Vec<&str> = query.split('&').collect();
+    let kept: Vec<&str> = params
+        .iter()
+        .copied()
+        .filter(|p| {
+            let name = query_name(p.split('=').next().unwrap_or(""));
+            !CREDENTIAL_QUERY_PARAMS.contains(&name.as_str())
+        })
+        .collect();
+    if kept.len() == params.len() {
+        return (tail.to_string(), false);
+    }
+    let query = if kept.is_empty() {
+        String::new()
+    } else {
+        format!("?{}", kept.join("&"))
+    };
+    (format!("{path}{query}{fragment}"), true)
+}
+
+/// `value` without the credentials of a URL in it, or `None` when it has none: the
+/// `user:pass@` of its authority, and any query parameter named like a credential (`token`,
+/// `auth`, `access_token`, `password`, in any case). Shared by `.npmrc`, the yarn
+/// configuration files and Bundler remotes.
 pub(crate) fn drop_url_credentials(value: &str) -> Option<String> {
     let (scheme, rest) = value.split_once("://")?;
     let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-    let (_userinfo, host) = rest[..authority_end].rsplit_once('@')?;
-    Some(format!("{scheme}://{host}{}", &rest[authority_end..]))
+    let (authority, tail) = rest.split_at(authority_end);
+    let (host, had_userinfo) = match authority.rsplit_once('@') {
+        Some((_userinfo, host)) => (host, true),
+        None => (authority, false),
+    };
+    let (tail, had_query_credential) = drop_query_credentials(tail);
+    (had_userinfo || had_query_credential).then(|| format!("{scheme}://{host}{tail}"))
 }
 
 /// A yarn configuration file with what the fetch must not get removed, and the counts.
@@ -924,8 +1058,9 @@ impl RegistryConfigSnapshot {
         for name in GEM_LOCKFILES {
             let path = tree.join(name);
             if is_regular(&path) {
-                gem_lock =
-                    Some(fs::read(&path).with_context(|| format!("reading {}", path.display()))?);
+                // Over the bound it is not kept (an absurd base: nothing is pinned to it, and
+                // the lane's own, equally large, lockfile is not fetched either).
+                gem_lock = read_dependency_input(&path).ok();
                 break;
             }
         }
@@ -1067,6 +1202,11 @@ fn prefetch_in(
                 "bundler: {with_credentials} remote URL(s) of {file} carried credentials; they were not used (the fetch never receives a token)"
             ));
         }
+        if let GemPlan::Fetch(_, fetch) = gem_plan(&tree, &Host::current())
+            && let Some(note) = unverified_note(&fetch)
+        {
+            notes.push(note);
+        }
     }
     let done = |outcome: FetchOutcome| {
         let ecosystems = match outcome {
@@ -1132,6 +1272,34 @@ fn prefetch_in(
     done(outcome)
 }
 
+/// The most gems the unverified note names.
+const UNVERIFIED_LISTED: usize = 20;
+
+/// The capsule line naming the gems that are downloaded with no checksum to check them against
+/// (neither the base's lockfile nor the lane's gives one), `None` when there are none.
+fn unverified_note(fetch: &Fetch) -> Option<String> {
+    let unverified = fetch.unverified();
+    if unverified.is_empty() {
+        return None;
+    }
+    let listed: Vec<String> = unverified
+        .iter()
+        .take(UNVERIFIED_LISTED)
+        .map(|spec| format!("{} {}", spec.name, spec.version))
+        .collect();
+    let more = unverified.len().saturating_sub(UNVERIFIED_LISTED);
+    Some(format!(
+        "bundler: {} gem(s) downloaded with no sha256 in the base's or the lane's lockfile, unverified: {}{}",
+        unverified.len(),
+        listed.join(", "),
+        if more > 0 {
+            format!(" and {more} more")
+        } else {
+            String::new()
+        }
+    ))
+}
+
 fn claim_failure(dir: &Path, e: &std::io::Error) -> String {
     format!(
         "could not record the use of the cache entry {}: {e}",
@@ -1188,7 +1356,7 @@ fn read_config(tree: &Path, name: &str) -> Result<Option<String>> {
     if !is_regular(&path) {
         return Ok(None);
     }
-    fs::read_to_string(&path)
+    read_dependency_text(&path)
         .map(Some)
         .with_context(|| format!("reading {}", path.display()))
 }
@@ -1347,12 +1515,12 @@ fn fetch_js(
             tool.name()
         );
     }
-    fs::copy(&manifest, project.join(NPM_MANIFEST))
+    copy_bounded(&manifest, &project.join(NPM_MANIFEST))
         .with_context(|| format!("copying {NPM_MANIFEST}"))?;
     for name in tool.lockfiles() {
         let from = tree.join(name);
         if is_regular(&from) {
-            fs::copy(&from, project.join(name)).with_context(|| format!("copying {name}"))?;
+            copy_bounded(&from, &project.join(name)).with_context(|| format!("copying {name}"))?;
         }
     }
     for file in stripped_configs(tool, tree)? {
@@ -1449,39 +1617,54 @@ fn fetch_js(
     }
 }
 
+/// Copy the lane-written file `from` to `to`, reading at most [`crate::MAX_DEPENDENCY_INPUT_BYTES`]
+/// of it (an error names the bound past it) and never following a symbolic link.
+fn copy_bounded(from: &Path, to: &Path) -> Result<()> {
+    let bytes = read_dependency_input(from).map_err(|e| anyhow::anyhow!("{e}"))?;
+    fs::write(to, bytes)?;
+    Ok(())
+}
+
 /// `text` as one shell word in single quotes.
 fn sh_quote(text: &str) -> String {
     format!("'{}'", text.replace('\'', "'\\''"))
 }
 
 /// The script that downloads every locked gem: one `gem fetch NAME --version V --platform P
-/// --clear-sources --source <remote>` per gem, the `gem` executable being `$1`, stopping at
+/// --clear-sources --source <remote>...` per gem, the `gem` executable being `$1`, stopping at
 /// the first that fails. The names, versions and platforms were checked by the lockfile reader
 /// and every word is quoted. No remote carries a credential: they are cleaned here, not
 /// trusted to have been.
-fn gem_fetch_script(downloads: &[Download]) -> String {
+///
+/// A `GEM` section's remotes are written once, as a shell function `srcN` that appends them
+/// (`srcN "$GEM" fetch ...`), and each gem line names its section's function, so the script is
+/// linear in the gems however many remotes a section has (S-3).
+fn gem_fetch_script(fetch: &Fetch) -> String {
     let mut script = String::from(
-        "#!/bin/sh\n# written by cowproof: one `gem fetch` per locked gem; $1 is the gem executable\n",
+        "#!/bin/sh\n# written by cowproof: one `gem fetch` per locked gem; $1 is the gem executable\nGEM=\"$1\"\n",
     );
-    for d in downloads {
-        let spec = &d.spec;
-        let mut line = format!(
-            "\"$1\" fetch {} --version {} --platform {} --clear-sources",
-            sh_quote(&spec.name),
-            sh_quote(&spec.version),
-            sh_quote(spec.platform.as_deref().unwrap_or("ruby")),
-        );
-        for remote in &d.remotes {
-            line.push_str(&format!(
+    let used: std::collections::BTreeSet<usize> =
+        fetch.downloads.iter().map(|d| d.source).collect();
+    for index in used {
+        script.push_str(&format!("src{index}() {{ \"$@\""));
+        for remote in &fetch.sources[index] {
+            script.push_str(&format!(
                 " --source {}",
                 sh_quote(&bundler::drop_credentials(remote))
             ));
         }
-        line.push_str(&format!(
-            " || {{ echo {} >&2; exit 1; }}\n",
+        script.push_str("; }\n");
+    }
+    for d in &fetch.downloads {
+        let spec = &d.spec;
+        script.push_str(&format!(
+            "src{} \"$GEM\" fetch {} --version {} --platform {} --clear-sources || {{ echo {} >&2; exit 1; }}\n",
+            d.source,
+            sh_quote(&spec.name),
+            sh_quote(&spec.version),
+            sh_quote(spec.platform.as_deref().unwrap_or("ruby")),
             sh_quote(&format!("cowproof: gem fetch {} failed", spec.label()))
         ));
-        script.push_str(&line);
     }
     script.push_str("exit 0\n");
     script
@@ -1502,8 +1685,10 @@ fn sha256_hex(path: &Path) -> Result<String> {
 /// the gem runs with a throwaway `HOME`, `GEM_HOME` and `GEM_SPEC_CACHE` and `--clear-sources`,
 /// so no `.gemrc`, `.bundle/config` or credential is in reach.
 ///
-/// Afterwards every gem must be there (a missing one is an error naming it) and, when the
-/// lockfile's `CHECKSUMS` gives a sha256 for it, must match (a mismatch is an error naming it).
+/// Afterwards every gem must be there (a missing one is an error naming it) and, when a
+/// lockfile gives a sha256 for it, must match (a mismatch is an error naming it). The sha256 is
+/// the BASE lockfile's when the base lists the gem with one, else the lane's (see
+/// [`bundler::plan_with_base`]).
 fn fetch_bundler(
     work: &Path,
     tree: &Path,
@@ -1512,12 +1697,9 @@ fn fetch_bundler(
     config: &FetchConfig,
 ) -> Result<()> {
     let tools = config.tools;
-    let GemPlan::Fetch(file, downloads) = gem_plan(tree, &Host::current()) else {
+    let GemPlan::Fetch(file, fetch) = gem_plan(tree, &Host::current()) else {
         bail!("the tree has no Bundler lockfile to fetch");
     };
-    let (_, lock) = gem_lock(tree)
-        .map_err(|e| anyhow::anyhow!("{e}"))?
-        .context("the Bundler lockfile is gone")?;
     let cache = fresh.join(BUNDLER_ENTRY_DIR).join(BUNDLER_CACHE);
     let home = work.join("home");
     let scripts = work.join("gem-fetch");
@@ -1525,7 +1707,7 @@ fn fetch_bundler(
     fs::create_dir_all(&home)?;
     fs::create_dir_all(&scripts)?;
     let script = scripts.join("fetch.sh");
-    fs::write(&script, gem_fetch_script(&downloads)).context("writing the gem fetch script")?;
+    fs::write(&script, gem_fetch_script(&fetch)).context("writing the gem fetch script")?;
 
     let found = tools.gem.as_deref();
     let gem_program = match found {
@@ -1570,7 +1752,7 @@ fn fetch_bundler(
         },
     )?;
 
-    for d in &downloads {
+    for d in &fetch.downloads {
         let name = d.spec.file_name();
         let path = cache.join(&name);
         if !is_regular(&path) {
@@ -1579,12 +1761,18 @@ fn fetch_bundler(
                 d.spec.label()
             );
         }
-        if let Some(want) = lock.checksum(&d.spec) {
+        if let Some(want) = &d.checksum {
             let got = sha256_hex(&path)?;
-            if got != want {
+            if got != want.sha256 {
+                let whose = if want.from_base {
+                    "the base's lockfile"
+                } else {
+                    file
+                };
                 bail!(
-                    "checksum mismatch for {}: {file} lists sha256 {want}, the download is {got}",
-                    d.spec.label()
+                    "checksum mismatch for {}: {whose} lists sha256 {}, the download is {got}",
+                    d.spec.label(),
+                    want.sha256
                 );
             }
         }
@@ -2712,10 +2900,10 @@ mod tests {
         assert_eq!(plan_of(&[("Gemfile", "source 'x'")]), GemPlan::Nothing);
         for name in ["Gemfile.lock", "gems.locked"] {
             match plan_of(&[(name, GEM_LOCK)]) {
-                GemPlan::Fetch(file, list) => {
+                GemPlan::Fetch(file, fetch) => {
                     assert_eq!(file, name);
-                    assert_eq!(list.len(), 1);
-                    assert_eq!(list[0].spec.file_name(), "rake-13.0.6.gem");
+                    assert_eq!(fetch.downloads.len(), 1);
+                    assert_eq!(fetch.downloads[0].spec.file_name(), "rake-13.0.6.gem");
                 }
                 other => panic!("{name}: {other:?}"),
             }
@@ -2825,28 +3013,33 @@ mod tests {
             "GEM\n  remote: https://user:SECRET@gems.example/\n  specs:\n    rake (13.0.6)\n    nokogiri (1.15.0-x86_64-linux)\n\nPLATFORMS\n  ruby\n",
         )
         .unwrap();
-        let bundler::Plan::Fetch(list) =
+        let bundler::Plan::Fetch(fetch) =
             bundler::plan("Gemfile.lock", &lock, &Host::of("x86_64", "linux"))
         else {
             panic!("expected a fetch plan");
         };
-        let script = gem_fetch_script(&list);
+        let script = gem_fetch_script(&fetch);
         assert!(
             !script.contains("SECRET") && !script.contains("user:"),
             "{script}"
         );
-        let lines: Vec<&str> = script.lines().filter(|l| l.starts_with("\"$1\"")).collect();
+        // The section's remotes are written once, in a function; each gem line names it.
+        assert!(
+            script.contains("src0() { \"$@\" --source 'https://gems.example/'; }\n"),
+            "{script}"
+        );
+        let lines: Vec<&str> = script.lines().filter(|l| l.starts_with("src0 ")).collect();
         assert_eq!(lines.len(), 2, "{script}");
         assert!(
             lines[0].starts_with(
-                "\"$1\" fetch 'nokogiri' --version '1.15.0' --platform 'x86_64-linux' --clear-sources --source 'https://gems.example/' || {"
+                "src0 \"$GEM\" fetch 'nokogiri' --version '1.15.0' --platform 'x86_64-linux' --clear-sources || {"
             ),
             "{}",
             lines[0]
         );
         assert!(
             lines[1].starts_with(
-                "\"$1\" fetch 'rake' --version '13.0.6' --platform 'ruby' --clear-sources --source 'https://gems.example/' || {"
+                "src0 \"$GEM\" fetch 'rake' --version '13.0.6' --platform 'ruby' --clear-sources || {"
             ),
             "{}",
             lines[1]
@@ -2989,6 +3182,455 @@ mod tests {
         assert_eq!(
             path_with_tool_dir("/usr/bin", Some(Path::new("relative/gem"))),
             "/usr/bin"
+        );
+    }
+
+    fn var_tmp() -> TempDir {
+        TempDir::new_in("/var/tmp").unwrap()
+    }
+
+    /// A sparse file of `len` bytes: a size without the bytes, so a test of the bound is fast.
+    fn sparse(path: &Path, len: u64) {
+        fs::File::create(path).unwrap().set_len(len).unwrap();
+    }
+
+    const OVER: u64 = crate::MAX_DEPENDENCY_INPUT_BYTES + 1;
+
+    // ---- S-3: a section's remotes are written once ----------------------------------------
+
+    fn fetch_script_of(remotes: usize, specs: usize) -> String {
+        let mut text = String::from("GEM\n");
+        for i in 0..remotes {
+            text.push_str(&format!("  remote: https://h{i}.example/\n"));
+        }
+        text.push_str("  specs:\n");
+        for i in 0..specs {
+            text.push_str(&format!("    gem{i} (1.0.0)\n"));
+        }
+        text.push_str("\nPLATFORMS\n  ruby\n");
+        let lock = bundler::parse(&text).unwrap();
+        let bundler::Plan::Fetch(fetch) =
+            bundler::plan("Gemfile.lock", &lock, &Host::of("x86_64", "linux"))
+        else {
+            panic!("expected a fetch plan");
+        };
+        gem_fetch_script(&fetch)
+    }
+
+    #[test]
+    fn the_fetch_script_is_linear_in_the_gems_whatever_the_remotes_per_section() {
+        // Sixteen remotes cost the script their text once: 2000 gems add the same bytes with
+        // one remote as with sixteen, apart from the one function line.
+        let one = fetch_script_of(1, 2000);
+        let many = fetch_script_of(bundler::MAX_REMOTES_PER_SOURCE, 2000);
+        let remote = "--source 'https://h10.example/' ".len();
+        assert!(
+            many.len() <= one.len() + bundler::MAX_REMOTES_PER_SOURCE * (remote + 2),
+            "one remote {} bytes, sixteen {} bytes",
+            one.len(),
+            many.len()
+        );
+        // And per gem, a constant line plus its name.
+        assert!(
+            many.len() <= 2000 * 200 + 1000,
+            "{} bytes for 2000 gems",
+            many.len()
+        );
+        assert_eq!(
+            many.matches("--source").count(),
+            bundler::MAX_REMOTES_PER_SOURCE
+        );
+        assert_eq!(
+            many.lines().filter(|l| l.starts_with("src0 ")).count(),
+            2000
+        );
+    }
+
+    #[test]
+    fn two_sections_get_two_functions_and_each_gem_names_its_own() {
+        let lock = bundler::parse(
+            "GEM\n  remote: https://a.example/\n  specs:\n    one (1.0)\n\nGEM\n  remote: https://b.example/\n  specs:\n    two (2.0)\n\nPLATFORMS\n  ruby\n",
+        )
+        .unwrap();
+        let bundler::Plan::Fetch(fetch) =
+            bundler::plan("Gemfile.lock", &lock, &Host::of("x86_64", "linux"))
+        else {
+            panic!("expected a fetch plan");
+        };
+        let script = gem_fetch_script(&fetch);
+        assert!(
+            script.contains("src0() { \"$@\" --source 'https://a.example/'; }"),
+            "{script}"
+        );
+        assert!(
+            script.contains("src1() { \"$@\" --source 'https://b.example/'; }"),
+            "{script}"
+        );
+        assert!(script.contains("src0 \"$GEM\" fetch 'one'"), "{script}");
+        assert!(script.contains("src1 \"$GEM\" fetch 'two'"), "{script}");
+    }
+
+    // ---- S-4: quoted keys and query tokens -----------------------------------------------
+
+    #[test]
+    fn a_quoted_npmrc_key_is_read_as_ini_reads_it_and_its_token_is_stripped() {
+        let text = "registry=https://registry.npmjs.org/\n\
+            \"//registry.npmjs.org/:_authToken\"=DOUBLE\n\
+            '//registry.npmjs.org/:_authToken'=SINGLE\n\
+            \"//a.example/:_authToken\" = SPACED\n\
+            '@scope:_password'  =  SPACED-SINGLE\n\
+            \"_auth\"=BARE-QUOTED\n\
+            \"//b.example/:_authtoken\"=UPPER\n\
+            \"\\u005fauthToken\"=ESCAPED\n\
+            \"//c.example/:keyfile\"=/x\n\
+            \"cert\"=\"-----BEGIN CERTIFICATE-----\n\
+            MIIPEM\n\
+            -----END CERTIFICATE-----\"\n\
+            always-auth=true\n";
+        let (out, n) = strip_npmrc_auth(text);
+        for secret in [
+            "DOUBLE",
+            "SINGLE",
+            "SPACED",
+            "SPACED-SINGLE",
+            "BARE-QUOTED",
+            "UPPER",
+            "ESCAPED",
+            "MIIPEM",
+        ] {
+            assert!(!out.contains(secret), "{secret} survived:\n{out}");
+        }
+        assert_eq!(n, 9, "{out}");
+        assert!(
+            out.contains("registry=https://registry.npmjs.org/\n"),
+            "{out}"
+        );
+        assert!(out.contains("always-auth=true"), "{out}");
+        // Keys that only look alike are kept.
+        let (out, n) =
+            strip_npmrc_auth("\"//h/:_authTokenX\"=KEEP\n'package-lock'=KEEP2\n\"monkey\"=KEEP3\n");
+        assert_eq!(n, 0, "{out}");
+        assert!(
+            out.contains("KEEP") && out.contains("KEEP2") && out.contains("KEEP3"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn a_credential_in_the_query_of_a_registry_url_is_stripped_and_counted() {
+        let text = "registry=https://npm.example/?token=QSECRET&x=1\n\
+            @s:registry = https://npm.example/p?x=1&Access_Token=ASECRET#frag\n\
+            @t:registry=https://npm.example/?PASSWORD=PSECRET\n\
+            @u:registry=https://npm.example/?%61uth=ESECRET&keep=yes\n\
+            @v:registry=https://u:USECRET@npm.example/?auth=ASECRET2\n\
+            @w:registry=https://npm.example/?tokens=KEEP&author=KEEP\n";
+        let (out, n) = strip_npmrc_auth(text);
+        for secret in ["QSECRET", "ASECRET", "PSECRET", "ESECRET", "USECRET"] {
+            assert!(!out.contains(secret), "{secret} survived:\n{out}");
+        }
+        assert_eq!(
+            n, 5,
+            "one per line changed, a double change counted once:\n{out}"
+        );
+        assert!(out.contains("registry=https://npm.example/?x=1\n"), "{out}");
+        assert!(
+            out.contains("@s:registry=https://npm.example/p?x=1#frag\n"),
+            "{out}"
+        );
+        assert!(out.contains("@t:registry=https://npm.example/\n"), "{out}");
+        assert!(
+            out.contains("@u:registry=https://npm.example/?keep=yes\n"),
+            "{out}"
+        );
+        assert!(out.contains("@v:registry=https://npm.example/\n"), "{out}");
+        assert!(
+            out.contains("?tokens=KEEP&author=KEEP"),
+            "a parameter named like one is not one:\n{out}"
+        );
+    }
+
+    #[test]
+    fn a_query_credential_is_stripped_from_yarn_and_bundler_urls_too() {
+        let yml =
+            strip_yarnrc_yml("npmRegistryServer: \"https://npm.example/?token=YSECRET&a=b\"\n");
+        assert!(
+            !yml.text.contains("YSECRET") && yml.text.contains("?a=b"),
+            "{}",
+            yml.text
+        );
+        assert_eq!(yml.credentials, 1);
+        let classic = strip_yarnrc("registry \"https://npm.example/?auth=CSECRET\"\n");
+        assert!(!classic.text.contains("CSECRET"), "{}", classic.text);
+        assert_eq!(classic.credentials, 1);
+        assert_eq!(
+            bundler::drop_credentials("https://gems.example/?token=GSECRET"),
+            "https://gems.example/"
+        );
+        assert!(bundler::has_credentials(
+            "https://gems.example/?access_token=x"
+        ));
+        assert!(!bundler::has_credentials("https://gems.example/?page=2"));
+    }
+
+    // ---- S-7: symlinks and sizes ----------------------------------------------------------
+
+    #[test]
+    fn a_symlinked_key_input_is_not_hashed_and_the_notes_name_it() {
+        let tmp = var_tmp();
+        let elsewhere = tmp.path().join("elsewhere");
+        fs::write(&elsewhere, "any file the director can read").unwrap();
+        for name in [
+            "Gemfile.lock",
+            "package-lock.json",
+            "Cargo.lock",
+            "yarn.lock",
+            "package.json",
+        ] {
+            let tree = tmp.path().join(format!("tree-{name}"));
+            fs::create_dir(&tree).unwrap();
+            std::os::unix::fs::symlink(&elsewhere, tree.join(name)).unwrap();
+            let empty = tmp.path().join(format!("empty-{name}"));
+            fs::create_dir(&empty).unwrap();
+            assert_eq!(
+                dependency_cache_key(&tree, "t").unwrap(),
+                dependency_cache_key(&empty, "t").unwrap(),
+                "{name}"
+            );
+            let notes = unfetched_notes(&tree);
+            assert!(
+                notes
+                    .iter()
+                    .any(|n| n.starts_with(&format!("{name}: a symbolic link"))),
+                "{name}: {notes:?}"
+            );
+        }
+        // A symlinked Cargo.lock asks for no cargo fetch.
+        let tree = tmp.path().join("tree-Cargo.lock");
+        assert!(!Needs::of(&tree).cargo);
+        // A regular file in a tree is not a symlink: no note.
+        let plain = tmp.path().join("plain");
+        fs::create_dir(&plain).unwrap();
+        fs::write(plain.join("Cargo.lock"), "# lock\n").unwrap();
+        assert!(unfetched_notes(&plain).is_empty());
+        assert!(Needs::of(&plain).cargo);
+    }
+
+    #[test]
+    fn a_lockfile_or_manifest_over_the_bound_is_not_read_and_is_not_fetched_naming_it() {
+        let tmp = var_tmp();
+        for (file, other) in [
+            ("Gemfile.lock", None),
+            ("gems.locked", None),
+            ("package-lock.json", None),
+            ("npm-shrinkwrap.json", None),
+            ("yarn.lock", None),
+            ("pnpm-lock.yaml", None),
+            ("package.json", Some("package-lock.json")),
+            ("Cargo.lock", None),
+        ] {
+            let tree = tmp.path().join(format!("t-{file}"));
+            fs::create_dir(&tree).unwrap();
+            sparse(&tree.join(file), OVER);
+            if let Some(other) = other {
+                fs::write(tree.join(other), "{}").unwrap();
+            }
+            let started = std::time::Instant::now();
+            let needs = Needs::of(&tree);
+            let notes = unfetched_notes(&tree);
+            let key = dependency_cache_key(&tree, "t").unwrap();
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "{file}: the file was read"
+            );
+            assert!(!needs.any(), "{file}: {needs:?}");
+            assert!(
+                notes
+                    .iter()
+                    .any(|n| n.starts_with(&format!("{file}: ")) && n.contains("8 MiB")),
+                "{file}: {notes:?}"
+            );
+            // The key still exists and tells the file from an absent one.
+            let empty = tmp.path().join(format!("e-{file}"));
+            fs::create_dir(&empty).unwrap();
+            assert_ne!(key, dependency_cache_key(&empty, "t").unwrap(), "{file}");
+        }
+    }
+
+    #[test]
+    fn a_file_exactly_at_the_bound_is_still_read_and_one_byte_over_is_refused() {
+        let tmp = var_tmp();
+        let at = tmp.path().join("at");
+        sparse(&at, crate::MAX_DEPENDENCY_INPUT_BYTES);
+        assert_eq!(
+            read_dependency_input(&at).unwrap().len() as u64,
+            crate::MAX_DEPENDENCY_INPUT_BYTES
+        );
+        let over = tmp.path().join("over");
+        sparse(&over, OVER);
+        let e = read_dependency_input(&over).unwrap_err();
+        assert!(e.to_string().contains("8 MiB bound"), "{e}");
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&at, &link).unwrap();
+        assert!(
+            read_dependency_input(&link).is_err(),
+            "a symlink is not followed"
+        );
+        assert!(read_dependency_text(&tmp.path().join("missing")).is_err());
+    }
+
+    #[test]
+    fn the_package_json_and_lockfile_copies_of_a_js_fetch_stop_at_the_bound() {
+        let tmp = var_tmp();
+        let from = tmp.path().join("package.json");
+        let to = tmp.path().join("copy.json");
+        fs::write(&from, "{}").unwrap();
+        copy_bounded(&from, &to).unwrap();
+        assert_eq!(fs::read_to_string(&to).unwrap(), "{}");
+        sparse(&from, OVER);
+        let e = copy_bounded(&from, &tmp.path().join("copy2.json")).unwrap_err();
+        assert!(format!("{e:#}").contains("8 MiB bound"), "{e:#}");
+        assert!(!tmp.path().join("copy2.json").exists());
+    }
+
+    // ---- S-9: the base's checksums and remotes -------------------------------------------
+
+    fn gem_lock_text(remote: &str, specs: &str, sums: &str) -> String {
+        let checks = if sums.is_empty() {
+            String::new()
+        } else {
+            format!("\nCHECKSUMS\n{sums}")
+        };
+        format!("GEM\n  remote: {remote}\n  specs:\n{specs}\nPLATFORMS\n  ruby\n{checks}")
+    }
+
+    /// A tree with the lane's lockfile and, when `base` is given, the base's in the place the
+    /// snapshot's `restore` leaves it.
+    fn tree_with_base(lane: &str, base: Option<&str>) -> TempDir {
+        let tmp = var_tmp();
+        fs::write(tmp.path().join("Gemfile.lock"), lane).unwrap();
+        if let Some(base) = base {
+            fs::create_dir_all(tmp.path().join(".cowproof-base")).unwrap();
+            fs::write(tmp.path().join(BASE_GEM_LOCKFILE), base).unwrap();
+        }
+        tmp
+    }
+
+    const SUM_BASE: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const SUM_LANE: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    #[test]
+    fn the_bases_gem_checksum_and_remote_decide_a_lanes_gem_plan() {
+        let linux = Host::of("x86_64", "linux");
+        let base = gem_lock_text(
+            "https://gems.corp.example/",
+            "    rake (13.0.6)\n",
+            &format!("  rake (13.0.6) sha256={SUM_BASE}\n"),
+        );
+        // The lane drops CHECKSUMS: the base's is compared.
+        let lane = gem_lock_text("https://gems.corp.example/", "    rake (13.0.6)\n", "");
+        let tmp = tree_with_base(&lane, Some(&base));
+        match gem_plan(tmp.path(), &linux) {
+            GemPlan::Fetch(_, fetch) => {
+                let sum = fetch.downloads[0].checksum.clone().unwrap();
+                assert_eq!((sum.sha256.as_str(), sum.from_base), (SUM_BASE, true));
+            }
+            other => panic!("{other:?}"),
+        }
+        // The lane's own checksum for the same gem does not replace it.
+        let own = gem_lock_text(
+            "https://gems.corp.example/",
+            "    rake (13.0.6)\n",
+            &format!("  rake (13.0.6) sha256={SUM_LANE}\n"),
+        );
+        match gem_plan(tree_with_base(&own, Some(&base)).path(), &linux) {
+            GemPlan::Fetch(_, fetch) => {
+                assert_eq!(
+                    fetch.downloads[0].checksum.as_ref().unwrap().sha256,
+                    SUM_BASE
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+        // Moved to the public host: not fetched, naming the gem and both remotes.
+        let moved = gem_lock_text("https://rubygems.org/", "    rake (13.0.6)\n", "");
+        let tmp = tree_with_base(&moved, Some(&base));
+        match gem_plan(tmp.path(), &linux) {
+            GemPlan::NotFetched(note) => assert!(
+                note.contains("rake (13.0.6)")
+                    && note.contains("https://rubygems.org/")
+                    && note.contains("https://gems.corp.example/"),
+                "{note}"
+            ),
+            other => panic!("{other:?}"),
+        }
+        assert!(!Needs::of(tmp.path()).bundler);
+        assert!(
+            unfetched_notes(tmp.path())
+                .iter()
+                .any(|n| n.contains("moved gem"))
+        );
+        // No base file, no pins: the lane's lockfile alone.
+        assert!(matches!(
+            gem_plan(tree_with_base(&moved, None).path(), &linux),
+            GemPlan::Fetch(..)
+        ));
+        // A symlinked or unparseable base file pins nothing.
+        let tmp = tree_with_base(&moved, Some("<<<<<<< HEAD\n"));
+        assert!(matches!(gem_plan(tmp.path(), &linux), GemPlan::Fetch(..)));
+    }
+
+    #[test]
+    fn a_new_gem_with_no_checksum_is_named_unverified_in_the_note() {
+        let lane = gem_lock_text(
+            "https://rubygems.org/",
+            "    rake (13.0.6)\n    extra (2.1.0)\n",
+            "",
+        );
+        let base = gem_lock_text(
+            "https://rubygems.org/",
+            "    rake (13.0.6)\n",
+            &format!("  rake (13.0.6) sha256={SUM_BASE}\n"),
+        );
+        let tmp = tree_with_base(&lane, Some(&base));
+        let GemPlan::Fetch(_, fetch) = gem_plan(tmp.path(), &Host::of("x86_64", "linux")) else {
+            panic!("expected a fetch plan");
+        };
+        let note = unverified_note(&fetch).expect("one gem is unverified");
+        assert!(
+            note.contains("1 gem(s)")
+                && note.contains("unverified: extra 2.1.0")
+                && !note.contains("rake"),
+            "{note}"
+        );
+        // Every gem verified: no note.
+        let all = gem_lock_text(
+            "https://rubygems.org/",
+            "    rake (13.0.6)\n",
+            &format!("  rake (13.0.6) sha256={SUM_LANE}\n"),
+        );
+        let GemPlan::Fetch(_, fetch) = gem_plan(
+            tree_with_base(&all, None).path(),
+            &Host::of("x86_64", "linux"),
+        ) else {
+            panic!("expected a fetch plan");
+        };
+        assert_eq!(unverified_note(&fetch), None);
+        // A long list is cut.
+        let mut specs = String::new();
+        for i in 0..30 {
+            specs.push_str(&format!("    g{i} (1.0)\n"));
+        }
+        let many = gem_lock_text("https://rubygems.org/", &specs, "");
+        let GemPlan::Fetch(_, fetch) = gem_plan(
+            tree_with_base(&many, None).path(),
+            &Host::of("x86_64", "linux"),
+        ) else {
+            panic!("expected a fetch plan");
+        };
+        let note = unverified_note(&fetch).unwrap();
+        assert!(
+            note.contains("30 gem(s)") && note.ends_with("and 10 more"),
+            "{note}"
         );
     }
 }

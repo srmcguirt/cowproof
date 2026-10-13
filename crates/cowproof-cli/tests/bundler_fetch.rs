@@ -485,6 +485,214 @@ fn the_checksums_section_is_compared_with_the_download_and_a_mismatch_is_infrast
     );
 }
 
+/// A lane whose BASE has `base` as its files and whose builder rewrites `Gemfile.lock` to
+/// `lane_lock` before its check (so the lane's patch is exactly that rewrite).
+fn lane_rewriting_lockfile(
+    base: &[(&'static str, String)],
+    lane_lock: &str,
+    cache: &Path,
+    gem: &Path,
+    bundle: &Path,
+) -> Lane {
+    let body = format!(
+        "cat > Gemfile.lock <<'COWPROOF_LOCK'\n{lane_lock}COWPROOF_LOCK\n{}",
+        run_checks(&["ok"])
+    );
+    let project = var_tmp("cp-gem-proj-");
+    for (rel, content) in base {
+        fs::write(project.path().join(rel), content).unwrap();
+    }
+    let packet = |id: &str| {
+        format!(
+            "# Task\n\n<!-- lane {} -->\n\nChange the lockfile.\n",
+            json!({
+                "id": id,
+                "owns": ["Gemfile.lock"],
+                "class": "light",
+                "checks": [{"id": "ok", "command": "true"}],
+            })
+        )
+    };
+    let mut lane = Lane::from_project(&body, project.path(), &packet);
+    lane.set_env("COWPROOF_CACHE_ROOT", cache);
+    lane.set_env("COWPROOF_FETCH_NETWORK", "none");
+    lane.set_env("COWPROOF_GEM", gem);
+    lane.set_env("COWPROOF_BUNDLE", bundle);
+    lane
+}
+
+#[test]
+fn a_lane_that_drops_checksums_is_still_held_to_the_bases_checksum() {
+    if !sandbox_available() {
+        return;
+    }
+    let (_gem_dir, gem) = fake_tool("gem", FAKE_GEM_OK);
+    let (_bundle_dir, bundle) = fake_tool("bundle", FAKE_BUNDLE_OK);
+    let real = format!("  fake-gem (1.0.0) sha256={}\n", sha256(GEM_BODY));
+    let tampered = format!("  fake-gem (1.0.0) sha256={}\n", sha256("the real gem\n"));
+    let remote = "https://rubygems.org/";
+
+    // Control: the base's checksum is the download's and the lane drops CHECKSUMS: proved,
+    // and nothing is unverified because the base verifies it.
+    let cache = var_tmp("cp-gem-cache-");
+    let base = vec![
+        ("Gemfile", GEMFILE.to_string()),
+        ("Gemfile.lock", lockfile(remote, ONE_GEM, &real)),
+    ];
+    let lane = lane_rewriting_lockfile(
+        &base,
+        &lockfile(remote, ONE_GEM, ""),
+        cache.path(),
+        &gem,
+        &bundle,
+    );
+    let held = var_tmp("cp-gem-held-");
+    run_with(&lane, &heldout(held.path(), NEEDS_GEMS), 0);
+    assert_eq!(lane.verdict()["verdict"], "proved");
+    let c = capsule(&lane);
+    assert!(
+        !c.dependency_fetch_notes
+            .iter()
+            .any(|n| n.contains("unverified")),
+        "{:?}",
+        c.dependency_fetch_notes
+    );
+
+    // The base's checksum is not the download's (the "real" gem is another file): the lane
+    // drops CHECKSUMS, and the download is still refused, as infrastructure.
+    let cache = var_tmp("cp-gem-cache-");
+    let base = vec![
+        ("Gemfile", GEMFILE.to_string()),
+        ("Gemfile.lock", lockfile(remote, ONE_GEM, &tampered)),
+    ];
+    let lane = lane_rewriting_lockfile(
+        &base,
+        &lockfile(remote, ONE_GEM, ""),
+        cache.path(),
+        &gem,
+        &bundle,
+    );
+    let out = lane.run(&[]);
+    assert_eq!(out.status.code(), Some(4), "{}", text(&out));
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(
+        stdout.contains("dependency fetch failed: ")
+            && stdout.contains("checksum mismatch for fake-gem (1.0.0)")
+            && stdout.contains("the base's lockfile lists sha256")
+            && stdout.contains(&sha256("the real gem\n"))
+            && stdout.contains(&sha256(GEM_BODY)),
+        "{}",
+        text(&out)
+    );
+    assert_eq!(lane.verdict()["verdict"], "infrastructure");
+    assert!(
+        fs::read_dir(cache.path().join("deps"))
+            .unwrap()
+            .next()
+            .is_none(),
+        "a download that fails the base's checksum is never installed"
+    );
+
+    // The lane writes the DOWNLOAD's checksum into its own lockfile: the base's still wins.
+    let cache = var_tmp("cp-gem-cache-");
+    let lane = lane_rewriting_lockfile(
+        &base,
+        &lockfile(remote, ONE_GEM, &real),
+        cache.path(),
+        &gem,
+        &bundle,
+    );
+    let out = lane.run(&[]);
+    assert_eq!(out.status.code(), Some(4), "{}", text(&out));
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("the base's lockfile lists sha256"),
+        "{}",
+        text(&out)
+    );
+}
+
+#[test]
+fn a_base_gem_the_lane_moves_to_another_remote_is_not_fetched_naming_both_remotes() {
+    if !sandbox_available() {
+        return;
+    }
+    let cache = var_tmp("cp-gem-cache-");
+    // The fake gem fails if it is called: nothing is fetched for a moved gem.
+    let (_gem_dir, gem) = fake_tool("gem", FAKE_GEM_MUST_NOT_RUN);
+    let (_bundle_dir, bundle) = fake_tool("bundle", FAKE_BUNDLE_OK);
+    let base = vec![
+        ("Gemfile", GEMFILE.to_string()),
+        (
+            "Gemfile.lock",
+            lockfile("https://gems.corp.example/", ONE_GEM, ""),
+        ),
+    ];
+    let lane = lane_rewriting_lockfile(
+        &base,
+        &lockfile("https://rubygems.org/", ONE_GEM, ""),
+        cache.path(),
+        &gem,
+        &bundle,
+    );
+    let out = lane.run(&[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    let c = capsule(&lane);
+    assert_eq!(c.dependency_fetch_outcome.as_deref(), Some("not_fetched"));
+    assert!(c.dependency_ecosystems.is_empty());
+    assert!(
+        c.dependency_fetch_notes
+            .iter()
+            .any(|n| n.contains("fake-gem (1.0.0)")
+                && n.contains("https://rubygems.org/")
+                && n.contains("https://gems.corp.example/")
+                && n.contains("moved gem")),
+        "{:?}",
+        c.dependency_fetch_notes
+    );
+}
+
+#[test]
+fn a_new_gem_with_no_checksum_is_fetched_and_listed_as_unverified() {
+    if !sandbox_available() {
+        return;
+    }
+    let cache = var_tmp("cp-gem-cache-");
+    let (_gem_dir, gem) = fake_tool("gem", FAKE_GEM_OK);
+    let (_bundle_dir, bundle) = fake_tool("bundle", FAKE_BUNDLE_OK);
+    let remote = "https://rubygems.org/";
+    let real = format!("  fake-gem (1.0.0) sha256={}\n", sha256(GEM_BODY));
+    let base = vec![
+        ("Gemfile", GEMFILE.to_string()),
+        ("Gemfile.lock", lockfile(remote, ONE_GEM, &real)),
+    ];
+    let specs = "    fake-gem (1.0.0)\n    new-gem (2.0.0)\n";
+    let lane = lane_rewriting_lockfile(
+        &base,
+        &lockfile(remote, specs, &real),
+        cache.path(),
+        &gem,
+        &bundle,
+    );
+    let held = var_tmp("cp-gem-held-");
+    run_with(&lane, &heldout(held.path(), NEEDS_GEMS), 0);
+    assert_eq!(lane.verdict()["verdict"], "proved");
+    let c = capsule(&lane);
+    assert_eq!(c.dependency_fetch_outcome.as_deref(), Some("fetched"));
+    let e = entry(cache.path(), &c);
+    assert!(e.join("bundler/cache/new-gem-2.0.0.gem").is_file());
+    let notes: Vec<&String> = c
+        .dependency_fetch_notes
+        .iter()
+        .filter(|n| n.contains("unverified"))
+        .collect();
+    assert_eq!(notes.len(), 1, "{:?}", c.dependency_fetch_notes);
+    assert!(
+        notes[0].contains("unverified: new-gem 2.0.0") && !notes[0].contains("fake-gem"),
+        "{}",
+        notes[0]
+    );
+}
+
 #[test]
 fn a_gem_the_lockfile_names_that_gem_fetch_did_not_produce_is_infrastructure() {
     if !sandbox_available() {

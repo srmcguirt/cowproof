@@ -1,9 +1,9 @@
-//! Proof tests for `docs/audit-2026-10-13.md`. A test for an open finding is `#[ignore]`d and
-//! FAILS today, so the suite stays green; `cargo test -p cowproof --test audit_2026_10_13 --
-//! --ignored` shows them failing. A test for a resolved finding (S-5, S-6) is not ignored.
-//! Each names the finding it proves. None needs a sandbox, a network or a tool.
+//! Proof tests for `docs/audit-2026-10-13.md`. A test of a finding that is still open is
+//! `#[ignore]`d and FAILS today, so the suite stays green; `cargo test -p cowproof --test
+//! audit_2026_10_13 -- --ignored` shows them failing. A resolved finding's test is not ignored
+//! and passes. Each names the finding it proves. None needs a sandbox, a network or a tool.
 
-use cowproof_run::bundler::{Host, Plan, parse, plan};
+use cowproof_run::bundler::{Host, Plan, parse, plan, plan_with_base};
 use std::fs;
 use std::path::Path;
 
@@ -23,40 +23,56 @@ fn audit_s1_a_gemfile_error_reaches_the_directors_terminal_with_its_escape_seque
     );
 }
 
-/// S-3. A lockfile of R `remote:` lines and S specs makes `plan` hold R x S remote strings, and
-/// `gem_fetch_script` writes one `--source` per remote per gem. A 1 MB `Gemfile.lock` is about
-/// 20 000 remotes and 30 000 specs: 600 million strings in the director's process.
+/// S-3 (resolved, lane/fix-s3-s4-s7-s9-deps). A lockfile of R `remote:` lines and S specs used
+/// to make `plan` hold R x S remote strings, and `gem_fetch_script` write one `--source` per
+/// remote per gem: a 1 MB `Gemfile.lock` was about 20 000 remotes and 30 000 specs, 600 million
+/// strings. Now a section's remotes are held once and a section may have 16 at most.
 #[test]
-#[ignore = "S-3: open finding"]
 fn audit_s3_the_bundler_plan_multiplies_remotes_by_specs() {
-    const R: usize = 1000;
+    const R: usize = 16;
     const S: usize = 1000;
-    let mut lock = String::from("GEM\n");
-    for i in 0..R {
-        lock.push_str(&format!("  remote: https://h{i}.example/\n"));
-    }
-    lock.push_str("  specs:\n");
-    for i in 0..S {
-        lock.push_str(&format!("    g{i} (1.0.0)\n"));
-    }
-    lock.push_str("\nPLATFORMS\n  ruby\n");
+    let build = |remotes: usize| {
+        let mut lock = String::from("GEM\n");
+        for i in 0..remotes {
+            lock.push_str(&format!("  remote: https://h{i}.example/\n"));
+        }
+        lock.push_str("  specs:\n");
+        for i in 0..S {
+            lock.push_str(&format!("    g{i} (1.0.0)\n"));
+        }
+        lock.push_str("\nPLATFORMS\n  ruby\n");
+        lock
+    };
+    let lock = build(R);
     let input_lines = lock.lines().count();
     let parsed = parse(&lock).expect("the lockfile parses");
-    let Plan::Fetch(downloads) = plan("Gemfile.lock", &parsed, &Host::of("x86_64", "linux")) else {
+    let Plan::Fetch(fetch) = plan("Gemfile.lock", &parsed, &Host::of("x86_64", "linux")) else {
         panic!("the plan fetches");
     };
-    let held: usize = downloads.iter().map(|d| d.remotes.len()).sum();
+    assert_eq!(fetch.downloads.len(), S);
+    // The remotes are held once, however many gems name them: the memory is linear in the input.
+    let held: usize = fetch.sources.iter().map(Vec::len).sum();
     assert!(
-        held <= 4 * input_lines,
+        held <= input_lines,
         "{input_lines} lines of input make the plan hold {held} remote strings"
     );
+    assert!(
+        fetch
+            .downloads
+            .iter()
+            .all(|d| std::ptr::eq(fetch.remotes(d), fetch.remotes(&fetch.downloads[0])))
+    );
+    // And more remotes than the bound do not parse at all, so the 1 000 x 1 000 lockfile of the
+    // audit is refused, naming the bound.
+    let e = parse(&build(1000)).expect_err("1000 remotes in one section");
+    assert!(e.why.contains("more than 16 remotes"), "{e}");
 }
 
-/// S-4. `ini` (what npm and pnpm read `.npmrc` with) unquotes a quoted key, so
-/// `"//host/:_authToken"=...` sets the token; the stripper looks at the text after the last `:`
-/// and sees `_authToken"`, so the token is handed to the fetch and lands in the entry's cache.
+/// S-4 (resolved, lane/fix-s3-s4-s7-s9-deps). `ini` (what npm and pnpm read `.npmrc` with)
+/// unquotes a quoted key, so `"//host/:_authToken"=...` sets the token; the stripper used to look
+/// at the text after the last `:` and see `_authToken"`, so the token reached the fetch and the
+/// entry's cache.
 #[test]
-#[ignore = "S-4: open finding"]
 fn audit_s4_a_quoted_npmrc_key_keeps_its_token() {
     let text = "registry=https://registry.npmjs.org/\n\
                 \"//registry.npmjs.org/:_authToken\"=DOUBLE-QUOTED-SECRET\n\
@@ -138,11 +154,10 @@ fn audit_s6_the_lanes_tool_does_not_label_a_builder_reported_figure() {
     );
 }
 
-/// S-7. Every planner refuses a symlinked lockfile (`is_regular`), but the cache key follows
+/// S-7 (resolved, lane/fix-s3-s4-s7-s9-deps). Every planner refuses a symlinked lockfile (`is_regular`), but the cache key follows
 /// it (`is_file`) and reads the whole target into memory: a lane's `Gemfile.lock -> <any
 /// readable file>` changes the key and makes the director read that file.
 #[test]
-#[ignore = "S-7: open finding"]
 fn audit_s7_a_symlinked_lockfile_does_not_belong_in_the_cache_key() {
     let tmp = tempfile::tempdir_in("/var/tmp").unwrap();
     let triple = "x86_64-unknown-linux-gnu";
@@ -157,5 +172,45 @@ fn audit_s7_a_symlinked_lockfile_does_not_belong_in_the_cache_key() {
         cowproof_run::dependency_cache_key(&empty, triple).unwrap(),
         cowproof_run::dependency_cache_key(&linked, triple).unwrap(),
         "a symlink the planners ignore still changes the key"
+    );
+}
+
+/// S-9 (resolved, lane/fix-s3-s4-s7-s9-deps). The lane's `Gemfile.lock` decided what to fetch,
+/// where from and what it must hash to: dropping `CHECKSUMS`, or moving a gem the base takes from
+/// a private host to rubygems.org, went unnoticed. The base now decides for the gems it lists
+/// (the end-to-end proofs are in `tests/bundler_fetch.rs`).
+#[test]
+fn audit_s9_a_lane_cannot_drop_a_checksum_or_move_a_gem_the_base_pins() {
+    let sum = "a".repeat(64);
+    let base = parse(&format!(
+        "GEM\n  remote: https://gems.corp.example/\n  specs:\n    rake (13.0.6)\n\nPLATFORMS\n  ruby\n\nCHECKSUMS\n  rake (13.0.6) sha256={sum}\n"
+    ))
+    .unwrap();
+    let host = Host::of("x86_64", "linux");
+    let dropped = parse(
+        "GEM\n  remote: https://gems.corp.example/\n  specs:\n    rake (13.0.6)\n\nPLATFORMS\n  ruby\n",
+    )
+    .unwrap();
+    let Plan::Fetch(fetch) = plan_with_base("Gemfile.lock", &dropped, Some(&base), &host) else {
+        panic!("the plan fetches");
+    };
+    assert_eq!(
+        fetch.downloads[0]
+            .checksum
+            .as_ref()
+            .map(|c| c.sha256.as_str()),
+        Some(sum.as_str()),
+        "the base's checksum survives a dropped CHECKSUMS section"
+    );
+    let moved = parse(
+        "GEM\n  remote: https://rubygems.org/\n  specs:\n    rake (13.0.6)\n\nPLATFORMS\n  ruby\n",
+    )
+    .unwrap();
+    assert!(
+        matches!(
+            plan_with_base("Gemfile.lock", &moved, Some(&base), &host),
+            Plan::NotFetched(_)
+        ),
+        "a gem the base takes from a private host is not fetched from another"
     );
 }

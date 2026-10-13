@@ -251,7 +251,8 @@ impl FetchAllowlist {
 /// symlink in a rebuilt tree could point anywhere).
 fn read_regular(path: &Path) -> Result<Option<String>> {
     match std::fs::symlink_metadata(path) {
-        Ok(m) if m.is_file() => std::fs::read_to_string(path)
+        // Bounded like every director-side read of a file a lane could have written.
+        Ok(m) if m.is_file() => crate::read_dependency_text(path)
             .map(Some)
             .with_context(|| format!("reading {}", path.display())),
         Ok(_) => Ok(None),
