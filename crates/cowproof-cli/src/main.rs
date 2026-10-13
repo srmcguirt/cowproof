@@ -574,11 +574,11 @@ async fn serve_net_bridge(args: NetBridgeArgs) -> Result<()> {
 /// command in this process. The command is argv, never a shell string.
 fn exec_behind_bridge(args: NetBridgeArgs) -> Result<()> {
     use std::io::{BufRead, BufReader};
-    use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
 
     let exe = std::env::current_exe().context("locating the cowproof executable")?;
-    let mut bridge = Command::new(exe)
+    let mut bridge_command = Command::new(exe);
+    bridge_command
         .arg("net-bridge")
         .arg("--port")
         .arg(args.port.to_string())
@@ -588,9 +588,9 @@ fn exec_behind_bridge(args: NetBridgeArgs) -> Result<()> {
         .arg(std::process::id().to_string())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context("starting the bridge")?;
+        .stderr(Stdio::piped());
+    let mut bridge =
+        portkit_core::spawn::spawn(&mut bridge_command).context("starting the bridge")?;
     let stderr = bridge
         .stderr
         .take()
@@ -617,9 +617,7 @@ fn exec_behind_bridge(args: NetBridgeArgs) -> Result<()> {
     }
     // The bridge now outlives this call only while its parent (this process,
     // then the exec'd command, which keeps the pid) is alive.
-    let error = Command::new(&args.command[0])
-        .args(&args.command[1..])
-        .exec();
+    let error = portkit_core::spawn::exec(Command::new(&args.command[0]).args(&args.command[1..]));
     let _ = bridge.kill();
     bail!("cannot execute {}: {error}", args.command[0])
 }

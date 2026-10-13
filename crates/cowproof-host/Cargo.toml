@@ -14,3 +14,6 @@ serde_json.workspace = true
 cowproof-core.workspace = true
 cowproof-prove.workspace = true
 libc = "0.2"
+
+[dev-dependencies]
+portkit-core.workspace = true

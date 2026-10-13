@@ -484,6 +484,7 @@ dependencies = [
  "cowproof-core",
  "cowproof-prove",
  "libc",
+ "portkit-core",
  "serde",
  "serde_json",
 ]
@@ -523,6 +524,7 @@ dependencies = [
  "cowproof-core",
  "cowproof-run",
  "libc",
+ "portkit-core",
  "portkit-port",
  "predicates",
  "regex",
@@ -1334,6 +1336,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "time",
+ "tokio",
  "tracing",
 ]
 

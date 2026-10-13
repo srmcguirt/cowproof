@@ -14,6 +14,7 @@ serde.workspace = true
 serde_json.workspace = true
 async-trait.workspace = true
 tracing.workspace = true
+tokio = { workspace = true, features = ["process", "time"] }
 config.workspace = true
 time.workspace = true
 regex = "1"

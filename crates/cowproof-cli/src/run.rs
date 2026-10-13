@@ -1367,10 +1367,10 @@ impl Launcher {
         // `builder_command` sets it) and each `run_check` command (`run_in_group`); the git
         // steps keep the runner's group, so a terminal Ctrl-C still reaches them. The check
         // groups are ended by the runner itself, from `CheckContext::groups`.
-        let mut child = child_cmd
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
+        child_cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+        // The builder can be a script written a moment ago: ETXTBSY is retried.
+        let mut child = portkit_core::spawn::spawn_async(&mut child_cmd)
+            .await
             .context("launching the builder")?;
         // `process_group(0)` makes the child its own leader, so its pid is the pgid.
         let pgid = child.id().context("reading the builder's process id")?;
@@ -2937,8 +2937,12 @@ pub(crate) async fn capture_patch(
             ]),
         ),
     ] {
-        let out = sandboxed_command(&policy, &profile, &argv, env.clone(), &layout.clone)?
-            .output()
+        let mut command = sandboxed_command(&policy, &profile, &argv, env.clone(), &layout.clone)?;
+        command.stdout(Stdio::piped()).stderr(Stdio::piped());
+        let out = portkit_core::spawn::spawn_async(&mut command)
+            .await
+            .with_context(|| what.to_string())?
+            .wait_with_output()
             .await
             .with_context(|| what.to_string())?;
         if !out.status.success() {
@@ -5373,16 +5377,21 @@ async fn lane_trace_verdict(
         .current_dir(&layout.control)
         .stdin(Stdio::null())
         .kill_on_drop(true);
-    let out = match tokio::time::timeout(DOCTOR_TIMEOUT, cmd.output()).await {
-        Ok(Ok(out)) => out,
-        Ok(Err(e)) => return untraced(format!("pk doctor could not run: {e}"), json!([])),
-        Err(_) => {
-            return untraced(
-                format!("pk doctor did not finish in {} s", DOCTOR_TIMEOUT.as_secs()),
-                json!([]),
-            );
-        }
-    };
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let spawned = portkit_core::spawn::spawn_async(&mut cmd).await;
+    let out =
+        match tokio::time::timeout(DOCTOR_TIMEOUT, async { spawned?.wait_with_output().await })
+            .await
+        {
+            Ok(Ok(out)) => out,
+            Ok(Err(e)) => return untraced(format!("pk doctor could not run: {e}"), json!([])),
+            Err(_) => {
+                return untraced(
+                    format!("pk doctor did not finish in {} s", DOCTOR_TIMEOUT.as_secs()),
+                    json!([]),
+                );
+            }
+        };
     let Ok(doc) = serde_json::from_slice::<Value>(&out.stdout) else {
         return untraced(
             format!(

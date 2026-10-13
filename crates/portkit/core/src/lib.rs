@@ -48,6 +48,7 @@ pub mod manifest;
 pub mod refs;
 pub mod registry;
 pub mod rewrite;
+pub mod spawn;
 pub mod tool;
 pub mod trace;
 pub mod validate;

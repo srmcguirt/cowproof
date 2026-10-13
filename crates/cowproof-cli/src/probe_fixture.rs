@@ -52,17 +52,12 @@ impl HangingTool {
         // harmlessly, so a timed probe measures the probe and not the scan.
         // The lock covers this fixture's tests only: a fork elsewhere in the binary can still
         // hold the script open for writing until it execs, and exec then fails with ETXTBSY.
-        // Retry the first run briefly; once one run has started no writer is left.
-        let mut tries = 0;
-        let warmed = loop {
-            match std::process::Command::new(&bin).arg("warm").status() {
-                Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy && tries < 100 => {
-                    tries += 1;
-                    std::thread::sleep(Duration::from_millis(20));
-                }
-                other => break other.unwrap(),
-            }
-        };
+        // The shared helper retries the first run briefly; once one run has started no writer
+        // is left.
+        let warmed = portkit_core::spawn::retry_busy(|| {
+            std::process::Command::new(&bin).arg("warm").status()
+        })
+        .unwrap();
         assert!(warmed.success());
         HangingTool {
             _guard: guard,

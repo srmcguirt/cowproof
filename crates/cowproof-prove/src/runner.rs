@@ -241,7 +241,10 @@ pub async fn run_in_group(
         .stderr(Stdio::piped())
         .process_group(0)
         .kill_on_drop(true);
-    let mut child = cmd.spawn().map_err(GroupError::Spawn)?;
+    // A freshly written script can be briefly busy to exec (ETXTBSY): see `portkit_core::spawn`.
+    let mut child = portkit_core::spawn::spawn_async(&mut cmd)
+        .await
+        .map_err(GroupError::Spawn)?;
     let bad = |what: &str| GroupError::Spawn(std::io::Error::other(what.to_string()));
     // process_group(0) makes the child its own group leader, so its pid is the pgid.
     let pgid = child

@@ -294,7 +294,8 @@ async fn run_process(
     let (program, args) = argv
         .split_first()
         .ok_or_else(|| Error::other("an empty command line"))?;
-    let mut child = Command::new(program)
+    let mut command = Command::new(program);
+    command
         .args(args)
         .env_clear()
         .envs(env.iter().map(|(k, v)| (k, v)))
@@ -303,8 +304,10 @@ async fn run_process(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .process_group(0)
-        .kill_on_drop(true)
-        .spawn()
+        .kill_on_drop(true);
+    // The reference may be a script written a moment ago (a shim): ETXTBSY is retried.
+    let mut child = portkit_core::spawn::spawn_async(&mut command)
+        .await
         .map_err(|e| Error::other(format!("could not start `{program}`: {e}")))?;
     let pgid = child.id();
 

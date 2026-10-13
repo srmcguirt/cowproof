@@ -23,6 +23,7 @@ regex.workspace = true
 toml.workspace = true
 cowproof-run.workspace = true
 portkit-port.workspace = true
+portkit-core.workspace = true
 libc = "0.2"
 
 [dev-dependencies]
