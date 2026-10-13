@@ -680,6 +680,17 @@ fn uuid_v4_of(seed: &str) -> String {
     )
 }
 
+/// The major version of the `node` on `PATH`.
+fn node_major() -> u32 {
+    let out = std::process::Command::new("node")
+        .args(["-p", "process.versions.node"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", text(&out));
+    let version = String::from_utf8(out.stdout).unwrap();
+    version.trim().split('.').next().unwrap().parse().unwrap()
+}
+
 fn is_uuid_v4(s: &str) -> bool {
     let b = s.as_bytes();
     b.len() == 36
@@ -714,18 +725,22 @@ const NODE_ENTROPY: &str = r#"
 import crypto, { randomBytes as named, randomUUID as namedUuid } from "node:crypto";
 const hex = (view) => Buffer.from(view.buffer, view.byteOffset, view.byteLength).toString("hex");
 export function entropy() {
-  return {
+  const out = {
     random_bytes: crypto.randomBytes(16).toString("hex"),
     named_import: named(8).toString("hex"),
     fill_sync: hex(crypto.randomFillSync(new Uint8Array(8))),
     get_random_values: hex(crypto.getRandomValues(new Uint32Array(2))),
-    web_get_random_values: hex(globalThis.crypto.getRandomValues(new Uint8Array(8))),
     random_uuid: crypto.randomUUID(),
     named_uuid: namedUuid(),
-    web_random_uuid: globalThis.crypto.randomUUID(),
     random_int: crypto.randomInt(281474976710655),
     random_int_range: crypto.randomInt(100000000, 200000000),
   };
+  // Node 18 has no global `crypto` in a module (only under `node -e`); 19 and later do.
+  if (globalThis.crypto) {
+    out.web_get_random_values = hex(globalThis.crypto.getRandomValues(new Uint8Array(8)));
+    out.web_random_uuid = globalThis.crypto.randomUUID();
+  }
+  return out;
 }
 export function first_uuid() { return crypto.randomUUID(); }
 export function first_bytes() { return crypto.randomBytes(16).toString("hex"); }
@@ -784,7 +799,16 @@ fn crypto_and_secrets_draw_one_seeded_stream_and_are_left_alone_unseeded() {
     let mut seen = Vec::new();
     if have("node") {
         let a = each_source_is_pinned(NODE, NODE_ENTROPY, "entropy");
-        for key in ["random_uuid", "named_uuid", "web_random_uuid"] {
+        // The web keys are absent only where Node has no global `crypto` in a module (18).
+        let web = node_major() >= 19;
+        assert_eq!(a.get("web_random_uuid").is_some(), web, "{a}");
+        assert_eq!(a.get("web_get_random_values").is_some(), web, "{a}");
+        let uuids: &[&str] = if web {
+            &["random_uuid", "named_uuid", "web_random_uuid"]
+        } else {
+            &["random_uuid", "named_uuid"]
+        };
+        for key in uuids {
             assert!(is_uuid_v4(a[key].as_str().unwrap()), "{key}: {}", a[key]);
         }
         let int = a["random_int_range"].as_u64().unwrap();
