@@ -1755,3 +1755,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "audit_2026_10_13.rs"]
+mod audit_2026_10_13;
