@@ -4952,24 +4952,31 @@ async fn replay_and_gate(
     match fetch_dependencies(rebuild, layout, Some(input.groups.clone())).await {
         Ok(None) => {}
         Ok(Some(fetch)) => {
-            capsule.dependency_cache_key = Some(fetch.key.clone());
+            // A tree with nothing this runner fetches has no entry and so no key to record:
+            // the outcome says so and the notes say which files were left out.
+            if fetch.outcome != FetchOutcome::NotFetched {
+                capsule.dependency_cache_key = Some(fetch.key.clone());
+            }
             capsule.dependency_fetch_outcome = Some(fetch.outcome.name().to_string());
+            capsule.dependency_ecosystems =
+                fetch.ecosystems.iter().map(|e| e.to_string()).collect();
+            capsule.dependency_fetch_notes = fetch.notes.clone();
             capsule.dependency_fetch_resolve = fetch.resolve_override.clone();
             match fetch.outcome {
                 FetchOutcome::Failed(why) => {
                     fetch_failed = true;
-                    evidence.infrastructure.push(format!(
-                        "dependency fetch (cargo fetch --locked) failed: {}",
-                        one_line(&why)
-                    ));
+                    evidence
+                        .infrastructure
+                        .push(format!("dependency fetch failed: {}", one_line(&why)));
                 }
-                _ => deps_dir = Some(fetch.dir),
+                FetchOutcome::NotFetched => {}
+                FetchOutcome::Hit | FetchOutcome::Fetched => deps_dir = Some(fetch.dir),
             }
         }
         Err(e) => {
             fetch_failed = true;
             evidence.infrastructure.push(format!(
-                "dependency fetch (cargo fetch --locked) could not run: {}",
+                "dependency fetch could not run: {}",
                 one_line(&format!("{e:#}"))
             ));
         }

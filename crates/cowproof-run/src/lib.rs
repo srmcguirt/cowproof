@@ -381,11 +381,31 @@ impl SandboxPolicy {
     /// ([`link_dependency_cache`]), so cargo finds them there and can write nothing
     /// into them. On macOS the profile also denies writes to every read-only grant,
     /// so the mount stays read-only wherever the cache lives.
+    ///
+    /// The npm part, when the entry has one, is mounted the same way: `npm/node_modules` and
+    /// `npm/cache` become READ-ONLY grants (the caller links the modules into the tree,
+    /// [`link_npm_modules`]), and npm is told to stay offline, to run no lifecycle scripts and
+    /// to use that cache (`npm_config_cache`).
     pub fn with_dependency_cache(mut self, deps_dir: &Path) -> Self {
         for name in DEPENDENCY_CACHE_DIRS {
             let dir = deps_dir.join("cargo").join(name);
             if dir.is_dir() {
                 self.ro_paths.push(dir);
+            }
+        }
+        let npm = deps_dir.join(NPM_ENTRY_DIR);
+        if npm.join(NPM_MODULES).is_dir() {
+            self.ro_paths.push(npm.join(NPM_MODULES));
+            let cache = npm.join(NPM_CACHE);
+            if cache.is_dir() {
+                self.ro_paths.push(cache.clone());
+                self.env_set.push((
+                    "npm_config_cache".to_string(),
+                    cache.to_string_lossy().into_owned(),
+                ));
+            }
+            for (k, v) in NPM_VERIFIER_ENV {
+                self.env_set.push((k.to_string(), v.to_string()));
             }
         }
         self
@@ -467,6 +487,32 @@ pub const SANDBOXED_ENV: &str = "COWPROOF_SANDBOXED";
 /// registry index, `.crate` files and unpacked sources, and git dependencies.
 pub const DEPENDENCY_CACHE_DIRS: [&str; 2] = ["registry", "git"];
 
+/// The npm lockfiles at the tree root, in the order `npm ci` prefers them (a shrinkwrap
+/// wins over a package lock).
+pub const NPM_LOCKFILES: [&str; 2] = ["npm-shrinkwrap.json", "package-lock.json"];
+
+/// The manifest `npm ci` checks the lockfile against.
+pub const NPM_MANIFEST: &str = "package.json";
+
+/// The directory of a cache entry that holds the npm part: `<entry>/npm/node_modules` (the
+/// install) and `<entry>/npm/cache` (npm's own cache, so an offline `npm ci` can run).
+pub const NPM_ENTRY_DIR: &str = "npm";
+
+/// What the verifier mounts of the npm part, relative to `<entry>/npm`.
+pub const NPM_MODULES: &str = "node_modules";
+pub const NPM_CACHE: &str = "cache";
+
+/// The environment npm gets in the verifier. `ignore-scripts` keeps npm from running a
+/// lifecycle script of an installed package (an explicit `npm test` or `npm run` still
+/// runs the script it names), `offline` keeps it off the network it does not have, and
+/// `logs-max=0` stops it from writing a debug log into the read-only cache.
+const NPM_VERIFIER_ENV: [(&str, &str); 4] = [
+    ("npm_config_offline", "true"),
+    ("npm_config_ignore_scripts", "true"),
+    ("npm_config_logs_max", "0"),
+    ("npm_config_update_notifier", "false"),
+];
+
 /// Link the cache's `registry` (and `git`, when present) into `cargo_home`, the
 /// verifier's private `CARGO_HOME`. The links point at the cache, which
 /// [`SandboxPolicy::with_dependency_cache`] grants read-only; the rest of
@@ -488,6 +534,33 @@ pub fn link_dependency_cache(deps_dir: &Path, cargo_home: &Path) -> Result<()> {
             .with_context(|| format!("linking {} into the verifier's CARGO_HOME", name))?;
     }
     Ok(())
+}
+
+/// Put the cache entry's `npm/node_modules` at `<tree>/node_modules`, the verifier's rebuilt
+/// tree, as a symlink to the entry. [`SandboxPolicy::with_dependency_cache`] grants the
+/// target read-only (a read-only `--ro-bind` on Linux, a `file-write*` deny on macOS), so a
+/// check reads the install and cannot write into it; the link itself is in the writable tree
+/// and a check can remove it, which only loses it. Nothing is done when the entry has no npm
+/// part. Whatever stood at `node_modules` (a directory a patch committed, a link a check
+/// left) is replaced, without following a symlink, and this is called before every check so
+/// each one starts from the trusted install.
+pub fn link_npm_modules(deps_dir: &Path, tree: &Path) -> Result<()> {
+    let target = deps_dir.join(NPM_ENTRY_DIR).join(NPM_MODULES);
+    if !target.is_dir() {
+        return Ok(());
+    }
+    let link = tree.join("node_modules");
+    if std::fs::read_link(&link).is_ok_and(|current| current == target) {
+        return Ok(());
+    }
+    match std::fs::symlink_metadata(&link) {
+        Ok(m) if m.is_dir() => std::fs::remove_dir_all(&link),
+        Ok(_) => std::fs::remove_file(&link),
+        Err(_) => Ok(()),
+    }
+    .with_context(|| format!("clearing {}", link.display()))?;
+    std::os::unix::fs::symlink(&target, &link)
+        .with_context(|| format!("linking node_modules into {}", tree.display()))
 }
 
 /// The temp directory a sandboxed process gets: a directory of the lane's own
@@ -561,6 +634,7 @@ impl LaneLayout {
 const LOCKFILES: &[&str] = &[
     "Cargo.lock",
     "package-lock.json",
+    "npm-shrinkwrap.json",
     "yarn.lock",
     "pnpm-lock.yaml",
     "Gemfile.lock",
@@ -591,6 +665,15 @@ pub fn dependency_cache_key(repo_tree: &Path, target_triple: &str) -> Result<Str
     hasher.update(target_triple.as_bytes());
 
     let mut names: Vec<&str> = LOCKFILES.iter().chain(REGISTRY_CONFIGS).copied().collect();
+    // `npm ci` refuses a lockfile that does not match `package.json`, so with an npm
+    // lockfile the manifest is an input too: the same lockfile beside another manifest is
+    // another key, never a hit on an install made for the first.
+    if NPM_LOCKFILES
+        .iter()
+        .any(|name| repo_tree.join(name).is_file())
+    {
+        names.push(NPM_MANIFEST);
+    }
     names.sort_unstable();
     for name in names {
         let path = repo_tree.join(name);
@@ -611,6 +694,37 @@ pub fn dependency_cache_key(repo_tree: &Path, target_triple: &str) -> Result<Str
 #[cfg(test)]
 mod cache_key_tests {
     use super::*;
+
+    #[test]
+    fn an_npm_lockfile_makes_the_manifest_part_of_the_key_and_a_shrinkwrap_is_a_lockfile() {
+        let triple = "x86_64-unknown-linux-gnu";
+        let key_of = |files: &[(&str, &str)]| {
+            let tmp = tempfile::tempdir().unwrap();
+            for (name, content) in files {
+                std::fs::write(tmp.path().join(name), content).unwrap();
+            }
+            dependency_cache_key(tmp.path(), triple).unwrap()
+        };
+        // The same lockfile beside another manifest is another key.
+        assert_ne!(
+            key_of(&[("package-lock.json", "L"), ("package.json", "A")]),
+            key_of(&[("package-lock.json", "L"), ("package.json", "B")])
+        );
+        // A manifest alone, or beside a cargo lockfile only, is not an input.
+        assert_eq!(
+            key_of(&[("package.json", "A")]),
+            key_of(&[("package.json", "B")])
+        );
+        assert_eq!(
+            key_of(&[("Cargo.lock", "L"), ("package.json", "A")]),
+            key_of(&[("Cargo.lock", "L"), ("package.json", "B")])
+        );
+        // npm-shrinkwrap.json is hashed like a lockfile.
+        assert_ne!(
+            key_of(&[("npm-shrinkwrap.json", "S1"), ("package.json", "A")]),
+            key_of(&[("npm-shrinkwrap.json", "S2"), ("package.json", "A")])
+        );
+    }
 
     #[test]
     fn same_inputs_produce_same_key() {
@@ -3002,6 +3116,107 @@ mod tests {
         std::fs::create_dir_all(&home2).unwrap();
         link_dependency_cache(&bare, &home2).unwrap();
         assert_eq!(std::fs::read_dir(&home2).unwrap().count(), 0);
+    }
+
+    fn npm_cache(root: &Path) -> PathBuf {
+        let deps = root.join("deps");
+        std::fs::create_dir_all(deps.join("npm/node_modules/fake-pkg")).unwrap();
+        std::fs::create_dir_all(deps.join("npm/cache")).unwrap();
+        deps
+    }
+
+    #[test]
+    fn the_npm_part_of_the_cache_is_mounted_read_only_and_npm_is_told_to_stay_offline() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let deps = npm_cache(tmp.path()).canonicalize().unwrap();
+        let lane = test_lane();
+        let policy = SandboxPolicy::verifier(&lane, Path::new("/nonexistent-cp/cache"))
+            .with_dependency_cache(&deps);
+        let modules = deps.join("npm/node_modules");
+        let cache = deps.join("npm/cache");
+        assert!(policy.ro_paths.contains(&modules), "{:?}", policy.ro_paths);
+        assert!(policy.ro_paths.contains(&cache), "{:?}", policy.ro_paths);
+        assert!(
+            !policy.rw_paths.iter().any(|p| p.starts_with(&deps)),
+            "nothing of the entry is writable: {:?}",
+            policy.rw_paths
+        );
+        for want in [
+            ("npm_config_offline", "true".to_string()),
+            ("npm_config_ignore_scripts", "true".to_string()),
+            ("npm_config_cache", cache.to_string_lossy().into_owned()),
+        ] {
+            assert!(
+                policy
+                    .env_set
+                    .contains(&(want.0.to_string(), want.1.clone())),
+                "{want:?} missing: {:?}",
+                policy.env_set
+            );
+        }
+        // The profile denies writes under the modules after every grant, and Linux binds
+        // them read-only.
+        let profile = render_macos_profile(&policy).unwrap();
+        let quoted = format!("(subpath {})", sbpl(&modules).unwrap());
+        let deny = profile
+            .find(&format!("(deny file-write* {quoted})"))
+            .expect("write deny");
+        assert!(profile.rfind("(allow file-read* file-write*").unwrap() < deny);
+        let args = render_bwrap_args(&policy_without_deny(policy.clone()), &[]).unwrap();
+        let m = modules.to_str().unwrap();
+        assert!(
+            args.windows(3)
+                .any(|w| w[0] == "--ro-bind" && w[1] == m && w[2] == m),
+            "{args:?}"
+        );
+        assert!(!args.windows(3).any(|w| w[0] == "--bind" && w[1] == m));
+
+        // An entry with no npm part changes nothing and sets no npm variable.
+        let cargo_only = fetched_cache(&tmp.path().join("c"), false);
+        let policy = SandboxPolicy::verifier(&lane, Path::new("/nonexistent-cp/cache"))
+            .with_dependency_cache(&cargo_only);
+        assert!(
+            !policy
+                .env_set
+                .iter()
+                .any(|(k, _)| k.starts_with("npm_config"))
+        );
+    }
+
+    #[test]
+    fn linking_node_modules_replaces_what_stood_there_and_does_nothing_without_an_npm_part() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let deps = npm_cache(tmp.path());
+        let target = deps.join("npm/node_modules");
+        let tree = tmp.path().join("tree");
+        // A directory a patch committed is replaced, not merged.
+        std::fs::create_dir_all(tree.join("node_modules/planted")).unwrap();
+        link_npm_modules(&deps, &tree).unwrap();
+        assert_eq!(
+            std::fs::read_link(tree.join("node_modules")).unwrap(),
+            target
+        );
+        assert!(tree.join("node_modules/fake-pkg").is_dir());
+        assert!(!target.join("planted").exists());
+        // A link a check left pointing elsewhere is replaced, and the elsewhere is untouched.
+        let elsewhere = tmp.path().join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::fs::write(elsewhere.join("keep"), "x").unwrap();
+        std::fs::remove_file(tree.join("node_modules")).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, tree.join("node_modules")).unwrap();
+        link_npm_modules(&deps, &tree).unwrap();
+        assert_eq!(
+            std::fs::read_link(tree.join("node_modules")).unwrap(),
+            target
+        );
+        assert!(elsewhere.join("keep").is_file());
+        // No npm part: the tree is left as it is.
+        let cargo_only = fetched_cache(&tmp.path().join("c"), false);
+        let bare = tmp.path().join("bare");
+        std::fs::create_dir_all(bare.join("node_modules")).unwrap();
+        link_npm_modules(&cargo_only, &bare).unwrap();
+        assert!(bare.join("node_modules").is_dir());
+        assert!(std::fs::read_link(bare.join("node_modules")).is_err());
     }
 
     // The macOS profile denies file writes everywhere and grants them back.

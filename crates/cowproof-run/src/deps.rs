@@ -42,16 +42,34 @@
 //! * **Upkeep**: every hit and install takes a lease and touches a use marker in the entry,
 //!   and `cowproof cache prune` removes the unused (see [`crate::cache`]); a fetch also
 //!   clears the stale work directories of interrupted runs.
-//! * **What is covered**: Cargo only. A tree with a `Cargo.lock` is fetched; a tree
-//!   without one has nothing to fetch and no cache entry. npm and the others are in the
-//!   backlog, not here.
+//! * **What is covered**: Cargo and npm.
+//!   * A tree with a `Cargo.lock` gets `<entry>/cargo/{registry,git}`.
+//!   * A tree with a `package-lock.json` or `npm-shrinkwrap.json` at its root gets
+//!     `<entry>/npm/node_modules` and `<entry>/npm/cache`. The fetch runs
+//!     `npm ci --ignore-scripts --no-audit --no-fund` in a scratch directory that holds
+//!     copies of `package.json`, the lockfile and the base's `.npmrc` with every auth line
+//!     (`_authToken`, `_auth`, `_password`, and credentials in a URL) removed, with
+//!     `npm_config_cache` inside the entry, and the sandbox environment is `PATH`, `HOME`,
+//!     the proxy variables and `npm_config_*` settings, nothing inherited. The allowlist is
+//!     `registry.npmjs.org`, the https hosts of the base `.npmrc`'s `registry` and
+//!     `@scope:registry`, and the base `cowproof.toml`'s `[proof] fetch_hosts`. No lifecycle
+//!     script of any package runs, at fetch or in the verifier. A tree with both lockfiles
+//!     fetches both into the one entry.
+//!   * Nothing else is fetched. A tree whose only dependency file is a `package.json`, a
+//!     `yarn.lock`, a `pnpm-lock.yaml` or a `Gemfile.lock` has no entry; the outcome is
+//!     [`FetchOutcome::NotFetched`] and says why in [`Prefetch::notes`], and is never
+//!     "fetched". yarn, pnpm and Bundler are in the backlog.
+//!   * `npm` is found by `COWPROOF_NPM` (an absolute path, the test hook the way `CARGO` is
+//!     for cargo) or the first `npm` on the director's `PATH`; its directory is put on the
+//!     fetch's `PATH` so its `node` is found. An `npm` that needs files under the hidden home
+//!     (nvm) is not reachable from the sandbox.
 
 use crate::bridge::bridge_port;
 use crate::cache::{self, Alive};
 use crate::fetch_proxy::{self, FetchAllowlist, FetchProxy, Resolver};
 use crate::{
-    LaneLayout, NetworkMode, REGISTRY_CONFIGS, SandboxPolicy, dependency_cache_key,
-    render_macos_profile, sandbox_command,
+    LaneLayout, NPM_CACHE, NPM_ENTRY_DIR, NPM_LOCKFILES, NPM_MANIFEST, NPM_MODULES, NetworkMode,
+    REGISTRY_CONFIGS, SandboxPolicy, dependency_cache_key, render_macos_profile, sandbox_command,
 };
 use anyhow::{Context, Result, bail};
 use std::ffi::OsString;
@@ -74,7 +92,11 @@ pub const FETCH_NETWORK_ENV: &str = "COWPROOF_FETCH_NETWORK";
 /// runner warns on stderr and the capsule records it (`dependency_fetch_resolve`).
 pub const FETCH_RESOLVE_ENV: &str = "COWPROOF_FETCH_RESOLVE";
 
-/// How long one `cargo fetch` may take.
+/// The environment variable that names the `npm` to fetch with (an absolute path to a file).
+/// Without it the first `npm` on the director's `PATH` is used. Tests point it at a fake.
+pub const NPM_ENV: &str = "COWPROOF_NPM";
+
+/// How long one `cargo fetch` or `npm ci` may take.
 pub const FETCH_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
 /// The cache root: `$COWPROOF_CACHE_ROOT` when set and non-empty, else `~/.cache/cowproof`.
@@ -173,16 +195,21 @@ pub enum FetchOutcome {
     Hit,
     /// This call fetched it.
     Fetched,
+    /// The tree has dependency files this runner does not fetch (a `package.json` with no
+    /// npm lockfile, a yarn, pnpm or Bundler lockfile) and nothing it does: no entry, and
+    /// [`Prefetch::notes`] says what was left out. Never reported as fetched.
+    NotFetched,
     /// The fetch could not run or failed; the reason is for the director.
     Failed(String),
 }
 
 impl FetchOutcome {
-    /// The word the capsule records: `hit`, `fetched` or `failed`.
+    /// The word the capsule records: `hit`, `fetched`, `not_fetched` or `failed`.
     pub fn name(&self) -> &'static str {
         match self {
             Self::Hit => "hit",
             Self::Fetched => "fetched",
+            Self::NotFetched => "not_fetched",
             Self::Failed(_) => "failed",
         }
     }
@@ -196,19 +223,166 @@ pub struct Prefetch {
     pub outcome: FetchOutcome,
     /// `<cache root>/deps/<key>`: valid when the outcome is not `Failed`.
     pub dir: PathBuf,
+    /// The ecosystems the entry holds (`cargo`, `npm`) when the outcome is a hit or a fetch,
+    /// else empty: what the capsule records as fetched.
+    pub ecosystems: Vec<&'static str>,
+    /// What was left out or changed, one line each: dependency files that are not fetched,
+    /// and the auth lines of the base `.npmrc` that were not used. The capsule records them.
+    pub notes: Vec<String>,
     /// The `COWPROOF_FETCH_RESOLVE` testing hook's addresses (`host=ip:port,...`) when the
     /// fetch ran with it set, else `None`. The capsule records it, so a proof made with it
     /// is visibly not a real fetch.
     pub resolve_override: Option<String>,
 }
 
-/// The `PATH` for the fetch and the `cargo` executable it runs.
+/// The `PATH` for the fetch and the `cargo` and `npm` executables it runs.
 #[derive(Debug, Clone)]
 pub struct FetchTools {
     /// The fetch's `PATH`, as the verifier's is.
     pub path: String,
     /// The `cargo` to run, granted read-only when it lives under the hidden home.
     pub cargo: Option<PathBuf>,
+    /// The `npm` to run ([`resolve_npm`]), granted read-only like `cargo`; its directory is
+    /// added to the fetch's `PATH` so the `node` beside it is found.
+    pub npm: Option<PathBuf>,
+}
+
+/// The `npm` a fetch runs: `$COWPROOF_NPM` when it names an existing absolute file, else
+/// the first absolute `PATH` entry that holds an `npm`. Empty and relative `PATH` entries
+/// are skipped, as for cargo: they would search the tree.
+pub fn resolve_npm(
+    npm_env: Option<&std::ffi::OsStr>,
+    path_env: Option<&std::ffi::OsStr>,
+) -> Option<PathBuf> {
+    if let Some(npm) = npm_env.map(Path::new)
+        && npm.is_absolute()
+        && npm.is_file()
+    {
+        return Some(npm.to_path_buf());
+    }
+    std::env::split_paths(path_env?)
+        .filter(|dir| dir.is_absolute())
+        .map(|dir| dir.join("npm"))
+        .find(|npm| npm.is_file())
+}
+
+/// Which ecosystems a rebuilt tree has something to fetch for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Needs {
+    pub cargo: bool,
+    pub npm: bool,
+}
+
+impl Needs {
+    /// What `tree` (the rebuilt tree) asks for: a `Cargo.lock`, and an npm lockfile that is a
+    /// regular file (a symlink in the tree could point anywhere).
+    pub fn of(tree: &Path) -> Self {
+        Self {
+            cargo: tree.join("Cargo.lock").is_file(),
+            npm: NPM_LOCKFILES.iter().any(|n| is_regular(&tree.join(n))),
+        }
+    }
+
+    fn any(self) -> bool {
+        self.cargo || self.npm
+    }
+
+    fn ecosystems(self) -> Vec<&'static str> {
+        let mut names = Vec::new();
+        if self.cargo {
+            names.push("cargo");
+        }
+        if self.npm {
+            names.push("npm");
+        }
+        names
+    }
+}
+
+fn is_regular(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|m| m.is_file())
+}
+
+/// The dependency files of `tree` this runner does not fetch, one line each, so the capsule
+/// says what a check may be missing. A `package.json` with an npm lockfile is fetched; one
+/// with a yarn or pnpm lockfile gets that lockfile's line; one with neither gets its own.
+pub fn unfetched_notes(tree: &Path) -> Vec<String> {
+    let has = |name: &str| is_regular(&tree.join(name));
+    let mut notes = Vec::new();
+    let npm_lock = NPM_LOCKFILES.iter().any(|n| has(n));
+    if has("yarn.lock") {
+        notes.push(
+            "yarn.lock: yarn is not fetched, so node_modules is not available to the verifier"
+                .to_string(),
+        );
+    }
+    if has("pnpm-lock.yaml") {
+        notes.push(
+            "pnpm-lock.yaml: pnpm is not fetched, so node_modules is not available to the verifier"
+                .to_string(),
+        );
+    }
+    if has(NPM_MANIFEST) && !npm_lock && !has("yarn.lock") && !has("pnpm-lock.yaml") {
+        notes.push(format!(
+            "{NPM_MANIFEST} without a package-lock.json or npm-shrinkwrap.json: nothing is fetched, so node_modules is not available to the verifier"
+        ));
+    }
+    if has("Gemfile.lock") {
+        notes.push("Gemfile.lock: Bundler is not fetched".to_string());
+    }
+    notes
+}
+
+/// `.npmrc` with every credential removed, and how many lines had one. A line is dropped when
+/// its key ends in `_authToken`, `_auth` or `_password` (the forms `_authToken=`,
+/// `//host/:_authToken=` and `@scope:_password=`); a `registry=` URL with `user:pass@` in it
+/// keeps the URL without the credentials. The fetch gets this copy and nothing from the
+/// original, and the entry holds none of it.
+pub fn strip_npmrc_auth(text: &str) -> (String, usize) {
+    let mut out = String::new();
+    let mut stripped = 0;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        let Some((key, value)) = trimmed.split_once('=') else {
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        };
+        if trimmed.starts_with(['#', ';']) {
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        }
+        let last = key
+            .trim()
+            .rsplit(':')
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if matches!(last.as_str(), "_auth" | "_authtoken" | "_password") {
+            stripped += 1;
+            continue;
+        }
+        match drop_url_credentials(value) {
+            Some(clean) => {
+                stripped += 1;
+                out.push_str(&format!("{}={clean}\n", key.trim()));
+            }
+            None => {
+                out.push_str(line);
+                out.push('\n');
+            }
+        }
+    }
+    (out, stripped)
+}
+
+/// `value` without the `user:pass@` of a URL in it, or `None` when it has none.
+fn drop_url_credentials(value: &str) -> Option<String> {
+    let (scheme, rest) = value.split_once("://")?;
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (_userinfo, host) = rest[..authority_end].rsplit_once('@')?;
+    Some(format!("{scheme}://{host}{}", &rest[authority_end..]))
 }
 
 /// The registry configuration files of a tree, and its `cowproof.toml` (whose
@@ -326,16 +500,44 @@ fn prefetch_in(
     let tree = work.join("tree");
     fs::create_dir(&tree)?;
     rebuild(&tree).context("rebuilding the tree to fetch dependencies for")?;
-    if !tree.join("Cargo.lock").is_file() {
+    let needs = Needs::of(&tree);
+    let mut notes = unfetched_notes(&tree);
+    if !needs.any() && notes.is_empty() {
         return Ok(None);
     }
     let key = dependency_cache_key(&tree, &host_target()).context("computing the cache key")?;
     let dir = cache_dir(cache_root, &key);
-    let done = |outcome| {
+    if !needs.any() {
+        return Ok(Some(Prefetch {
+            key,
+            outcome: FetchOutcome::NotFetched,
+            dir,
+            ecosystems: Vec::new(),
+            notes,
+            resolve_override: None,
+        }));
+    }
+    if needs.npm
+        && let Some(text) = read_npmrc(&tree)?
+    {
+        let (_, stripped) = strip_npmrc_auth(&text);
+        if stripped > 0 {
+            notes.push(format!(
+                "npm: {stripped} credential line(s) of .npmrc were not used (the fetch never receives a token)"
+            ));
+        }
+    }
+    let done = |outcome: FetchOutcome| {
+        let ecosystems = match outcome {
+            FetchOutcome::Hit | FetchOutcome::Fetched => needs.ecosystems(),
+            _ => Vec::new(),
+        };
         Ok(Some(Prefetch {
             key: key.clone(),
             outcome,
             dir: dir.clone(),
+            ecosystems,
+            notes: notes.clone(),
             resolve_override: config.egress.and_then(|e| e.resolver.spec()),
         }))
     };
@@ -347,7 +549,7 @@ fn prefetch_in(
     let claim = || cache::claim(&dir, std::process::id(), alive);
     // An entry a prune removed between the look and the claim is looked at again.
     for _ in 0..3 {
-        match entry_state(&dir) {
+        match entry_state(&dir, needs) {
             EntryState::Complete => match claim() {
                 Ok(()) => return done(FetchOutcome::Hit),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
@@ -364,8 +566,17 @@ fn prefetch_in(
     }
 
     let fresh = work.join("new");
-    let outcome = match fetch_cargo(work, &tree, &fresh, lane, config) {
-        Ok(()) => match install(&fresh, &dir) {
+    let fetched = (|| -> Result<()> {
+        if needs.cargo {
+            fetch_cargo(work, &tree, &fresh, lane, config)?;
+        }
+        if needs.npm {
+            fetch_npm(work, &tree, &fresh, lane, config)?;
+        }
+        Ok(())
+    })();
+    let outcome = match fetched {
+        Ok(()) => match install(&fresh, &dir, needs) {
             Ok(outcome) => match claim() {
                 Ok(()) => outcome,
                 Err(e) => FetchOutcome::Failed(claim_failure(&dir, &e)),
@@ -391,10 +602,19 @@ enum EntryState {
     Incomplete,
 }
 
-fn entry_state(dir: &Path) -> EntryState {
+/// An entry is complete when it holds the part of every ecosystem the tree asks for. The key
+/// covers the lockfiles, so the same key always asks for the same ecosystems; an entry made
+/// before npm was fetched, for a tree that has both lockfiles, lacks the npm part and is
+/// incomplete (the message tells the director to remove it).
+fn entry_state(dir: &Path, needs: Needs) -> EntryState {
     match fs::symlink_metadata(dir) {
         Err(_) => EntryState::Absent,
-        Ok(_) if dir.join("cargo/registry").is_dir() => EntryState::Complete,
+        Ok(_)
+            if (!needs.cargo || dir.join("cargo/registry").is_dir())
+                && (!needs.npm || dir.join(NPM_ENTRY_DIR).join(NPM_MODULES).is_dir()) =>
+        {
+            EntryState::Complete
+        }
         Ok(_) => EntryState::Incomplete,
     }
 }
@@ -402,11 +622,11 @@ fn entry_state(dir: &Path) -> EntryState {
 /// Move a finished fetch into the cache. The rename is the only moment the entry
 /// appears, so it is whole or absent. If another lane installed the same key first the
 /// rename fails, the entry is complete, and this lane's copy is dropped: a hit.
-fn install(fresh: &Path, dir: &Path) -> Result<FetchOutcome> {
+fn install(fresh: &Path, dir: &Path, needs: Needs) -> Result<FetchOutcome> {
     match fs::rename(fresh, dir) {
         Ok(()) => Ok(FetchOutcome::Fetched),
         Err(e) => {
-            if entry_state(dir) == EntryState::Complete {
+            if entry_state(dir, needs) == EntryState::Complete {
                 let _ = fs::remove_dir_all(fresh);
                 Ok(FetchOutcome::Hit)
             } else {
@@ -414,6 +634,48 @@ fn install(fresh: &Path, dir: &Path) -> Result<FetchOutcome> {
             }
         }
     }
+}
+
+/// The base's `.npmrc` as text (`None` when it is absent, a directory or a symlink).
+fn read_npmrc(tree: &Path) -> Result<Option<String>> {
+    let path = tree.join(".npmrc");
+    if !is_regular(&path) {
+        return Ok(None);
+    }
+    fs::read_to_string(&path)
+        .map(Some)
+        .with_context(|| format!("reading {}", path.display()))
+}
+
+/// What one sandboxed fetch command is: the same sandbox, proxy and process group for cargo
+/// and npm, with only these parts differing.
+struct Job<'a> {
+    /// Names the command in messages: `cargo fetch --locked`.
+    label: &'static str,
+    /// The program, absolute when the tool was found, else the bare name.
+    program: String,
+    args: Vec<String>,
+    /// The executable to grant read-only (it may live under the hidden home).
+    exe: Option<&'a Path>,
+    /// The sandboxed command's working directory.
+    cwd: &'a Path,
+    path: String,
+    /// The private `HOME`.
+    home: &'a Path,
+    /// Granted read-write besides the entry being filled.
+    rw: Vec<PathBuf>,
+    /// Granted read-only.
+    ro: Vec<PathBuf>,
+    /// Set in the sandbox before the proxy variables.
+    env: Vec<(String, String)>,
+    /// The variables that point the tool at the bridge.
+    proxy_env: &'static [&'static str],
+    /// Builds the allowlist from the base tree.
+    allowlist: fn(&Path) -> Result<FetchAllowlist>,
+    /// The tree the allowlist is read from (the base's configuration).
+    tree: &'a Path,
+    /// What to say of a failed command's output.
+    describe: fn(&[u8]) -> String,
 }
 
 /// `cargo fetch --locked` in `tree`, filling `<fresh>/cargo`, under
@@ -425,14 +687,6 @@ fn fetch_cargo(
     lane: &LaneLayout,
     config: &FetchConfig,
 ) -> Result<()> {
-    let FetchConfig {
-        network,
-        tools,
-        timeout,
-        exec,
-        egress,
-        ..
-    } = *config;
     let cargo_home = fresh.join("cargo");
     let home = work.join("home");
     fs::create_dir_all(&cargo_home).context("creating the fetch CARGO_HOME")?;
@@ -440,6 +694,193 @@ fn fetch_cargo(
     // only path dependencies has none): the mount point always exists.
     fs::create_dir_all(cargo_home.join("registry"))?;
     fs::create_dir_all(&home)?;
+    let tools = config.tools;
+    let program = match &tools.cargo {
+        Some(c) if c.is_absolute() => c.to_string_lossy().into_owned(),
+        _ => "cargo".to_string(),
+    };
+    run_fetch(
+        work,
+        lane,
+        fresh,
+        config,
+        Job {
+            label: "cargo fetch --locked",
+            program,
+            args: vec!["fetch".to_string(), "--locked".to_string()],
+            exe: tools
+                .cargo
+                .as_deref()
+                .filter(|c| c.is_absolute() && c.is_file()),
+            cwd: tree,
+            path: tools.path.clone(),
+            home: &home,
+            rw: Vec::new(),
+            ro: vec![tree.to_path_buf()],
+            env: vec![(
+                "CARGO_HOME".to_string(),
+                cargo_home.to_string_lossy().into_owned(),
+            )],
+            proxy_env: &["CARGO_HTTP_PROXY", "HTTPS_PROXY", "https_proxy"],
+            allowlist: FetchAllowlist::from_tree,
+            tree,
+            describe: |output| tail(output, 1500),
+        },
+    )
+}
+
+/// `npm ci --ignore-scripts --no-audit --no-fund` in a scratch copy of the tree's
+/// `package.json`, lockfile and credential-free `.npmrc`, filling `<fresh>/npm`: npm's cache
+/// in `cache` (it writes there while it runs) and the install in `node_modules`, moved out of
+/// the scratch directory when the command succeeds.
+fn fetch_npm(
+    work: &Path,
+    tree: &Path,
+    fresh: &Path,
+    lane: &LaneLayout,
+    config: &FetchConfig,
+) -> Result<()> {
+    let tools = config.tools;
+    let project = work.join("npm-project");
+    let home = work.join("home");
+    let entry = fresh.join(NPM_ENTRY_DIR);
+    let cache = entry.join(NPM_CACHE);
+    fs::create_dir_all(&project).context("creating the npm fetch directory")?;
+    fs::create_dir_all(&home)?;
+    fs::create_dir_all(&cache).context("creating the npm cache directory")?;
+
+    // Only the manifest, the lockfile(s) and the credential-free `.npmrc` go in. Each is read
+    // from the rebuilt tree as a regular file: a symlink there could point anywhere.
+    let manifest = tree.join(NPM_MANIFEST);
+    if !is_regular(&manifest) {
+        bail!(
+            "npm ci --ignore-scripts cannot run: the tree has an npm lockfile but no {NPM_MANIFEST} at its root"
+        );
+    }
+    fs::copy(&manifest, project.join(NPM_MANIFEST))
+        .with_context(|| format!("copying {NPM_MANIFEST}"))?;
+    for name in NPM_LOCKFILES {
+        let from = tree.join(name);
+        if is_regular(&from) {
+            fs::copy(&from, project.join(name)).with_context(|| format!("copying {name}"))?;
+        }
+    }
+    if let Some(text) = read_npmrc(tree)? {
+        fs::write(project.join(".npmrc"), strip_npmrc_auth(&text).0)
+            .context("writing the credential-free .npmrc")?;
+    }
+    // A global npm configuration of the host is not read: an empty one stands in for it.
+    let global = home.join("npmrc-global");
+    fs::write(&global, "").context("writing the empty global npm configuration")?;
+
+    let program = match &tools.npm {
+        Some(n) if n.is_absolute() => n.to_string_lossy().into_owned(),
+        _ => "npm".to_string(),
+    };
+    // npm is a script that finds `node` on `PATH`: its own directory comes along.
+    let mut path = tools.path.clone();
+    if let Some(dir) = tools
+        .npm
+        .as_deref()
+        .and_then(Path::parent)
+        .and_then(Path::to_str)
+        && Path::new(dir).is_absolute()
+        && !dir.contains(':')
+        && !path.split(':').any(|e| e == dir)
+    {
+        path = if path.is_empty() {
+            dir.to_string()
+        } else {
+            format!("{path}:{dir}")
+        };
+    }
+    run_fetch(
+        work,
+        lane,
+        fresh,
+        config,
+        Job {
+            label: "npm ci --ignore-scripts",
+            program,
+            args: ["ci", "--ignore-scripts", "--no-audit", "--no-fund"]
+                .map(str::to_string)
+                .to_vec(),
+            exe: tools
+                .npm
+                .as_deref()
+                .filter(|n| n.is_absolute() && n.is_file()),
+            cwd: &project,
+            path,
+            home: &home,
+            rw: vec![project.clone()],
+            ro: Vec::new(),
+            env: [
+                ("npm_config_cache", cache.to_string_lossy().into_owned()),
+                (
+                    "npm_config_globalconfig",
+                    global.to_string_lossy().into_owned(),
+                ),
+                ("npm_config_ignore_scripts", "true".to_string()),
+                ("npm_config_logs_max", "0".to_string()),
+                ("npm_config_update_notifier", "false".to_string()),
+            ]
+            .map(|(k, v)| (k.to_string(), v))
+            .to_vec(),
+            proxy_env: &[
+                "npm_config_https_proxy",
+                "npm_config_proxy",
+                "HTTPS_PROXY",
+                "https_proxy",
+            ],
+            allowlist: FetchAllowlist::npm_from_tree,
+            tree,
+            describe: npm_failure,
+        },
+    )?;
+
+    // The install moves out of the scratch directory into the entry. A lockfile with no
+    // packages leaves no `node_modules`; the mount point exists all the same.
+    let modules = entry.join(NPM_MODULES);
+    match fs::rename(project.join("node_modules"), &modules) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir_all(&modules).with_context(|| format!("creating {}", modules.display()))
+        }
+        Err(e) => Err(e).with_context(|| format!("moving node_modules into {}", entry.display())),
+    }
+}
+
+/// The first line npm reported as an error (`npm ERR!` or `npm error`), else its first line
+/// of output, cut to a sensible length.
+fn npm_failure(output: &[u8]) -> String {
+    let text = String::from_utf8_lossy(output);
+    let lines = || text.lines().map(str::trim).filter(|l| !l.is_empty());
+    let line = lines()
+        .find(|l| {
+            let l = l.to_ascii_lowercase();
+            l.starts_with("npm err") || l.starts_with("npm error")
+        })
+        .or_else(|| lines().next())
+        .unwrap_or("no output");
+    line.chars().take(300).collect()
+}
+
+/// Run one fetch command under the fetch sandbox with the registry-only proxy (or the other
+/// network modes), and judge how it ended.
+fn run_fetch(
+    work: &Path,
+    lane: &LaneLayout,
+    fresh: &Path,
+    config: &FetchConfig,
+    job: Job,
+) -> Result<()> {
+    let FetchConfig {
+        network,
+        timeout,
+        exec,
+        egress,
+        ..
+    } = *config;
 
     // The registry-only mode: serve the allowlist's proxy on a socket in the work
     // directory before the sandbox is rendered (the policy names the socket), and stop it
@@ -449,18 +890,19 @@ fn fetch_cargo(
             let egress = egress.context(
                 "the registry-only fetch needs the cowproof executable that runs the bridge",
             )?;
-            // Read from the tree, which the caller rebuilt with the BASE's cargo
-            // configuration and `cowproof.toml` (see `RegistryConfigSnapshot`), never the
-            // patch's.
-            let allow = FetchAllowlist::from_tree(tree)
+            // Read from the tree, which the caller rebuilt with the BASE's configuration and
+            // `cowproof.toml` (see `RegistryConfigSnapshot`), never the patch's.
+            let allow = (job.allowlist)(job.tree)
                 .context("building the fetch's host allowlist from the base")?;
             let socket = work.join("fetch.sock");
-            let port = free_bridge_port(
+            let seed = format!(
+                "{}-{}",
                 work.file_name()
                     .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_default()
-                    .as_str(),
-            )?;
+                    .unwrap_or_default(),
+                job.label
+            );
+            let port = free_bridge_port(&seed)?;
             let proxy = FetchProxy::new(allow.clone(), egress.resolver.clone())
                 .start(&socket)
                 .context("starting the registry-only fetch proxy")?;
@@ -478,34 +920,25 @@ fn fetch_cargo(
         (None, _) => NetworkMode::None,
     };
     let mut policy = SandboxPolicy::dependency_fetch(lane, fresh, sandbox_network);
-    policy.rw_paths.push(home.clone());
-    policy.ro_paths.push(tree.to_path_buf());
-    if let Some(cargo) = tools
-        .cargo
-        .as_ref()
-        .filter(|c| c.is_absolute() && c.is_file())
-    {
-        policy.executables.push(cargo.clone());
+    policy.rw_paths.push(job.home.to_path_buf());
+    policy.rw_paths.extend(job.rw.iter().cloned());
+    policy.ro_paths.extend(job.ro.iter().cloned());
+    if let Some(exe) = job.exe {
+        policy.executables.push(exe.to_path_buf());
     }
-    let program = match &tools.cargo {
-        Some(c) if c.is_absolute() => c.to_string_lossy().into_owned(),
-        _ => "cargo".to_string(),
-    };
     // `RUSTUP_HOME` (the director's rustup home) comes from the policy, with its grant.
     let mut env = vec![
-        ("PATH".to_string(), tools.path.clone()),
-        ("HOME".to_string(), home.to_string_lossy().into_owned()),
+        ("PATH".to_string(), job.path.clone()),
+        ("HOME".to_string(), job.home.to_string_lossy().into_owned()),
     ];
-    policy.env_set = vec![(
-        "CARGO_HOME".to_string(),
-        cargo_home.to_string_lossy().into_owned(),
-    )];
-    let mut argv = vec![program, "fetch".to_string(), "--locked".to_string()];
+    policy.env_set = job.env.clone();
+    let mut argv = vec![job.program.clone()];
+    argv.extend(job.args.iter().cloned());
     if let Some((_, _, socket, port, bridge_exe)) = &registry {
-        // cargo cannot speak to a Unix socket: the bridge, started inside the sandbox by the
-        // wrapper, listens on 127.0.0.1:<port> and copies bytes to the proxy's socket.
+        // The tool cannot speak to a Unix socket: the bridge, started inside the sandbox by
+        // the wrapper, listens on 127.0.0.1:<port> and copies bytes to the proxy's socket.
         let url = format!("http://127.0.0.1:{port}");
-        for key in ["CARGO_HTTP_PROXY", "HTTPS_PROXY", "https_proxy"] {
+        for key in job.proxy_env {
             policy.env_set.push((key.to_string(), url.clone()));
         }
         policy.executables.push(bridge_exe.clone());
@@ -540,8 +973,9 @@ fn fetch_cargo(
         .args(sandbox_args)
         .env_clear()
         .envs(env)
-        .current_dir(tree);
-    let ended = exec(command, timeout).context("running the sandboxed cargo fetch");
+        .current_dir(job.cwd);
+    let label = job.label;
+    let ended = exec(command, timeout).with_context(|| format!("running the sandboxed {label}"));
     // Stop the proxy before judging the fetch: a host it refused is the likely reason a
     // fetch failed, and the message names it first.
     let refused = match registry {
@@ -552,22 +986,20 @@ fn fetch_cargo(
         String::new()
     } else {
         format!(
-            "the registry-only fetch refused a connection to {} (allowed: {}; name a git \
-             dependency's host in `[proof] fetch_hosts` of the base cowproof.toml, or set \
-             {FETCH_NETWORK_ENV}=open): ",
+            "the registry-only fetch refused a connection to {} (allowed: {}; name the host in \
+             `[proof] fetch_hosts` of the base cowproof.toml, or set {FETCH_NETWORK_ENV}=open): ",
             refused.0.join(", "),
             refused.1
         )
     };
     match ended? {
-        FetchEnd::TimedOut => bail!(
-            "{named}cargo fetch --locked timed out after {}s",
-            timeout.as_secs()
-        ),
-        FetchEnd::Exited { status, output } if !status.success() => bail!(
-            "{named}cargo fetch --locked failed ({status}): {}",
-            tail(&output, 1500)
-        ),
+        FetchEnd::TimedOut => bail!("{named}{label} timed out after {}s", timeout.as_secs()),
+        FetchEnd::Exited { status, output } if !status.success() => {
+            bail!(
+                "{named}{label} failed ({status}): {}",
+                (job.describe)(&output)
+            )
+        }
         FetchEnd::Exited { .. } => Ok(()),
     }
 }
@@ -599,6 +1031,11 @@ fn tail(bytes: &[u8], max: usize) -> String {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    const CARGO: Needs = Needs {
+        cargo: true,
+        npm: false,
+    };
 
     /// A fetch configuration for a test that never reaches the command: running one is a
     /// failure of the test.
@@ -683,8 +1120,8 @@ mod tests {
         fs::write(fresh.join("cargo/registry/crate"), "x").unwrap();
         let dir = tmp.path().join("deps/key");
         fs::create_dir_all(dir.parent().unwrap()).unwrap();
-        assert_eq!(install(&fresh, &dir).unwrap(), FetchOutcome::Fetched);
-        assert_eq!(entry_state(&dir), EntryState::Complete);
+        assert_eq!(install(&fresh, &dir, CARGO).unwrap(), FetchOutcome::Fetched);
+        assert_eq!(entry_state(&dir, CARGO), EntryState::Complete);
         assert_eq!(
             fs::read_to_string(dir.join("cargo/registry/crate")).unwrap(),
             "x"
@@ -701,7 +1138,7 @@ mod tests {
         let fresh = tmp.path().join("new");
         complete_entry(&fresh);
         fs::write(fresh.join("cargo/registry/loser"), "l").unwrap();
-        assert_eq!(install(&fresh, &dir).unwrap(), FetchOutcome::Hit);
+        assert_eq!(install(&fresh, &dir, CARGO).unwrap(), FetchOutcome::Hit);
         assert!(dir.join("cargo/registry/winner").is_file());
         assert!(!dir.join("cargo/registry/loser").exists());
         assert!(!fresh.exists(), "the losing copy is removed");
@@ -719,7 +1156,7 @@ mod tests {
                     complete_entry(&fresh);
                     fs::write(fresh.join("cargo/registry/who"), i.to_string()).unwrap();
                     let dir = dir.clone();
-                    s.spawn(move || install(&fresh, &dir).unwrap())
+                    s.spawn(move || install(&fresh, &dir, CARGO).unwrap())
                 })
                 .collect();
             handles.into_iter().map(|h| h.join().unwrap()).collect()
@@ -732,7 +1169,7 @@ mod tests {
             1,
             "{outcomes:?}"
         );
-        assert_eq!(entry_state(&dir), EntryState::Complete);
+        assert_eq!(entry_state(&dir, CARGO), EntryState::Complete);
         for i in 0..8 {
             assert!(!tmp.path().join(format!("new{i}")).exists());
         }
@@ -741,14 +1178,20 @@ mod tests {
     #[test]
     fn a_directory_without_a_registry_is_incomplete_not_a_hit() {
         let tmp = TempDir::new().unwrap();
-        assert_eq!(entry_state(&tmp.path().join("nope")), EntryState::Absent);
+        assert_eq!(
+            entry_state(&tmp.path().join("nope"), CARGO),
+            EntryState::Absent
+        );
         fs::create_dir_all(tmp.path().join("half/cargo")).unwrap();
         assert_eq!(
-            entry_state(&tmp.path().join("half")),
+            entry_state(&tmp.path().join("half"), CARGO),
             EntryState::Incomplete
         );
         complete_entry(&tmp.path().join("whole"));
-        assert_eq!(entry_state(&tmp.path().join("whole")), EntryState::Complete);
+        assert_eq!(
+            entry_state(&tmp.path().join("whole"), CARGO),
+            EntryState::Complete
+        );
     }
 
     #[test]
@@ -850,26 +1293,35 @@ mod tests {
         assert!(t.join("real").exists());
     }
 
-    #[test]
-    fn a_tree_without_a_cargo_lock_has_nothing_to_fetch_and_no_cache_entry() {
-        let tmp = TempDir::new().unwrap();
-        let root = tmp.path().join("cache");
-        let lane = LaneLayout {
-            clone: tmp.path().join("lane/clone"),
-            home: tmp.path().join("lane/home"),
-            scratch: tmp.path().join("lane/scratch"),
-            control: tmp.path().join("lane/control"),
-            real_home: tmp.path().join("home"),
-            sock: tmp.path().join("lane/sock/runner.sock"),
-            lanes_root: tmp.path().to_path_buf(),
-        };
-        let tools = FetchTools {
+    fn lane_in(tmp: &Path) -> LaneLayout {
+        LaneLayout {
+            clone: tmp.join("lane/clone"),
+            home: tmp.join("lane/home"),
+            scratch: tmp.join("lane/scratch"),
+            control: tmp.join("lane/control"),
+            real_home: tmp.join("home"),
+            sock: tmp.join("lane/sock/runner.sock"),
+            lanes_root: tmp.to_path_buf(),
+        }
+    }
+
+    fn no_tools() -> FetchTools {
+        FetchTools {
             path: "/usr/bin:/bin".into(),
             cargo: None,
-        };
+            npm: None,
+        }
+    }
+
+    #[test]
+    fn a_tree_with_no_dependency_file_has_nothing_to_fetch_and_no_cache_entry() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("cache");
+        let lane = lane_in(tmp.path());
+        let tools = no_tools();
         let got = prefetch(
             |tree| {
-                fs::write(tree.join("package-lock.json"), "{}")?;
+                fs::write(tree.join("README.md"), "hello")?;
                 Ok(())
             },
             &root,
@@ -891,6 +1343,172 @@ mod tests {
     }
 
     #[test]
+    fn dependency_files_that_are_not_fetched_are_not_fetched_and_say_so() {
+        for (files, expect) in [
+            (
+                &["package.json"][..],
+                "package.json without a package-lock.json",
+            ),
+            (
+                &["package.json", "yarn.lock"][..],
+                "yarn.lock: yarn is not fetched",
+            ),
+            (
+                &["package.json", "pnpm-lock.yaml"][..],
+                "pnpm-lock.yaml: pnpm is not fetched",
+            ),
+            (
+                &["Gemfile.lock"][..],
+                "Gemfile.lock: Bundler is not fetched",
+            ),
+        ] {
+            let tmp = TempDir::new().unwrap();
+            let root = tmp.path().join("cache");
+            let lane = lane_in(tmp.path());
+            let tools = no_tools();
+            let got = prefetch(
+                |tree| {
+                    for f in files {
+                        fs::write(tree.join(f), "{}")?;
+                    }
+                    Ok(())
+                },
+                &root,
+                &lane,
+                &config(&tools, &|_| true),
+            )
+            .unwrap()
+            .unwrap_or_else(|| panic!("{files:?}: the omission is reported"));
+            assert_eq!(got.outcome, FetchOutcome::NotFetched, "{files:?}");
+            assert_eq!(got.outcome.name(), "not_fetched");
+            assert!(got.ecosystems.is_empty(), "{files:?}: {:?}", got.ecosystems);
+            assert!(
+                got.notes.iter().any(|n| n.contains(expect)),
+                "{files:?}: {:?}",
+                got.notes
+            );
+            assert!(!got.dir.exists(), "{files:?}: no entry was made");
+        }
+    }
+
+    #[test]
+    fn a_package_json_beside_an_npm_lockfile_is_not_reported_as_unfetched() {
+        let tmp = TempDir::new().unwrap();
+        for files in [
+            &["package.json", "package-lock.json"][..],
+            &["package.json", "npm-shrinkwrap.json"][..],
+        ] {
+            let t = tmp.path().join(files[1]);
+            fs::create_dir_all(&t).unwrap();
+            for f in files {
+                fs::write(t.join(f), "{}").unwrap();
+            }
+            assert!(Needs::of(&t).npm, "{files:?}");
+            assert!(
+                unfetched_notes(&t).is_empty(),
+                "{files:?}: {:?}",
+                unfetched_notes(&t)
+            );
+        }
+        // A lockfile that is a symlink is not a lockfile: it could point anywhere.
+        let linked = tmp.path().join("linked");
+        fs::create_dir_all(&linked).unwrap();
+        fs::write(linked.join("real"), "{}").unwrap();
+        std::os::unix::fs::symlink(linked.join("real"), linked.join("package-lock.json")).unwrap();
+        assert!(!Needs::of(&linked).npm);
+    }
+
+    #[test]
+    fn an_entry_must_hold_every_part_the_tree_asks_for() {
+        let tmp = TempDir::new().unwrap();
+        let both = Needs {
+            cargo: true,
+            npm: true,
+        };
+        let npm = Needs {
+            cargo: false,
+            npm: true,
+        };
+        let old = tmp.path().join("old");
+        complete_entry(&old);
+        assert_eq!(entry_state(&old, CARGO), EntryState::Complete);
+        assert_eq!(
+            entry_state(&old, both),
+            EntryState::Incomplete,
+            "a cargo-only entry is not a hit for a tree with an npm lockfile too"
+        );
+        assert_eq!(entry_state(&old, npm), EntryState::Incomplete);
+        let full = tmp.path().join("full");
+        complete_entry(&full);
+        fs::create_dir_all(full.join("npm/node_modules")).unwrap();
+        assert_eq!(entry_state(&full, both), EntryState::Complete);
+        let only = tmp.path().join("only");
+        fs::create_dir_all(only.join("npm/node_modules")).unwrap();
+        assert_eq!(entry_state(&only, npm), EntryState::Complete);
+        assert_eq!(entry_state(&only, CARGO), EntryState::Incomplete);
+    }
+
+    #[test]
+    fn the_npmrc_the_fetch_gets_has_no_credential_in_it() {
+        let rc = "registry=https://reg.example/npm/\n\
+                  //reg.example/npm/:_authToken=SECRET-1\n\
+                  //reg.example/:_auth=SECRET-2\n\
+                  @corp:_password=SECRET-3\n\
+                  _authToken=SECRET-4\n\
+                  ; _authToken=commented\n\
+                  @corp:registry=https://user:SECRET-5@corp.example/\n\
+                  always-auth=true\n";
+        let (clean, stripped) = strip_npmrc_auth(rc);
+        for secret in ["SECRET-1", "SECRET-2", "SECRET-3", "SECRET-4", "SECRET-5"] {
+            assert!(!clean.contains(secret), "{secret} survived:\n{clean}");
+        }
+        assert_eq!(stripped, 5, "{clean}");
+        for kept in [
+            "registry=https://reg.example/npm/",
+            "@corp:registry=https://corp.example/",
+            "always-auth=true",
+            "; _authToken=commented",
+        ] {
+            assert!(clean.contains(kept), "{kept} was lost:\n{clean}");
+        }
+    }
+
+    #[test]
+    fn npm_is_found_by_the_hook_variable_or_the_path_and_never_by_a_relative_entry() {
+        let tmp = TempDir::new().unwrap();
+        let bin = tmp.path().join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        fs::write(bin.join("npm"), "#!/bin/sh\n").unwrap();
+        let path = std::env::join_paths([Path::new(""), Path::new("rel"), bin.as_path()]).unwrap();
+        assert_eq!(resolve_npm(None, Some(&path)), Some(bin.join("npm")));
+        let hook = tmp.path().join("hook-npm");
+        fs::write(&hook, "x").unwrap();
+        assert_eq!(
+            resolve_npm(Some(hook.as_os_str()), Some(&path)),
+            Some(hook.clone())
+        );
+        // A hook that is not an existing absolute file falls back to the PATH.
+        assert_eq!(
+            resolve_npm(Some("relative-npm".as_ref()), Some(&path)),
+            Some(bin.join("npm"))
+        );
+        assert_eq!(resolve_npm(None, Some("".as_ref())), None);
+        assert_eq!(resolve_npm(None, None), None);
+    }
+
+    #[test]
+    fn an_npm_failure_is_named_by_its_first_error_line() {
+        let out = b"npm WARN deprecated x\nnpm ERR! code E404\nnpm ERR! 404 Not Found\n";
+        assert_eq!(npm_failure(out), "npm ERR! code E404");
+        assert_eq!(
+            npm_failure(b"npm error code ETARGET\n"),
+            "npm error code ETARGET"
+        );
+        assert_eq!(npm_failure(b"\n  boom\n"), "boom");
+        assert_eq!(npm_failure(b""), "no output");
+    }
+
+    #[test]
     fn a_complete_entry_is_a_hit_and_nothing_runs() {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path().join("cache");
@@ -907,6 +1525,7 @@ mod tests {
         let tools = FetchTools {
             path: String::new(),
             cargo: None,
+            npm: None,
         };
         let build = |tree: &Path| -> Result<()> {
             fs::write(tree.join("Cargo.lock"), "# lock\n")?;
@@ -959,6 +1578,7 @@ mod tests {
         let tools = FetchTools {
             path: String::new(),
             cargo: None,
+            npm: None,
         };
         let got = prefetch(|_| Ok(()), &root, &lane, &config(&tools, &|_| false)).unwrap();
         assert!(got.is_none(), "the fetch itself ran");
@@ -985,6 +1605,7 @@ mod tests {
         let tools = FetchTools {
             path: String::new(),
             cargo: None,
+            npm: None,
         };
         prefetch(|_| Ok(()), &root, &lane, &config(&tools, &|_| true)).unwrap();
         assert_eq!(
@@ -1014,6 +1635,7 @@ mod tests {
         let tools = FetchTools {
             path: String::new(),
             cargo: None,
+            npm: None,
         };
         let got = prefetch(
             |_| Ok(()),

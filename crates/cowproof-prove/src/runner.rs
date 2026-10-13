@@ -664,8 +664,8 @@ pub struct SandboxedRunner {
     lane: LaneLayout,
     cache_dir: PathBuf,
     platform: String,
-    /// The trusted dependency cache (D6): its `cargo/registry` and `cargo/git` are
-    /// mounted read-only into every check. `None` for a lane with nothing fetched.
+    /// The trusted dependency cache (D6): its `cargo/registry` and `cargo/git` (and the npm
+    /// part, `npm/node_modules` and `npm/cache`) are mounted read-only into every check. `None` for a lane with nothing fetched.
     deps_cache: Option<PathBuf>,
     /// The first port of the lane's block (`COWPROOF_PORT_BASE`, with
     /// `COWPROOF_PORT_COUNT`), when the lane holds a class slot. `None` sets neither.
@@ -784,6 +784,10 @@ impl CheckRunner for SandboxedRunner {
             SandboxPolicy::verifier(&lane, &self.cache_dir).with_runtime_dirs(&self.runtime_dirs);
         if let Some(deps) = &self.deps_cache {
             policy = policy.with_dependency_cache(deps);
+            // The entry's npm install appears at `<tree>/node_modules` before every check
+            // (a read-only mount behind a link), so each check starts from the trusted one.
+            cowproof_run::link_npm_modules(deps, tree)
+                .map_err(|e| InfraError::SpawnError(format!("node_modules link failed: {e:#}")))?;
         }
         policy.executables.extend(self.executables.iter().cloned());
 

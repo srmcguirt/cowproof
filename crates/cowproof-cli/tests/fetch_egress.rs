@@ -343,7 +343,8 @@ fn a_host_the_base_does_not_allow_fails_the_fetch_as_infrastructure_naming_the_h
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();
     assert!(
         stdout.contains(&format!("{}: infrastructure: ", lane.id))
-            && stdout.contains("dependency fetch (cargo fetch --locked) failed")
+            && stdout.contains("dependency fetch failed: ")
+            && stdout.contains("cargo fetch --locked failed")
             && stdout.contains("refused a connection to evil.example:443"),
         "{}",
         text(&out)

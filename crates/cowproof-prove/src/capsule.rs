@@ -355,9 +355,22 @@ pub struct Capsule {
     /// Dependency cache key computed on the rebuilt tree (D11, D14).
     #[serde(default)]
     pub dependency_cache_key: Option<String>,
-    /// Dependency fetch outcome: "hit", "fetched", or an error message (D6, F-1).
+    /// Dependency fetch outcome: "hit", "fetched", "not_fetched" (the tree has dependency
+    /// files this runner does not fetch, and `dependency_fetch_notes` says which), or
+    /// "failed" (D6, F-1).
     #[serde(default)]
     pub dependency_fetch_outcome: Option<String>,
+    /// The ecosystems the dependency cache entry holds (`cargo`, `npm`) when the outcome is
+    /// "hit" or "fetched". Absent when none, so capsules made before npm was fetched, and
+    /// their seals, are unchanged.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dependency_ecosystems: Vec<String>,
+    /// What the dependency fetch left out or did not use, one line each: lockfiles and
+    /// manifests that are not fetched (yarn, pnpm, Bundler, a `package.json` with no npm
+    /// lockfile) and the credential lines of the base `.npmrc` that were dropped. Absent when
+    /// there are none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dependency_fetch_notes: Vec<String>,
     /// Set only when the dependency fetch ran with the `COWPROOF_FETCH_RESOLVE` testing hook:
     /// its `host=ip:port,...` text. A capsule that carries it was made against a fake, not a
     /// real registry.
@@ -459,6 +472,8 @@ impl Capsule {
             flaky_checks: HashSet::new(),
             dependency_cache_key: None,
             dependency_fetch_outcome: None,
+            dependency_ecosystems: Vec::new(),
+            dependency_fetch_notes: Vec::new(),
             dependency_fetch_resolve: None,
             runtime_dirs: Vec::new(),
             prefix_version: None,

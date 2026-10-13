@@ -45,6 +45,9 @@ use tokio::sync::Semaphore;
 /// The hosts every fetch may reach: the crates.io index and its download host.
 pub const DEFAULT_HOSTS: [&str; 3] = ["index.crates.io", "static.crates.io", "crates.io"];
 
+/// The host an npm fetch may reach with no configuration: the public npm registry.
+pub const DEFAULT_NPM_HOSTS: [&str; 1] = ["registry.npmjs.org"];
+
 /// The one port a tunnel may be opened to.
 pub const TUNNEL_PORT: u16 = 443;
 
@@ -77,6 +80,32 @@ impl FetchAllowlist {
         Self {
             hosts: DEFAULT_HOSTS.iter().map(|h| (*h).to_string()).collect(),
         }
+    }
+
+    /// The defaults of an npm fetch alone: the public npm registry, and not the crates.io
+    /// hosts, so the two fetches of one tree each reach only their own registry.
+    pub fn npm_defaults() -> Self {
+        Self {
+            hosts: DEFAULT_NPM_HOSTS.iter().map(|h| (*h).to_string()).collect(),
+        }
+    }
+
+    /// The allowlist of an npm fetch of the tree `tree`, which must be the BASE: the
+    /// `.npmrc` and the `cowproof.toml` as they were before `lane.patch`. The npm defaults,
+    /// then the https hosts of every `registry=` and `@scope:registry=` entry of the base's
+    /// `.npmrc`, then `[proof] fetch_hosts`. A hostname named only by a `//host/:_authToken`
+    /// line is not allowed by it: that line says who to authenticate to, not where to go.
+    pub fn npm_from_tree(tree: &Path) -> Result<Self> {
+        let mut list = Self::npm_defaults();
+        if let Some(text) = read_regular(&tree.join(".npmrc"))? {
+            list = list.with_hosts(npmrc_hosts(&text))?;
+        }
+        if let Some(text) = read_regular(&tree.join(POLICY_FILE))? {
+            list = list.with_hosts(
+                fetch_hosts(&text).with_context(|| format!("reading {POLICY_FILE}"))?,
+            )?;
+        }
+        Ok(list)
     }
 
     /// Add `hosts`, each a plain host name (see [`normalize_host`]).
@@ -211,6 +240,28 @@ fn cargo_config_hosts(text: &str) -> Result<Vec<String>> {
         take(registry, &["index"]);
     }
     Ok(urls.iter().filter_map(|u| https_host(u)).collect())
+}
+
+/// The https hosts an `.npmrc` names as registries: the value of `registry` and of any
+/// `@scope:registry` key. Comment lines (`;`, `#`) and every other key are ignored, and a
+/// value that is not an https URL on port 443 names no host.
+fn npmrc_hosts(text: &str) -> Vec<String> {
+    let mut hosts = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.starts_with(['#', ';']) {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let key = key.trim();
+        if key == "registry" || (key.starts_with('@') && key.ends_with(":registry")) {
+            let value = value.trim().trim_matches(['"', '\'']);
+            hosts.extend(https_host(value));
+        }
+    }
+    hosts
 }
 
 /// `[proof] fetch_hosts` of a `cowproof.toml`.
@@ -629,6 +680,53 @@ mod tests {
             assert!(!list.allows(host, 443), "{host}: {:?}", sorted(&list));
         }
         assert!(list.allows("index.crates.io", 443), "the defaults stay");
+    }
+
+    #[test]
+    fn an_npm_fetch_allows_the_npm_registry_and_the_bases_npmrc_registries_only() {
+        let tmp = TempDir::new().unwrap();
+        // No configuration: the public registry, and not the crates.io hosts.
+        let bare = FetchAllowlist::npm_from_tree(tmp.path()).unwrap();
+        assert!(
+            bare.allows("registry.npmjs.org", 443),
+            "{:?}",
+            sorted(&bare)
+        );
+        assert!(!bare.allows("index.crates.io", 443), "{:?}", sorted(&bare));
+
+        std::fs::write(
+            tmp.path().join(".npmrc"),
+            "; a comment\n# registry=https://commented.example/\n\
+             registry = https://Mirror.Example/npm/\n\
+             @corp:registry=\"https://corp.example:443/\"\n\
+             @odd:registry=https://odd.example:8443/\n\
+             @plain:registry=http://plain.example/\n\
+             //auth-only.example/:_authToken=secret\n\
+             always-auth=true\n",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("cowproof.toml"),
+            "[proof]\nfetch_hosts = [\"git.example\"]\n",
+        )
+        .unwrap();
+        let list = FetchAllowlist::npm_from_tree(tmp.path()).unwrap();
+        for host in [
+            "registry.npmjs.org",
+            "mirror.example",
+            "corp.example",
+            "git.example",
+        ] {
+            assert!(list.allows(host, 443), "{host}: {:?}", sorted(&list));
+        }
+        for host in [
+            "commented.example",
+            "odd.example",
+            "plain.example",
+            "auth-only.example",
+        ] {
+            assert!(!list.allows(host, 443), "{host}: {:?}", sorted(&list));
+        }
     }
 
     #[test]

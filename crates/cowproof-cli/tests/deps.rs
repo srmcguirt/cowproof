@@ -16,7 +16,9 @@
 
 mod common;
 
-use common::{Lane, git, output, run_checks, sandbox_available, text, var_tmp};
+use common::{
+    FAKE_NPM_OK, Lane, fake_npm, git, output, run_checks, sandbox_available, text, var_tmp,
+};
 use cowproof_prove::Capsule;
 use serde_json::{Value, json};
 use std::fs;
@@ -348,7 +350,8 @@ fn a_fetch_that_fails_is_infrastructure_exit_4_naming_the_fetch_never_refuted() 
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();
     assert!(
         stdout.contains(&format!("{}: infrastructure: ", lane.id))
-            && stdout.contains("dependency fetch (cargo fetch --locked) failed"),
+            && stdout.contains("dependency fetch failed: ")
+            && stdout.contains("cargo fetch --locked failed"),
         "{}",
         text(&out)
     );
@@ -590,4 +593,51 @@ fn verify_that_cannot_fetch_is_infrastructure_exit_4_naming_the_fetch() {
             && err.contains("COWPROOF_FETCH_NETWORK"),
         "{err}"
     );
+}
+
+#[test]
+fn a_tree_with_a_cargo_lock_and_a_package_lock_fetches_both_into_one_entry() {
+    if !sandbox_available() {
+        return;
+    }
+    let cache = var_tmp("cp-deps-cache-");
+    let (_npm_dir, npm) = fake_npm(FAKE_NPM_OK);
+    let mut project = vendored_project(None);
+    project.push((
+        "package.json".into(),
+        "{\"name\":\"app\",\"version\":\"1.0.0\"}\n".into(),
+    ));
+    project.push((
+        "package-lock.json".into(),
+        "{\"lockfileVersion\":3,\"packages\":{}}\n".into(),
+    ));
+    let mut lane = lane(
+        &project,
+        &run_checks(&["build"]),
+        build_check(),
+        cache.path(),
+    );
+    lane.set_env("COWPROOF_NPM", &npm);
+    // The cargo build is the builder's own check; node_modules is proved by a held-out check
+    // that only the verifier runs.
+    let held = var_tmp("cp-deps-held-");
+    let heldout = held.path().join("h.toml");
+    fs::write(
+        &heldout,
+        "[[check]]\nid = \"held-modules\"\ncommand = \"test -f node_modules/fake-pkg/index.js\"\n",
+    )
+    .unwrap();
+    let out = lane.run(&[Path::new("--heldout"), &heldout]);
+    assert_eq!(out.status.code(), Some(0), "cowproof run:\n{}", text(&out));
+    assert_eq!(lane.verdict()["verdict"], "proved");
+
+    let c = capsule(&lane);
+    assert_eq!(c.dependency_fetch_outcome.as_deref(), Some("fetched"));
+    assert_eq!(
+        c.dependency_ecosystems,
+        vec!["cargo".to_string(), "npm".to_string()]
+    );
+    let entry = cache_entry(cache.path(), &c.dependency_cache_key.unwrap());
+    assert!(entry.join("cargo/registry").is_dir());
+    assert!(entry.join("npm/node_modules/fake-pkg/index.js").is_file());
 }

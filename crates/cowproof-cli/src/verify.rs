@@ -43,12 +43,14 @@ is named); 4 infrastructure (the capsule was refused as tampered, unsandboxed or
 or the replay could not run, or the dependency fetch the checks need failed; never a \
 refutation).
 
-Dependencies: a capsule whose tree has a Cargo.lock names a dependency cache key. The cache \
-is <cache root>/deps/<key>, the cache root being ~/.cache/cowproof or $COWPROOF_CACHE_ROOT; \
-verify fetches it (cargo fetch --locked, in a sandbox; the network is $COWPROOF_FETCH_NETWORK: \
-`registry` by default, a proxy that tunnels only to the base's registry hosts and the base \
-cowproof.toml's [proof] fetch_hosts; `open` for full outbound network; or `none`) when it is \
-absent, and mounts it read-only for the checks.")]
+Dependencies: a capsule whose tree has a Cargo.lock, a package-lock.json or an \
+npm-shrinkwrap.json names a dependency cache key. The cache is <cache root>/deps/<key>, the \
+cache root being ~/.cache/cowproof or $COWPROOF_CACHE_ROOT; verify fetches it (cargo fetch \
+--locked and npm ci --ignore-scripts, in a sandbox; npm is $COWPROOF_NPM or the first npm on \
+PATH; the network is $COWPROOF_FETCH_NETWORK: `registry` by default, a proxy that tunnels only \
+to the base's registry hosts and the base cowproof.toml's [proof] fetch_hosts; `open` for full \
+outbound network; or `none`) when it is absent, and mounts it read-only for the checks \
+(node_modules appears in the tree, read-only).")]
 pub struct VerifyArgs {
     /// The capsule directory (`control/capsule` of a lane)
     capsule_dir: PathBuf,
@@ -234,12 +236,17 @@ pub(crate) async fn fetch_dependencies(
     let bridge_exe = std::env::current_exe()
         .and_then(|p| p.canonicalize())
         .context("locating the cowproof executable for the fetch's bridge")?;
+    // `$COWPROOF_NPM` (a test hook, as `$CARGO` is for cargo) or the first `npm` on `PATH`.
+    let npm = deps::resolve_npm(
+        std::env::var_os(deps::NPM_ENV).as_deref(),
+        std::env::var_os("PATH").as_deref(),
+    );
     let root = deps::cache_root(&layout.real_home);
     let layout = layout.clone();
     let cancelled = Arc::new(AtomicBool::new(false));
     let _cancel = CancelOnDrop(cancelled.clone());
     tokio::task::spawn_blocking(move || {
-        let tools = FetchTools { path, cargo };
+        let tools = FetchTools { path, cargo, npm };
         let egress = FetchEgress {
             bridge_exe,
             resolver,
@@ -312,7 +319,14 @@ async fn capsule_dependencies(
     match fetch_dependencies(rebuild, layout, None).await {
         Err(e) => Err(format!("dependency fetch could not run: {e:#}")),
         Ok(None) => Err(format!(
-            "the capsule names dependency cache {key}, but the rebuilt tree has no Cargo.lock"
+            "the capsule names dependency cache {key}, but the rebuilt tree has no Cargo.lock \
+             or npm lockfile"
+        )),
+        Ok(Some(Prefetch {
+            outcome: FetchOutcome::NotFetched,
+            ..
+        })) => Err(format!(
+            "the capsule names dependency cache {key}, but the rebuilt tree has nothing to fetch"
         )),
         Ok(Some(p)) if p.key != key => Err(format!(
             "the rebuilt tree's dependency cache key {} is not the capsule's {key}",

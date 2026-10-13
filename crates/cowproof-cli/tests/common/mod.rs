@@ -341,6 +341,56 @@ pub fn var_tmp(prefix: &str) -> TempDir {
         .unwrap()
 }
 
+/// A FAKE `npm` that succeeds. It records what it was given into the npm cache directory
+/// the fetch names (`$npm_config_cache`, a directory of the cache entry being made, the only
+/// place the fetch sandbox lets it write besides its scratch directory): `argv.txt` (one
+/// argument per line), `env.txt` (its sorted environment), `npmrc.txt` (the `.npmrc` it was
+/// given, if any) and `cwd.txt`. It installs `node_modules/fake-pkg/index.js` into its working
+/// directory, as `npm ci` installs into the project.
+#[allow(dead_code)] // `tests/npm_fetch.rs` and `tests/deps.rs` use it; the other test crates do not
+pub const FAKE_NPM_OK: &str = r#"#!/bin/sh
+printf '%s\n' "$@" > "$npm_config_cache/argv.txt"
+env | sort > "$npm_config_cache/env.txt"
+pwd > "$npm_config_cache/cwd.txt"
+if [ -f .npmrc ]; then cat .npmrc > "$npm_config_cache/npmrc.txt"; fi
+mkdir -p node_modules/fake-pkg
+printf 'module.exports = 42;\n' > node_modules/fake-pkg/index.js
+exit 0
+"#;
+
+/// A FAKE `npm` whose install fails the way a missing package does.
+#[allow(dead_code)] // `tests/npm_fetch.rs` uses it; the other test crates do not
+pub const FAKE_NPM_FAILS: &str = r#"#!/bin/sh
+echo "npm WARN deprecated fake-pkg@1.0.0: for the test" >&2
+echo "npm ERR! code E404" >&2
+echo "npm ERR! 404 Not Found - GET https://registry.npmjs.org/fake-pkg" >&2
+exit 1
+"#;
+
+/// A FAKE `npm` that must not be called: a run that reaches it is a cache miss.
+#[allow(dead_code)] // `tests/npm_fetch.rs` uses it; the other test crates do not
+pub const FAKE_NPM_MUST_NOT_RUN: &str = r#"#!/bin/sh
+echo "npm ERR! the fake npm was called although the cache entry was complete" >&2
+exit 1
+"#;
+
+/// Write an executable `npm` with `body` into a new directory under `/var/tmp` and return the
+/// directory (keep it alive) and the path of the script. Pass the path to a lane as
+/// `COWPROOF_NPM`, the way `CARGO` names the cargo the verifier uses.
+#[allow(dead_code)] // `tests/npm_fetch.rs` and `tests/deps.rs` use it; the other test crates do not
+pub fn fake_npm(body: &str) -> (TempDir, PathBuf) {
+    let dir = var_tmp("cp-fake-npm-");
+    let npm = dir.path().canonicalize().unwrap().join("npm");
+    {
+        // Linux refuses to exec a file some process holds open for writing (ETXTBSY), and a
+        // fork on another test thread can inherit that handle: write under the fork lock.
+        let _g = fork_lock();
+        fs::write(&npm, body).unwrap();
+        fs::set_permissions(&npm, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    (dir, npm)
+}
+
 pub fn git(repo: &Path, args: &[&str]) {
     let out = output(
         Command::new("git")
