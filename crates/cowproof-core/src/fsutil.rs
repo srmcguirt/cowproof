@@ -123,6 +123,25 @@ mod tests {
     }
 
     #[test]
+    fn the_mode_change_refuses_a_symlink_and_leaves_its_target_alone() {
+        // The swap-race protection, without the race: `make_owner_writable` is handed a path
+        // that is a symlink to a read-only directory. `O_NOFOLLOW` makes the open fail, so
+        // no mode change can land on the target.
+        let t = tmp();
+        let outside = t.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        fs::set_permissions(&outside, fs::Permissions::from_mode(0o555)).unwrap();
+        let link = t.path().join("link");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        let result = make_owner_writable(&link);
+        let after = mode(&outside);
+        // Restore the mode before any assertion, so the temp dir stays removable.
+        fs::set_permissions(&outside, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(result.is_err(), "a symlink was opened as a directory");
+        assert_eq!(after, 0o555, "the target's mode was changed through a link");
+    }
+
+    #[test]
     fn a_symlink_at_the_path_itself_is_unlinked_not_followed() {
         let t = tmp();
         let outside = t.path().join("outside");
