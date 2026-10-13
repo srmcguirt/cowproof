@@ -6,7 +6,11 @@
 //! Yarn Berry `exec:` runs a Node script at fetch time. [`yarn_local_path`] and
 //! [`pnpm_local_path`] name the first such entry; the fetch is then `not_fetched`.
 //!
-//! The readers are line-based, like the other lockfile readers, and only look at the fields
+//! `package-lock.json` and `npm-shrinkwrap.json` are read as JSON ([`npm_local_path`]) for the
+//! same entries: a `packages` key or `resolved` that leaves the tree, a `"link": true` entry
+//! whose target does, and lockfile v1's `dependencies` `version` and `resolved`.
+//!
+//! The yarn and pnpm readers are line-based, like the other lockfile readers, and only look at the fields
 //! that can carry a path: yarn's descriptors (the header lines) and its `resolved` or
 //! `resolution` line, pnpm's keys and the values of `specifier`, `version`, `directory`,
 //! `tarball` and `resolution`. Anything in those fields the reader does not understand (a
@@ -322,6 +326,78 @@ fn flow_is_local(value: &str) -> bool {
     })
 }
 
+/// The first entry of an npm lockfile (`package-lock.json`, `npm-shrinkwrap.json`) that names a
+/// local path outside the tree, as its key: a `packages` key (the `node_modules/...` path) that
+/// leaves the tree, a `packages` entry whose `resolved` is a `file:` path that does, a
+/// `"link": true` entry whose `resolved` does, and (lockfile v1, and the v1 copy that v2 keeps)
+/// a `dependencies` entry whose `version` or `resolved` does. Workspace links inside the tree
+/// (`"resolved": "packages/a", "link": true`) are allowed. `Err` for text that is not a JSON
+/// object, so the caller fails closed: the JSON reader of this crate is stricter than npm's.
+pub(crate) fn npm_local_path(text: &str) -> Result<Option<String>, String> {
+    let doc: serde_json::Value =
+        serde_json::from_str(text).map_err(|e| format!("is not valid JSON: {e}"))?;
+    let Some(root) = doc.as_object() else {
+        return Err("is not a JSON object".to_string());
+    };
+    if let Some(packages) = root.get("packages") {
+        let Some(map) = packages.as_object() else {
+            return Ok(Some("packages".to_string()));
+        };
+        for (key, entry) in map {
+            if (!key.is_empty() && escapes_tree(key)) || npm_entry_is_local(entry) {
+                return Ok(Some(key.clone()));
+            }
+        }
+    }
+    Ok(root
+        .get("dependencies")
+        .and_then(|deps| npm_v1_local("dependencies", deps)))
+}
+
+/// Whether one lockfile entry resolves to a local path that leaves the tree, or is not an
+/// entry this reader understands.
+fn npm_entry_is_local(entry: &serde_json::Value) -> bool {
+    use serde_json::Value;
+    let Some(o) = entry.as_object() else {
+        return true;
+    };
+    let link = match o.get("link") {
+        None => false,
+        Some(Value::Bool(b)) => *b,
+        Some(_) => return true,
+    };
+    match o.get("version") {
+        Some(Value::String(v)) if range_is_local(v, false) => return true,
+        _ => {}
+    }
+    match o.get("resolved") {
+        None => link,
+        Some(Value::String(r)) => {
+            range_is_local(r, false) || (link && escapes_tree(r.strip_prefix("file:").unwrap_or(r)))
+        }
+        Some(_) => true,
+    }
+}
+
+/// The v1 `dependencies` tree below `path`: the dotted key of the first entry that is local.
+fn npm_v1_local(path: &str, deps: &serde_json::Value) -> Option<String> {
+    let Some(map) = deps.as_object() else {
+        return Some(path.to_string());
+    };
+    for (name, entry) in map {
+        let here = format!("{path}.{name}");
+        if npm_entry_is_local(entry) {
+            return Some(here);
+        }
+        if let Some(nested) = entry.get("dependencies")
+            && let Some(found) = npm_v1_local(&format!("{here}.dependencies"), nested)
+        {
+            return Some(found);
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -456,5 +532,63 @@ mod tests {
             yarn_local_path(text).as_deref(),
             Some("resolved \"file:../b\"")
         );
+    }
+
+    #[test]
+    fn npm_lock_refuses_host_file_paths_links_and_keys_that_leave_the_tree() {
+        for bad in [
+            r#"{"lockfileVersion":3,"packages":{"":{},"node_modules/a":{"version":"1.0.0","resolved":"file:/etc/a.tgz"}}}"#,
+            r#"{"lockfileVersion":3,"packages":{"node_modules/a":{"resolved":"file:../a.tgz"}}}"#,
+            r#"{"lockfileVersion":3,"packages":{"node_modules/a":{"resolved":"file:~/a.tgz"}}}"#,
+            r#"{"lockfileVersion":3,"packages":{"node_modules/a":{"resolved":"file:"}}}"#,
+            r#"{"lockfileVersion":3,"packages":{"node_modules/a":{"resolved":"file:%2e%2e/a"}}}"#,
+            r#"{"lockfileVersion":3,"packages":{"node_modules/a":{"resolved":"../a","link":true}}}"#,
+            r#"{"lockfileVersion":3,"packages":{"node_modules/a":{"resolved":"/abs/a","link":true}}}"#,
+            r#"{"lockfileVersion":3,"packages":{"node_modules/a":{"resolved":"file:../a","link":true}}}"#,
+            r#"{"lockfileVersion":3,"packages":{"node_modules/a":{"link":true}}}"#,
+            r#"{"lockfileVersion":3,"packages":{"node_modules/a":{"link":"yes","resolved":"x"}}}"#,
+            r#"{"lockfileVersion":3,"packages":{"../outside":{"version":"1.0.0"}}}"#,
+            r#"{"lockfileVersion":3,"packages":{"node_modules/../../x":{"version":"1.0.0"}}}"#,
+            r#"{"lockfileVersion":3,"packages":{"/abs/x":{"version":"1.0.0"}}}"#,
+            r#"{"lockfileVersion":3,"packages":{"node_modules/a":{"resolved":7}}}"#,
+            r#"{"lockfileVersion":3,"packages":[]}"#,
+            r#"{"lockfileVersion":1,"dependencies":{"a":{"version":"file:../a"}}}"#,
+            r#"{"lockfileVersion":1,"dependencies":{"a":{"version":"1.0.0","resolved":"file:/abs/a.tgz"}}}"#,
+            r#"{"lockfileVersion":1,"dependencies":{"a":{"version":"1.0.0","dependencies":{"b":{"version":"file:/abs/b"}}}}}"#,
+            r#"{"lockfileVersion":2,"packages":{},"dependencies":{"a":{"version":"file:../a"}}}"#,
+        ] {
+            assert!(
+                matches!(npm_local_path(bad), Ok(Some(_))),
+                "{bad}: {:?}",
+                npm_local_path(bad)
+            );
+        }
+    }
+
+    #[test]
+    fn npm_lock_allows_workspace_links_and_registry_entries_and_names_the_entry() {
+        for ok in [
+            r#"{"name":"app","lockfileVersion":3,"packages":{"":{"workspaces":["packages/*"]},"node_modules/a":{"resolved":"packages/a","link":true},"packages/a":{"name":"a","version":"1.0.0"},"node_modules/foo":{"version":"1.0.0","resolved":"https://registry.npmjs.org/foo/-/foo-1.0.0.tgz","integrity":"sha512-x"},"node_modules/@s/bar":{"version":"2.0.0","resolved":"https://registry.npmjs.org/@s/bar/-/bar-2.0.0.tgz"}}}"#,
+            r#"{"lockfileVersion":3,"packages":{"node_modules/a":{"resolved":"file:vendor/a.tgz"},"node_modules/b":{"resolved":"vendor/b","link":true}}}"#,
+            r#"{"lockfileVersion":1,"dependencies":{"a":{"version":"file:vendor/a","dependencies":{"b":{"version":"1.0.0","resolved":"https://r/b.tgz"}}}}}"#,
+            r#"{"lockfileVersion":3,"packages":{}}"#,
+        ] {
+            assert_eq!(npm_local_path(ok), Ok(None), "{ok}");
+        }
+        assert_eq!(
+            npm_local_path(
+                r#"{"packages":{"":{},"node_modules/a":{"resolved":"https://r/a.tgz"},"node_modules/b":{"resolved":"file:/etc/b"}}}"#
+            ),
+            Ok(Some("node_modules/b".to_string()))
+        );
+        assert_eq!(
+            npm_local_path(
+                r#"{"dependencies":{"a":{"version":"1.0.0","dependencies":{"b":{"version":"file:/b"}}}}}"#
+            ),
+            Ok(Some("dependencies.a.dependencies.b".to_string()))
+        );
+        // Not JSON, or not an object: refused by the caller.
+        assert!(npm_local_path("{").is_err());
+        assert!(npm_local_path("[]").is_err());
     }
 }

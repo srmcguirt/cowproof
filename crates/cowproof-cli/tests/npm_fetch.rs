@@ -1496,3 +1496,122 @@ fn relative_workspace_paths_in_a_lockfile_are_fetched_and_a_relative_exec_is_not
         "a@exec:./scripts/gen.js",
     );
 }
+
+/// An npm lockfile of `packages` entries, as `(key, entry JSON)` pairs.
+fn npm_lock(entries: &[(&str, &str)]) -> String {
+    let mut packages = String::from("\"\":{\"name\":\"app\",\"version\":\"1.0.0\"}");
+    for (key, entry) in entries {
+        packages.push_str(&format!(",{}:{entry}", serde_json::to_string(key).unwrap()));
+    }
+    format!(
+        "{{\"name\":\"app\",\"version\":\"1.0.0\",\"lockfileVersion\":3,\"requires\":true,\"packages\":{{{packages}}}}}\n"
+    )
+}
+
+#[test]
+fn an_npm_lockfile_entry_with_a_host_path_is_not_fetched_naming_the_key() {
+    if !sandbox_available() {
+        return;
+    }
+    let cases = [
+        // (lockfile, the key the note names)
+        (
+            npm_lock(&[(
+                "node_modules/a",
+                "{\"version\":\"1.0.0\",\"resolved\":\"file:/etc/a.tgz\"}",
+            )]),
+            "node_modules/a",
+        ),
+        (
+            npm_lock(&[("node_modules/b", "{\"resolved\":\"file:../b.tgz\"}")]),
+            "node_modules/b",
+        ),
+        (
+            npm_lock(&[("node_modules/c", "{\"resolved\":\"../c\",\"link\":true}")]),
+            "node_modules/c",
+        ),
+        (
+            npm_lock(&[(
+                "node_modules/d",
+                "{\"resolved\":\"/home/u/d\",\"link\":true}",
+            )]),
+            "node_modules/d",
+        ),
+        (
+            npm_lock(&[("../outside", "{\"version\":\"1.0.0\"}")]),
+            "../outside",
+        ),
+        (
+            "{\"lockfileVersion\":1,\"dependencies\":{\"e\":{\"version\":\"file:../e\"}}}\n"
+                .to_string(),
+            "dependencies.e",
+        ),
+    ];
+    for (lock, key) in cases {
+        assert_local_path_refused(
+            &[manifest(), ("package-lock.json", &lock)],
+            "COWPROOF_NPM",
+            "npm",
+            "package-lock.json",
+            key,
+        );
+    }
+    // npm-shrinkwrap.json is read the same way.
+    let lock = npm_lock(&[("node_modules/a", "{\"resolved\":\"file:/etc/a.tgz\"}")]);
+    assert_local_path_refused(
+        &[manifest(), ("npm-shrinkwrap.json", &lock)],
+        "COWPROOF_NPM",
+        "npm",
+        "npm-shrinkwrap.json",
+        "node_modules/a",
+    );
+}
+
+#[test]
+fn the_note_for_an_npm_host_path_key_escapes_its_control_characters() {
+    if !sandbox_available() {
+        return;
+    }
+    let lock = npm_lock(&[("../\u{1b}[2J\u{9b}0c", "{\"version\":\"1.0.0\"}")]);
+    let notes = assert_local_path_refused(
+        &[manifest(), ("package-lock.json", &lock)],
+        "COWPROOF_NPM",
+        "npm",
+        "package-lock.json",
+        "../\\u{1b}[2J\\u{9b}0c",
+    );
+    assert!(
+        notes.iter().all(|n| !n.chars().any(char::is_control)),
+        "{notes:?}"
+    );
+}
+
+#[test]
+fn an_npm_workspace_link_inside_the_tree_is_fetched() {
+    if !sandbox_available() {
+        return;
+    }
+    let cache = var_tmp("cp-npm-local-cache-");
+    let (_dir, npm) = fake_npm(FAKE_NPM_OK);
+    let lock = npm_lock(&[
+        (
+            "node_modules/a",
+            "{\"resolved\":\"packages/a\",\"link\":true}",
+        ),
+        ("packages/a", "{\"name\":\"a\",\"version\":\"1.0.0\"}"),
+        (
+            "node_modules/foo",
+            "{\"version\":\"1.0.0\",\"resolved\":\"https://registry.npmjs.org/foo/-/foo-1.0.0.tgz\"}",
+        ),
+    ]);
+    let lane = new_lane(
+        &[manifest(), ("package-lock.json", &lock)],
+        cache.path(),
+        &npm,
+    );
+    let held = var_tmp("cp-npm-local-held-");
+    run_with(&lane, &heldout(held.path(), NEEDS_MODULES), 0);
+    let c = capsule(&lane);
+    assert_eq!(c.dependency_fetch_outcome.as_deref(), Some("fetched"));
+    assert_eq!(c.dependency_ecosystems, vec!["npm".to_string()]);
+}

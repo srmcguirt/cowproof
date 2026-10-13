@@ -503,10 +503,16 @@ pub fn js_plan(tree: &Path) -> JsPlan {
         ));
     }
     if npm {
+        // Both of npm's lockfiles are read: a shrinkwrap wins, but neither may name the host.
+        for name in NPM_LOCKFILES.iter().copied().filter(|n| has(n)) {
+            if let Some(note) = local_path_note(tree, name, js_lock::npm_local_path) {
+                return JsPlan::NotFetched(note);
+            }
+        }
         return JsPlan::Fetch(JsTool::Npm);
     }
     if pnpm {
-        return match local_path_note(tree, PNPM_LOCKFILE, js_lock::pnpm_local_path) {
+        return match local_path_note(tree, PNPM_LOCKFILE, |t| Ok(js_lock::pnpm_local_path(t))) {
             Some(note) => JsPlan::NotFetched(note),
             None => JsPlan::Fetch(JsTool::Pnpm),
         };
@@ -514,7 +520,7 @@ pub fn js_plan(tree: &Path) -> JsPlan {
     if !yarn {
         return JsPlan::Nothing;
     }
-    if let Some(note) = local_path_note(tree, YARN_LOCKFILE, js_lock::yarn_local_path) {
+    if let Some(note) = local_path_note(tree, YARN_LOCKFILE, |t| Ok(js_lock::yarn_local_path(t))) {
         return JsPlan::NotFetched(note);
     }
     let lock = read_dependency_text(&tree.join(YARN_LOCKFILE)).unwrap_or_default();
@@ -536,26 +542,36 @@ pub fn js_plan(tree: &Path) -> JsPlan {
 const LOCAL_ENTRY_LISTED: usize = 200;
 
 /// The capsule line when the JavaScript lockfile `name` of `tree` holds an entry `scan`
-/// refuses (a local path with an absolute path or a `..` component, or a Berry `exec:`): it is
-/// lane-written, and a fetch with registry network must not copy or link host files into the
-/// cache entry or run a script. The entry is quoted with every control character escaped.
-/// A lockfile that cannot be read as text is refused the same way.
-fn local_path_note(tree: &Path, name: &str, scan: fn(&str) -> Option<String>) -> Option<String> {
+/// refuses: a local path with an absolute path or a `..` component, or a Berry `exec:`. The
+/// lockfile is lane-written, and a fetch with registry network must not copy or link host
+/// files into the cache entry or run a script. The entry is quoted with every control
+/// character escaped. A lockfile that cannot be read as text, or that `scan` cannot parse (npm's
+/// JSON), is refused the same way.
+fn local_path_note(
+    tree: &Path,
+    name: &str,
+    scan: impl Fn(&str) -> std::result::Result<Option<String>, String>,
+) -> Option<String> {
+    let not_read = |why: String| {
+        format!(
+            "{name}: not read ({why}), so node_modules is not fetched and is not available to the verifier"
+        )
+    };
     let text = match read_dependency_text(&tree.join(name)) {
         Ok(text) => text,
-        Err(e) => {
-            return Some(format!(
-                "{name}: not read ({e}), so node_modules is not fetched and is not available to the verifier"
-            ));
-        }
+        Err(e) => return Some(not_read(e.to_string())),
     };
-    scan(&text).map(|entry| {
-        let entry: String = entry.chars().take(LOCAL_ENTRY_LISTED).collect();
-        format!(
-            "{name}: the entry `{}` names a local path outside the tree (an absolute path or a `..` component) or code to run at fetch time (`exec:`), so node_modules is not fetched and is not available to the verifier",
-            cowproof_core::one_line(&entry)
-        )
-    })
+    match scan(&text) {
+        Err(why) => Some(not_read(why)),
+        Ok(None) => None,
+        Ok(Some(entry)) => {
+            let entry: String = entry.chars().take(LOCAL_ENTRY_LISTED).collect();
+            Some(format!(
+                "{name}: the entry `{}` names a local path outside the tree (an absolute path or a `..` component) or code to run at fetch time (`exec:`), so node_modules is not fetched and is not available to the verifier",
+                cowproof_core::one_line(&entry)
+            ))
+        }
+    }
 }
 
 /// The capsule line for a lockfile or manifest over [`crate::MAX_DEPENDENCY_INPUT_BYTES`].
@@ -2843,6 +2859,45 @@ mod tests {
         fs::write(tmp.path().join("pnpm-lock.yaml"), [0xff, 0xfe]).unwrap();
         let note = not_fetched(js_plan(tmp.path()));
         assert!(note.starts_with("pnpm-lock.yaml: not read"), "{note}");
+    }
+
+    #[test]
+    fn an_npm_lockfile_entry_with_a_host_path_is_not_fetched_and_the_note_names_its_key() {
+        let plan = |files: &[(&str, &str)]| {
+            let tmp = TempDir::new().unwrap();
+            for (name, text) in files {
+                fs::write(tmp.path().join(name), text).unwrap();
+            }
+            js_plan(tmp.path())
+        };
+        let bad = r#"{"lockfileVersion":3,"packages":{"":{},"node_modules/a":{"resolved":"file:../a.tgz"}}}"#;
+        for name in ["package-lock.json", "npm-shrinkwrap.json"] {
+            match plan(&[(name, bad)]) {
+                JsPlan::NotFetched(note) => {
+                    assert!(note.starts_with(&format!("{name}: ")), "{note}");
+                    assert!(note.contains("`node_modules/a`"), "{note}");
+                }
+                other => panic!("{name}: {other:?}"),
+            }
+        }
+        // Either of the two files is enough, whichever npm would read.
+        match plan(&[
+            ("package-lock.json", bad),
+            ("npm-shrinkwrap.json", "{\"packages\":{}}"),
+        ]) {
+            JsPlan::NotFetched(note) => assert!(note.starts_with("package-lock.json: "), "{note}"),
+            other => panic!("{other:?}"),
+        }
+        // A workspace link inside the tree is fetched; text that is not JSON is not read.
+        let ok = r#"{"lockfileVersion":3,"packages":{"node_modules/a":{"resolved":"packages/a","link":true},"packages/a":{"version":"1.0.0"}}}"#;
+        assert_eq!(
+            plan(&[("package-lock.json", ok)]),
+            JsPlan::Fetch(JsTool::Npm)
+        );
+        match plan(&[("package-lock.json", "{")]) {
+            JsPlan::NotFetched(note) => assert!(note.contains("not valid JSON"), "{note}"),
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]
