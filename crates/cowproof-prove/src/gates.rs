@@ -20,6 +20,11 @@ use std::process::Command;
 /// Configuration for a single gate execution.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct GatePacket {
+    /// The lane's id. A new file under the base commit's handoff directory whose name
+    /// carries it as a whole token is accepted without being owned (see `handoff_accepted`). Empty means
+    /// no such allowance.
+    #[serde(default)]
+    pub lane_id: String,
     /// Paths the patch is allowed to touch.
     pub owns: Vec<String>,
     /// Per-path, the maximum number of lines allowed to be removed.
@@ -61,7 +66,7 @@ pub fn run_gates(
     verify_commit(base_repo, base_commit)?;
 
     // Gate 1: Ownership
-    let ownership_result = check_ownership(lane_patch, packet)?;
+    let ownership_result = check_ownership(base_repo, base_commit, lane_patch, packet)?;
     gates.push(ownership_result);
 
     // Gate 2: Append-only
@@ -228,8 +233,57 @@ pub fn base_migration_baseline(repo: &Path, commit: &str) -> Result<Option<Strin
     }
 }
 
+/// Whether `name` holds `lane_id` as a whole token: the characters before it are the start of
+/// the name or a separator (`-`, `_`, `.`), and so are the ones after it. `notes` is a token of
+/// `notes.md`, `release-notes.md` and `notes-v2.md`, not of `footnotes.md` or `notesy.md`, and
+/// `t-run-1` is one of `t-run-1.md`, not of `t-run-10.md`.
+fn has_id_token(name: &str, lane_id: &str) -> bool {
+    let is_sep = |c: char| matches!(c, '-' | '_' | '.');
+    name.match_indices(lane_id).any(|(at, _)| {
+        name[..at].chars().next_back().is_none_or(is_sep)
+            && name[at + lane_id.len()..].chars().next().is_none_or(is_sep)
+    })
+}
+
+/// Whether `path` is a handoff file the ownership gate accepts without `owns`: under
+/// `handoff_dir` at any depth, and a file name that carries the lane id as a whole token
+/// (`has_id_token`). `handoff_dir` comes from the base commit (a patch cannot move it). A
+/// directory that is empty, absolute or has a `.`/`..`/empty component names no handoff
+/// directory (`.` would otherwise be the whole repository), and a lane id that
+/// `validate_lane_id` refuses (empty included) matches nothing.
+fn handoff_accepted(path: &str, handoff_dir: &str, lane_id: &str) -> bool {
+    let plain = |p: &str| p.split('/').all(|c| !matches!(c, "" | "." | ".."));
+    let dir = handoff_dir.trim_end_matches('/');
+    if cowproof_run::lane::validate_lane_id(lane_id).is_err() || dir.is_empty() || !plain(dir) {
+        return false;
+    }
+    let Some(rest) = path
+        .strip_prefix(dir)
+        .and_then(|rest| rest.strip_prefix('/'))
+    else {
+        return false;
+    };
+    plain(rest)
+        && rest
+            .rsplit('/')
+            .next()
+            .is_some_and(|name| has_id_token(name, lane_id))
+}
+
 /// Gate 1: Ownership - files outside `owns` fail.
-fn check_ownership(lane_patch: &str, packet: &GatePacket) -> Result<GateResult> {
+///
+/// One allowance: a regular file the patch **creates** under the base commit's handoff
+/// directory, named for the lane (`handoff_accepted`), needs no `owns`, so the handoff the
+/// builder preamble asks for passes without the director naming it. Editing, deleting or
+/// renaming a file that already exists there (another lane's handoff), a symlink, and a
+/// path the always-protected globs name all stay outside. The evidence names each file
+/// accepted this way.
+fn check_ownership(
+    base_repo: &Path,
+    base_commit: &str,
+    lane_patch: &str,
+    packet: &GatePacket,
+) -> Result<GateResult> {
     let deltas = parse_patch(lane_patch);
     let files: Vec<String> = deltas.iter().map(|d| d.path.clone()).collect();
 
@@ -241,12 +295,34 @@ fn check_ownership(lane_patch: &str, packet: &GatePacket) -> Result<GateResult> 
         "**/.env.*".into(),
     ];
 
-    let outside = outside_ownership(&files, &packet.owns, &always_protected);
+    let mut outside = outside_ownership(&files, &packet.owns, &always_protected);
+
+    // The handoff directory is the base commit's, never the patched tree's.
+    let mut accepted = Vec::new();
+    if !outside.is_empty() && !packet.lane_id.is_empty() {
+        let handoff_dir = load_rules_from_base(base_repo, base_commit)?.handoff_dir;
+        outside.retain(|file| {
+            let creates_regular_file = deltas.iter().any(|d| {
+                d.path == *file && matches!(d.new_file_mode.as_deref(), Some("100644" | "100755"))
+            });
+            let protected = always_protected.iter().any(|g| glob_matches(g, file));
+            let ok = creates_regular_file
+                && !protected
+                && handoff_accepted(file, &handoff_dir, &packet.lane_id);
+            if ok {
+                accepted.push(file.clone());
+            }
+            !ok
+        });
+    }
 
     let passed = outside.is_empty();
     let mut evidence = Vec::new();
     if !passed {
         evidence.push(format!("Files outside owns globs: {}", outside.join(", ")));
+    }
+    for file in accepted {
+        evidence.push(format!("handoff file accepted outside owns: {file}"));
     }
 
     Ok(GateResult {
@@ -618,7 +694,7 @@ explanation = "This catches and can swallow every exception."
     impl TestRepo {
         /// Commit `files` as the base revision.
         fn new(files: &[(&str, &str)]) -> Result<Self> {
-            let dir = TempDir::new()?;
+            let dir = TempDir::new_in("/var/tmp")?;
             let repo = dir.path();
             git(repo, &["init", "-q"])?;
             git(repo, &["config", "user.email", "test@test.local"])?;
@@ -699,6 +775,7 @@ explanation = "This catches and can swallow every exception."
 
     fn packet(owns: &[&str]) -> GatePacket {
         GatePacket {
+            lane_id: String::new(),
             owns: owns.iter().map(|s| s.to_string()).collect(),
             append_only: BTreeMap::new(),
             protected: vec![],
@@ -731,7 +808,8 @@ diff --git a/AGENTS.md b/AGENTS.md
 +# new
 "#;
 
-        let result = check_ownership(patch, &packet(&["src/**"]))?;
+        let repo = TestRepo::new(&[])?;
+        let result = check_ownership(repo.path(), &repo.base, patch, &packet(&["src/**"]))?;
         assert!(!result.passed);
         assert_eq!(result.evidence.len(), 1);
         assert!(result.evidence[0].contains("AGENTS.md"));
@@ -749,10 +827,306 @@ diff --git a/AGENTS.md b/AGENTS.md
 +// new
 "#;
 
-        let result = check_ownership(patch, &packet(&["src/**"]))?;
+        let repo = TestRepo::new(&[])?;
+        let result = check_ownership(repo.path(), &repo.base, patch, &packet(&["src/**"]))?;
         assert!(result.passed);
         assert!(result.evidence.is_empty());
         Ok(())
+    }
+
+    /// A packet for lane `lane-hd` that owns only `src/**`.
+    fn lane_packet() -> GatePacket {
+        GatePacket {
+            lane_id: "lane-hd".into(),
+            ..packet(&["src/**"])
+        }
+    }
+
+    /// The ownership gate over a real `git diff` of `repo`'s working tree.
+    fn ownership_of(repo: &TestRepo, packet: &GatePacket) -> Result<GateResult> {
+        check_ownership(repo.path(), &repo.base, &repo.patch()?, packet)
+    }
+
+    #[test]
+    fn a_new_handoff_named_for_the_lane_passes_without_owns_and_the_evidence_names_it() -> Result<()>
+    {
+        let repo = TestRepo::new(&[])?;
+        repo.write("docs/handoffs/lane-hd.md", "# handoff\n")?;
+        repo.write("docs/handoffs/2026-10-12-lane-hd-notes.md", "notes\n")?;
+        repo.write("docs/handoffs/deep/er/lane-hd.md", "deep\n")?;
+        repo.write("src/a.rs", "// a\n")?;
+        let result = ownership_of(&repo, &lane_packet())?;
+        assert!(result.passed, "{:?}", result.evidence);
+        assert_eq!(
+            result.evidence,
+            vec![
+                "handoff file accepted outside owns: docs/handoffs/2026-10-12-lane-hd-notes.md",
+                "handoff file accepted outside owns: docs/handoffs/deep/er/lane-hd.md",
+                "handoff file accepted outside owns: docs/handoffs/lane-hd.md",
+            ]
+        );
+        // Through the whole gate run, too.
+        let report = run_gates(repo.path(), &repo.base, &repo.patch()?, &lane_packet())?;
+        assert!(gate(&report, "ownership").passed);
+        Ok(())
+    }
+
+    #[test]
+    fn a_new_handoff_without_the_lane_id_in_its_name_still_needs_owns() -> Result<()> {
+        let repo = TestRepo::new(&[])?;
+        repo.write("docs/handoffs/notes.md", "notes\n")?;
+        // The lane id in a directory name is not a file name.
+        repo.write("docs/handoffs/lane-hd/notes.md", "notes\n")?;
+        let result = ownership_of(&repo, &lane_packet())?;
+        assert!(!result.passed);
+        assert_eq!(
+            result.evidence,
+            vec![
+                "Files outside owns globs: docs/handoffs/lane-hd/notes.md, docs/handoffs/notes.md"
+            ]
+        );
+        // A packet with no lane id (an older caller) gets no allowance either.
+        let repo = TestRepo::new(&[])?;
+        repo.write("docs/handoffs/lane-hd.md", "# handoff\n")?;
+        assert!(!ownership_of(&repo, &packet(&["src/**"]))?.passed);
+        Ok(())
+    }
+
+    #[test]
+    fn a_handoff_that_holds_the_lane_id_inside_a_longer_word_still_needs_owns() -> Result<()> {
+        let repo = TestRepo::new(&[])?;
+        repo.write("docs/handoffs/release-notes.md", "ok\n")?;
+        repo.write("docs/handoffs/footnotes.md", "no\n")?;
+        repo.write("docs/handoffs/notesy.md", "no\n")?;
+        let packet = GatePacket {
+            lane_id: "notes".into(),
+            ..packet(&["src/**"])
+        };
+        let result = ownership_of(&repo, &packet)?;
+        assert!(!result.passed);
+        assert_eq!(
+            result.evidence,
+            vec![
+                "Files outside owns globs: docs/handoffs/footnotes.md, docs/handoffs/notesy.md",
+                "handoff file accepted outside owns: docs/handoffs/release-notes.md",
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn modifying_an_existing_handoff_still_needs_owns_even_with_the_lane_id() -> Result<()> {
+        let repo = TestRepo::new(&[("docs/handoffs/lane-hd.md", "# old\n")])?;
+        repo.write("docs/handoffs/lane-hd.md", "# rewritten\n")?;
+        let result = ownership_of(&repo, &lane_packet())?;
+        assert!(!result.passed);
+        assert_eq!(
+            result.evidence,
+            vec!["Files outside owns globs: docs/handoffs/lane-hd.md"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn deleting_an_existing_handoff_still_needs_owns() -> Result<()> {
+        let repo = TestRepo::new(&[("docs/handoffs/lane-hd.md", "# old\n")])?;
+        repo.remove("docs/handoffs/lane-hd.md")?;
+        let result = ownership_of(&repo, &lane_packet())?;
+        assert!(!result.passed);
+        assert_eq!(
+            result.evidence,
+            vec!["Files outside owns globs: docs/handoffs/lane-hd.md"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn renaming_a_handoff_to_a_lane_named_one_still_needs_owns() -> Result<()> {
+        // Another lane's handoff, moved to a name that carries this lane's id: the new
+        // path is not a created file (git reports a rename), so it is not accepted.
+        let repo = TestRepo::new(&[("docs/handoffs/other.md", "# other lane's handoff\n")])?;
+        git(
+            repo.path(),
+            &["mv", "docs/handoffs/other.md", "docs/handoffs/lane-hd.md"],
+        )?;
+        let result = ownership_of(&repo, &lane_packet())?;
+        assert!(!result.passed, "{:?}", result.evidence);
+        assert_eq!(
+            result.evidence,
+            vec!["Files outside owns globs: docs/handoffs/lane-hd.md"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn moving_the_handoff_dir_in_the_patch_gains_nothing() -> Result<()> {
+        let repo = TestRepo::new(&[("cowproof.toml", "[paths]\nhandoffs = \"docs/handoffs\"\n")])?;
+        repo.write("cowproof.toml", "[paths]\nhandoffs = \"src\"\n")?;
+        repo.write("src/lane-hd.rs", "fn main() {}\n")?;
+        // Not owned (the packet owns docs only), and `src` is the patched tree's handoff dir.
+        let packet = GatePacket {
+            lane_id: "lane-hd".into(),
+            ..packet(&["docs/**"])
+        };
+        let result = ownership_of(&repo, &packet)?;
+        assert!(!result.passed);
+        assert_eq!(
+            result.evidence,
+            vec!["Files outside owns globs: cowproof.toml, src/lane-hd.rs"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn the_base_handoff_dir_from_cowproof_toml_is_the_one_used() -> Result<()> {
+        let repo =
+            TestRepo::new(&[("cowproof.toml", "[paths]\nhandoffs = \"notes/handoffs/\"\n")])?;
+        repo.write("notes/handoffs/lane-hd.md", "# handoff\n")?;
+        // The default directory is not the base's, so a file there needs owns.
+        repo.write("docs/handoffs/lane-hd.md", "# handoff\n")?;
+        let packet = GatePacket {
+            lane_id: "lane-hd".into(),
+            ..packet(&["cowproof.toml"])
+        };
+        let result = ownership_of(&repo, &packet)?;
+        assert!(!result.passed);
+        assert_eq!(
+            result.evidence,
+            vec![
+                "Files outside owns globs: docs/handoffs/lane-hd.md",
+                "handoff file accepted outside owns: notes/handoffs/lane-hd.md",
+            ]
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_added_under_the_handoff_dir_is_not_accepted() -> Result<()> {
+        let repo = TestRepo::new(&[])?;
+        fs::create_dir_all(repo.path().join("docs/handoffs"))?;
+        std::os::unix::fs::symlink(
+            "../../src/secret.rs",
+            repo.path().join("docs/handoffs/lane-hd.md"),
+        )?;
+        let result = ownership_of(&repo, &lane_packet())?;
+        assert!(!result.passed);
+        assert_eq!(
+            result.evidence,
+            vec!["Files outside owns globs: docs/handoffs/lane-hd.md"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_protected_path_is_not_accepted_as_a_handoff() -> Result<()> {
+        // A base whose handoff directory is the repository root would accept `.env`.
+        let repo = TestRepo::new(&[("cowproof.toml", "[paths]\nhandoffs = \"cfg\"\n")])?;
+        repo.write("cfg/.env.lane-hd", "SECRET=1\n")?;
+        repo.write("cfg/.env", "SECRET=1\n")?;
+        let result = ownership_of(&repo, &lane_packet())?;
+        assert!(!result.passed);
+        assert_eq!(
+            result.evidence,
+            vec!["Files outside owns globs: cfg/.env, cfg/.env.lane-hd"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn handoff_accepted_matches_the_directory_and_the_file_name_only() {
+        let ok = |p: &str, d: &str, id: &str| handoff_accepted(p, d, id);
+        assert!(ok("docs/handoffs/x-lane-a.md", "docs/handoffs", "lane-a"));
+        // Boundaries: a separator or an end on each side, never part of a longer word.
+        for name in [
+            "notes.md",
+            "2026-10-12-notes.md",
+            "notes-v2.md",
+            "release-notes.md",
+            "a_notes_b",
+            "notes",
+        ] {
+            assert!(
+                ok(&format!("docs/handoffs/{name}"), "docs/handoffs", "notes"),
+                "{name}"
+            );
+        }
+        for name in [
+            "footnotes.md",
+            "notesy.md",
+            "annotes.md",
+            "xnotesx.md",
+            "notes2.md",
+        ] {
+            assert!(
+                !ok(&format!("docs/handoffs/{name}"), "docs/handoffs", "notes"),
+                "{name}"
+            );
+        }
+        // A later occurrence counts when an earlier one is inside a word.
+        assert!(ok(
+            "docs/handoffs/footnotes-notes.md",
+            "docs/handoffs",
+            "notes"
+        ));
+        // A short id does not match every name that holds the letter.
+        assert!(!ok("docs/handoffs/x.md", "docs/handoffs", "xx"));
+        assert!(!ok("docs/handoffs/index.md", "docs/handoffs", "x"));
+        assert!(ok("docs/handoffs/x.md", "docs/handoffs", "x"));
+        // An id with separators of its own is one token: `t-run-1` is not `t-run-10`.
+        assert!(ok("docs/handoffs/t-run-1.md", "docs/handoffs", "t-run-1"));
+        assert!(ok(
+            "docs/handoffs/2026-t-run-1-notes.md",
+            "docs/handoffs",
+            "t-run-1"
+        ));
+        assert!(!ok("docs/handoffs/t-run-10.md", "docs/handoffs", "t-run-1"));
+        assert!(!ok(
+            "docs/handoffs/t-run-10-notes.md",
+            "docs/handoffs",
+            "t-run-1"
+        ));
+        // An id the lane-id validator refuses accepts nothing.
+        for id in ["", ".", "..", "a/b", "a b", "a*", &"a".repeat(65)] {
+            assert!(!ok("docs/handoffs/a.md", "docs/handoffs", id), "{id:?}");
+            assert!(
+                !ok(&format!("docs/handoffs/{id}"), "docs/handoffs", id),
+                "{id:?}"
+            );
+        }
+        assert!(ok("docs/handoffs/a/b/lane-a", "docs/handoffs/", "lane-a"));
+        // A sibling that merely shares the prefix, the directory itself, another name.
+        assert!(!ok(
+            "docs/handoffs-old/lane-a.md",
+            "docs/handoffs",
+            "lane-a"
+        ));
+        assert!(!ok("docs/handoffs", "docs/handoffs", "lane-a"));
+        assert!(!ok("docs/handoffs/lane-b.md", "docs/handoffs", "lane-a"));
+        assert!(!ok(
+            "docs/handoffs/lane-a/readme.md",
+            "docs/handoffs",
+            "lane-a"
+        ));
+        // No lane id, or a directory that is not one.
+        assert!(!ok("docs/handoffs/lane-a.md", "docs/handoffs", ""));
+        for dir in [
+            "",
+            ".",
+            "/",
+            "/docs",
+            "docs/../src",
+            "docs//handoffs",
+            "./docs",
+        ] {
+            assert!(!ok("src/lane-a.rs", dir, "lane-a"), "{dir:?}");
+            assert!(!ok("docs/handoffs/lane-a.md", dir, "lane-a"), "{dir:?}");
+        }
+        assert!(!ok(
+            "docs/handoffs/../src/lane-a.rs",
+            "docs/handoffs",
+            "lane-a"
+        ));
     }
 
     #[test]

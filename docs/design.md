@@ -90,7 +90,7 @@ packet -> lint -> preflight -> dispatch -> run <-> escalate -> handback -> verif
 - **Preflight**: a cheap adversarial pass tries to satisfy the packet's visible checks by cheating (stubbing, deleting assertions, hard-coding outputs). If a cheat passes, the checks go back to the director. Idea from SpecGuard (arXiv 2610.09159) and GraderGuard. Not in the first slice.
 - **Dispatch**: requires a committed base by default. With `--allow-dirty`, the uncommitted diff is recorded as a base patch and travels in the capsule, so the base can be rebuilt as commit plus base patch. Then: COW clone (APFS clonefile, reflink, copy fallback), OS sandbox (fail closed), lane-private HOME and Claude config directory, port block, scratch directory, machine-wide class slots, disk floor. Ported from `run-lane.mjs`.
 - **Run and escalate**: see the escalation protocol.
-- **Handback**: in-scope patch (including the handoff the builder writes in the clone), outside-ownership patch (kept, never applied). The runner, not the builder, writes `summary.json`, `escalations.jsonl` and the trace rollup, into the control directory.
+- **Handback**: in-scope patch (including the handoff the builder writes in the clone, a new file named for the lane under the handoff directory, which the ownership gate accepts without `owns`), outside-ownership patch (kept, never applied). The runner, not the builder, writes `summary.json`, `escalations.jsonl` and the trace rollup, into the control directory.
 - **Verify**: see Verifier.
 - **Gates**: mechanical checks over the patch and the verifier's results (see Proof gates).
 - **Capsule**: everything needed to replay, sealed into one bundle (see Proof capsule).
@@ -167,7 +167,7 @@ The builder is untrusted. It may have read hostile content in the repository, an
 
 | Gate | Catches | Source |
 | --- | --- | --- |
-| Ownership | changes outside `owns` | exists |
+| Ownership | changes outside `owns`. One allowance (decided 2026-10-12): a regular file the patch creates under the base commit's handoff directory (`[paths] handoffs`, else `handoffDir`, else `docs/handoffs`; read from the base, so a patch that moves it gains nothing), at any depth, whose file name carries the lane id as a whole token, with the start or end of the name or a separator (`-`, `_`, `.`) on each side (`docs/handoffs/<lane-id>.md`, `docs/handoffs/2026-10-12-<lane-id>-notes.md`; lane `notes` takes `release-notes.md`, not `footnotes.md`), needs no `owns`; the gate's evidence says `handoff file accepted outside owns: <path>` for each. Editing, deleting or renaming a file that already exists there, adding one whose name lacks the lane id, a symlink, and a path the always-protected globs name (`.env*`) still need `owns`, so one lane cannot rewrite another's handoff | exists |
 | Append-only | deleted assertions, emptied test files | exists |
 | Protected paths | edits to tests, fixtures or policies the packet must not touch | new |
 | Verifier re-run | checks the builder claimed but that fail when run independently | new |
@@ -288,7 +288,7 @@ api_key_builders = 6
 subscription_builders = 2
 
 [paths]
-handoffs = "docs/handoffs"   # inside the clone; reaches the real tree only in the lane patch. Also where the report looks for the handoff; wins over the older lanes.config.json handoffDir (the report warns when they differ)
+handoffs = "docs/handoffs"   # inside the clone; reaches the real tree only in the lane patch. A new file here named for the lane id passes the ownership gate without `owns` (read from the base). Also where the report looks for the handoff; wins over the older lanes.config.json handoffDir (the report warns when they differ)
 
 [classes]
 light = 6
@@ -363,7 +363,7 @@ The review loop stopped at round 2 (CONVERGENCE) with 7 blocking concerns, recor
 | R2-6 polyglot scope missing from the steps | portkit integration, Polyglot scope; Next Steps 9 and 10 |
 | R2-7 portkit-integration.md missing | the document now exists; its decisions are listed in the portkit section |
 
-Minor concerns also addressed: R2-8, R2-9, R2-17, R2-18, R2-23, R2-24, R2-25, R2-27, R2-28, R2-29. The others remain open as recorded.
+Minor concerns also addressed: R2-8, R2-9, R2-15 (the ownership gate accepts a new handoff named for the lane, 2026-10-12), R2-17, R2-18, R2-23, R2-24, R2-25, R2-27, R2-28, R2-29. The others remain open as recorded.
 
 ## What I noticed about how you think
 

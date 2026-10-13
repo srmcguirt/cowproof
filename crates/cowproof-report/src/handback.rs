@@ -1231,6 +1231,7 @@ mod tests {
 
         // The gate, reading the base commit.
         let packet = cowproof_prove::gates::GatePacket {
+            lane_id: String::new(),
             owns: vec!["work.rs".into()],
             append_only: Default::default(),
             protected: Vec::new(),

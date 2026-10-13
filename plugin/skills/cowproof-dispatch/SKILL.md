@@ -22,7 +22,7 @@ A packet is a Markdown file. It starts with a JSON header inside an HTML comment
 ```markdown
 <!-- lane {
   "id": "add-greeting",
-  "owns": ["src/greeting.rs", "tests/greeting.rs", "docs/handoffs/add-greeting.md"],
+  "owns": ["src/greeting.rs", "tests/greeting.rs"],
   "allow": ["cargo *"],
   "checks": [
     { "id": "build", "command": "cargo build --locked" },
@@ -35,7 +35,6 @@ A packet is a Markdown file. It starts with a JSON header inside an HTML comment
 Add `src/greeting.rs` with a public `greeting(name: &str) -> String` that
 returns `Hello, <name>!`, and declare the module from the crate root.
 Cover it with a test in `tests/greeting.rs` that calls the real function.
-Write your handoff to `docs/handoffs/add-greeting.md`.
 
 ## Checks
 
@@ -47,7 +46,7 @@ Header fields, camelCase:
 
 - `id`: lowercase letters, digits and dashes, 2 to 61 characters. It names the lane directory and prefixes every escalation id.
 - `owns`: required, at least one path or glob. The ownership gate fails any patch that touches a path outside it. `.env*` is never ownable.
-- Put the handoff path in `owns`. The builder is told to write a handoff in its clone, and the ownership gate counts that file like any other, so an unowned handoff fails the lane. Say in the task text where it goes.
+- Leave the handoff out of `owns`. The builder preamble tells the builder to write a new file named for the lane in the repository's handoff directory (`docs/handoffs/<lane-id>.md`; the directory is `[paths] handoffs` in the base `cowproof.toml`), and the ownership gate accepts a new file there whose name carries the lane id as a whole token (set off by `-`, `_`, `.` or the ends of the name; lane `notes` takes `release-notes.md`, not `footnotes.md`) without `owns`. The gate reads the directory from the base commit, so a patch cannot move it. It does not accept an edit, a deletion or a rename of a handoff that already exists, a name without the lane id, or a symlink; a packet that wants one of those must own the path. The evidence lists each file accepted this way (`handoff file accepted outside owns: ...`).
 - `checks`: each has an `id` (`[a-z0-9][a-z0-9_-]{0,63}`, unique), a `command`, and optionally `"flaky": true`. These are the proof gates. The builder runs them through its `run_check` tool, and the verifier replays them.
 - `allow`: command patterns (for example `"cargo *"`). While the lane is not wide, `cowproof lint` rejects a check command in the `## Checks` section that no pattern matches.
 - `appendOnly`: optional map of path to the most lines the patch may remove from it.

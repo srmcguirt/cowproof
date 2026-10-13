@@ -435,6 +435,7 @@ mod tests {
             added: added.iter().map(|(n, s)| (*n, s.to_string())).collect(),
             removed: removed.iter().map(|s| (0, s.to_string())).collect(),
             context: vec![],
+            new_file_mode: None,
         }
     }
 

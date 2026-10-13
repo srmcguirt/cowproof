@@ -1370,6 +1370,65 @@ fn an_edit_outside_owns_is_refuted_by_the_ownership_gate() {
     assert_eq!(gates["any_failed"], true);
 }
 
+/// The fake builder's handoff: a new file under `docs/handoffs`, named `name_template` with
+/// the lane id (the lane directory's name; `$HOME` is `<lane>/home`) in place of `ID`.
+fn handoff_packet(name_template: &str) -> Harness {
+    let write = format!(
+        "id=\"$(basename \"$(dirname \"$HOME\")\")\"\nmkdir -p docs/handoffs\n\
+         echo handoff > \"docs/handoffs/$(echo '{name_template}' | sed \"s/ID/$id/\")\"\n"
+    );
+    Harness::with_packet(
+        &format!("{write}{}", run_checks(&["edit"])),
+        json!(["README.md", "created.txt"]),
+        json!([{"id": "edit", "command": "grep -q edited README.md"}]),
+    )
+}
+
+#[test]
+fn a_handoff_named_for_the_lane_passes_the_ownership_gate_without_owns() {
+    if !sandbox_available() {
+        return;
+    }
+    let h = handoff_packet("ID-notes.md");
+    h.run_expecting(0);
+    let gates: Value = serde_json::from_str(&h.read("control/capsule/gates.json")).unwrap();
+    let ownership = gates["gates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|g| g["name"] == "ownership")
+        .unwrap();
+    assert_eq!(ownership["passed"], true, "{ownership}");
+    assert_eq!(
+        ownership["evidence"],
+        json!([format!(
+            "handoff file accepted outside owns: docs/handoffs/{}-notes.md",
+            h.id
+        )])
+    );
+    assert!(
+        fs::read_to_string(h.lane().join("control/lane.patch"))
+            .unwrap()
+            .contains(&format!("docs/handoffs/{}-notes.md", h.id)),
+        "the handoff is in the patch"
+    );
+}
+
+#[test]
+fn a_handoff_without_the_lane_id_is_refuted_by_the_ownership_gate() {
+    if !sandbox_available() {
+        return;
+    }
+    let h = handoff_packet("notes.md");
+    h.run_expecting(2);
+    let verdict = h.verdict();
+    assert_eq!(verdict["failedGates"], json!(["ownership"]), "{verdict}");
+    assert!(
+        reasons(&verdict)[0].contains("docs/handoffs/notes.md"),
+        "{verdict}"
+    );
+}
+
 #[test]
 fn a_check_that_passes_in_the_lane_but_not_in_the_rebuilt_tree_is_a_divergence() {
     if !sandbox_available() {

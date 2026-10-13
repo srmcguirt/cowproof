@@ -167,6 +167,7 @@ The director may also send you a `note` message without opening an escalation. N
 
 When your work is done, the runner writes a summary into the control directory. You write a handoff in the clone for the director and the next lane (if there is one):
 
+- **Where it goes.** Write the handoff as a new file named for your lane id (the `id` in the packet's header) in the repository's handoff directory, which is `docs/handoffs/` unless the packet says another: `docs/handoffs/<lane-id>.md`. The ownership gate accepts a new file there without the packet owning it. It does not accept an edit to a handoff that already exists, a file whose name does not carry your lane id as a whole word (set off by `-`, `_`, `.` or the ends of the name), or a symlink.
 - **What you built.** Be specific: names of new files, functions, tests, migrations. Where you reused existing code, name it.
 - **Checks you ran.** List every check id you ran, whether it passed or failed, and any attempt count if you retried.
 - **Limits.** Did you hit the cost cap, the timeout, or the parked time limit? Record it.

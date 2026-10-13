@@ -6,6 +6,10 @@ pub struct PatchDelta {
     pub removed: Vec<(usize, String)>,
     /// Unchanged lines shown in hunks, consulted by `requires`.
     pub context: Vec<String>,
+    /// The mode git printed on a `new file mode` header (`100644`, `120000` for a symlink,
+    /// ...): `Some` only when the patch creates the file. A rename, a copy, a mode change
+    /// and an edit carry no such header.
+    pub new_file_mode: Option<String>,
 }
 
 /// Parse a unified diff patch into deltas per file.
@@ -27,6 +31,7 @@ pub fn parse_patch(patch: &str) -> Vec<PatchDelta> {
                 added: Vec::new(),
                 removed: Vec::new(),
                 context: Vec::new(),
+                new_file_mode: None,
             });
             new_line = 1;
             continue;
@@ -38,6 +43,11 @@ pub fn parse_patch(patch: &str) -> Vec<PatchDelta> {
             continue;
         }
         if !in_hunk && !line.starts_with("@@") {
+            // Extended header lines sit between `diff --git` and the first hunk (a binary
+            // patch's data lines contain no spaces, so none can pass for one).
+            if let Some(mode) = line.strip_prefix("new file mode ") {
+                d.new_file_mode = Some(mode.trim().to_string());
+            }
             continue;
         }
         if line.starts_with("@@") {
@@ -89,5 +99,26 @@ mod tests {
         // Second hunk: line added at position 12 (10 context + 1 from first hunk + 1 = 12)
         let added_lines: Vec<_> = deltas[0].added.iter().map(|(line, _)| *line).collect();
         assert_eq!(added_lines, vec![3, 12]);
+    }
+
+    #[test]
+    fn new_file_mode_is_read_from_the_header_only() {
+        let patch = "diff --git a/new.md b/new.md\nnew file mode 100644\nindex 0000000..e69de29\n--- /dev/null\n+++ b/new.md\n@@ -0,0 +1,2 @@\n+new file mode 120000\n+x\n\
+diff --git a/link b/link\nnew file mode 120000\nindex 0000000..e69de29\n--- /dev/null\n+++ b/link\n@@ -0,0 +1 @@\n+target\n\
+diff --git a/old.md b/old.md\nindex 1111111..2222222 100644\n--- a/old.md\n+++ b/old.md\n@@ -1 +1 @@\n-a\n+b\n\
+diff --git a/gone.md b/gone.md\ndeleted file mode 100644\nindex 1111111..0000000\n--- a/gone.md\n+++ /dev/null\n@@ -1 +0,0 @@\n-a\n";
+        let modes: Vec<(String, Option<String>)> = parse_patch(patch)
+            .into_iter()
+            .map(|d| (d.path, d.new_file_mode))
+            .collect();
+        assert_eq!(
+            modes,
+            vec![
+                ("new.md".to_string(), Some("100644".to_string())),
+                ("link".to_string(), Some("120000".to_string())),
+                ("old.md".to_string(), None),
+                ("gone.md".to_string(), None),
+            ]
+        );
     }
 }

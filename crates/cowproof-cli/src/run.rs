@@ -4666,6 +4666,7 @@ async fn replay_and_gate(
 
     // Gates load their configuration from the base revision, not the patch.
     let packet = GatePacket {
+        lane_id: header.id.clone(),
         owns: header.owns.clone(),
         append_only: header.append_only.clone(),
         protected: vec![],
