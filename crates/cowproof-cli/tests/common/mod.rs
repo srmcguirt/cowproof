@@ -1,6 +1,6 @@
 //! Shared pieces for the CLI tests that drive a whole lane: a fork lock, sandbox
-//! availability, a real git repository, a copy of the `cowproof` binary outside the
-//! home, a FAKE `claude`, and the MCP frames the fake sends to `cowproof lane-tools`.
+//! availability, a real git repository, one shared copy of the `cowproof` and `pk` binaries
+//! outside the home (per test process, not per test), a FAKE `claude`, and the MCP frames the fake sends to `cowproof lane-tools`.
 //!
 //! `tests/run.rs` keeps its own copies of these (another lane is editing it); new test
 //! files use this module so there is one copy to move it to.
@@ -11,7 +11,9 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
+use std::time::Duration;
 use tempfile::TempDir;
 
 pub const REAL_KEY: &str = "sk-test-real-xyz";
@@ -140,6 +142,194 @@ pub fn signal_group(name: &str, pgid: u32) -> bool {
 #[allow(dead_code)]
 pub fn pid_alive(pid: u32) -> bool {
     cowproof_prove::runner::pid_exists(pid) == Some(true)
+}
+
+/// Prefix of the per-process directory that holds the shared binaries.
+const SHARED_BIN_PREFIX: &str = "cp-bin-";
+
+/// The debug `cowproof` and `pk` (277 MB and 205 MB), copied once per test process to where a
+/// sandbox can reach them. The build puts them under the home, which both sandboxes hide, so a
+/// lane test runs a copy under `/var/tmp`. Copying them for every test saturated a small
+/// container's disk during a workspace run.
+///
+/// `<dir>` is `/var/tmp/cp-bin-<pid>`: `<dir>/cowproof` and `<dir>/pk` (the runner finds `pk`
+/// beside its own executable), and `<dir>/bare/cowproof`, a hard link to the same file with no
+/// `pk` beside it, for tests of a runner that has none. Nothing here may be written to or
+/// removed by a test: a test that needs to replace or remove a file takes its own directory of
+/// links ([`link_binaries_into`]) and removes the name before it writes.
+struct SharedBins {
+    dir: PathBuf,
+    cowproof: PathBuf,
+    pk: PathBuf,
+    bare_cowproof: PathBuf,
+}
+
+static SHARED_BINS: OnceLock<SharedBins> = OnceLock::new();
+
+/// Bytes `fs::copy` has moved into the shared directory by this process (hard links add none).
+static SHARED_BYTES_COPIED: AtomicU64 = AtomicU64::new(0);
+
+fn shared_bins() -> &'static SharedBins {
+    SHARED_BINS.get_or_init(install_shared_bins)
+}
+
+/// The shared `cowproof`, with `pk` beside it.
+#[allow(dead_code)] // only the lane tests that include `common` copy the binaries
+pub fn shared_cowproof() -> &'static Path {
+    &shared_bins().cowproof
+}
+
+/// The shared `pk`, beside [`shared_cowproof`].
+#[allow(dead_code)] // `tests/run.rs` is the one that wants it
+pub fn shared_pk() -> &'static Path {
+    &shared_bins().pk
+}
+
+/// The shared `cowproof` with no `pk` beside it, as an install of `cowproof` alone looks.
+#[allow(dead_code)] // the lane tests that run a bare runner use it; the others do not
+pub fn shared_cowproof_alone() -> &'static Path {
+    &shared_bins().bare_cowproof
+}
+
+/// Bytes copied into the shared directory so far by this process.
+#[allow(dead_code)] // reported by the helper itself; kept for a test that wants to assert it
+pub fn shared_bytes_copied() -> u64 {
+    SHARED_BYTES_COPIED.load(Ordering::SeqCst)
+}
+
+/// Remove the shared directory when the process exits. Statics are never dropped, so this is
+/// an `atexit` handler; a process that is killed leaves its directory for the next run's
+/// sweep.
+extern "C" fn remove_shared_bins_at_exit() {
+    if let Some(bins) = SHARED_BINS.get() {
+        let _ = fs::remove_dir_all(&bins.dir);
+    }
+}
+
+/// Remove the `cp-bin-<pid>` directories whose process is gone: a killed run's leftovers.
+fn sweep_dead_shared_bins() {
+    let Ok(entries) = fs::read_dir("/var/tmp") else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(pid) = name
+            .to_str()
+            .and_then(|n| n.strip_prefix(SHARED_BIN_PREFIX))
+            .and_then(|n| n.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if cowproof_prove::runner::pid_exists(pid) == Some(false) {
+            let _ = fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
+/// Copy `src` to `dir/name` through a temporary name in the same directory and a rename, so
+/// the name never shows a half-written file. The write holds `FORK_LOCK`: a fork on another
+/// thread must not inherit the write handle (ETXTBSY on Linux).
+fn publish_copy(src: &Path, dir: &Path, name: &str) -> PathBuf {
+    let tmp = dir.join(format!(".{name}.tmp"));
+    let dest = dir.join(name);
+    {
+        let _g = fork_lock();
+        let bytes = fs::copy(src, &tmp).unwrap();
+        SHARED_BYTES_COPIED.fetch_add(bytes, Ordering::SeqCst);
+        fs::rename(&tmp, &dest).unwrap();
+    }
+    dest
+}
+
+/// Run an executable once (`--version`, whatever it answers), so its first-run cost (macOS
+/// scans a never-run file for seconds) is paid here and not inside a clock the runner keeps.
+/// Linux can still refuse the first exec with ETXTBSY if a fork on another thread inherited
+/// the write handle (a spawn elsewhere in the test binary does not take [`fork_lock`]); retry
+/// briefly. Once one run has started no writer is left.
+fn warm_up_shared(exe: &Path) {
+    let mut tries = 0;
+    loop {
+        let child = {
+            let _g = fork_lock();
+            Command::new(exe)
+                .arg("--version")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+        };
+        match child {
+            Ok(mut child) => {
+                let _ = child.wait();
+                return;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy && tries < 200 => {
+                tries += 1;
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(_) => return,
+        }
+    }
+}
+
+fn install_shared_bins() -> SharedBins {
+    sweep_dead_shared_bins();
+    let dir = PathBuf::from(format!(
+        "/var/tmp/{SHARED_BIN_PREFIX}{}",
+        std::process::id()
+    ));
+    // A directory of this pid is a dead process's, whose pid was reused.
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir(&dir).unwrap();
+    let cowproof = publish_copy(Path::new(env!("CARGO_BIN_EXE_cowproof")), &dir, "cowproof");
+    let pk = publish_copy(Path::new(env!("CARGO_BIN_EXE_pk")), &dir, "pk");
+    let bare = dir.join("bare");
+    fs::create_dir(&bare).unwrap();
+    let bare_cowproof = link_or_copy(&cowproof, &bare.join("cowproof"));
+    warm_up_shared(&cowproof);
+    warm_up_shared(&pk);
+    let bins = SharedBins {
+        dir: dir.clone(),
+        cowproof,
+        pk,
+        bare_cowproof,
+    };
+    // SAFETY: `atexit` takes a plain `extern "C" fn()` that lives for the whole process.
+    unsafe {
+        libc::atexit(remove_shared_bins_at_exit);
+    }
+    eprintln!(
+        "cp-bin: {} bytes copied into {}",
+        SHARED_BYTES_COPIED.load(Ordering::SeqCst),
+        dir.display()
+    );
+    bins
+}
+
+/// A hard link at `dest` to `src` (no bytes written), else a copy when the two are on
+/// different file systems.
+fn link_or_copy(src: &Path, dest: &Path) -> PathBuf {
+    if fs::hard_link(src, dest).is_err() {
+        let bytes = {
+            let _g = fork_lock();
+            fs::copy(src, dest).unwrap()
+        };
+        SHARED_BYTES_COPIED.fetch_add(bytes, Ordering::SeqCst);
+    }
+    dest.to_path_buf()
+}
+
+/// Hard-link the shared `cowproof` and `pk` into `dir`, side by side, for a test that must
+/// remove or replace one of them. Link names are the test's to unlink; its writes must
+/// create a new file (remove the name first), never write through the link, which would
+/// change the shared binary. Returns the `cowproof` and `pk` paths in `dir`.
+#[allow(dead_code)] // `tests/run.rs` is the one that replaces `pk`
+pub fn link_binaries_into(dir: &Path) -> (PathBuf, PathBuf) {
+    fs::create_dir_all(dir).unwrap();
+    (
+        link_or_copy(shared_cowproof(), &dir.join("cowproof")),
+        link_or_copy(shared_pk(), &dir.join("pk")),
+    )
 }
 
 /// A temporary directory under `/var/tmp`: not `/tmp` (bwrap hides it) and not the home
@@ -275,12 +465,8 @@ impl Lane {
         .unwrap();
 
         // The test binary lives under the home in a normal checkout, which the sandbox
-        // hides, so a copy outside it is what runs.
-        let cowproof = work.path().join("cowproof");
-        {
-            let _g = fork_lock();
-            fs::copy(env!("CARGO_BIN_EXE_cowproof"), &cowproof).unwrap();
-        }
+        // hides, so the process's shared copy outside it is what runs (no `pk` beside it).
+        let cowproof = shared_cowproof_alone().to_path_buf();
         let fake = work.path().join("fake-claude");
         let script = format!(
             r#"#!/bin/sh
@@ -338,11 +524,7 @@ exit 0
         let packet_path = work.path().join("packet.md");
         fs::write(&packet_path, packet(&id)).unwrap();
 
-        let cowproof = work.path().join("cowproof");
-        {
-            let _g = fork_lock();
-            fs::copy(env!("CARGO_BIN_EXE_cowproof"), &cowproof).unwrap();
-        }
+        let cowproof = shared_cowproof_alone().to_path_buf();
         let fake = work.path().join("fake-claude");
         let script = format!(
             r#"#!/bin/sh

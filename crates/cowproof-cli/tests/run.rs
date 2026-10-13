@@ -52,14 +52,13 @@ const FAKE_STREAM: &str = concat!(
 
 /// Linux refuses to exec a file that some process holds open for writing
 /// (ETXTBSY). Tests run on parallel threads: if one thread forks while another
-/// is writing an executable (the copied `cowproof` or a fake `claude`), the
+/// is writing an executable (the shared `cowproof` copy or a fake `claude`), the
 /// child inherits the write handle until it execs, and an exec of that file in
 /// the meantime fails with "Text file busy". Writing executables and forking
-/// both take this lock, so a fork never overlaps a write.
-static FORK_LOCK: Mutex<()> = Mutex::new(());
-
+/// both take this lock, so a fork never overlaps a write. It is the lock in
+/// `tests/common`, which also writes the shared binaries.
 fn fork_lock() -> std::sync::MutexGuard<'static, ()> {
-    FORK_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    common::fork_lock()
 }
 
 /// `Command::output` with the spawn under `FORK_LOCK`. Only the fork is held,
@@ -167,7 +166,7 @@ fn unique_lane_id() -> String {
 struct Harness {
     /// The lane id (lowercase letters, digits and dashes), unique per harness.
     id: String,
-    /// Holds the repository, the packet, the fake and the cowproof copy.
+    /// Holds the repository, the packet and the fake.
     work: TempDir,
     /// Holds the lanes, nothing else.
     lanes: TempDir,
@@ -182,8 +181,8 @@ struct Harness {
 }
 
 impl Harness {
-    /// A committed repository, a packet with three declared checks, a copy of
-    /// the cowproof binary outside the home, and a fake `claude` whose body is
+    /// A committed repository, a packet with three declared checks, the shared
+    /// cowproof binary outside the home, and a fake `claude` whose body is
     /// `fake_body` (after the common recording prologue).
     fn new(fake_body: &str) -> Self {
         Self::with_packet(
@@ -237,16 +236,12 @@ impl Harness {
         fs::write(&packet, &packet_text).unwrap();
 
         // The test binary lives under the home in a normal checkout, which
-        // the sandbox hides, so the copy is what runs (and what the
-        // builder's MCP config names).
-        let cowproof = work.path().join("cowproof");
-        {
-            let _g = fork_lock();
-            fs::copy(env!("CARGO_BIN_EXE_cowproof"), &cowproof).unwrap();
-            // `pk` goes beside it, as an install puts them: the runner finds the
-            // portkit CLI as the sibling of its own executable (G8).
-            fs::copy(env!("CARGO_BIN_EXE_pk"), work.path().join("pk")).unwrap();
-        }
+        // the sandbox hides, so the process's shared copy under `/var/tmp` is
+        // what runs (and what the builder's MCP config names). `pk` sits
+        // beside it, as an install puts them: the runner finds the portkit CLI
+        // as the sibling of its own executable (G8). A test that removes or
+        // replaces `pk` takes its own links first (`Harness::own_binaries`).
+        let cowproof = common::shared_cowproof().to_path_buf();
 
         let fake = work.path().join("fake-claude");
         let script = format!(
@@ -299,9 +294,8 @@ exit 0
         // preflight, which gives up at 30 s. That is the host's cost, not the property under test,
         // and it belongs outside every clock the runner keeps (the preflight's 30 s, the
         // builder's wall-clock limit, `pk doctor`'s 30 s), so each executable runs once here.
-        for exe in [&fake, &cowproof, &work.path().join("pk")] {
-            warm_up(exe);
-        }
+        // The shared `cowproof` and `pk` were warmed once, when the process made them.
+        warm_up(&fake);
 
         Harness {
             id,
@@ -314,6 +308,16 @@ exit 0
             cowproof,
             runner_stderr: Mutex::new(None),
         }
+    }
+
+    /// Give this harness its own `cowproof` and `pk`, side by side in `work/bin`, for a test that
+    /// removes or replaces `pk`, and return the private `pk`. They are hard links to the
+    /// process's shared binaries, so nothing is copied; the test must remove the name before it
+    /// writes a replacement (never write through the link, which would change the shared file).
+    fn own_binaries(&mut self) -> PathBuf {
+        let (cowproof, pk) = common::link_binaries_into(&self.work.path().join("bin"));
+        self.cowproof = cowproof;
+        pk
     }
 
     /// Add (or replace) one field of the packet's `<!-- lane {...} -->` header,
@@ -2845,8 +2849,8 @@ fn a_stop_does_not_count_the_slow_work_after_the_builder_is_gone_as_waiting_for_
     // time is not, and the test measures the second.
     let grace = term_grace();
     let bound = grace * 3 / 4;
-    let h = owned_packet(&nonblocking_sleeper("Quit?"));
-    let pk = h.work.path().join("pk");
+    let mut h = owned_packet(&nonblocking_sleeper("Quit?"));
+    let pk = h.own_binaries();
     {
         let _g = fork_lock();
         fs::remove_file(&pk).unwrap();
@@ -4527,7 +4531,7 @@ fn the_builder_settings_have_the_three_hooks_with_the_absolute_pk_beside_cowproo
     let h = Harness::new("");
     h.run_ok();
     let settings: Value = serde_json::from_str(&h.seg(1, "settings.json")).unwrap();
-    let pk = h.work.path().canonicalize().unwrap().join("pk");
+    let pk = common::shared_pk().canonicalize().unwrap();
     for (event, arg) in [
         ("PostToolUse", "post-tool-use"),
         ("UserPromptSubmit", "user-prompt-submit"),
@@ -4652,8 +4656,8 @@ fn with_no_pk_beside_cowproof_there_are_no_hooks_and_the_lane_is_untraced_but_pr
     if !sandbox_available() {
         return;
     }
-    let h = owned_packet(&run_checks(&["edit", "made"]));
-    fs::remove_file(h.work.path().join("pk")).unwrap();
+    let mut h = owned_packet(&run_checks(&["edit", "made"]));
+    fs::remove_file(h.own_binaries()).unwrap();
     h.run_expecting(0);
     assert_eq!(h.verdict()["verdict"], "proved");
 
@@ -4674,9 +4678,9 @@ fn a_doctor_that_fails_makes_the_lane_untraced_and_never_changes_the_verdict() {
     if !sandbox_available() {
         return;
     }
-    let h = owned_packet(&run_checks(&["edit", "made"]));
+    let mut h = owned_packet(&run_checks(&["edit", "made"]));
     // A `pk` that exits non-zero with output that is not JSON, in place of the real one.
-    let pk = h.work.path().join("pk");
+    let pk = h.own_binaries();
     {
         let _g = fork_lock();
         fs::remove_file(&pk).unwrap();

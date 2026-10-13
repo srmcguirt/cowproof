@@ -797,7 +797,7 @@ const FAKE_PRINT: &str = concat!(
 struct Bfx {
     fx: Fx,
     id: String,
-    /// Holds the `cowproof` copy and the fake.
+    /// Holds the fake.
     _tools: TempDir,
     /// A directory outside the lane that the fake tries to write to.
     outside: TempDir,
@@ -815,12 +815,8 @@ impl Bfx {
         let tools = var_tmp("cp-hostagent-tools-");
         let outside = var_tmp("cp-hostagent-outside-");
         // The test binary lives under the home in a normal checkout, which the sandbox hides, so
-        // a copy outside it is what runs.
-        let cowproof = tools.path().join("cowproof");
-        {
-            let _g = fork_lock();
-            fs::copy(env!("CARGO_BIN_EXE_cowproof"), &cowproof).unwrap();
-        }
+        // the process's shared copy outside it is what runs (no `pk` beside it).
+        let cowproof = common::shared_cowproof_alone().to_path_buf();
         let fake = tools.path().join("fake-claude");
         let script = format!(
             r#"#!/bin/sh
