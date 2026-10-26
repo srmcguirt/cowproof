@@ -1,0 +1,7 @@
+# Semgrep CE scope. Build output and recorded test data are not ours to lint.
+target/
+fixtures/
+crates/**/tests/fixtures/
+schema/
+*.patch
+*.jsonl

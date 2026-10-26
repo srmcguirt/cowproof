@@ -15,7 +15,10 @@
 //! The lane tests need the sandbox like `tests/run.rs` (skipped without it, a failure under
 //! `COWPROOF_REQUIRE_SANDBOX=1`). The preflight refusals need neither a lane nor a sandbox.
 
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "a shared test helper; not every test crate that includes this module uses it"
+)]
 mod common;
 
 use common::{

@@ -7,3 +7,6 @@
 docs/*.review.*/
 # host inventories stay private
 hosts.json
+# per-machine Claude Code state; .claude/settings.json is shared
+.claude/worktrees/
+.claude/settings.local.json

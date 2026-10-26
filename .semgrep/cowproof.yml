@@ -1,0 +1,117 @@
+# Project rules for Semgrep CE: the security and house-style mistakes an agent can make here
+# without noticing. CI fails a pull request on any NEW finding at WARNING or ERROR
+# (.github/workflows/checks.yml diffs against the base commit), so a rule may have old hits.
+# Each message says why, so a finding points at the reason rather than at the rule.
+rules:
+  # --- Security: cowproof runs untrusted builders and their commands on the user's machine. ---
+
+  - id: cowproof-shell-string-built-with-format
+    message: >-
+      A value interpolated into an `sh -c` string is shell injection when it comes from a
+      repository, a packet or a builder. Pass it as its own argument (`Command::new(prog).arg(v)`),
+      or as a positional parameter (`sh -c '... "$1"' sh <value>`).
+    severity: ERROR
+    languages: [regex]
+    paths:
+      include: ["crates/**/*.rs"]
+    pattern-regex: (?s)"-c"\s*\)?\s*\.arg\(\s*&?format!
+
+  - id: cowproof-tls-verification-disabled
+    message: >-
+      Never turn off certificate or hostname checks. A builder's network is the one an attacker
+      controls; a run that cannot verify its peer must fail.
+    severity: ERROR
+    languages: [regex]
+    paths:
+      include: ["crates/**/*.rs"]
+    pattern-regex: danger_accept_invalid_(?:certs|hostnames)\s*\(\s*true|\.dangerous\(\)|NoCertificateVerification
+
+  - id: cowproof-world-writable-mode
+    message: >-
+      A world-writable file or directory lets any local user swap what cowproof later reads or
+      runs. Use 0o600/0o700 for private state, 0o644/0o755 at most for shared files.
+    severity: ERROR
+    languages: [regex]
+    paths:
+      include: ["crates/**/*.rs"]
+      exclude: ["crates/**/tests/**"]
+    pattern-regex: (?:set_mode|\.mode|from_mode)\(\s*0o[0-7]?[0-7][0-7][2367]\s*\)
+
+  - id: cowproof-secret-in-output
+    message: >-
+      Do not print or log a credential. Name the variable (`ANTHROPIC_API_KEY is set`) instead of
+      its value; run logs, traces and capsules are shared.
+    severity: ERROR
+    languages: [regex]
+    paths:
+      include: ["crates/**/*.rs"]
+    pattern-either:
+      # an inline format argument: println!("{api_key}")
+      - pattern-regex: (?i)\b(?:print|println|eprint|eprintln|trace|debug|info|warn|error)!\([^;\n]*\{\s*[\w.]*(?:api_?key|token|secret|password|credential)\w*\s*(?::[^}]*)?\}
+      # a positional argument after the format string: println!("{}", api_key)
+      - pattern-regex: (?i)\b(?:print|println|eprint|eprintln|trace|debug|info|warn|error)!\(\s*"[^"\n]*"\s*,[^;\n]*\b[\w.]*(?:api_?key|token|secret|password|credential)\w*\b(?!\s*\()
+
+  - id: cowproof-predictable-temp-path
+    message: >-
+      A fixed or pid-derived name under the shared temp directory can be pre-created or symlinked
+      by another local user. Use `tempfile::TempDir` / `tempfile::Builder`, which create the path
+      atomically with a random name.
+    severity: WARNING
+    languages: [regex]
+    paths:
+      include: ["crates/**/src/**/*.rs"]
+    pattern-regex: temp_dir\(\)\s*\.join\(
+
+  - id: portkit-mcp-no-stdout
+    message: >-
+      crates/portkit/CLAUDE.md: on the MCP stdio transport stdout is the protocol channel; one
+      stray print corrupts the stream. Diagnostics go to stderr through `tracing`.
+    severity: ERROR
+    languages: [regex]
+    paths:
+      include: ["crates/portkit/mcp/src/**/*.rs"]
+    patterns:
+      - pattern-regex: \b(?:print|println|dbg)!\s*\(
+      - pattern-not-regex: //[^\n]*
+
+  # --- Slop: what an agent leaves behind to make a check go quiet. ---
+
+  - id: cowproof-crate-wide-allow
+    message: >-
+      A crate- or module-wide `#![allow(...)]` silences the lint for code nobody has written yet.
+      Put the allow on the one item that needs it, with a `reason = "..."`.
+    severity: WARNING
+    languages: [regex]
+    paths:
+      include: ["crates/**/*.rs"]
+    pattern-regex: '#!\[allow\((?!dead_code)'
+
+  - id: cowproof-lint-wall-removed
+    message: >-
+      Do not loosen the workspace's lint or advisory gates to make a change pass. Fix the finding;
+      if it is a real exception, allow it on the one item with a reason and say why in the PR.
+    severity: ERROR
+    languages: [regex]
+    paths:
+      include: ["crates/**/*.rs"]
+    pattern-regex: '#!?\[allow\((?:[^)]*\b)?(?:warnings|unsafe_code|clippy::(?:all|correctness|suspicious|undocumented_unsafe_blocks|dbg_macro|todo|unimplemented))\b'
+
+  - id: cowproof-test-ignored-without-reason
+    message: >-
+      An ignored test is a gate that always passes. Fix it, or write `#[ignore = "why, and when
+      it comes back"]`.
+    severity: WARNING
+    languages: [regex]
+    paths:
+      include: ["crates/**/*.rs"]
+    pattern-regex: '(?m)^\s*#\[ignore\]'
+
+  - id: cowproof-no-em-dash
+    message: >-
+      House style: no em dashes in cowproof's code, comments or docs. Use a colon, a comma, or
+      two sentences.
+    severity: WARNING
+    languages: [regex]
+    paths:
+      include: ["crates/**/*.rs", "*.md", "docs/**/*.md", "plugin/**", "scripts/**", ".github/**"]
+    pattern-regex: "—"

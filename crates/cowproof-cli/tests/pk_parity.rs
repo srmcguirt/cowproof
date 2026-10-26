@@ -7,7 +7,10 @@
 //! as plugins, on the direct registry and through the MCP envelope: a tool that is right
 //! direct and wrong through MCP is still broken for the agent that has to call it.
 
-#[allow(dead_code)] // this file needs only the fork lock, `var_tmp` and the signal helper
+#[allow(
+    dead_code,
+    reason = "this file needs only the fork lock, `var_tmp` and the signal helper"
+)]
 mod common;
 mod pk_support;
 

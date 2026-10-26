@@ -7,7 +7,7 @@
 //! lock, the throwaway directory under `/var/tmp` and the signal helper, so no test starts a
 //! process with `kill`.
 
-#![allow(dead_code)] // each test file uses some of these
+#![allow(dead_code, reason = "each test file uses some of these")]
 
 use crate::common;
 use serde_json::{Value, json};

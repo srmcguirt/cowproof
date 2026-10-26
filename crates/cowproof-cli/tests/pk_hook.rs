@@ -8,7 +8,10 @@
 //!
 //! `pk.rs` covers where the hook writes under `PORTKIT_STATE_DIR` and `pk doctor`.
 
-#[allow(dead_code)] // this file needs only the fork lock, `var_tmp` and the signal helper
+#[allow(
+    dead_code,
+    reason = "this file needs only the fork lock, `var_tmp` and the signal helper"
+)]
 mod common;
 mod pk_support;
 

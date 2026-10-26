@@ -20,3 +20,6 @@ ignore = "0.4"
 memchr = "2"
 ast-grep-core = "0.45"
 ast-grep-language = "0.45"
+
+[lints]
+workspace = true

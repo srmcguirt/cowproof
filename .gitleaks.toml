@@ -1,0 +1,22 @@
+# gitleaks: the default rules, less the fake credentials cowproof's own tests are built from.
+# The redactor (crates/cowproof-core/src/redact.rs) is tested on key-shaped strings, so its
+# fixtures look like leaks by design. Keep each exception narrow: a path that only holds test
+# input, or a marker that no real credential contains.
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "redactor test input"
+paths = [
+  '''^crates/cowproof-core/tests/fixtures/redact/''',
+  '''^crates/cowproof-core/src/redact\.rs$''',
+]
+
+[[allowlists]]
+description = "placeholders and markers the tests name on purpose"
+regexes = [
+  '''placeholder[-_]''',
+  '''SECRET-MARKER-''',
+  '''sk-test-''',
+  '''^interleaved-thinking-\d{4}-\d{2}-\d{2}$''', # an Anthropic beta header name
+]

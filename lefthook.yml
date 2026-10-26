@@ -1,0 +1,38 @@
+# Local checks. One-time per machine, from any checkout: `lefthook install` (the hooks live in
+# the shared .git/hooks, so every worktree gets them). A missing tool skips its check with a
+# note rather than blocking; CI (.github/workflows/checks.yml, ci.yml) runs them without that
+# escape.
+pre-commit:
+  parallel: true
+  jobs:
+    - name: gitleaks
+      run: |
+        command -v gitleaks >/dev/null || { echo "gitleaks not installed (brew install gitleaks); skipped"; exit 0; }
+        gitleaks git --pre-commit --staged --no-banner --redact
+    - name: scrub-check
+      run: ./scripts/scrub-check
+    - name: rustfmt
+      glob: "*.rs"
+      run: rustfmt --check --edition 2024 {staged_files}
+    - name: shellcheck
+      glob: "{*.sh,scripts/*,plugin/scripts/*}"
+      exclude: "fixtures/"
+      run: |
+        command -v shellcheck >/dev/null || { echo "shellcheck not installed (brew install shellcheck); skipped"; exit 0; }
+        shellcheck -S warning {staged_files}
+    - name: semgrep project rules
+      glob: "*.{rs,md,sh,yml}"
+      run: |
+        if command -v semgrep >/dev/null; then sg=semgrep
+        elif command -v uvx >/dev/null; then sg="uvx semgrep@1.182.1"
+        else echo "semgrep not installed (brew install semgrep); skipped"; exit 0; fi
+        $sg scan --metrics=off --quiet --error --severity ERROR --config .semgrep/ {staged_files}
+
+pre-push:
+  jobs:
+    - name: clippy
+      run: cargo clippy --workspace --all-targets --locked -- -D warnings
+    - name: cargo deny
+      run: |
+        command -v cargo-deny >/dev/null || { echo "cargo-deny not installed (cargo install cargo-deny); skipped"; exit 0; }
+        cargo deny --locked check

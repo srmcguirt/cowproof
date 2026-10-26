@@ -6,7 +6,10 @@
 //! until something counts bytes. These tests check that the counting is real and that it
 //! stays off unless asked for.
 
-#[allow(dead_code)] // this file needs only the fork lock, `var_tmp` and the signal helper
+#[allow(
+    dead_code,
+    reason = "this file needs only the fork lock, `var_tmp` and the signal helper"
+)]
 mod common;
 mod pk_support;
 

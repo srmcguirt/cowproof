@@ -4,7 +4,7 @@
 //! so no test reads or touches the real home or the real cache. A "dead" pid is a child
 //! that was started and reaped; a "live" one is a child still sleeping.
 
-#[allow(dead_code)] // this file needs only a few of the shared helpers
+#[allow(dead_code, reason = "this file needs only a few of the shared helpers")]
 mod common;
 
 use common::{output, text, var_tmp};

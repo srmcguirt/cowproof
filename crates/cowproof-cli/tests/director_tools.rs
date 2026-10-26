@@ -11,7 +11,10 @@
 //! so a change to what the queue records cannot leave the tool reading a format
 //! the tests made up.
 
-#[allow(dead_code)] // this file needs only the signal helper of the shared module
+#[allow(
+    dead_code,
+    reason = "this file needs only the signal helper of the shared module"
+)]
 mod common;
 
 use common::signal_pid;

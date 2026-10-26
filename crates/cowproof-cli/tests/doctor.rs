@@ -12,7 +12,7 @@
 //! launcher (`sandbox-exec`, `bwrap`) is found on the builder's `PATH`, so a `PATH` with
 //! no launcher on it makes the launch fail the way a host without one would.
 
-#[allow(dead_code)] // this file needs only a few of the shared helpers
+#[allow(dead_code, reason = "this file needs only a few of the shared helpers")]
 mod common;
 
 use common::{fork_lock, git, output, sandbox_available, text, var_tmp};

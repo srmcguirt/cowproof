@@ -20,7 +20,10 @@
 //! today, so for them the level is a guard against one being added with stdout as its
 //! writer; `pk` does log (to stderr), and its sessions assert that it did.
 
-#[allow(dead_code)] // this file needs only the fork lock, `var_tmp` and the signal helper
+#[allow(
+    dead_code,
+    reason = "this file needs only the fork lock, `var_tmp` and the signal helper"
+)]
 mod common;
 mod pk_support;
 

@@ -11,7 +11,10 @@
 //! `/var/tmp` (not `/tmp`, which bwrap hides, and not the home, which both
 //! sandboxes hide), and the lanes root sits beside, not around, the fake.
 
-#[allow(dead_code)] // this file keeps its own copies of most shared helpers
+#[allow(
+    dead_code,
+    reason = "this file keeps its own copies of most shared helpers"
+)]
 mod common;
 
 use common::{pid_alive, signal_group, signal_pid};
