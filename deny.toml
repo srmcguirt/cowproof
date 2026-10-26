@@ -1,0 +1,36 @@
+# cargo-deny: RustSec advisories, licences, duplicate crates and crate sources. cowproof ships
+# binaries and publishes crates under MIT, so every dependency licence must be one a user can
+# redistribute under it. CI runs `cargo deny check` (.github/workflows/checks.yml).
+[graph]
+all-features = true
+
+[advisories]
+# Unmaintained and unsound crates fail as well as vulnerable ones. An ignore names the advisory,
+# why it does not reach a user, and when to revisit it.
+ignore = []
+
+[licenses]
+confidence-threshold = 0.9
+allow = [
+  "MIT",
+  "MIT-0",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Zlib",
+  "Unlicense",
+  "CC0-1.0",
+  "Unicode-3.0",
+  "CDLA-Permissive-2.0",
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

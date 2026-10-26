@@ -53,3 +53,30 @@ assert_cmd = "2"
 predicates = "3"
 tempfile = "3"
 toml = "0.8"
+
+# Lints every member opts into with `[lints] workspace = true`. Each one is at zero today and
+# catches something an agent leaves behind or a reviewer misses; CI's `-D warnings` makes
+# a `warn` here fail too. Raise a lint here only once the workspace is clean of it.
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+# Left-behind scaffolding.
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"
+# A silenced lint says why, so a reviewer can judge it.
+allow_attributes_without_reason = "deny"
+# Every unsafe block names the invariant it relies on, one operation at a time.
+undocumented_unsafe_blocks = "deny"
+multiple_unsafe_ops_per_block = "deny"
+unnecessary_safety_comment = "deny"
+unnecessary_safety_doc = "deny"
+mem_forget = "deny"
+fn_to_numeric_cast_any = "deny"
+# Small slips that read as correct.
+lossy_float_literal = "deny"
+suspicious_xor_used_as_pow = "deny"
+try_err = "deny"
+empty_drop = "deny"
+large_include_file = "deny"

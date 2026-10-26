@@ -3042,8 +3042,10 @@ impl Phase {
 /// one, never half of either. Nothing here waits, so a second signal never has to cut
 /// it short. Each step is marked on `clock` (the caller's, started at the signal), so a
 /// slow file operation shows up in [`report_slow_exit`] under its own name.
-// The clock is the eighth argument; the call sites are four and each already names its own values.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the clock is the eighth argument; the call sites are four and each already names its own values"
+)]
 fn record_interrupted(
     layout: &LaneLayout,
     lane_id: &str,

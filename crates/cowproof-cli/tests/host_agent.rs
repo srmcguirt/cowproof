@@ -6,7 +6,7 @@
 //! `HOME` or writes into the source tree. The "remote" is the same machine: the lanes root
 //! stands for `~/.cache/cowproof/remote-lanes` on the other host.
 
-#[allow(dead_code)] // this file needs only a few of the shared helpers
+#[allow(dead_code, reason = "this file needs only a few of the shared helpers")]
 mod common;
 
 use common::{

@@ -82,7 +82,10 @@ pub fn sandbox_available() -> bool {
 
 /// `kill(-pgid, 0)` fails with ESRCH: no process is left in the process group `pgid`. A
 /// permission error or an unanswerable pgid is not "gone".
-#[allow(dead_code)] // `tests/host_agent.rs` and `tests/remote.rs` use it; the other test crates that share this module do not
+#[allow(
+    dead_code,
+    reason = "`tests/host_agent.rs` and `tests/remote.rs` use it; the other test crates that share this module do not"
+)]
 pub fn group_gone(pgid: &str) -> bool {
     // kill(2), not the shell: dash's `kill` (Ubuntu's /bin/sh) rejects `--`, so a shell
     // probe reads every group as alive there.
@@ -92,7 +95,10 @@ pub fn group_gone(pgid: &str) -> bool {
 
 /// [`group_gone`], polled for at most `within`: a group whose leader has just been told to
 /// end is not empty until the kernel has reaped every member, which a loaded host does late.
-#[allow(dead_code)] // `tests/remote.rs` uses it; the other test crates that share this module do not
+#[allow(
+    dead_code,
+    reason = "`tests/remote.rs` uses it; the other test crates that share this module do not"
+)]
 pub fn wait_group_gone(pgid: &str, within: std::time::Duration) -> bool {
     let deadline = std::time::Instant::now() + within;
     loop {
@@ -111,7 +117,10 @@ pub fn wait_group_gone(pgid: &str, within: std::time::Duration) -> bool {
 /// procps `kill` keeps only the first digit of a negative id not preceded by `--`, so
 /// `kill -KILL -1234` is `kill(-1, SIGKILL)`, which ends every process of the user. Every
 /// signal here goes through `kill(2)` in `cowproof_prove::runner`, which refuses group 0 and 1.
-#[allow(dead_code)] // each test crate that shares this module uses some of the helpers
+#[allow(
+    dead_code,
+    reason = "each test crate that shares this module uses some of the helpers"
+)]
 pub fn signal_number(name: &str) -> libc::c_int {
     match name {
         "0" => 0,
@@ -125,21 +134,30 @@ pub fn signal_number(name: &str) -> libc::c_int {
 
 /// Send the named signal (see [`signal_number`]) to the one process `pid`. Whether `kill(2)`
 /// accepted it; with `"0"` that is "the process exists and is ours to signal".
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "a shared test helper; not every test crate that includes this module uses it"
+)]
 pub fn signal_pid(name: &str, pid: u32) -> bool {
     cowproof_prove::runner::signal_pid(pid, signal_number(name))
 }
 
 /// Send the named signal to every process in the group `pgid` (never 0 or 1: those are
 /// refused, and the answer is false).
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "a shared test helper; not every test crate that includes this module uses it"
+)]
 pub fn signal_group(name: &str, pgid: u32) -> bool {
     cowproof_prove::runner::signal_group(pgid, signal_number(name))
 }
 
 /// Whether the process `pid` exists (a zombie does): the system's own answer, `ESRCH` being no.
 /// A pid it cannot be asked about is not alive.
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "a shared test helper; not every test crate that includes this module uses it"
+)]
 pub fn pid_alive(pid: u32) -> bool {
     cowproof_prove::runner::pid_exists(pid) == Some(true)
 }
@@ -174,25 +192,34 @@ fn shared_bins() -> &'static SharedBins {
 }
 
 /// The shared `cowproof`, with `pk` beside it.
-#[allow(dead_code)] // only the lane tests that include `common` copy the binaries
+#[allow(
+    dead_code,
+    reason = "only the lane tests that include `common` copy the binaries"
+)]
 pub fn shared_cowproof() -> &'static Path {
     &shared_bins().cowproof
 }
 
 /// The shared `pk`, beside [`shared_cowproof`].
-#[allow(dead_code)] // `tests/run.rs` is the one that wants it
+#[allow(dead_code, reason = "`tests/run.rs` is the one that wants it")]
 pub fn shared_pk() -> &'static Path {
     &shared_bins().pk
 }
 
 /// The shared `cowproof` with no `pk` beside it, as an install of `cowproof` alone looks.
-#[allow(dead_code)] // the lane tests that run a bare runner use it; the others do not
+#[allow(
+    dead_code,
+    reason = "the lane tests that run a bare runner use it; the others do not"
+)]
 pub fn shared_cowproof_alone() -> &'static Path {
     &shared_bins().bare_cowproof
 }
 
 /// Bytes copied into the shared directory so far by this process.
-#[allow(dead_code)] // reported by the helper itself; kept for a test that wants to assert it
+#[allow(
+    dead_code,
+    reason = "reported by the helper itself; kept for a test that wants to assert it"
+)]
 pub fn shared_bytes_copied() -> u64 {
     SHARED_BYTES_COPIED.load(Ordering::SeqCst)
 }
@@ -323,7 +350,7 @@ fn link_or_copy(src: &Path, dest: &Path) -> PathBuf {
 /// remove or replace one of them. Link names are the test's to unlink; its writes must
 /// create a new file (remove the name first), never write through the link, which would
 /// change the shared binary. Returns the `cowproof` and `pk` paths in `dir`.
-#[allow(dead_code)] // `tests/run.rs` is the one that replaces `pk`
+#[allow(dead_code, reason = "`tests/run.rs` is the one that replaces `pk`")]
 pub fn link_binaries_into(dir: &Path) -> (PathBuf, PathBuf) {
     fs::create_dir_all(dir).unwrap();
     (
@@ -347,7 +374,10 @@ pub fn var_tmp(prefix: &str) -> TempDir {
 /// argument per line), `env.txt` (its sorted environment), `package_json.txt` (the `package.json` it was given), `npmrc.txt` (the `.npmrc` it was
 /// given, if any) and `cwd.txt`. It installs `node_modules/fake-pkg/index.js` into its working
 /// directory, as `npm ci` installs into the project.
-#[allow(dead_code)] // `tests/npm_fetch.rs` and `tests/deps.rs` use it; the other test crates do not
+#[allow(
+    dead_code,
+    reason = "`tests/npm_fetch.rs` and `tests/deps.rs` use it; the other test crates do not"
+)]
 pub const FAKE_NPM_OK: &str = r#"#!/bin/sh
 printf '%s\n' "$@" > "$npm_config_cache/argv.txt"
 env | sort > "$npm_config_cache/env.txt"
@@ -360,7 +390,10 @@ exit 0
 "#;
 
 /// A FAKE `npm` whose install fails the way a missing package does.
-#[allow(dead_code)] // `tests/npm_fetch.rs` uses it; the other test crates do not
+#[allow(
+    dead_code,
+    reason = "`tests/npm_fetch.rs` uses it; the other test crates do not"
+)]
 pub const FAKE_NPM_FAILS: &str = r#"#!/bin/sh
 echo "npm WARN deprecated fake-pkg@1.0.0: for the test" >&2
 echo "npm ERR! code E404" >&2
@@ -369,7 +402,10 @@ exit 1
 "#;
 
 /// A FAKE `npm` that must not be called: a run that reaches it is a cache miss.
-#[allow(dead_code)] // `tests/npm_fetch.rs` uses it; the other test crates do not
+#[allow(
+    dead_code,
+    reason = "`tests/npm_fetch.rs` uses it; the other test crates do not"
+)]
 pub const FAKE_NPM_MUST_NOT_RUN: &str = r#"#!/bin/sh
 echo "npm ERR! the fake npm was called although the cache entry was complete" >&2
 exit 1
@@ -380,7 +416,10 @@ exit 1
 /// `npm_config_store_dir` for pnpm): `argv.txt`, `env.txt`, `cwd.txt`, `package_json.txt`, and the configuration
 /// files it was given (`npmrc.txt`, `yarnrc.txt`, `yarnrc_yml.txt`). It installs
 /// `node_modules/fake-pkg/index.js` into its working directory.
-#[allow(dead_code)] // `tests/npm_fetch.rs` uses it; the other test crates do not
+#[allow(
+    dead_code,
+    reason = "`tests/npm_fetch.rs` uses it; the other test crates do not"
+)]
 pub fn fake_js_ok(cache_var: &str) -> String {
     format!(
         r#"#!/bin/sh
@@ -400,7 +439,10 @@ exit 0
 }
 
 /// A FAKE `yarn` whose install fails the way a missing package does.
-#[allow(dead_code)] // `tests/npm_fetch.rs` uses it; the other test crates do not
+#[allow(
+    dead_code,
+    reason = "`tests/npm_fetch.rs` uses it; the other test crates do not"
+)]
 pub const FAKE_YARN_FAILS: &str = r#"#!/bin/sh
 echo "warning fake-pkg@1.0.0: deprecated, for the test" >&2
 echo "error Couldn't find package \"fake-pkg\" on the \"npm\" registry." >&2
@@ -409,7 +451,10 @@ exit 1
 "#;
 
 /// A FAKE `pnpm` whose install fails the way a missing package does.
-#[allow(dead_code)] // `tests/npm_fetch.rs` uses it; the other test crates do not
+#[allow(
+    dead_code,
+    reason = "`tests/npm_fetch.rs` uses it; the other test crates do not"
+)]
 pub const FAKE_PNPM_FAILS: &str = r#"#!/bin/sh
 echo "Progress: resolved 1, reused 0, downloaded 0, added 0" >&2
 echo " ERR_PNPM_FETCH_404  GET https://registry.npmjs.org/fake-pkg: Not Found - 404" >&2
@@ -418,7 +463,10 @@ exit 1
 
 /// A FAKE `yarn` or `pnpm` that must not be called: a run that reaches it is a cache miss, or
 /// a tree that should not have been installed at all.
-#[allow(dead_code)] // `tests/npm_fetch.rs` uses it; the other test crates do not
+#[allow(
+    dead_code,
+    reason = "`tests/npm_fetch.rs` uses it; the other test crates do not"
+)]
 pub const FAKE_JS_MUST_NOT_RUN: &str = r#"#!/bin/sh
 echo "error the fake tool was called although nothing should have been installed" >&2
 exit 1
@@ -428,7 +476,10 @@ exit 1
 /// under `/var/tmp` and return the directory (keep it alive) and the path of the script. Pass
 /// the path to a lane as `COWPROOF_NPM`, `COWPROOF_YARN` or `COWPROOF_PNPM`, the way `CARGO`
 /// names the cargo the verifier uses.
-#[allow(dead_code)] // `tests/npm_fetch.rs` and `tests/deps.rs` use it; the other test crates do not
+#[allow(
+    dead_code,
+    reason = "`tests/npm_fetch.rs` and `tests/deps.rs` use it; the other test crates do not"
+)]
 pub fn fake_tool(name: &str, body: &str) -> (TempDir, PathBuf) {
     let dir = var_tmp(&format!("cp-fake-{name}-"));
     let tool = dir.path().canonicalize().unwrap().join(name);
@@ -443,13 +494,19 @@ pub fn fake_tool(name: &str, body: &str) -> (TempDir, PathBuf) {
 }
 
 /// [`fake_tool`] for `npm`.
-#[allow(dead_code)] // `tests/npm_fetch.rs` and `tests/deps.rs` use it; the other test crates do not
+#[allow(
+    dead_code,
+    reason = "`tests/npm_fetch.rs` and `tests/deps.rs` use it; the other test crates do not"
+)]
 pub fn fake_npm(body: &str) -> (TempDir, PathBuf) {
     fake_tool("npm", body)
 }
 
 /// A held-out file in `dir` with one check, `held`, that runs only in the verifier.
-#[allow(dead_code)] // the dependency-fetch tests use it; the other test crates do not
+#[allow(
+    dead_code,
+    reason = "the dependency-fetch tests use it; the other test crates do not"
+)]
 pub fn heldout(dir: &Path, command: &str) -> PathBuf {
     let path = dir.join("h.toml");
     fs::write(
@@ -461,7 +518,10 @@ pub fn heldout(dir: &Path, command: &str) -> PathBuf {
 }
 
 /// `cowproof run` of `lane` with the held-out file `heldout`, asserting its exit code.
-#[allow(dead_code)] // the dependency-fetch tests use it; the other test crates do not
+#[allow(
+    dead_code,
+    reason = "the dependency-fetch tests use it; the other test crates do not"
+)]
 pub fn run_with(lane: &Lane, heldout: &Path, code: i32) -> Output {
     let out = lane.run(&[Path::new("--heldout"), heldout]);
     assert_eq!(
@@ -474,13 +534,19 @@ pub fn run_with(lane: &Lane, heldout: &Path, code: i32) -> Output {
 }
 
 /// The sealed capsule of `lane`.
-#[allow(dead_code)] // the dependency-fetch tests use it; the other test crates do not
+#[allow(
+    dead_code,
+    reason = "the dependency-fetch tests use it; the other test crates do not"
+)]
 pub fn capsule(lane: &Lane) -> cowproof_prove::Capsule {
     cowproof_prove::Capsule::read(&lane.capsule_dir()).unwrap()
 }
 
 /// The dependency cache entry a capsule names, under the cache root `cache`.
-#[allow(dead_code)] // the dependency-fetch tests use it; the other test crates do not
+#[allow(
+    dead_code,
+    reason = "the dependency-fetch tests use it; the other test crates do not"
+)]
 pub fn entry(cache: &Path, capsule: &cowproof_prove::Capsule) -> PathBuf {
     cache
         .join("deps")
@@ -488,7 +554,10 @@ pub fn entry(cache: &Path, capsule: &cowproof_prove::Capsule) -> PathBuf {
 }
 
 /// Every regular file under `dir`, links not followed.
-#[allow(dead_code)] // the dependency-fetch tests use it; the other test crates do not
+#[allow(
+    dead_code,
+    reason = "the dependency-fetch tests use it; the other test crates do not"
+)]
 pub fn files_under(dir: &Path) -> Vec<PathBuf> {
     let mut found = Vec::new();
     let mut pending = vec![dir.to_path_buf()];
@@ -592,13 +661,16 @@ impl Lane {
     /// A committed repository with a README, and a packet that owns `README.md` and
     /// `created.txt` and declares `checks`. The fake edits README.md, creates
     /// created.txt, then runs `fake_body`.
-    #[allow(dead_code)] // `tests/slots.rs` builds every lane with a class
+    #[allow(dead_code, reason = "`tests/slots.rs` builds every lane with a class")]
     pub fn new(fake_body: &str, checks: Value) -> Self {
         Self::with_class(fake_body, checks, "light")
     }
 
     /// [`Lane::new`] with the packet's resource `class` (`light`, `crate`, `rust`, `pg`).
-    #[allow(dead_code)] // `tests/slots.rs` uses it; the other test crates that share this module do not
+    #[allow(
+        dead_code,
+        reason = "`tests/slots.rs` uses it; the other test crates that share this module do not"
+    )]
     pub fn with_class(fake_body: &str, checks: Value, class: &str) -> Self {
         let id = unique_lane_id();
         let work = var_tmp("cp-ver-work-");
@@ -671,7 +743,10 @@ exit 0
     /// recursively), with the packet text `packet(lane_id)` gives. Unlike [`Lane::new`], the
     /// fake changes nothing by itself: it runs `fake_body` in the clone, so the lane's patch
     /// is exactly what `fake_body` does to the project.
-    #[allow(dead_code)] // `tests/adversarial.rs` uses it; the other test crates that share this module do not
+    #[allow(
+        dead_code,
+        reason = "`tests/adversarial.rs` uses it; the other test crates that share this module do not"
+    )]
     pub fn from_project(fake_body: &str, project: &Path, packet: &dyn Fn(&str) -> String) -> Self {
         let id = unique_lane_id();
         let work = var_tmp("cp-ver-work-");
@@ -724,13 +799,19 @@ exit 0
     }
 
     /// The fake `claude`, for a hosts config that names it as the host's `claude`.
-    #[allow(dead_code)] // `tests/remote.rs` uses it; the other test crates that share this module do not
+    #[allow(
+        dead_code,
+        reason = "`tests/remote.rs` uses it; the other test crates that share this module do not"
+    )]
     pub fn fake_claude(&self) -> &Path {
         &self.fake
     }
 
     /// Set an environment variable for every later `cowproof` child of this lane.
-    #[allow(dead_code)] // `tests/deps.rs` uses it; the other test crates that share this module do not
+    #[allow(
+        dead_code,
+        reason = "`tests/deps.rs` uses it; the other test crates that share this module do not"
+    )]
     pub fn set_env(&mut self, key: &str, value: impl Into<OsString>) {
         self.envs.retain(|(k, _)| k != key);
         self.envs.push((key.to_string(), value.into()));
@@ -738,7 +819,10 @@ exit 0
 
     /// Add `files` (relative path, content) to the repository and commit them, so they
     /// are part of the base the lane starts from.
-    #[allow(dead_code)] // `tests/deps.rs` uses it; the other test crates that share this module do not
+    #[allow(
+        dead_code,
+        reason = "`tests/deps.rs` uses it; the other test crates that share this module do not"
+    )]
     pub fn commit_files(&self, files: &[(&str, &str)]) {
         for (rel, content) in files {
             let path = self.repo.join(rel);
@@ -778,7 +862,7 @@ exit 0
     }
 
     /// `cowproof run` with the real key set, plus `extra` arguments.
-    #[allow(dead_code)] // `tests/slots.rs` starts its runs without waiting
+    #[allow(dead_code, reason = "`tests/slots.rs` starts its runs without waiting")]
     pub fn run(&self, extra: &[&Path]) -> Output {
         output(&mut self.run_command(extra))
     }
@@ -801,7 +885,10 @@ exit 0
 }
 
 /// Copy the directory `from` to `to`, recursively (regular files and directories only).
-#[allow(dead_code)] // `Lane::from_project` uses it; the other test crates that share this module do not
+#[allow(
+    dead_code,
+    reason = "`Lane::from_project` uses it; the other test crates that share this module do not"
+)]
 pub fn copy_tree(from: &Path, to: &Path) {
     fs::create_dir_all(to).unwrap();
     for entry in fs::read_dir(from).unwrap() {
@@ -818,7 +905,10 @@ pub fn copy_tree(from: &Path, to: &Path) {
 
 /// Start `cmd` without waiting, its stdout dropped and its stderr written to the file
 /// `stderr` (read it while the process runs). The spawn is under `FORK_LOCK`.
-#[allow(dead_code)] // `tests/slots.rs` uses it; the other test crates that share this module do not
+#[allow(
+    dead_code,
+    reason = "`tests/slots.rs` uses it; the other test crates that share this module do not"
+)]
 pub fn spawn_to_file(cmd: &mut Command, stderr: &Path) -> std::process::Child {
     let file = fs::File::create(stderr).unwrap();
     let _g = fork_lock();
@@ -844,7 +934,7 @@ pub fn text(out: &Output) -> String {
 
 /// One scripted model reply: some text, then tool calls (`(tool name, arguments)`). A reply
 /// with tool calls ends with `finish_reason: tool_calls`, one without ends the turn.
-#[allow(dead_code)] // only `tests/opencode.rs` scripts replies
+#[allow(dead_code, reason = "only `tests/opencode.rs` scripts replies")]
 #[derive(Clone, Debug)]
 pub struct Reply {
     pub text: Option<String>,
@@ -853,7 +943,10 @@ pub struct Reply {
     pub delay_ms: u64,
 }
 
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "a shared test helper; not every test crate that includes this module uses it"
+)]
 impl Reply {
     pub fn text(text: &str) -> Self {
         Reply {
@@ -879,7 +972,10 @@ impl Reply {
 }
 
 /// What the fake saw of one request.
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "a shared test helper; not every test crate that includes this module uses it"
+)]
 #[derive(Clone, Debug)]
 pub struct Seen {
     pub method: String,
@@ -919,7 +1015,10 @@ pub fn openrouter_test_key() -> String {
 
 /// One entry of the fake's model list, in the shape of OpenRouter's `GET /models`. Prices are
 /// the strings OpenRouter sends: USD per token.
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "a shared test helper; not every test crate that includes this module uses it"
+)]
 #[derive(Clone, Debug)]
 pub struct FakeModel {
     pub id: String,
@@ -931,7 +1030,10 @@ pub struct FakeModel {
     pub max_completion_tokens: Option<u64>,
 }
 
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "a shared test helper; not every test crate that includes this module uses it"
+)]
 impl FakeModel {
     /// A model with only a prompt and a completion price, and no limits.
     pub fn new(id: &str, prompt: &str, completion: &str) -> Self {
@@ -976,7 +1078,10 @@ impl FakeModel {
 }
 
 /// How the fake answers `GET /api/v1/models`.
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "a shared test helper; not every test crate that includes this module uses it"
+)]
 #[derive(Clone, Debug)]
 pub enum ModelsMode {
     /// 200 with these models.
@@ -995,7 +1100,10 @@ pub enum ModelsMode {
 /// (`POST /api/v1/chat/completions`) from a script and records every request it gets, whatever
 /// the path. A request that offers no tools (a title generator, say) gets a plain reply and does
 /// not consume the script.
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "a shared test helper; not every test crate that includes this module uses it"
+)]
 pub struct FakeOpenRouter {
     addr: std::net::SocketAddr,
     state: std::sync::Arc<Mutex<FakeState>>,
@@ -1003,7 +1111,10 @@ pub struct FakeOpenRouter {
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "a shared test helper; not every test crate that includes this module uses it"
+)]
 impl FakeOpenRouter {
     pub fn start(script: Vec<Reply>) -> Self {
         Self::start_with(script, None)
@@ -1361,7 +1472,7 @@ fn fake_serve(
 
 /// The lettered synthetic key the Codex tests give the director, and the one the fake requires.
 /// Not a real key: it is a repeated alphabet fragment, which the scrub check does not flag.
-#[allow(dead_code)] // only `tests/codex.rs` uses the fake OpenAI
+#[allow(dead_code, reason = "only `tests/codex.rs` uses the fake OpenAI")]
 pub fn openai_test_key() -> String {
     format!("sk-proj-{}", "abcdefghij".repeat(6))
 }
@@ -1369,7 +1480,10 @@ pub fn openai_test_key() -> String {
 /// One scripted reply of the fake OpenAI: some reasoning, some text, then function calls
 /// (`(namespace, tool name, arguments)`; a namespace is how Codex offers an MCP server's
 /// tools), and the usage the call reports.
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "a shared test helper; not every test crate that includes this module uses it"
+)]
 #[derive(Clone, Debug)]
 pub struct ResponsesReply {
     pub reasoning: Option<String>,
@@ -1381,7 +1495,10 @@ pub struct ResponsesReply {
     pub usage: (u64, u64, u64),
 }
 
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "a shared test helper; not every test crate that includes this module uses it"
+)]
 impl ResponsesReply {
     pub fn text(text: &str) -> Self {
         ResponsesReply {
@@ -1451,7 +1568,10 @@ struct OpenAiState {
 /// (`POST /v1/responses`, streamed) from a script and records every request it gets, whatever
 /// the path or method. It requires `Authorization: Bearer <openai_test_key()>`, as OpenAI
 /// requires a key, and answers 401 to anything else. A path it does not serve is a 404.
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "a shared test helper; not every test crate that includes this module uses it"
+)]
 pub struct FakeOpenAi {
     addr: std::net::SocketAddr,
     state: std::sync::Arc<Mutex<OpenAiState>>,
@@ -1459,7 +1579,10 @@ pub struct FakeOpenAi {
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "a shared test helper; not every test crate that includes this module uses it"
+)]
 impl FakeOpenAi {
     pub fn start(script: Vec<ResponsesReply>) -> Self {
         Self::start_with(script, None)
@@ -1808,20 +1931,29 @@ fn openai_serve(
 
 /// The lettered synthetic OAuth token the subscription tests give the director. Not a real
 /// token: a repeated alphabet fragment after the prefix `claude setup-token` tokens carry.
-#[allow(dead_code)] // only `tests/subscription.rs` uses the fake Anthropic
+#[allow(
+    dead_code,
+    reason = "only `tests/subscription.rs` uses the fake Anthropic"
+)]
 pub fn claude_oauth_test_token() -> String {
     format!("sk-ant-oat01-{}", "abcdefghij".repeat(6))
 }
 
 /// A lettered synthetic API key, for the tests that give the director both credentials.
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "a shared test helper; not every test crate that includes this module uses it"
+)]
 pub fn anthropic_test_key() -> String {
     format!("sk-ant-api03-{}", "zyxwvutsrq".repeat(6))
 }
 
 /// What the fake Anthropic saw of one request: the method, the whole target (query included)
 /// and every header, names lower case.
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "a shared test helper; not every test crate that includes this module uses it"
+)]
 #[derive(Clone, Debug)]
 pub struct AnthropicSeen {
     pub method: String,
@@ -1830,7 +1962,10 @@ pub struct AnthropicSeen {
     pub body: Vec<u8>,
 }
 
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "a shared test helper; not every test crate that includes this module uses it"
+)]
 impl AnthropicSeen {
     pub fn header(&self, name: &str) -> Option<&str> {
         self.headers
@@ -1844,7 +1979,10 @@ impl AnthropicSeen {
 /// message and records every request it gets, whatever the path, method or credential. It does
 /// not check the credential: the tests read it from the record, so a wrong one is a finding and
 /// not a silent 401.
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "a shared test helper; not every test crate that includes this module uses it"
+)]
 pub struct FakeAnthropic {
     addr: std::net::SocketAddr,
     seen: std::sync::Arc<Mutex<Vec<AnthropicSeen>>>,
@@ -1852,7 +1990,10 @@ pub struct FakeAnthropic {
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "a shared test helper; not every test crate that includes this module uses it"
+)]
 impl FakeAnthropic {
     pub fn start() -> Self {
         use std::sync::atomic::Ordering;

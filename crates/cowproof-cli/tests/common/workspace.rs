@@ -38,7 +38,7 @@ pub fn demand(what: &str) {
 
 /// Whether the test named `what` must be skipped because the workspace is absent. Prints
 /// the skip, and panics instead when `COWPROOF_WORKSPACE_TESTS=1` says it must run.
-#[allow(dead_code)] // `no_kill_binary` uses `demand` and `root` only
+#[allow(dead_code, reason = "`no_kill_binary` uses `demand` and `root` only")]
 pub fn skipped(what: &str) -> bool {
     demand(what);
     if root().is_some() {

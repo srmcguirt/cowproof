@@ -510,7 +510,10 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
 }
 
 /// The envelope a process case records.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one field per part of the recorded envelope"
+)]
 pub fn envelope(
     exit: i32,
     stdout: &str,

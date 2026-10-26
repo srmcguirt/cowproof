@@ -5,7 +5,7 @@
 //! The real binary, a `HOME` of its own under `/var/tmp`, and synthetic keys: nothing here is
 //! anyone's key, and the "private key" is lettered filler.
 
-#[allow(dead_code)] // this file needs only a few of the shared helpers
+#[allow(dead_code, reason = "this file needs only a few of the shared helpers")]
 mod common;
 
 use common::{fork_lock, output, var_tmp};

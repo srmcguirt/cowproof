@@ -9,7 +9,10 @@
 //! preflight refusals need neither.
 
 // The other test crates that share this module use helpers this one does not.
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "a shared test helper; not every test crate that includes this module uses it"
+)]
 mod common;
 
 use common::{

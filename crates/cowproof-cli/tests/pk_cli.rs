@@ -5,7 +5,10 @@
 //! plugins through a `pk.toml` and call the real `pk` binary. The replay tests that were in
 //! `cli.rs` are in `pk_parity.rs`; the budget tests keep their place here.
 
-#[allow(dead_code)] // this file needs only the fork lock, `var_tmp` and the signal helper
+#[allow(
+    dead_code,
+    reason = "this file needs only the fork lock, `var_tmp` and the signal helper"
+)]
 mod common;
 mod pk_support;
 

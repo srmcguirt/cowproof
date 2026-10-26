@@ -20,3 +20,6 @@ sha2.workspace = true
 [dev-dependencies]
 async-trait.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+
+[lints]
+workspace = true

@@ -4,7 +4,7 @@
 //! reads cannot drift from the shape portkit writes. The ranking and the fingerprint are
 //! tested in `crates/cowproof-report/tests/port_candidates.rs`.
 
-#[allow(dead_code)] // this file needs only a few of the shared helpers
+#[allow(dead_code, reason = "this file needs only a few of the shared helpers")]
 mod common;
 
 use common::{fork_lock, output, text, var_tmp};
