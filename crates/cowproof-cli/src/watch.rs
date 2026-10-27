@@ -418,18 +418,29 @@ fn lane_credential(run: &RunJson) -> Option<LaneCredential> {
     })
 }
 
-/// The bytes the budget kept out of a traced lane's context: `traceTotals.savedBytes` of
-/// `control/run.json` (D5). The runner reads the lane's trace once, at lane end, and writes the
-/// totals into `run.json` then, so a lane that is still running, an untraced lane, an older
-/// `run.json` without the figure all have none; a `run.json` that cannot be read has none here
-/// and the snapshot says so in `run_json`. This never opens the trace files, so a missing or
-/// malformed trace cannot fail `watch`. The figure is the builder's own account (it can write
-/// its trace): informational, and labelled so wherever it is shown.
+/// The bytes the budget kept out of an ended traced lane's context: `traceTotals.savedBytes`
+/// of `control/run.json` (D5). The runner reads the lane's trace once, at lane end, and writes
+/// the totals into `run.json` then, so an untraced lane and an older `run.json` without the
+/// figure have none; a `run.json` that cannot be read has none here and the snapshot says so
+/// in `run_json`. A lane that is still running has no `run.json` yet: [`lane_snapshots`] reads
+/// its figure so far from the trace itself ([`live_ctx_saved`]). The figure is the builder's
+/// own account (it can write its trace): informational, and labelled so wherever it is shown.
 fn lane_ctx_saved(run: &RunJson) -> Option<u64> {
     let RunJson::Doc(doc) = run else {
         return None;
     };
     doc.get("traceTotals")?.get("savedBytes")?.as_u64()
+}
+
+/// The bytes the budget has kept out of a running lane's context so far, read from the lane's
+/// portkit trace on each look (`cowproof_report::traces::live_lane_trace_totals`: no link
+/// followed, at most 8 MiB and 4096 directory entries, a malformed line counted rather than
+/// fatal), so a missing or malformed trace cannot fail `watch`. None when the lane has no trace
+/// or the walk gave up. The runner does not yet know whether `pk doctor` passed, or whether a
+/// segment will run on a runtime without hooks, so a lane can show a figure while it runs and
+/// none once it ends untraced.
+fn live_ctx_saved(lane_dir: &Path) -> Option<u64> {
+    cowproof_report::traces::live_lane_trace_totals(lane_dir).map(|t| t.saved_bytes)
 }
 
 /// Bytes as a short human figure: `950`, `12.3k`, `4.5M`, `1.2G` (decimal units).
@@ -465,14 +476,19 @@ pub struct LaneSnapshot {
     /// The credential mode, present only when it is not the default API key.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub credential: Option<LaneCredential>,
-    /// Bytes the budget kept out of the lane's context, once the lane has ended with trace
-    /// totals (`traceTotals.savedBytes`); none while it runs, and for an untraced lane. The
-    /// builder wrote the trace it comes from, so the name says whose figure it is (audit S-6).
+    /// Bytes the budget kept out of the lane's context: the lane-end trace totals
+    /// (`traceTotals.savedBytes`) once it has ended, the trace so far while it runs, none for
+    /// an untraced lane. The builder wrote the trace it comes from, so the name says whose
+    /// figure it is (audit S-6).
     #[serde(
         rename = "ctx_saved_bytes_builder_reported",
         skip_serializing_if = "Option::is_none"
     )]
     pub ctx_saved_bytes: Option<u64>,
+    /// The saved figure was read from the trace of a lane that is still running, so it is the
+    /// figure so far and the lane-end one replaces it.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub ctx_saved_while_running: bool,
     /// `"unreadable"` when the lane's `run.json` is there and cannot be used (too large, a
     /// link, or not JSON): `credential` and the saved figure are then unknown, not absent.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -500,15 +516,24 @@ pub fn lane_snapshots(
         let notes = count_pending_notes(&control_dir, id);
         // Read once: the state, the credential and the saved figure all come from it.
         let run = read_run_json(&lane_dir);
+        let state = get_lane_state(&lane_dir, &run);
+        // No `run.json` and no verdict: the runner has not reached lane end.
+        let running = run == RunJson::Absent && state == "running";
+        let ctx_saved_bytes = if running {
+            live_ctx_saved(&lane_dir)
+        } else {
+            lane_ctx_saved(&run)
+        };
         rows.push(LaneSnapshot {
             id: id.to_string(),
-            state: get_lane_state(&lane_dir, &run),
+            state,
             queue_unreadable: parked.is_err() || notes.is_err(),
             parked: parked.ok().flatten(),
             pending_notes: notes.ok(),
             last_event_ms: get_last_event_time(&lane_dir),
             credential: lane_credential(&run),
-            ctx_saved_bytes: lane_ctx_saved(&run),
+            ctx_saved_while_running: running && ctx_saved_bytes.is_some(),
+            ctx_saved_bytes,
             run_json: (run == RunJson::Unreadable).then_some("unreadable"),
         });
     }
@@ -529,8 +554,8 @@ fn watch_table(lanes_root: &Path, cache_ttl_ms: u64) -> Result<()> {
 ///
 /// Two columns are optional so that the table of plain lanes is unchanged: `CTX-SAVED` appears
 /// when some lane has trace totals, and `CREDENTIAL` when some lane is not on the default API
-/// key. `CTX-SAVED` is `-` for a lane without a figure (untraced, still running, or an older
-/// `run.json`), and `?` for a lane whose `run.json` could not be read. A column also appears for
+/// key. `CTX-SAVED` is `-` for a lane without a figure (untraced, or an older `run.json`); a
+/// running lane shows its figure so far. It is `?` for a lane whose `run.json` could not be read. A column also appears for
 /// such a lane, so a builder cannot blank it by making its `run.json` unreadable (audit S-5).
 /// The saved figure is the builder's own account, so its header carries a `*` (audit S-6) and
 /// [`saved_footnote`] explains it under the table.
@@ -1037,10 +1062,104 @@ mod tests {
         assert_eq!(lane_ctx_saved(&read_run_json(running.path())), None);
     }
 
+    fn trace_line(produced: u64, delivered: u64) -> String {
+        format!(
+            r#"{{"tool":"Read","target":"a","surface":"cli","outcome":"ok","at":"x","duration_ms":0.0,"input_bytes":1,"produced_bytes":{produced},"delivered_bytes":{delivered}}}"#
+        )
+    }
+
+    #[test]
+    fn a_running_lane_shows_the_saved_bytes_of_its_trace_so_far() {
+        let root = tempfile::tempdir().unwrap();
+        let lane = root.path().join("lane-a");
+        let traces = lane.join("portkit/traces");
+        fs::create_dir_all(lane.join("control")).unwrap();
+        fs::create_dir_all(&traces).unwrap();
+        let file = traces.join("2026-10-27.jsonl");
+        fs::write(&file, trace_line(9_000, 1_000) + "\n").unwrap();
+        let look = || lane_snapshots(root.path(), 0, 0).unwrap().remove(0);
+
+        let first = look();
+        assert_eq!(first.state, "running");
+        assert_eq!(first.ctx_saved_bytes, Some(8_000));
+        assert!(first.ctx_saved_while_running);
+        let json = serde_json::to_value(&first).unwrap();
+        assert_eq!(json["ctx_saved_bytes_builder_reported"], 8_000);
+        assert_eq!(json["ctx_saved_while_running"], true);
+
+        // The builder goes on writing: the next look sees the new record, and a line it is
+        // still writing does not fail the look.
+        fs::write(
+            &file,
+            format!(
+                "{}\n{}\n{{\"tool\":",
+                trace_line(9_000, 1_000),
+                trace_line(500, 0)
+            ),
+        )
+        .unwrap();
+        assert_eq!(look().ctx_saved_bytes, Some(8_500));
+
+        // At lane end the runner's figure in run.json is the one shown, not the trace.
+        fs::write(
+            lane.join("control/run.json"),
+            r#"{"status":"finished","traceTotals":{"savedBytes":7}}"#,
+        )
+        .unwrap();
+        let ended = look();
+        assert_eq!(ended.ctx_saved_bytes, Some(7));
+        assert!(!ended.ctx_saved_while_running);
+        let json = serde_json::to_value(&ended).unwrap();
+        assert!(json.get("ctx_saved_while_running").is_none(), "{json}");
+    }
+
+    #[test]
+    fn a_running_lane_without_a_usable_trace_shows_no_figure() {
+        let root = tempfile::tempdir().unwrap();
+        let lane = root.path().join("lane-a");
+        fs::create_dir_all(lane.join("control")).unwrap();
+        // No trace directory at all.
+        assert_eq!(
+            lane_snapshots(root.path(), 0, 0).unwrap()[0].ctx_saved_bytes,
+            None
+        );
+        // A `portkit` directory that is a link is not followed.
+        let elsewhere = tempfile::tempdir().unwrap();
+        fs::create_dir_all(elsewhere.path().join("traces")).unwrap();
+        fs::write(
+            elsewhere.path().join("traces/a.jsonl"),
+            trace_line(9_000, 1_000) + "\n",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(elsewhere.path(), lane.join("portkit")).unwrap();
+        let row = lane_snapshots(root.path(), 0, 0).unwrap().remove(0);
+        assert_eq!(row.ctx_saved_bytes, None);
+        assert!(!row.ctx_saved_while_running);
+    }
+
+    #[test]
+    fn a_proved_lane_is_not_read_live_even_before_its_run_json() {
+        // A verdict without run.json is not a running lane: its trace is not opened.
+        let root = tempfile::tempdir().unwrap();
+        let lane = root.path().join("lane-a");
+        fs::create_dir_all(lane.join("portkit/traces")).unwrap();
+        fs::create_dir_all(lane.join("control")).unwrap();
+        fs::write(lane.join("control/verdict.json"), r#"{"verdict":"proved"}"#).unwrap();
+        fs::write(
+            lane.join("portkit/traces/a.jsonl"),
+            trace_line(9_000, 1_000) + "\n",
+        )
+        .unwrap();
+        let row = lane_snapshots(root.path(), 0, 0).unwrap().remove(0);
+        assert_eq!(row.state, "proved");
+        assert_eq!(row.ctx_saved_bytes, None);
+    }
+
     #[test]
     fn a_malformed_or_missing_trace_never_reaches_the_watch_column() {
-        // `watch` reads run.json only. A lane whose trace directory is garbage (or a symlink
-        // loop, or absent) and whose run.json has no totals still shows `-`.
+        // For an ended lane `watch` reads run.json only. A lane whose trace directory is
+        // garbage (or a symlink loop, or absent) and whose run.json has no totals still shows
+        // `-`.
         let lane = lane_with_run_json(r#"{"status":"finished"}"#);
         let traces = lane.path().join("portkit/traces");
         fs::create_dir_all(&traces).unwrap();
@@ -1058,6 +1177,7 @@ mod tests {
             last_event_ms: None,
             credential: None,
             ctx_saved_bytes: saved,
+            ctx_saved_while_running: false,
             run_json: None,
         }
     }

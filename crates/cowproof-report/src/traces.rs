@@ -39,6 +39,17 @@ pub const MAX_LANE_FILES: usize = 256;
 /// the directory returns names in. The names beyond it are counted in `unread_files`.
 pub const MAX_LANE_LISTING: usize = 4096;
 
+/// A running lane's walk (`cowproof watch` and the director's `lanes` tool, on every call)
+/// reads at most this many bytes of trace: an eighth of [`MAX_LANE_BYTES`], because it is
+/// repeated each time the director looks, and still two thousand times a day of one lane.
+pub const LIVE_LANE_BYTES: u64 = 8 * 1024 * 1024;
+
+/// A running lane's walk gives up when the `traces` directory holds more than this many
+/// entries of any kind, instead of listing them all: the lane-end walk lists the whole
+/// directory once, but a builder that fills it with millions of names would make every look
+/// the director takes walk them again. A lane writes one file a day.
+pub const LIVE_LANE_ENTRIES: usize = 4096;
+
 /// `by_tool` keeps this many tool names; the rest are folded into [`OTHER_TOOLS`] (audit S-5).
 pub const MAX_TOOL_NAMES: usize = 64;
 
@@ -78,8 +89,33 @@ pub struct LaneTraces {
     pub records: Vec<CallRecord>,
 }
 
+/// How far one walk may go.
+struct Limits {
+    /// The bytes of trace read in all.
+    lane_bytes: u64,
+    /// The entries of the `traces` directory looked at before the walk gives up; none for no
+    /// limit.
+    scan_entries: Option<usize>,
+}
+
+/// The lane-end walk: the runner's totals and `port-candidates`.
+const AT_LANE_END: Limits = Limits {
+    lane_bytes: MAX_LANE_BYTES,
+    scan_entries: None,
+};
+
+/// The walk of a lane that is still running, repeated on each look.
+const LIVE: Limits = Limits {
+    lane_bytes: LIVE_LANE_BYTES,
+    scan_entries: Some(LIVE_LANE_ENTRIES),
+};
+
 /// `<lane>/portkit/traces/*.jsonl`, with no link followed at any step.
 pub fn read_lane_traces(lane_dir: &Path) -> LaneTraces {
+    walk(lane_dir, &AT_LANE_END)
+}
+
+fn walk(lane_dir: &Path, limits: &Limits) -> LaneTraces {
     let mut out = LaneTraces {
         state: LaneState::Untraced,
         files: 0,
@@ -112,9 +148,13 @@ pub fn read_lane_traces(lane_dir: &Path) -> LaneTraces {
         out.state = LaneState::Skipped;
         return out;
     };
-    let (files, overflow) = list_bounded(read, MAX_LANE_LISTING);
+    let Some((files, overflow)) = list_bounded(read, MAX_LANE_LISTING, limits.scan_entries) else {
+        out.unreadable += 1;
+        out.state = LaneState::Skipped;
+        return out;
+    };
     out.unread_files += overflow;
-    let mut budget = MAX_LANE_BYTES;
+    let mut budget = limits.lane_bytes;
     for file in files {
         let path = file.path();
         let Ok(kind) = file.file_type() else {
@@ -176,11 +216,20 @@ impl Ord for Named {
 /// entries are held: a max-heap on the name drops the largest whenever it is full. A
 /// directory returns its names in an order of its own, so stopping after `limit` entries
 /// would read a different set on each run; keeping the smallest names reads the same set
-/// whatever the order (a name is unique in a directory, so there are no ties).
-fn list_bounded(read: fs::ReadDir, limit: usize) -> (Vec<fs::DirEntry>, usize) {
+/// whatever the order (a name is unique in a directory, so there are no ties). With
+/// `scan_limit`, a directory of more entries than that (of any name or kind) is none: the
+/// walk stops there rather than list the rest.
+fn list_bounded(
+    read: fs::ReadDir,
+    limit: usize,
+    scan_limit: Option<usize>,
+) -> Option<(Vec<fs::DirEntry>, usize)> {
     let mut heap: BinaryHeap<Named> = BinaryHeap::with_capacity(limit.min(1024) + 1);
     let mut overflow = 0usize;
-    for entry in read.filter_map(Result::ok) {
+    for (seen, entry) in read.filter_map(Result::ok).enumerate() {
+        if scan_limit.is_some_and(|max| seen >= max) {
+            return None;
+        }
         if Path::new(&entry.file_name())
             .extension()
             .is_none_or(|ext| ext != "jsonl")
@@ -194,7 +243,7 @@ fn list_bounded(read: fs::ReadDir, limit: usize) -> (Vec<fs::DirEntry>, usize) {
         }
     }
     let files = heap.into_sorted_vec().into_iter().map(|n| n.0).collect();
-    (files, overflow)
+    Some((files, overflow))
 }
 
 /// Why a trace file was not read.
@@ -260,7 +309,19 @@ fn parse_records(bytes: &[u8], out: &mut LaneTraces) {
 /// walk that was skipped has none either). A lane past the aggregate bound is still traced:
 /// its totals cover the files read and `unread_files` says how many were left.
 pub fn lane_trace_totals(lane_dir: &Path) -> Option<TraceTotals> {
-    let traces = read_lane_traces(lane_dir);
+    totals_of(read_lane_traces(lane_dir))
+}
+
+/// The totals of a lane that is still running, so far: the same walk and sums as
+/// [`lane_trace_totals`] within the smaller bounds a repeated look needs ([`LIVE_LANE_BYTES`],
+/// [`LIVE_LANE_ENTRIES`]). The builder is writing the trace while it is read, so its last
+/// line may be cut (counted as malformed until the next look), and the runner's figure at lane
+/// end, read within the larger bounds, is the one that is kept.
+pub fn live_lane_trace_totals(lane_dir: &Path) -> Option<TraceTotals> {
+    totals_of(walk(lane_dir, &LIVE))
+}
+
+fn totals_of(traces: LaneTraces) -> Option<TraceTotals> {
     (traces.state == LaneState::Traced).then(|| {
         let mut totals = trace_totals(&traces.records, traces.malformed_lines as u64);
         totals.unread_files = traces.unread_files as u64;
@@ -806,7 +867,8 @@ mod tests {
         // Not a trace file: neither held nor counted.
         fs::write(traces.join("00000.txt"), "x").unwrap();
 
-        let (held, overflow) = list_bounded(fs::read_dir(&traces).unwrap(), MAX_LANE_LISTING);
+        let (held, overflow) =
+            list_bounded(fs::read_dir(&traces).unwrap(), MAX_LANE_LISTING, None).unwrap();
         assert_eq!(held.len(), MAX_LANE_LISTING);
         assert_eq!(overflow, 5000 - MAX_LANE_LISTING);
         let names: Vec<String> = held
@@ -841,5 +903,64 @@ mod tests {
         let walk = read_lane_traces(lane.path());
         assert_eq!((walk.files, walk.unread_files), (1, 0));
         assert_eq!(lane_trace_totals(lane.path()).unwrap().unread_files, 0);
+    }
+    #[test]
+    fn a_running_lanes_totals_are_the_lane_end_sums_within_the_live_bounds() {
+        let lane = tempfile::tempdir_in("/var/tmp").unwrap();
+        assert_eq!(
+            live_lane_trace_totals(lane.path()),
+            None,
+            "no trace directory"
+        );
+        let traces = lane.path().join("portkit/traces");
+        fs::create_dir_all(&traces).unwrap();
+        trace_file(&traces, "a.jsonl", 0);
+        trace_file(&traces, "b.jsonl", 0);
+        let live = live_lane_trace_totals(lane.path()).expect("traced");
+        assert_eq!(Some(live.clone()), lane_trace_totals(lane.path()));
+        assert_eq!((live.calls, live.saved_bytes), (2, 100));
+    }
+
+    #[test]
+    fn a_running_lane_with_a_line_still_being_written_counts_it_as_malformed() {
+        let lane = tempfile::tempdir_in("/var/tmp").unwrap();
+        let traces = lane.path().join("portkit/traces");
+        fs::create_dir_all(&traces).unwrap();
+        let half = &line()[..40];
+        fs::write(traces.join("a.jsonl"), format!("{}\n{half}", line())).unwrap();
+        let live = live_lane_trace_totals(lane.path()).expect("traced");
+        assert_eq!((live.calls, live.malformed_lines), (1, 1));
+    }
+
+    #[test]
+    fn the_live_walk_reads_at_most_8_mib_and_counts_what_it_left() {
+        let lane = tempfile::tempdir_in("/var/tmp").unwrap();
+        let traces = lane.path().join("portkit/traces");
+        fs::create_dir_all(&traces).unwrap();
+        // Two files of 5 MiB: the lane-end walk reads both, the live walk one.
+        trace_file(&traces, "a.jsonl", 5 * 1024 * 1024);
+        trace_file(&traces, "b.jsonl", 5 * 1024 * 1024);
+        let live = live_lane_trace_totals(lane.path()).expect("still traced");
+        assert_eq!((live.calls, live.unread_files), (1, 1));
+        let end = lane_trace_totals(lane.path()).unwrap();
+        assert_eq!((end.calls, end.unread_files), (2, 0));
+    }
+
+    #[test]
+    fn the_live_walk_gives_up_on_a_directory_of_too_many_entries() {
+        let lane = tempfile::tempdir_in("/var/tmp").unwrap();
+        let traces = lane.path().join("portkit/traces");
+        fs::create_dir_all(&traces).unwrap();
+        trace_file(&traces, "a.jsonl", 0);
+        // Names of any kind count: the walk stops before it has listed them all.
+        for n in 0..LIVE_LANE_ENTRIES {
+            fs::write(traces.join(format!("{n:05}.txt")), "").unwrap();
+        }
+        let walk = walk(lane.path(), &LIVE);
+        assert_eq!(walk.state, LaneState::Skipped);
+        assert_eq!((walk.files, walk.unreadable), (0, 1));
+        assert_eq!(live_lane_trace_totals(lane.path()), None);
+        // The lane-end walk lists the whole directory and still reads the trace.
+        assert_eq!(lane_trace_totals(lane.path()).unwrap().calls, 1);
     }
 }

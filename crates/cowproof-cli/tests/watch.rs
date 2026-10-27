@@ -592,9 +592,10 @@ fn watch_shows_ctx_saved_for_traced_lanes_and_a_dash_for_the_rest() {
         Some(r#"{"status":"finished","traceTotals":{"calls":2,"deliveredBytes":50}}"#),
         None,
     );
-    // Still running: the runner writes the totals at lane end, so there are none yet.
+    // Still running with no trace yet: nothing to show.
     lane_with(root, "e-running", None, None);
-    // Its trace is garbage and run.json says nothing about it: watch never opens the trace.
+    // Its trace is garbage and run.json says nothing about it: watch never opens the trace
+    // of an ended lane.
     lane_with(
         root,
         "f-bad-trace",
@@ -616,6 +617,18 @@ fn watch_shows_ctx_saved_for_traced_lanes_and_a_dash_for_the_rest() {
         None,
     );
 
+    // Still running with a trace: the figure so far, read from the trace on this look.
+    lane_with(root, "h-running-traced", None, None);
+    let traces = root.join("h-running-traced/portkit/traces");
+    fs::create_dir_all(&traces).unwrap();
+    fs::write(
+        traces.join("2026-10-27.jsonl"),
+        r#"{"tool":"Read","target":"a","surface":"cli","outcome":"ok","at":"x","duration_ms":0.0,"input_bytes":1,"produced_bytes":40000,"delivered_bytes":2000}"#
+            .to_string()
+            + "\n",
+    )
+    .unwrap();
+
     let table = watch_table_text(root);
     assert_eq!(
         table[0],
@@ -636,6 +649,7 @@ fn watch_shows_ctx_saved_for_traced_lanes_and_a_dash_for_the_rest() {
     };
     assert_eq!(saved("a-traced"), "12.3k");
     assert_eq!(saved("b-zero"), "0");
+    assert_eq!(saved("h-running-traced"), "38.0k");
     for untraced in [
         "c-untraced",
         "d-older",
@@ -645,10 +659,10 @@ fn watch_shows_ctx_saved_for_traced_lanes_and_a_dash_for_the_rest() {
     ] {
         assert_eq!(saved(untraced), "-", "{untraced}");
     }
-    // Seven lanes and the header, then the footnote that says whose figure the column is.
-    assert_eq!(table.len(), 9);
+    // Eight lanes and the header, then the footnote that says whose figure the column is.
+    assert_eq!(table.len(), 10);
     assert_eq!(
-        table[8],
+        table[9],
         ["* builder-written trace figure: informational, no verdict reads it."]
     );
 }

@@ -297,7 +297,9 @@ impl Tool for LanesTool {
              the question), its pending notes and its last event time. Reads the lane files \
              and returns at once. `ctx_saved_bytes_builder_reported` comes from the lane's \
              own portkit trace, which its builder can write: it is the builder's account, \
-             not a measurement, and no verdict reads it. `run_json: \"unreadable\"` means \
+             not a measurement, and no verdict reads it. With `ctx_saved_while_running` \
+             the lane is still running and the figure is its trace so far; the lane-end \
+             figure replaces it. `run_json: \"unreadable\"` means \
              the lane's run.json is there and cannot be used, so its credential mode and \
              figures are unknown, not absent.",
             json!({
